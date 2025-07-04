@@ -34,8 +34,11 @@ except ImportError:
 try:
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import letter
-    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.lib.fonts import addMapping
     PDF_AVAILABLE = True
 except ImportError:
     PDF_AVAILABLE = False
@@ -343,36 +346,502 @@ class FileGenerator:
             if line:
                 doc.add_paragraph(line)
 
-    def generate_pdf(self, data: Union[str, Dict], **kwargs) -> bytes:
-        """Generate PDF content"""
+    def generate_pdf(self, data: Union[str, Dict, List], **kwargs) -> bytes:
+        """Generate PDF content with flexible data structure support using canvas for Japanese"""
         if not PDF_AVAILABLE:
             raise ImportError("reportlab is required for PDF generation. Install with: pip install reportlab")
         
+        # Try canvas approach for better Japanese font control
+        return self._generate_pdf_with_canvas(data)
+    
+    def _generate_pdf_with_canvas(self, data) -> bytes:
+        """Generate PDF using canvas for direct font control"""
         buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter)
-        styles = getSampleStyleSheet()
-        story = []
+        
+        # Force download and register Japanese font with detailed logging
+        print("=== PDF Generation with Japanese Font Support ===")
+        font_registered = self._download_and_register_japanese_font()
+        
+        if font_registered:
+            font_name = 'NotoSansJP'
+            print(f"✓ Using Japanese font: {font_name}")
+        else:
+            font_name = 'Helvetica'
+            print(f"✗ Japanese font failed, using: {font_name}")
+        
+        # Create canvas
+        c = canvas.Canvas(buffer, pagesize=letter)
+        width, height = letter
+        
+        # Set initial position and margins
+        y_position = height - 50
+        left_margin = 50
+        right_margin = 50
+        max_width = width - left_margin - right_margin
+        line_height = 20
+        
+        # Convert data to text lines
+        text_lines = self._extract_text_lines(data)
+        print(f"Extracted {len(text_lines)} lines of text")
+        
+        for i, line in enumerate(text_lines):
+            if y_position < 50:  # New page if needed
+                c.showPage()
+                y_position = height - 50
+            
+            # Determine font size based on content
+            if line.startswith('# '):
+                font_size = 16
+                line = line[2:]
+                y_position -= 5
+            elif line.startswith('## '):
+                font_size = 14
+                line = line[3:]
+                y_position -= 3
+            elif line.startswith('• '):
+                font_size = 11
+            else:
+                font_size = 12
+            
+            # Set font with error handling
+            try:
+                c.setFont(font_name, font_size)
+                print(f"Line {i+1}: Font set to {font_name} {font_size}pt")
+            except Exception as font_error:
+                print(f"Font setting error: {font_error}")
+                c.setFont('Helvetica', font_size)
+                font_name = 'Helvetica'  # Fallback permanently
+            
+            # Draw text with word wrapping
+            try:
+                # Check if text fits in one line
+                text_width = c.stringWidth(line, font_name, font_size)
+                
+                if text_width <= max_width:
+                    # Text fits, draw normally
+                    c.drawString(left_margin, y_position, line)
+                    print(f"Line {i+1}: Drew text successfully")
+                else:
+                    # Text too long, need to wrap
+                    wrapped_lines = self._wrap_text(line, font_name, font_size, max_width, c)
+                    print(f"Line {i+1}: Wrapped into {len(wrapped_lines)} lines")
+                    
+                    for wrap_line in wrapped_lines:
+                        if y_position < 50:  # New page if needed
+                            c.showPage()
+                            y_position = height - 50
+                            c.setFont(font_name, font_size)
+                        
+                        c.drawString(left_margin, y_position, wrap_line)
+                        y_position -= line_height
+                    
+                    # Skip the normal y_position decrement since we already did it
+                    continue
+                    
+            except Exception as e:
+                print(f"Text drawing error for line {i+1}: {e}")
+                # Keep original text but add error note
+                try:
+                    c.drawString(left_margin, y_position, f"[JP Font Error] {line}")
+                    print(f"Line {i+1}: Drew with error prefix")
+                except:
+                    c.drawString(left_margin, y_position, f"[Line {i+1}: Font not available]")
+            
+            y_position -= line_height
+        
+        print("PDF generation completed, saving...")
+        c.save()
+        buffer.seek(0)
+        result = buffer.read()
+        print(f"PDF saved, size: {len(result)} bytes")
+        return result
+    
+    def _extract_text_lines(self, data) -> list:
+        """Extract text lines from various data structures"""
+        lines = []
         
         if isinstance(data, str):
-            story.append(Paragraph(data, styles['Normal']))
-        else:
-            if 'title' in data:
-                story.append(Paragraph(data['title'], styles['Title']))
-                story.append(Spacer(1, 12))
+            lines = data.split('\n')
+        elif isinstance(data, dict):
+            # Extract title
+            title_keys = ['title', 'タイトル', 'name', 'subject']
+            for key in title_keys:
+                if key in data and data[key]:
+                    lines.append(f"# {data[key]}")
+                    lines.append("")
+                    break
             
-            if 'sections' in data:
+            # Extract content/text
+            content_keys = ['content', 'text', 'body', 'description']
+            for key in content_keys:
+                if key in data and data[key]:
+                    if isinstance(data[key], str):
+                        lines.extend(data[key].split('\n'))
+                    else:
+                        lines.append(str(data[key]))
+                    lines.append("")
+                    break
+            
+            # Extract sections - with proper field mapping
+            if 'sections' in data and isinstance(data['sections'], list):
                 for section in data['sections']:
-                    if 'title' in section:
-                        story.append(Paragraph(section['title'], styles['Heading1']))
-                    if 'content' in section:
-                        story.append(Paragraph(section['content'], styles['Normal']))
-                        story.append(Spacer(1, 12))
-            elif 'content' in data:
-                story.append(Paragraph(data['content'], styles['Normal']))
+                    if isinstance(section, dict):
+                        # Handle heading/title
+                        heading_keys = ['heading', 'title', 'name']
+                        for key in heading_keys:
+                            if key in section and section[key]:
+                                lines.append(f"## {section[key]}")
+                                break
+                        
+                        # Handle text/content  
+                        text_keys = ['text', 'content', 'body']
+                        for key in text_keys:
+                            if key in section and section[key]:
+                                if isinstance(section[key], str):
+                                    lines.extend(section[key].split('\n'))
+                                else:
+                                    lines.append(str(section[key]))
+                                break
+                        
+                        # Handle list
+                        if 'list' in section and isinstance(section['list'], list):
+                            for item in section['list']:
+                                lines.append(f"• {item}")
+                        
+                        # Handle table
+                        if 'table' in section and isinstance(section['table'], dict):
+                            table = section['table']
+                            if 'headers' in table and isinstance(table['headers'], list):
+                                lines.append(" | ".join(str(h) for h in table['headers']))
+                                lines.append("-" * 40)
+                            
+                            if 'rows' in table and isinstance(table['rows'], list):
+                                for row in table['rows']:
+                                    if isinstance(row, list):
+                                        lines.append(" | ".join(str(cell) for cell in row))
+                        
+                        lines.append("")
+            
+            # Extract other fields
+            processed = {'title', 'タイトル', 'name', 'subject', 'content', 'text', 'body', 'description', 'sections'}
+            for key, value in data.items():
+                if key not in processed and value:
+                    lines.append(f"## {key}")
+                    if isinstance(value, (list, dict)):
+                        lines.append(str(value))
+                    else:
+                        lines.extend(str(value).split('\n'))
+                    lines.append("")
         
-        doc.build(story)
-        buffer.seek(0)
-        return buffer.read()
+        elif isinstance(data, list):
+            for item in data:
+                lines.extend(self._extract_text_lines(item))
+        
+        return [line.strip() for line in lines if line.strip()]
+    
+    def _wrap_text(self, text: str, font_name: str, font_size: int, max_width: float, canvas_obj) -> list:
+        """Wrap text to fit within specified width"""
+        words = text.split(' ')
+        lines = []
+        current_line = ""
+        
+        for word in words:
+            # Test if adding this word would exceed width
+            test_line = current_line + (" " if current_line else "") + word
+            test_width = canvas_obj.stringWidth(test_line, font_name, font_size)
+            
+            if test_width <= max_width:
+                current_line = test_line
+            else:
+                # Current line is full, start new line
+                if current_line:
+                    lines.append(current_line)
+                    current_line = word
+                else:
+                    # Single word is too long, break it
+                    lines.extend(self._break_long_word(word, font_name, font_size, max_width, canvas_obj))
+                    current_line = ""
+        
+        # Add the last line if there's content
+        if current_line:
+            lines.append(current_line)
+        
+        return lines
+    
+    def _break_long_word(self, word: str, font_name: str, font_size: int, max_width: float, canvas_obj) -> list:
+        """Break a single long word that doesn't fit"""
+        lines = []
+        current_part = ""
+        
+        for char in word:
+            test_part = current_part + char
+            test_width = canvas_obj.stringWidth(test_part, font_name, font_size)
+            
+            if test_width <= max_width:
+                current_part = test_part
+            else:
+                if current_part:
+                    lines.append(current_part)
+                current_part = char
+        
+        if current_part:
+            lines.append(current_part)
+        
+        return lines
+    
+    def _setup_japanese_styles(self):
+        """Setup Japanese styles by downloading Noto Sans JP if needed"""
+        styles = getSampleStyleSheet()
+        
+        # Always try to download and register Japanese font
+        font_registered = self._download_and_register_japanese_font()
+        
+        if font_registered:
+            # Update all styles to use Japanese font
+            font_name = 'NotoSansJP'
+            
+            # Update existing styles
+            styles['Normal'].fontName = font_name
+            styles['Title'].fontName = font_name
+            styles['Heading1'].fontName = font_name
+            styles['Heading2'].fontName = font_name
+            styles['Heading3'].fontName = font_name
+            
+            # Create custom Japanese-optimized styles
+            styles.add(ParagraphStyle(
+                name='JapaneseNormal',
+                parent=styles['Normal'],
+                fontName=font_name,
+                fontSize=12,
+                leading=16
+            ))
+            
+            styles.add(ParagraphStyle(
+                name='JapaneseTitle',
+                parent=styles['Title'],
+                fontName=font_name,
+                fontSize=18,
+                leading=22
+            ))
+            
+            print(f"Japanese font '{font_name}' registered and applied to styles")
+        else:
+            print("Failed to register Japanese font, using default fonts")
+        
+        return styles
+    
+    def _needs_japanese_font(self) -> bool:
+        """Check if Japanese font is needed by testing if default font can handle hiragana"""
+        try:
+            # Try to create a simple paragraph with Japanese text
+            test_text = "こんにちは"  # Simple hiragana
+            styles = getSampleStyleSheet()
+            Paragraph(test_text, styles['Normal'])
+            return True  # Always try to get Japanese font for better support
+        except:
+            return True
+    
+    def _download_and_register_japanese_font(self) -> bool:
+        """Download Noto Sans JP from Google Fonts and register it"""
+        # First check if font is already registered
+        try:
+            from reportlab.lib.fonts import tt2ps
+            if 'NotoSansJP' in pdfmetrics._fonts:
+                print("Japanese font already registered")
+                return True
+        except:
+            pass
+        
+        # Try to download and register TTF version
+        return self._download_ttf_japanese_font()
+    
+    def _download_ttf_japanese_font(self) -> bool:
+        """Download TTF version of Japanese font with robust error handling"""
+        try:
+            # Use only TRUE TTF fonts (not OTF) that reportlab can handle
+            font_urls = [
+                # Known working TTF Japanese font from Adobe
+                "https://github.com/adobe-fonts/source-han-sans/raw/release/Variable/TTF/Subset/SourceHanSansJP-VF.ttf",
+                # Alternative: Working Noto Sans JP TTF
+                "https://github.com/googlefonts/noto-cjk/raw/main/Sans/Variable/TTF/NotoSansCJKjp-VF.ttf"
+            ]
+            
+            import tempfile
+            import os
+            
+            for font_url in font_urls:
+                try:
+                    print(f"Attempting to download font from: {font_url}")
+                    response = requests.get(font_url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'})
+                    
+                    if response.status_code == 200:
+                        temp_dir = tempfile.gettempdir()
+                        font_path = os.path.join(temp_dir, 'NotoSansJP-Regular.ttf')
+                        
+                        with open(font_path, 'wb') as f:
+                            f.write(response.content)
+                        
+                        print(f"Font downloaded successfully: {len(response.content)} bytes")
+                        
+                        # Register the font with reportlab
+                        try:
+                            pdfmetrics.registerFont(TTFont('NotoSansJP', font_path))
+                            print("Font registered with reportlab")
+                            
+                            # Test font registration by checking available fonts
+                            registered_fonts = pdfmetrics.getRegisteredFontNames()
+                            if 'NotoSansJP' in registered_fonts:
+                                print("✓ Font registration confirmed")
+                                
+                                # Test drawing Japanese text with canvas
+                                test_buffer = io.BytesIO()
+                                test_canvas = canvas.Canvas(test_buffer)
+                                try:
+                                    test_canvas.setFont('NotoSansJP', 12)
+                                    test_canvas.drawString(100, 100, "こんにちは")
+                                    test_canvas.save()
+                                    print("✓ Canvas font test successful")
+                                    return True
+                                except Exception as canvas_e:
+                                    print(f"✗ Canvas font test failed: {canvas_e}")
+                                    return False
+                            else:
+                                print("✗ Font not found in registered fonts list")
+                                return False
+                                
+                        except Exception as reg_e:
+                            print(f"Font registration error: {reg_e}")
+                            continue
+                    else:
+                        print(f"Font download failed: HTTP {response.status_code}")
+                        
+                except Exception as e:
+                    print(f"Font download error from {font_url}: {e}")
+                    continue
+            
+            print("All font download attempts failed")
+            return False
+            
+        except Exception as e:
+            print(f"Font download general error: {e}")
+            return False
+    
+    def _safe_japanese_text(self, text: str) -> str:
+        """Return text as-is since we now download Japanese fonts"""
+        return str(text) if text else ""
+    
+    def _parse_pdf_structure(self, story, data: dict, styles):
+        """Parse dictionary structure for PDF generation"""
+        # Add title if present
+        title_keys = ['title', 'タイトル', 'name', 'subject']
+        for key in title_keys:
+            if key in data and data[key]:
+                safe_title = self._safe_japanese_text(str(data[key]))
+                story.append(Paragraph(safe_title, styles['Title']))
+                story.append(Spacer(1, 12))
+                break
+        
+        # Add metadata if present
+        meta_keys = ['date', 'author', 'created']
+        meta_info = []
+        for key in meta_keys:
+            if key in data and data[key]:
+                meta_info.append(f"{key.title()}: {data[key]}")
+        
+        if meta_info:
+            safe_meta = self._safe_japanese_text(" | ".join(meta_info))
+            story.append(Paragraph(safe_meta, styles['Normal']))
+            story.append(Spacer(1, 12))
+        
+        # Process content
+        processed = set(title_keys + meta_keys)
+        
+        for key, value in data.items():
+            if key in processed:
+                continue
+                
+            if key == 'content':
+                if isinstance(value, list):
+                    for item in value:
+                        self._add_pdf_text_content(story, item, styles)
+                else:
+                    self._add_pdf_text_content(story, value, styles)
+            elif key == 'sections':
+                if isinstance(value, list):
+                    for section in value:
+                        if isinstance(section, dict):
+                            # Handle section dictionary
+                            section_title = section.get('title') or section.get('heading', '')
+                            if section_title:
+                                safe_title = self._safe_japanese_text(str(section_title))
+                                story.append(Paragraph(safe_title, styles['Heading1']))
+                            
+                            section_content = section.get('content') or section.get('body', '')
+                            if section_content:
+                                self._add_pdf_text_content(story, section_content, styles)
+                            story.append(Spacer(1, 12))
+                        else:
+                            self._add_pdf_text_content(story, section, styles)
+            elif value:
+                # Other fields
+                if isinstance(value, (list, dict)):
+                    safe_key = self._safe_japanese_text(f"{str(key).title()}:")
+                    story.append(Paragraph(safe_key, styles['Heading2']))
+                    if isinstance(value, list):
+                        for item in value:
+                            self._add_pdf_text_content(story, item, styles)
+                    else:
+                        safe_value = self._safe_japanese_text(str(value))
+                        story.append(Paragraph(safe_value, styles['Normal']))
+                    story.append(Spacer(1, 12))
+                else:
+                    safe_text = self._safe_japanese_text(f"{str(key).title()}: {value}")
+                    story.append(Paragraph(safe_text, styles['Normal']))
+                    story.append(Spacer(1, 6))
+    
+    def _add_pdf_text_content(self, story, content, styles):
+        """Add text content to PDF story with proper formatting"""
+        if not content:
+            return
+            
+        content = str(content)
+        
+        # Handle markdown-style headings
+        if content.startswith('# '):
+            safe_text = self._safe_japanese_text(content[2:])
+            story.append(Paragraph(safe_text, styles['Heading1']))
+        elif content.startswith('## '):
+            safe_text = self._safe_japanese_text(content[3:])
+            story.append(Paragraph(safe_text, styles['Heading2']))
+        elif content.startswith('### '):
+            safe_text = self._safe_japanese_text(content[4:])
+            story.append(Paragraph(safe_text, styles['Heading3']))
+        elif content.startswith('---'):
+            # Horizontal rule - add some space
+            story.append(Spacer(1, 12))
+        elif content.startswith('|') and '|' in content[1:]:
+            # Simple table handling - convert to formatted text
+            safe_content = self._safe_japanese_text(content)
+            try:
+                story.append(Paragraph(f"<font name='Courier'>{safe_content}</font>", styles['Normal']))
+            except:
+                # Fallback if Courier is not available
+                story.append(Paragraph(safe_content, styles['Normal']))
+        else:
+            # Regular content - handle line breaks
+            lines = content.replace('\\n', '\n').split('\n')
+            for line in lines:
+                line = line.strip()
+                if line:
+                    # Handle bullet points
+                    if line.startswith('- '):
+                        safe_text = self._safe_japanese_text(f"• {line[2:]}")
+                        story.append(Paragraph(safe_text, styles['Normal']))
+                    else:
+                        safe_text = self._safe_japanese_text(line)
+                        story.append(Paragraph(safe_text, styles['Normal']))
+                        
+        story.append(Spacer(1, 6))
 
     def generate_xlsx(self, data: Union[List[Dict], Dict, List[List]], **kwargs) -> bytes:
         """Generate XLSX content with flexible data structure support"""
