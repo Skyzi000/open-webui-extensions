@@ -1,9 +1,9 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 3.0.0
+version: 4.0.0
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab
-description: Smart file generator that uploads all files to Open WebUI file system
+description: Advanced file generator with flexible data structure parsing and external service upload
 """
 
 import csv
@@ -792,8 +792,9 @@ class Tools:
         result += f"  filename='users.csv'\n"
         result += f")\n"
         result += f"```\n\n"
-        result += f"🎯 **New in v3.0:** File upload approach for all files!\n"
-        result += f"🚀 **All files:** Uploaded to Open WebUI file system\n"
+        result += f"🎯 **New in v4.0:** Smart data parsing & external upload!\n"
+        result += f"🚀 **All files:** Multi-service upload with delete tokens\n"
+        result += f"🧠 **AI-friendly:** Flexible parsing for any data structure\n"
         result += f"📝 **Open WebUI optimized:** Clean Markdown output"
         
         return result
