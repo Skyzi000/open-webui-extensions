@@ -216,52 +216,132 @@ class FileGenerator:
         return content.encode('utf-8')
 
     def generate_docx(self, data: Union[str, Dict], **kwargs) -> bytes:
-        """Generate DOCX content"""
+        """Generate DOCX content - handles any AI-generated structure"""
         if not DOCX_AVAILABLE:
             raise ImportError("python-docx is required for DOCX generation. Install with: pip install python-docx")
         
         doc = Document()
         
         if isinstance(data, str):
-            doc.add_paragraph(data)
+            self._add_text_content(doc, data)
         else:
-            if 'title' in data:
-                doc.add_heading(data['title'], 0)
-            
-            if 'sections' in data:
-                for section in data['sections']:
-                    if 'title' in section:
-                        doc.add_heading(section['title'], level=1)
-                    if 'content' in section:
-                        doc.add_paragraph(section['content'])
-            elif 'content' in data:
-                content = data['content']
-                if isinstance(content, list):
-                    # Handle list of content objects
-                    for item in content:
-                        if isinstance(item, dict):
-                            if 'heading' in item:
-                                doc.add_heading(item['heading'], level=1)
-                            if 'body' in item:
-                                # Handle multi-line content
-                                body_text = item['body']
-                                if isinstance(body_text, str):
-                                    # Split by newlines and add each as separate paragraph
-                                    for line in body_text.split('\n'):
-                                        if line.strip():  # Skip empty lines
-                                            doc.add_paragraph(line.strip())
-                                else:
-                                    doc.add_paragraph(str(body_text))
-                        else:
-                            doc.add_paragraph(str(item))
-                else:
-                    # Handle string content
-                    doc.add_paragraph(str(content))
+            self._parse_any_structure(doc, data)
         
         buffer = io.BytesIO()
         doc.save(buffer)
         buffer.seek(0)
         return buffer.read()
+    
+    def _parse_any_structure(self, doc, data):
+        """Parse any dictionary structure intelligently"""
+        if not isinstance(data, dict):
+            doc.add_paragraph(str(data))
+            return
+        
+        # Extract title first
+        title_keys = ['title', 'タイトル', 'name', 'subject', 'heading']
+        for key in title_keys:
+            if key in data and data[key]:
+                doc.add_heading(str(data[key]), 0)
+                break
+        
+        # Extract metadata 
+        meta_keys = ['date', 'author', 'created', 'updated', 'version']
+        meta_info = []
+        for key in meta_keys:
+            if key in data and data[key]:
+                meta_info.append(f"{key.title()}: {data[key]}")
+        
+        if meta_info:
+            meta_p = doc.add_paragraph(" | ".join(meta_info))
+            meta_p.italic = True
+            doc.add_paragraph("")
+        
+        # Process remaining content
+        processed = set(title_keys + meta_keys)
+        
+        for key, value in data.items():
+            if key in processed:
+                continue
+                
+            if isinstance(value, list):
+                self._process_list(doc, key, value)
+            elif isinstance(value, dict):
+                doc.add_heading(str(key).replace('_', ' ').title(), 1)
+                self._parse_any_structure(doc, value)
+            elif value:
+                self._add_key_value(doc, key, value)
+    
+    def _process_list(self, doc, key, items):
+        """Process list items flexibly"""
+        if not items:
+            return
+            
+        # Don't add heading for common list names
+        if key not in ['sections', 'content', 'items', 'data']:
+            doc.add_heading(str(key).replace('_', ' ').title(), 1)
+        
+        for item in items:
+            if isinstance(item, dict):
+                self._process_dict_item(doc, item)
+            elif isinstance(item, str) and item.strip():
+                self._add_text_content(doc, item)
+            elif item:
+                doc.add_paragraph(str(item))
+    
+    def _process_dict_item(self, doc, item):
+        """Process dictionary item looking for common patterns"""
+        heading_keys = ['heading', 'title', 'name', 'section', 'header']
+        content_keys = ['body', 'content', 'text', 'description', 'details']
+        
+        heading = None
+        content = None
+        
+        # Find heading
+        for h_key in heading_keys:
+            if h_key in item and item[h_key]:
+                heading = str(item[h_key])
+                break
+        
+        # Find content  
+        for c_key in content_keys:
+            if c_key in item and item[c_key]:
+                content = str(item[c_key])
+                break
+        
+        if heading:
+            doc.add_heading(heading, 2)
+        
+        if content:
+            self._add_text_content(doc, content)
+        
+        # Process any remaining fields
+        processed = set(heading_keys + content_keys)
+        for key, value in item.items():
+            if key not in processed and value:
+                self._add_key_value(doc, key, value)
+    
+    def _add_key_value(self, doc, key, value):
+        """Add key-value pair appropriately"""
+        if isinstance(value, str) and len(value) > 50:
+            doc.add_heading(str(key).replace('_', ' ').title(), 2)
+            self._add_text_content(doc, value)
+        else:
+            doc.add_paragraph(f"{str(key).replace('_', ' ').title()}: {value}")
+    
+    def _add_text_content(self, doc, text):
+        """Add text with proper line handling"""
+        if not text:
+            return
+            
+        # Handle various line break formats
+        text = str(text).replace('\\n', '\n')
+        lines = text.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if line:
+                doc.add_paragraph(line)
 
     def generate_pdf(self, data: Union[str, Dict], **kwargs) -> bytes:
         """Generate PDF content"""
@@ -294,19 +374,108 @@ class FileGenerator:
         buffer.seek(0)
         return buffer.read()
 
-    def generate_xlsx(self, data: List[Dict], **kwargs) -> bytes:
-        """Generate XLSX content"""
+    def generate_xlsx(self, data: Union[List[Dict], Dict, List[List]], **kwargs) -> bytes:
+        """Generate XLSX content with flexible data structure support"""
         if not PANDAS_AVAILABLE:
             raise ImportError("pandas and openpyxl are required for XLSX generation. Install with: pip install pandas openpyxl")
         
-        df = pd.DataFrame(data)
         buffer = io.BytesIO()
         
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Sheet1', index=False)
+            if isinstance(data, dict):
+                # Handle multiple sheets or complex structure
+                sheets_written = False
+                
+                for key, value in data.items():
+                    # Skip metadata keys
+                    if key.startswith('_'):
+                        continue
+                        
+                    sheet_name = str(key)[:31]  # Excel sheet name limit
+                    
+                    try:
+                        if isinstance(value, list) and value:
+                            if isinstance(value[0], list):
+                                # List of lists - treat as raw data with first row as header
+                                df = pd.DataFrame(value[1:], columns=value[0] if value else [])
+                            elif isinstance(value[0], dict):
+                                # List of dictionaries
+                                df = pd.DataFrame(value)
+                            else:
+                                # Simple list - single column
+                                df = pd.DataFrame({sheet_name: value})
+                        elif isinstance(value, dict):
+                            # Look for table-like data in nested dict
+                            table_data = self._extract_table_from_dict(value)
+                            if table_data:
+                                # Found table data
+                                if len(table_data) > 1:
+                                    df = pd.DataFrame(table_data[1:], columns=table_data[0])
+                                else:
+                                    df = pd.DataFrame(table_data)
+                            else:
+                                # Convert dict to key-value pairs
+                                df = pd.DataFrame(list(value.items()), columns=['項目', '内容'])
+                        else:
+                            # Single value
+                            df = pd.DataFrame({sheet_name: [value]})
+                        
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        sheets_written = True
+                        
+                    except Exception:
+                        # If conversion fails, create simple sheet with the data
+                        simple_df = pd.DataFrame({sheet_name: [str(value)]})
+                        simple_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        sheets_written = True
+                
+                # If no sheets were written, create a default one
+                if not sheets_written:
+                    default_df = pd.DataFrame({'Data': ['No valid data found']})
+                    default_df.to_excel(writer, sheet_name='Sheet1', index=False)
+                    
+            elif isinstance(data, list):
+                # Handle list data
+                if data and isinstance(data[0], list):
+                    # List of lists
+                    if len(data) > 1:
+                        df = pd.DataFrame(data[1:], columns=data[0])
+                    else:
+                        df = pd.DataFrame(data)
+                elif data and isinstance(data[0], dict):
+                    # List of dictionaries
+                    df = pd.DataFrame(data)
+                else:
+                    # Simple list
+                    df = pd.DataFrame({'Values': data})
+                
+                df.to_excel(writer, sheet_name='Sheet1', index=False)
+            else:
+                # Single value or other type
+                df = pd.DataFrame({'Data': [str(data)]})
+                df.to_excel(writer, sheet_name='Sheet1', index=False)
         
         buffer.seek(0)
         return buffer.read()
+
+    def _extract_table_from_dict(self, data: dict) -> Optional[List[List]]:
+        """Extract table-like data from nested dictionary"""
+        table_keys = ['table', 'テーブル', 'data', 'データ', 'rows', '行']
+        
+        for key in table_keys:
+            if key in data:
+                value = data[key]
+                if isinstance(value, list) and value:
+                    # Check if it's a proper table (list of lists)
+                    if isinstance(value[0], list):
+                        return value
+        
+        # Look for any list of lists in the dict values
+        for value in data.values():
+            if isinstance(value, list) and value and isinstance(value[0], list):
+                return value
+                
+        return None
 
     def generate_zip(self, files: Dict[str, Any], **kwargs) -> bytes:
         """Generate ZIP content"""
@@ -421,11 +590,15 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
                 response = requests.post(service["url"], files=files, data=data, headers=headers, timeout=15)
             
             if response.status_code == 200:
+                download_url = ""
+                delete_token = ""
+                
                 if service["name"] == "file.io":
                     # file.io returns JSON - handle parsing errors
                     try:
                         result = response.json()
                         download_url = result.get("link", "")
+                        # file.io doesn't provide delete capability
                     except Exception:
                         # JSON parsing failed, treat as error
                         error_info = f"{service['name']}: Invalid JSON response - {response.text[:100]}"
@@ -434,8 +607,27 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
                 else:
                     # transfer.sh and 0x0.st return plain text URL
                     download_url = response.text.strip()
+                    
+                    # For 0x0.st, get the management token from X-Token header
+                    if service["name"] == "0x0.st":
+                        delete_token = response.headers.get("X-Token", "")
                 
                 if download_url:
+                    # Build response with optional delete instructions
+                    delete_section = ""
+                    if delete_token and service["name"] == "0x0.st":
+                        delete_section = f"""
+### 🗑️ ファイル削除
+
+0x0.stでファイルを削除するには、以下のコマンドを実行してください：
+
+```bash
+curl -F "token={delete_token}" -F "delete=" {download_url}
+```
+
+⚠️ **注意**: このコマンドを実行するとファイルが即座に削除されます
+"""
+                    
                     return f"""## ✅ ファイル生成・アップロード完了
 
 **📄 ファイル名:** `{filename}`  
@@ -451,7 +643,7 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
 ```
 {download_url}
 ```
-
+{delete_section}
 💡 **保持期間**: {service["retention"]}  
 🔗 **共有**: このリンクを他の人と共有できます
 """
@@ -525,12 +717,15 @@ class Tools:
             if file_type not in supported_types:
                 return f"❌ Unsupported file type: {file_type}. Supported: {', '.join(supported_types)}"
 
-            # Generate filename if not provided
-            if not filename:
+            # Generate filename if not provided or is Field object
+            if not filename or hasattr(filename, 'default'):
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 filename = f"generated_{timestamp}.{file_type}"
-            elif not filename.endswith(f'.{file_type}'):
-                filename += f'.{file_type}'
+            else:
+                # Ensure filename is string and has correct extension
+                filename = str(filename)
+                if not filename.endswith(f'.{file_type}'):
+                    filename += f'.{file_type}'
 
             # Prepare kwargs for file generators
             kwargs = {
