@@ -1,9 +1,9 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 4.0.0
+version: 5.0.0
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab
-description: Advanced file generator with flexible data structure parsing and external service upload
+description: Advanced file generator with Japanese font support, professional table rendering, and text wrapping
 """
 
 import csv
@@ -384,10 +384,27 @@ class FileGenerator:
         text_lines = self._extract_text_lines(data)
         print(f"Extracted {len(text_lines)} lines of text")
         
-        for i, line in enumerate(text_lines):
+        i = 0
+        while i < len(text_lines):
+            line = text_lines[i]
+            
             if y_position < 50:  # New page if needed
                 c.showPage()
                 y_position = height - 50
+            
+            # Handle table rendering
+            if line == "__TABLE_START__":
+                if i + 2 < len(text_lines) and text_lines[i + 2] == "__TABLE_END__":
+                    table_data = json.loads(text_lines[i + 1])
+                    table_height = self._draw_table(c, table_data, left_margin, y_position, max_width, font_name)
+                    y_position -= table_height
+                    i += 3  # Skip START, data, and END
+                    continue
+                else:
+                    # Malformed table, treat as normal text
+                    print("Warning: Malformed table structure, treating as text")
+                    i += 1
+                    continue
             
             # Determine font size based on content
             if line.startswith('# '):
@@ -435,7 +452,8 @@ class FileGenerator:
                         c.drawString(left_margin, y_position, wrap_line)
                         y_position -= line_height
                     
-                    # Skip the normal y_position decrement since we already did it
+                    # Skip the normal y_position decrement since we already did it in the loop
+                    i += 1
                     continue
                     
             except Exception as e:
@@ -448,6 +466,7 @@ class FileGenerator:
                     c.drawString(left_margin, y_position, f"[Line {i+1}: Font not available]")
             
             y_position -= line_height
+            i += 1
         
         print("PDF generation completed, saving...")
         c.save()
@@ -508,17 +527,11 @@ class FileGenerator:
                             for item in section['list']:
                                 lines.append(f"• {item}")
                         
-                        # Handle table
+                        # Handle table - mark for special rendering
                         if 'table' in section and isinstance(section['table'], dict):
-                            table = section['table']
-                            if 'headers' in table and isinstance(table['headers'], list):
-                                lines.append(" | ".join(str(h) for h in table['headers']))
-                                lines.append("-" * 40)
-                            
-                            if 'rows' in table and isinstance(table['rows'], list):
-                                for row in table['rows']:
-                                    if isinstance(row, list):
-                                        lines.append(" | ".join(str(cell) for cell in row))
+                            lines.append("__TABLE_START__")
+                            lines.append(json.dumps(section['table']))
+                            lines.append("__TABLE_END__")
                         
                         lines.append("")
             
@@ -588,6 +601,120 @@ class FileGenerator:
             lines.append(current_part)
         
         return lines
+    
+    def _draw_table(self, canvas_obj, table_data: dict, x: float, y: float, max_width: float, font_name: str) -> float:
+        """Draw a properly formatted table and return its height"""
+        if not table_data:
+            return 0
+        
+        headers = table_data.get('headers', [])
+        rows = table_data.get('rows', [])
+        
+        if not headers and not rows:
+            return 0
+        
+        # Table styling
+        table_font_size = 10
+        header_font_size = 11
+        cell_padding = 4
+        row_height = 16
+        header_height = 20
+        
+        # Calculate column widths with safety check
+        num_cols = len(headers) if headers else (len(rows[0]) if rows and len(rows[0]) > 0 else 1)
+        if num_cols == 0:
+            num_cols = 1
+        col_width = max_width / num_cols
+        
+        
+        current_y = y
+        
+        try:
+            # Draw headers
+            if headers:
+                # Header background (light gray)
+                canvas_obj.setFillColorRGB(0.9, 0.9, 0.9)
+                canvas_obj.rect(x, current_y - header_height, max_width, header_height, fill=1, stroke=1)
+                
+                # Header text
+                canvas_obj.setFillColorRGB(0, 0, 0)  # Black text
+                canvas_obj.setFont(font_name, header_font_size)
+                
+                for i, header in enumerate(headers):
+                    text_x = x + (i * col_width) + cell_padding
+                    text_y = current_y - header_height + cell_padding
+                    
+                    # Truncate if too long
+                    header_str = str(header)
+                    max_header_width = col_width - (2 * cell_padding)
+                    # Accurate truncation with safety counter
+                    truncate_count = 0
+                    while (canvas_obj.stringWidth(header_str, font_name, header_font_size) > max_header_width 
+                           and len(header_str) > 3 and truncate_count < 100):
+                        header_str = header_str[:-4] + "..."
+                        truncate_count += 1
+                    
+                    canvas_obj.drawString(text_x, text_y, header_str)
+                
+                current_y -= header_height
+            
+            # Draw rows
+            canvas_obj.setFont(font_name, table_font_size)
+            
+            for row in rows:
+                # Row background (alternating)
+                row_index = rows.index(row)
+                if row_index % 2 == 0:
+                    canvas_obj.setFillColorRGB(0.95, 0.95, 0.95)
+                else:
+                    canvas_obj.setFillColorRGB(1, 1, 1)
+                
+                canvas_obj.rect(x, current_y - row_height, max_width, row_height, fill=1, stroke=1)
+                
+                # Row text
+                canvas_obj.setFillColorRGB(0, 0, 0)  # Black text
+                
+                for i, cell in enumerate(row):
+                    if i >= num_cols:  # Don't exceed table width
+                        break
+                        
+                    text_x = x + (i * col_width) + cell_padding
+                    text_y = current_y - row_height + cell_padding
+                    
+                    # Truncate if too long
+                    cell_str = str(cell)
+                    max_cell_width = col_width - (2 * cell_padding)
+                    # Accurate truncation with safety counter
+                    truncate_count = 0
+                    while (canvas_obj.stringWidth(cell_str, font_name, table_font_size) > max_cell_width 
+                           and len(cell_str) > 3 and truncate_count < 100):
+                        cell_str = cell_str[:-4] + "..."
+                        truncate_count += 1
+                    
+                    canvas_obj.drawString(text_x, text_y, cell_str)
+                
+                current_y -= row_height
+            
+            # Table border
+            canvas_obj.setStrokeColorRGB(0, 0, 0)
+            canvas_obj.setLineWidth(1)
+            total_height = y - current_y
+            canvas_obj.rect(x, current_y, max_width, total_height, fill=0, stroke=1)
+            
+            # Column dividers
+            for i in range(1, num_cols):
+                line_x = x + (i * col_width)
+                canvas_obj.line(line_x, y, line_x, current_y)
+            
+            print(f"Table drawn: {len(headers)} headers, {len(rows)} rows, height: {total_height}")
+            return total_height + 10  # Add some spacing after table
+            
+        except Exception as e:
+            print(f"Table drawing error: {e}")
+            # Fallback to simple text
+            canvas_obj.setFont(font_name, 10)
+            canvas_obj.drawString(x, current_y, "[Table rendering error]")
+            return 20
     
     def _setup_japanese_styles(self):
         """Setup Japanese styles by downloading Noto Sans JP if needed"""
