@@ -1,9 +1,26 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.9.0
-requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4
-description: Advanced file generator with WeasyPrint/reportlab PDF generation, Japanese font support, BeautifulSoup HTML parsing, and rich DOCX formatting
+version: 0.10.0
+requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests
+description: |
+  Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
+  
+  ## Supported Formats
+  - **Text**: All text-based formats (CSV, JSON, XML, TXT, HTML, Markdown, YAML, TOML, JavaScript, Python, SQL, etc.)
+  - **Binary**: DOCX (with rich formatting), XLSX (Excel), PDF (with Japanese fonts), ZIP (with URL downloading support)
+  
+  ## Key Features
+  - Advanced PDF generation with WeasyPrint/ReportLab and Japanese font support
+  - Rich DOCX formatting with HTML input support
+  - ZIP archive creation with remote file downloading from URLs
+  - Automatic cloud upload to multiple services (transfer.sh, 0x0.st, file.io)
+  - Comprehensive error handling and service fallback
+  - BeautifulSoup HTML parsing for clean document generation
+  - Pandas integration for advanced data processing
+  
+  ## Input Format Documentation
+  Each file type expects specific data formats - see generate_file() docstring for detailed specifications.
 """
 
 import csv
@@ -17,6 +34,7 @@ from typing import Dict, List, Any, Optional, Union
 from datetime import datetime
 from pydantic import BaseModel, Field
 from fastapi import UploadFile
+
 
 # Optional dependencies with graceful fallback
 try:
@@ -70,6 +88,8 @@ class FileGenerator:
             'txt': 'text/plain',
             'html': 'text/html',
             'md': 'text/markdown',
+            'yaml': 'application/x-yaml',
+            'toml': 'application/toml',
             'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             'pdf': 'application/pdf',
             'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -83,19 +103,8 @@ class FileGenerator:
         """Generate file content based on type"""
         
         try:
-            if file_type == 'csv':
-                return self.generate_csv(data, **kwargs)
-            elif file_type == 'json':
-                return self.generate_json(data, **kwargs)
-            elif file_type == 'xml':
-                return self.generate_xml(data, **kwargs)
-            elif file_type == 'txt':
-                return self.generate_txt(data, **kwargs)
-            elif file_type == 'html':
-                return self.generate_html(data, **kwargs)
-            elif file_type == 'md':
-                return self.generate_markdown(data, **kwargs)
-            elif file_type == 'docx':
+            # Special binary formats that need custom processing
+            if file_type == 'docx':
                 return self.generate_docx(data, **kwargs)
             elif file_type == 'pdf':
                 return self.generate_pdf(data, **kwargs)
@@ -103,20 +112,23 @@ class FileGenerator:
                 return self.generate_xlsx(data, **kwargs)
             elif file_type == 'zip':
                 return self.generate_zip(data, **kwargs)
-            elif file_type == 'js':
-                return self.generate_javascript(data, **kwargs)
-            elif file_type == 'py':
-                return self.generate_python(data, **kwargs)
-            elif file_type == 'sql':
-                return self.generate_sql(data, **kwargs)
             else:
-                return None
+                # Default: treat as text-based format
+                return self.generate_text(data, **kwargs)
         except Exception as e:
             raise Exception(f"Content generation failed: {str(e)}")
 
     def get_mime_type(self, file_type: str) -> str:
         """Get MIME type for file format"""
         return self.mime_types.get(file_type, 'application/octet-stream')
+
+    def generate_text(self, data: Union[str, Any], **kwargs) -> bytes:
+        """Generate text content from string data"""
+        if isinstance(data, str):
+            return data.encode('utf-8')
+        else:
+            # Fallback to string representation
+            return str(data).encode('utf-8')
 
     def generate_csv(self, data: Union[List[Dict], List[List], str], **kwargs) -> bytes:
         """Generate CSV content"""
@@ -232,6 +244,22 @@ class FileGenerator:
                 content += data['content']
         
         return content.encode('utf-8')
+
+    def generate_yaml(self, data: Union[str, Any], **kwargs) -> bytes:
+        """Generate YAML content from pre-formatted string"""
+        if isinstance(data, str):
+            return data.encode('utf-8')
+        else:
+            # Fallback to string representation
+            return str(data).encode('utf-8')
+
+    def generate_toml(self, data: Union[str, Any], **kwargs) -> bytes:
+        """Generate TOML content from pre-formatted string"""
+        if isinstance(data, str):
+            return data.encode('utf-8')
+        else:
+            # Fallback to string representation
+            return str(data).encode('utf-8')
 
     def generate_docx(self, data: Union[str, Dict], **kwargs) -> bytes:
         """Generate DOCX content - for docx files, please provide data in HTML format"""
@@ -2613,19 +2641,19 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
             "name": "transfer.sh",
             "url": f"https://transfer.sh/{safe_filename}",
             "method": "put",
-            "retention": "サービス設定に依存"
+            "retention": "Depends on service settings"
         },
         {
             "name": "0x0.st", 
             "url": "https://0x0.st",
             "method": "post",
-            "retention": "30日～1年（ファイルサイズ依存）"
+            "retention": "30 days to 1 year (depends on file size)"
         },
         {
             "name": "file.io",
             "url": "https://file.io",
             "method": "post", 
-            "retention": "14日（1回ダウンロードで削除）"
+            "retention": "14 days (deleted after first download)"
         }
     ]
     
@@ -2678,35 +2706,35 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
                     delete_section = ""
                     if delete_token and service["name"] == "0x0.st":
                         delete_section = f"""
-### 🗑️ ファイル削除
+### 🗑️ File Deletion
 
-0x0.stでファイルを削除するには、以下のコマンドを実行してください：
+To delete the file from 0x0.st, run the following command:
 
 ```bash
 curl -F "token={delete_token}" -F "delete=" {download_url}
 ```
 
-⚠️ **注意**: このコマンドを実行するとファイルが即座に削除されます
+⚠️ **Warning**: This command will immediately delete the file
 """
                     
-                    return f"""## ✅ ファイル生成・アップロード完了
+                    return f"""## ✅ File Generated and Uploaded Successfully
 
-**📄 ファイル名:** `{filename}`  
-**💾 サイズ:** {file_size} bytes ({file_size/1024:.1f} KB)  
-**🕒 作成日時:** {datetime.now().strftime('%Y年%m月%d日 %H:%M')}  
-**🌐 サービス:** {service["name"]}
+**📄 Filename:** `{filename}`  
+**💾 Size:** {file_size} bytes ({file_size/1024:.1f} KB)  
+**🕒 Created:** {datetime.now().strftime('%Y-%m-%d %H:%M')}  
+**🌐 Service:** {service["name"]}
 
-### 📥 ダウンロード
+### 📥 Download
 
-**[⬇️ {filename} をダウンロード]({download_url})**
+**[⬇️ Download {filename}]({download_url})**
 
-### 📋 直接リンク
+### 📋 Direct Link
 ```
 {download_url}
 ```
 {delete_section}
-💡 **保持期間**: {service["retention"]}  
-🔗 **共有**: このリンクを他の人と共有できます
+💡 **Retention:** {service["retention"]}  
+🔗 **Sharing:** This link can be shared with others
 """
             else:
                 # HTTP error - collect status and response
@@ -2720,20 +2748,20 @@ curl -F "token={delete_token}" -F "delete=" {download_url}
             continue
     
     # All services failed - show detailed errors
-    error_details = "\n".join(errors) if errors else "詳細不明"
+    error_details = "\n".join(errors) if errors else "Unknown details"
     
-    return f"""## ❌ 全サービスでアップロード失敗
+    return f"""## ❌ Upload Failed on All Services
 
-**ファイル:** `{filename}` ({file_size} bytes)
+**File:** `{filename}` ({file_size} bytes)
 
-### デバッグ情報
+### Debug Information
 ```
 {error_details}
 ```
 
-試行したサービス: transfer.sh, 0x0.st, file.io
+Attempted services: transfer.sh, 0x0.st, file.io
 
-💡 **解決策**: エラー詳細を確認してネットワーク設定をチェックしてください
+💡 **Solution**: Check the error details and verify your network settings
 """
 
 
@@ -2752,7 +2780,7 @@ class Tools:
 
     def generate_file(
         self,
-        file_type: str = Field(..., description="File type: csv, json, xml, txt, html, md, docx, pdf, xlsx, zip, js, py, sql"),
+        file_type: str = Field(..., description="File type (extension): any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, etc.) or binary format (docx, pdf, xlsx, zip)"),
         data: Any = Field(..., description="Data to convert to file format"),
         filename: Optional[str] = Field(None, description="Custom filename (optional)"),
         indent: Optional[int] = Field(2, description="JSON indentation (for JSON files)"),
@@ -2766,12 +2794,7 @@ class Tools:
         
         :param file_type: Type of file to generate
         :param data: Data to convert - expected formats by file type:
-                    - CSV: List[Dict] (list of dictionaries), List[List] (list of lists), or str (CSV string)
-                    - JSON: Any JSON-serializable data (dict, list, str, int, etc.)
-                    - XML: Dict (dictionary/object structure)
-                    - TXT: str (plain text) or List[str] (list of strings)
-                    - HTML: str (HTML string) or Dict with keys: title, body, style
-                    - MD: str (markdown text) or similar to HTML format
+                    - Any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, etc.): str (pre-formatted text content)
                     - DOCX: str (HTML format preferred for rich formatting)
                     - PDF: str (HTML format preferred for rich formatting)
                     - XLSX: List[Dict] (list of dictionaries) or tabular data
@@ -2783,10 +2806,9 @@ class Tools:
         """
         
         try:
-            # Validate file type
-            supported_types = ['csv', 'json', 'xml', 'txt', 'html', 'md', 'docx', 'pdf', 'xlsx', 'zip', 'js', 'py', 'sql']
-            if file_type not in supported_types:
-                return f"❌ Unsupported file type: {file_type}. Supported: {', '.join(supported_types)}"
+            # Only validate that file_type is provided - support any text format
+            if not file_type or not isinstance(file_type, str):
+                return "❌ Invalid file type provided"
 
             # Generate filename if not provided or is Field object
             if not filename or hasattr(filename, 'default'):
@@ -2846,36 +2868,21 @@ class Tools:
         :return: List of supported formats with availability status
         """
         
-        formats_info = {
-            'csv': '✅ Always available',
-            'json': '✅ Always available', 
-            'xml': '✅ Always available',
-            'txt': '✅ Always available',
-            'html': '✅ Always available',
-            'md': '✅ Always available',
-            'js': '✅ Always available',
-            'py': '✅ Always available', 
-            'sql': '✅ Always available',
-            'zip': '✅ Always available',
-            'docx': '✅ Available' if DOCX_AVAILABLE else '❌ Requires: pip install python-docx',
-            'pdf': '✅ Available' if PDF_AVAILABLE else '❌ Requires: pip install reportlab',
-            'xlsx': '✅ Available' if PANDAS_AVAILABLE else '❌ Requires: pip install pandas openpyxl'
-        }
-        
         result = "📋 **Universal File Generator - Supported Formats:**\n\n"
-        for fmt, status in formats_info.items():
-            result += f"• **{fmt.upper()}**: {status}\n"
-        
-        result += f"\n💡 **Usage example:**\n"
+        result += "**Text Formats:** ✅ Any text-based format (unlimited support)\n"
+        result += "- Examples: csv, json, xml, txt, html, md, yaml, toml, js, py, sql, ini, conf, log, etc.\n\n"
+        result += "**Binary Formats:**\n"
+        result += f"- **DOCX**: {'✅ Available' if DOCX_AVAILABLE else '❌ Requires: pip install python-docx'}\n"
+        result += f"- **PDF**: {'✅ Available' if PDF_AVAILABLE else '❌ Requires: pip install reportlab'}\n"
+        result += f"- **XLSX**: {'✅ Available' if PANDAS_AVAILABLE else '❌ Requires: pip install pandas openpyxl'}\n"
+        result += "- **ZIP**: ✅ Always available\n\n"
+        result += f"💡 **Usage example:**\n"
         result += f"```\n"
         result += f"generate_file(\n"
         result += f"  file_type='csv',\n"
-        result += f"  data=[{{'name': 'Alice', 'age': 25}}, {{'name': 'Bob', 'age': 30}}],\n"
+        result += f"  data='name,age\\nAlice,25\\nBob,30',\n"
         result += f"  filename='users.csv'\n"
         result += f")\n"
         result += f"```\n\n"
-        result += f"🚀 **All files:** Multi-service upload with delete tokens\n"
-        result += f"🧠 **AI-friendly:** Flexible parsing for any data structure\n"
-        result += f"📝 **Open WebUI optimized:** Clean Markdown output"
         
         return result
