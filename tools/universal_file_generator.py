@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.12.1
+version: 0.12.2
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2459,7 +2459,7 @@ class Tools:
         self.generator = FileGenerator()
         self.valves = self.Valves()
 
-    def generate_file(
+    async def generate_file(
         self,
         file_type: str = Field(..., description="File type (extension): any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, etc.) or binary format (docx, pdf, xlsx, zip)"),
         data: Any = Field(..., description="Data to convert to file format"),
@@ -2467,7 +2467,8 @@ class Tools:
         indent: Optional[int] = Field(2, description="JSON indentation (for JSON files)"),
         root_name: Optional[str] = Field("root", description="Root element name (for XML files)"),
         __request__: object = None,
-        __user__: dict = {}
+        __user__: dict = {},
+        __event_emitter__: object = None
     ) -> str:
         """
         Generate a file of specified type from provided data
@@ -2487,6 +2488,9 @@ class Tools:
         """
         
         try:
+            # Store event emitter for notifications
+            self.event_emitter = __event_emitter__
+            
             # Only validate that file_type is provided - support any text format
             if not file_type or not isinstance(file_type, str):
                 return "❌ Invalid file type provided"
@@ -2523,19 +2527,67 @@ class Tools:
                 file_content = self.generator.generate_content(file_type, data, **kwargs)
                 
                 if file_content is None:
+                    # Emit failure notification
+                    if hasattr(self, 'event_emitter') and self.event_emitter:
+                        await self.event_emitter({
+                            "type": "notification",
+                            "data": {
+                                "type": "error",
+                                "content": f"{file_type}ファイルの生成に失敗しました"
+                            }
+                        })
                     return f"❌ Failed to generate {file_type} content"
                     
                 if len(file_content) == 0:
+                    # Emit empty content notification
+                    if hasattr(self, 'event_emitter') and self.event_emitter:
+                        await self.event_emitter({
+                            "type": "notification",
+                            "data": {
+                                "type": "warning",
+                                "content": f"{file_type}ファイルの内容が空です"
+                            }
+                        })
                     return f"❌ Generated empty {file_type} content"
                     
             except Exception as e:
+                # Emit error notification
+                if hasattr(self, 'event_emitter') and self.event_emitter:
+                    await self.event_emitter({
+                        "type": "notification",
+                        "data": {
+                            "type": "error",
+                            "content": f"コンテンツ生成エラー: {str(e)}"
+                        }
+                    })
                 return f"❌ Content generation error: {str(e)}"
 
             # Unified file processing - always use upload approach
             file_size = len(file_content)
-            return _upload_file(file_content, filename, file_type, file_size)
+            upload_result = _upload_file(file_content, filename, file_type, file_size)
+            
+            # Emit success notification
+            if hasattr(self, 'event_emitter') and self.event_emitter:
+                await self.event_emitter({
+                    "type": "notification",
+                    "data": {
+                        "type": "success",
+                        "content": f"{filename}を正常に生成しました"
+                    }
+                })
+            
+            return upload_result
 
         except Exception as e:
+            # Emit error notification for unexpected errors
+            if hasattr(self, 'event_emitter') and self.event_emitter:
+                await self.event_emitter({
+                    "type": "notification",
+                    "data": {
+                        "type": "error",
+                        "content": f"予期しないエラーが発生しました: {str(e)}"
+                    }
+                })
             return f"❌ Unexpected error generating {file_type} file: {str(e)}"
 
     def list_supported_formats(
