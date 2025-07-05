@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.12.2
+version: 0.13.0
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2270,6 +2270,42 @@ class FileGenerator:
         with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             # Handle list of {filename, url} format
             if isinstance(files, list):
+                # Check if it's a list of strings (just filenames) - return error
+                if files and isinstance(files[0], str):
+                    error_msg = """❌ ZIP Creation Error: List of filenames provided without content.
+
+To create a ZIP file, please provide data in one of these formats:
+
+**Format 1: Dictionary (filename -> content/URL)**
+```json
+{
+  "file_type": "zip",
+  "data": {
+    "sample.csv": "Name,Age\\nJohn,25\\nJane,30",
+    "sample.json": "{\\"message\\": \\"Hello World\\"}",
+    "sample.txt": "https://example.com/file.txt"
+  },
+  "filename": "my_files.zip"
+}
+```
+
+**Format 2: List (filename + URL)**
+```json
+{
+  "file_type": "zip", 
+  "data": [
+    {"filename": "sample.csv", "url": "https://example.com/file.csv"},
+    {"filename": "sample.json", "url": "https://example.com/file.json"}
+  ],
+  "filename": "my_files.zip"
+}
+```
+
+- Dictionary format: filename as key, content or URL as value
+- List format: each element must contain 'filename' and 'url' keys
+- URLs will be automatically downloaded"""
+                    raise ValueError(error_msg)
+                
                 for file_info in files:
                     if isinstance(file_info, dict) and 'filename' in file_info and 'url' in file_info:
                         filename = file_info['filename']
@@ -2288,7 +2324,19 @@ class FileGenerator:
             # Handle original dict format
             elif isinstance(files, dict):
                 for filename, content in files.items():
-                    if isinstance(content, str):
+                    # Check if content is a URL string
+                    if isinstance(content, str) and (content.startswith('http://') or content.startswith('https://')):
+                        try:
+                            print(f"Downloading {filename} from {content}")
+                            response = requests.get(content, timeout=30)
+                            response.raise_for_status()
+                            zf.writestr(filename, response.content)
+                        except Exception as e:
+                            print(f"Failed to download {filename}: {str(e)}")
+                            # Add error file instead
+                            error_content = f"Failed to download {filename} from {content}\nError: {str(e)}"
+                            zf.writestr(f"ERROR_{filename}.txt", error_content.encode('utf-8'))
+                    elif isinstance(content, str):
                         zf.writestr(filename, content.encode('utf-8'))
                     elif isinstance(content, bytes):
                         zf.writestr(filename, content)
@@ -2299,9 +2347,15 @@ class FileGenerator:
                             file_content = self.generate_content(file_ext, content)
                             if file_content:
                                 zf.writestr(filename, file_content)
-                        except:
-                            # Fallback to string representation
-                            zf.writestr(filename, str(content).encode('utf-8'))
+                            else:
+                                # If generation failed, add error file
+                                error_content = f"Failed to generate {file_ext} content from provided data"
+                                zf.writestr(f"ERROR_{filename}.txt", error_content.encode('utf-8'))
+                        except Exception as e:
+                            print(f"Error generating {file_ext} content: {str(e)}")
+                            # Add error file with details
+                            error_content = f"Failed to generate {file_ext} content from provided data\nError: {str(e)}\nData type: {type(content)}"
+                            zf.writestr(f"ERROR_{filename}.txt", error_content.encode('utf-8'))
         
         buffer.seek(0)
         return buffer.read()
@@ -2464,8 +2518,6 @@ class Tools:
         file_type: str = Field(..., description="File type (extension): any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, etc.) or binary format (docx, pdf, xlsx, zip)"),
         data: Any = Field(..., description="Data to convert to file format"),
         filename: Optional[str] = Field(None, description="Custom filename (optional)"),
-        indent: Optional[int] = Field(2, description="JSON indentation (for JSON files)"),
-        root_name: Optional[str] = Field("root", description="Root element name (for XML files)"),
         __request__: object = None,
         __user__: dict = {},
         __event_emitter__: object = None
@@ -2480,10 +2532,8 @@ class Tools:
                     - DOCX: str (HTML format preferred for rich formatting)
                     - PDF: str (HTML format preferred for rich formatting)
                     - XLSX: List[Dict] (list of dictionaries) or tabular data
-                    - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {filename, url} objects for downloading files from URLs - local file paths are not supported)
+                    - ZIP: Dict[str, Any] (filename -> content mapping; if content is a URL string, it will be downloaded; if content is structured data, it will be generated as the appropriate file type) OR List[Dict] (list of {filename, url} objects for downloading files from URLs - local file paths are not supported)
         :param filename: Optional custom filename
-        :param indent: JSON indentation level (default: 2)
-        :param root_name: XML root element name (default: 'root')
         :return: Markdown with download information
         """
         
@@ -2505,22 +2555,8 @@ class Tools:
                 if not filename.endswith(f'.{file_type}'):
                     filename += f'.{file_type}'
 
-            # Prepare kwargs for file generators - handle Field objects
-            # Extract actual values from Field objects if present
-            try:
-                actual_indent = indent.default if hasattr(indent, 'default') else indent
-            except:
-                actual_indent = 2  # fallback default
-            
-            try:
-                actual_root_name = root_name.default if hasattr(root_name, 'default') else root_name
-            except:
-                actual_root_name = "root"  # fallback default
-            
-            kwargs = {
-                'indent': actual_indent,
-                'root_name': actual_root_name
-            }
+            # No additional kwargs needed - all formats expect pre-formatted content
+            kwargs = {}
 
             # Generate file content
             try:
