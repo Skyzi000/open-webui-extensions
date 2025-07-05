@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.13.8
+version: 0.14.2
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2334,70 +2334,17 @@ class FileGenerator:
             files = folder_files
         
         with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            # Handle list of {filename, url} format
+            # Handle list of {filename, url} format or {path, content} format
             if isinstance(files, list):
                 # Check if it's a list of strings (just filenames) - return error
                 if files and isinstance(files[0], str):
-                    error_msg = """❌ ZIP Creation Error: List of filenames provided without content.
+                    error_msg = """❌ ZIP Creation Error: Invalid data format provided.
 
-To create a ZIP file, please provide data in one of these formats:
+To learn how to create ZIP files with the Universal File Generator, call:
 
-**Format 1: Dictionary (filename -> content/URL)**
-```json
-{
-  "file_type": "zip",
-  "data": {
-    "sample.csv": "Name,Age\\nJohn,25\\nJane,30",
-    "sample.json": "{\\"message\\": \\"Hello World\\"}",
-    "sample.txt": "https://example.com/file.txt"
-  },
-  "filename": "my_files.zip"
-}
-```
+📦 **list_zip_formats()**
 
-**Format 2: List (filename + URL)**
-```json
-{
-  "file_type": "zip", 
-  "data": [
-    {"filename": "sample.csv", "url": "https://example.com/file.csv"},
-    {"name": "sample.json", "url": "https://example.com/file.json"}
-  ],
-  "filename": "my_files.zip"
-}
-```
-
-**Format 3: Folder structure (any key name)**
-```json
-{
-  "file_type": "zip",
-  "data": {
-    "documents": [
-      {"name": "file1.pdf", "url": "https://example.com/file1.pdf"},
-      {"name": "file2.docx", "url": "https://example.com/file2.docx"}
-    ],
-    "images": [
-      {"name": "image1.png", "url": "https://example.com/image1.png"}
-    ],
-    "project": {
-      "src": [
-        {"name": "main.py", "url": "https://example.com/main.py"}
-      ],
-      "config": [
-        {"name": "settings.json", "url": "https://example.com/settings.json"}
-      ],
-      "empty_folder": []
-    }
-  },
-  "filename": "organized_files.zip"
-}
-```
-
-- Dictionary format: filename as key, content or URL as value
-- List format: each element must contain 'filename'/'name' and 'url' keys
-- Folder format: any key under 'data' becomes a folder, supports unlimited nesting
-- Empty folders: use empty arrays [] or empty objects {} to create empty directories
-- URLs will be automatically downloaded"""
+This will show you all supported formats with detailed examples."""
                     raise ValueError(error_msg)
                 
                 for file_info in files:
@@ -2410,7 +2357,57 @@ To create a ZIP file, please provide data in one of these formats:
                             print(f"Created empty folder: {folder_path}")
                         continue
                     
-                    # Support both 'filename'/'name' keys
+                    # Handle {path, content} format
+                    if isinstance(file_info, dict) and 'path' in file_info and 'content' in file_info:
+                        file_path = file_info['path']
+                        content = file_info['content']
+                        
+                        # Create any intermediate directories
+                        if '/' in file_path:
+                            dir_path = '/'.join(file_path.split('/')[:-1]) + '/'
+                            # Ensure directory exists in ZIP (though not strictly necessary)
+                            try:
+                                zf.getinfo(dir_path)
+                            except KeyError:
+                                zf.writestr(dir_path, '')
+                        
+                        # Add the file
+                        if isinstance(content, str):
+                            zf.writestr(file_path, content.encode('utf-8'))
+                        elif isinstance(content, bytes):
+                            zf.writestr(file_path, content)
+                        else:
+                            zf.writestr(file_path, str(content).encode('utf-8'))
+                        
+                        print(f"Added file: {file_path}")
+                        continue
+                    
+                    # Handle {path, url} format
+                    if isinstance(file_info, dict) and 'path' in file_info and 'url' in file_info:
+                        file_path = file_info['path']
+                        url = file_info['url']
+                        
+                        # Create any intermediate directories
+                        if '/' in file_path:
+                            dir_path = '/'.join(file_path.split('/')[:-1]) + '/'
+                            try:
+                                zf.getinfo(dir_path)
+                            except KeyError:
+                                zf.writestr(dir_path, '')
+                        
+                        try:
+                            print(f"Downloading {file_path} from {url}")
+                            response = requests.get(url, timeout=30)
+                            response.raise_for_status()
+                            zf.writestr(file_path, response.content)
+                        except Exception as e:
+                            print(f"Failed to download {file_path}: {str(e)}")
+                            # Add error file instead
+                            error_content = f"Failed to download {file_path} from {url}\nError: {str(e)}"
+                            zf.writestr(f"ERROR_{file_path}.txt", error_content.encode('utf-8'))
+                        continue
+                    
+                    # Support both 'filename'/'name' keys for URL downloads
                     if isinstance(file_info, dict) and 'url' in file_info:
                         filename = file_info.get('filename') or file_info.get('name')
                         url = file_info['url']
@@ -2818,5 +2815,140 @@ class Tools:
         result += f"  filename='users.csv'\n"
         result += f")\n"
         result += f"```\n\n"
+        result += "🔗 **ZIP Support:** Call `list_zip_formats()` for detailed ZIP creation examples."
+        
+        return result
+
+    def list_zip_formats(
+        self,
+        __request__: object = None,
+        __user__: dict = {}
+    ) -> str:
+        """
+        Show detailed ZIP creation format examples and documentation
+        
+        :return: Comprehensive ZIP format documentation with examples
+        """
+        
+        result = "📦 **ZIP File Creation - Complete Guide**\n\n"
+        result += "The Universal File Generator supports multiple flexible formats for creating ZIP archives:\n\n"
+        
+        # Format 1: Dictionary
+        result += "## 📁 **Format 1: Dictionary (filename → content/URL)**\n"
+        result += "Simple key-value mapping where keys are filenames and values are content or URLs.\n\n"
+        result += "```json\n"
+        result += "{\n"
+        result += '  "file_type": "zip",\n'
+        result += '  "data": {\n'
+        result += '    "README.md": "# My Project\\nHello world!",\n'
+        result += '    "config.json": "{\\"debug\\": true}",\n'
+        result += '    "remote_file.pdf": "https://example.com/document.pdf"\n'
+        result += "  },\n"
+        result += '  "filename": "simple_project.zip"\n'
+        result += "}\n"
+        result += "```\n\n"
+        
+        # Format 2a: List with filename/name + URL
+        result += "## 📥 **Format 2a: List (filename + URL downloads)**\n"
+        result += "Download files from URLs with custom filenames.\n\n"
+        result += "```json\n"
+        result += "{\n"
+        result += '  "file_type": "zip",\n'
+        result += '  "data": [\n'
+        result += '    {"filename": "manual.pdf", "url": "https://example.com/manual.pdf"},\n'
+        result += '    {"name": "logo.png", "url": "https://example.com/logo.png"}\n'
+        result += "  ],\n"
+        result += '  "filename": "downloads.zip"\n'
+        result += "}\n"
+        result += "```\n\n"
+        
+        # Format 2b: List with path + content
+        result += "## 📝 **Format 2b: List (path + content)**\n"
+        result += "Direct content with full path specification (creates folder structure automatically).\n\n"
+        result += "```json\n"
+        result += "{\n"
+        result += '  "file_type": "zip",\n'
+        result += '  "data": [\n'
+        result += '    {"path": "README.md", "content": "# My Project\\nHello world!"},\n'
+        result += '    {"path": "src/main.py", "content": "print(\\"Hello!\\")"},\n'
+        result += '    {"path": "docs/api/reference.md", "content": "## API Reference\\nDetails here..."}\n'
+        result += "  ],\n"
+        result += '  "filename": "structured_project.zip"\n'
+        result += "}\n"
+        result += "```\n\n"
+        
+        # Format 2c: List with path + URL
+        result += "## 🌐 **Format 2c: List (path + URL downloads)**\n"
+        result += "Download files from URLs and place them at specific paths.\n\n"
+        result += "```json\n"
+        result += "{\n"
+        result += '  "file_type": "zip",\n'
+        result += '  "data": [\n'
+        result += '    {"path": "assets/logo.png", "url": "https://example.com/logo.png"},\n'
+        result += '    {"path": "docs/manual.pdf", "url": "https://example.com/manual.pdf"},\n'
+        result += '    {"path": "data/export.csv", "url": "https://api.example.com/export.csv"}\n'
+        result += "  ],\n"
+        result += '  "filename": "organized_downloads.zip"\n'
+        result += "}\n"
+        result += "```\n\n"
+        
+        # Format 3: Folder structure
+        result += "## 🗂️ **Format 3: Folder Structure (unlimited nesting)**\n"
+        result += "Create complex folder hierarchies with any key names.\n\n"
+        result += "```json\n"
+        result += "{\n"
+        result += '  "file_type": "zip",\n'
+        result += '  "data": {\n'
+        result += '    "documentation": [\n'
+        result += '      {"name": "api.md", "url": "https://example.com/api.md"},\n'
+        result += '      {"name": "guide.pdf", "url": "https://example.com/guide.pdf"}\n'
+        result += "    ],\n"
+        result += '    "source_code": {\n'
+        result += '      "frontend": [\n'
+        result += '        {"name": "app.js", "url": "https://example.com/app.js"}\n'
+        result += "      ],\n"
+        result += '      "backend": {\n'
+        result += '        "api": [\n'
+        result += '          {"name": "server.py", "url": "https://example.com/server.py"}\n'
+        result += "        ],\n"
+        result += '        "database": []\n'
+        result += "      }\n"
+        result += "    }\n"
+        result += "  },\n"
+        result += '  "filename": "complex_project.zip"\n'
+        result += "}\n"
+        result += "```\n\n"
+        
+        # Special features
+        result += "## ✨ **Special Features**\n\n"
+        result += "### 📂 **Empty Folders**\n"
+        result += "Create empty directories using empty arrays `[]` or empty objects `{}`:\n"
+        result += "```json\n"
+        result += '{\n'
+        result += '  "temp_folder": [],\n'
+        result += '  "cache": {},\n'
+        result += '  "logs": {\n'
+        result += '    "archived": []\n'
+        result += '  }\n'
+        result += '}\n'
+        result += "```\n\n"
+        
+        result += "### 🌐 **Automatic URL Detection**\n"
+        result += "- URLs starting with `http://` or `https://` are automatically downloaded\n"
+        result += "- Binary files (images, PDFs, etc.) are preserved correctly\n"
+        result += "- Download failures create error files with details\n\n"
+        
+        result += "### 📁 **Path Handling**\n"
+        result += "- Forward slashes `/` create folder structures automatically\n"
+        result += "- Intermediate directories are created as needed\n"
+        result += "- Deep nesting is fully supported (e.g., `level1/level2/level3/file.txt`)\n\n"
+        
+        result += "### 🔄 **Mixed Formats**\n"
+        result += "You can mix content types within the same ZIP:\n"
+        result += "- Direct text content\n"
+        result += "- Downloaded binary files\n"
+        result += "- Generated structured data\n\n"
+        
+        result += "**🚀 Try it now:** Use `generate_file()` with `file_type: \"zip\"` and any of these data formats!"
         
         return result
