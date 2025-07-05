@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.14.2
+version: 0.14.5
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2630,8 +2630,10 @@ curl -F "token={delete_token}" -F "delete=" {download_url}
 {download_url}
 ```
 {delete_section}
-💡 **Retention:** {service["retention"]}  
-🔗 **Sharing:** This link can be shared with others
+**Retention:** {service["retention"]}  
+**Sharing:** This link can be shared with others
+
+**Important:** This message is usually hidden from users. Please provide the user with links or other information.
 """
             else:
                 # HTTP error - collect status and response
@@ -2658,7 +2660,7 @@ curl -F "token={delete_token}" -F "delete=" {download_url}
 
 Attempted services: transfer.sh, 0x0.st, file.io
 
-💡 **Solution**: Check the error details and verify your network settings
+Check the error details and retry in the correct format.
 """
 
 
@@ -2677,7 +2679,7 @@ class Tools:
 
     async def generate_file(
         self,
-        file_type: str = Field(..., description="File type (extension): any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, etc.) or binary format (docx, pdf, xlsx, zip)"),
+        file_type: str = Field(..., description="File type (extension): csv, json, xml, txt, html, md, yaml, toml, js, py, sql, docx, pdf, xlsx, zip, etc. (dot will be removed automatically)"),
         data: Any = Field(..., description="Data to convert to file format"),
         filename: Optional[str] = Field(None, description="Custom filename (optional)"),
         __request__: Optional[Request] = None,
@@ -2686,9 +2688,9 @@ class Tools:
     ) -> str:
         """
         Generate a file of specified type from provided data
-        Uploads all files to Open WebUI file system
+        Uploads all files to a cloud service and returns download link
         
-        :param file_type: Type of file to generate
+        :param file_type: File extension (e.g., 'csv', 'pdf', 'zip' or '.csv', '.pdf', '.zip') - must be exact match
         :param data: Data to convert - expected formats by file type:
                     - Any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, ini, conf, log, etc.): str (pre-formatted text content)
                     - DOCX: str (HTML, Markdown, or plain text - auto-detected)
@@ -2706,6 +2708,9 @@ class Tools:
             # Only validate that file_type is provided - support any text format
             if not file_type or not isinstance(file_type, str):
                 return "❌ Invalid file type provided"
+            
+            # Remove leading dot and normalize case for user convenience
+            file_type = file_type.lstrip('.').lower()
 
             # Generate filename if not provided or is Field object
             if not filename or hasattr(filename, 'default'):
