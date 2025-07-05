@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
-author: AI Assistant
-version: 0.17.4
+author: Skyzi000 & Claude
+version: 0.17.5
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2360,10 +2360,10 @@ This will show you the supported format with examples."""
         # Check if password is requested but pyzipper is not available
         if password and not PYZIPPER_AVAILABLE:
             raise ImportError(
-                "❌ ZIP暗号化エラー: パスワード保護が要求されましたが、pyzipperライブラリがインストールされていません。\n\n"
-                "解決方法:\n"
+                "❌ ZIP Encryption Error: Password protection requested but pyzipper library is not installed.\n\n"
+                "Solution:\n"
                 "pip install pyzipper\n\n"
-                "または、パスワードなしでZIPファイルを作成してください。"
+                "Or create ZIP file without password protection."
             )
         
         # Use pyzipper for encryption support if password provided
