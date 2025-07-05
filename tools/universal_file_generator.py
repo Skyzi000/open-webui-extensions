@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.15.0
+version: 0.15.1
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2323,12 +2323,20 @@ class FileGenerator:
         return None
 
     def generate_zip(self, files: Union[Dict[str, Any], List[Dict[str, str]]], **kwargs) -> bytes:
-        """Generate ZIP content (path-based format only)"""
+        """Generate ZIP content (supports dictionary and path-based formats)"""
         buffer = io.BytesIO()
         
-        # Only support path-based format (list of {path, content/url})
+        # Convert dictionary format to path-based format if needed
+        if isinstance(files, dict):
+            # Convert {"filename": "content"} to [{"path": "filename", "content": "content"}]
+            path_files = []
+            for filename, content in files.items():
+                path_files.append({"path": filename, "content": content})
+            files = path_files
+        
+        # Now files should be a list
         if not isinstance(files, list):
-            error_msg = """❌ ZIP Creation Error: Only path-based format is supported.
+            error_msg = """❌ ZIP Creation Error: Invalid format.
 
 To learn how to create ZIP files, call:
 
@@ -2714,11 +2722,26 @@ class Tools:
         :return: Simple ZIP format documentation with examples
         """
         
-        result = "📦 **ZIP File Creation - Path Format**\n\n"
-        result += "The Universal File Generator uses a simple path-based format for ZIP creation:\n\n"
+        result = "📦 **ZIP File Creation - Supported Formats**\n\n"
+        result += "The Universal File Generator supports two simple formats for ZIP creation:\n\n"
         
-        # Path format only
-        result += "## 📁 **Path Format (recommended)**\n"
+        # Dictionary format
+        result += "## 📁 **Dictionary Format (simple)**\n"
+        result += "Simple filename → content mapping.\n\n"
+        result += "```json\n"
+        result += "{\n"
+        result += '  "file_type": "zip",\n'
+        result += '  "data": {\n'
+        result += '    "README.md": "# My Project\\nHello world!",\n'
+        result += '    "src/main.py": "print(\\"Hello!\\"))",\n'
+        result += '    "config/app.yaml": "app: demo\\nmode: dev"\n'
+        result += "  },\n"
+        result += '  "filename": "project.zip"\n'
+        result += "}\n"
+        result += "```\n\n"
+        
+        # Path format
+        result += "## 📋 **Path Format (advanced)**\n"
         result += "Use list of objects with `path` and `content`/`url` fields.\n\n"
         result += "```json\n"
         result += "{\n"
@@ -2727,7 +2750,6 @@ class Tools:
         result += '    {"path": "README.md", "content": "# My Project\\nHello world!"},\n'
         result += '    {"path": "src/main.py", "content": "print(\\"Hello!\\")"},\n'
         result += '    {"path": "assets/logo.png", "url": "https://example.com/logo.png"},\n'
-        result += '    {"path": "docs/api/reference.md", "content": "## API Reference\\nDetails..."},\n'
         result += '    {"path": "temp/", "content": ""}\n'
         result += "  ],\n"
         result += '  "filename": "project.zip"\n'
@@ -2736,12 +2758,12 @@ class Tools:
         
         # Rules
         result += "## 📋 **Rules**\n"
-        result += "- Use `path` for file location (supports nested folders)\n"
-        result += "- Use `content` for text content OR `url` for downloading\n"
+        result += "- Dictionary: `\"filename\": \"content\"` pairs\n"
+        result += "- Path format: `path` + `content` or `url`\n"
         result += "- Empty folders: path ending with `/` and empty content\n"
         result += "- URLs are downloaded automatically\n"
         result += "- Forward slashes `/` create folder structures\n\n"
         
-        result += "**🚀 Try it now:** Use `generate_file()` with `file_type: \"zip\"` and this format!"
+        result += "**🚀 Try it now:** Use `generate_file()` with `file_type: \"zip\"` and either format!"
         
         return result
