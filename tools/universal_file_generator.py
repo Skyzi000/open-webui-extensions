@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.11.3
+version: 0.12.1
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -257,75 +257,23 @@ class FileGenerator:
     def _parse_html_to_docx(self, doc, html_content):
         """Parse HTML to DOCX format using BeautifulSoup"""
         if not BS4_AVAILABLE:
-            # Fallback to regex parsing
-            self._parse_html_to_docx_regex(doc, html_content)
-            return
+            raise ImportError("BeautifulSoup4 is required for HTML parsing. Install with: pip install beautifulsoup4")
         
-        try:
-            # Parse HTML with BeautifulSoup
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # Remove head and script tags
-            for tag in soup(['head', 'script', 'style']):
-                tag.decompose()
-            
-            # Find body content or use entire soup
-            body = soup.find('body') or soup
-            
-            # Process each top-level element
-            for element in body.descendants:
-                if hasattr(element, 'name') and element.name and element.parent == body:
-                    self._process_html_element(doc, element)
-        except Exception:
-            # Fallback to regex parsing if BeautifulSoup fails
-            self._parse_html_to_docx_regex(doc, html_content)
+        # Parse HTML with BeautifulSoup
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Remove head and script tags
+        for tag in soup(['head', 'script', 'style']):
+            tag.decompose()
+        
+        # Find body content or use entire soup
+        body = soup.find('body') or soup
+        
+        # Process each top-level element
+        for element in body.descendants:
+            if hasattr(element, 'name') and element.name and element.parent == body:
+                self._process_html_element(doc, element)
     
-    def _parse_html_to_docx_regex(self, doc, html_content):
-        """Fallback regex-based HTML parsing"""
-        import re
-        
-        # Remove DOCTYPE and html tags
-        html_content = re.sub(r'<!DOCTYPE[^>]*>', '', html_content)
-        html_content = re.sub(r'<html[^>]*>|</html>', '', html_content)
-        html_content = re.sub(r'<head>.*?</head>', '', html_content, flags=re.DOTALL)
-        html_content = re.sub(r'<body[^>]*>|</body>', '', html_content)
-        
-        # Parse content
-        blocks = re.split(r'(<h[1-6]>.*?</h[1-6]>|<p>.*?</p>|<ul>.*?</ul>|<ol>.*?</ol>|<table>.*?</table>|<div[^>]*>.*?</div>)', html_content, flags=re.DOTALL)
-        
-        for block in blocks:
-            block = block.strip()
-            if not block:
-                continue
-                
-            # Handle headings
-            if block.startswith('<h'):
-                level = int(block[2])
-                text = re.sub(r'<[^>]+>', '', block)
-                if text.strip():
-                    doc.add_heading(text.strip(), level)
-            
-            # Handle paragraphs
-            elif block.startswith('<p'):
-                self._parse_html_paragraph_to_docx(doc, block)
-            
-            # Handle lists
-            elif block.startswith('<ul') or block.startswith('<ol'):
-                items = re.findall(r'<li[^>]*>(.*?)</li>', block, re.DOTALL)
-                for item in items:
-                    self._parse_html_content_to_docx(doc, item, style='List Bullet')
-            
-            # Handle tables
-            elif block.startswith('<table'):
-                self._parse_html_table_to_docx_regex(doc, block)
-            
-            # Handle divs
-            elif block.startswith('<div'):
-                self._parse_html_content_to_docx(doc, block)
-            
-            # Handle plain text
-            else:
-                self._parse_html_content_to_docx(doc, block)
     
     def _process_html_element(self, doc, element):
         """Process individual HTML elements with BeautifulSoup"""
@@ -421,46 +369,19 @@ class FileGenerator:
                             # Handle plain text
                             row_cells[j].text = cell_data
     
-    def _parse_html_table_to_docx_regex(self, doc, table_html):
-        """Parse HTML table to DOCX format using regex (fallback)"""
-        import re
-        
-        # Extract table rows
-        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL)
-        if not rows:
-            return
-        
-        # Create table in DOCX
-        table_data = []
-        for row in rows:
-            cells = re.findall(r'<t[hd][^>]*>(.*?)</t[hd]>', row, re.DOTALL)
-            cell_texts = []
-            for cell in cells:
-                text = re.sub(r'<[^>]+>', '', cell).strip()
-                cell_texts.append(text)
-            if cell_texts:
-                table_data.append(cell_texts)
-        
-        if table_data:
-            # Add table to document
-            table = doc.add_table(rows=len(table_data), cols=len(table_data[0]))
-            table.style = 'Table Grid'
-            
-            for i, row_data in enumerate(table_data):
-                row_cells = table.rows[i].cells
-                for j, cell_data in enumerate(row_data):
-                    if j < len(row_cells):
-                        row_cells[j].text = cell_data
 
     def _parse_html_element_to_docx(self, doc, element, style=None):
         """Parse HTML element with links and images to DOCX using BeautifulSoup"""
         if not BS4_AVAILABLE:
-            # Fallback to regex parsing
-            if style:
-                paragraph = doc.add_paragraph(style=style)
-            else:
-                paragraph = doc.add_paragraph()
-            self._parse_html_content_with_formatting_regex(paragraph, str(element))
+            # Simple text stripping fallback
+            import re
+            text = re.sub(r'<[^>]+>', '', str(element)).strip()
+            if text:
+                if style:
+                    paragraph = doc.add_paragraph(style=style)
+                else:
+                    paragraph = doc.add_paragraph()
+                paragraph.add_run(text)
             return
         
         # Create a new paragraph
@@ -472,28 +393,7 @@ class FileGenerator:
         # Parse content with BeautifulSoup
         self._parse_html_content_with_formatting_bs4(paragraph, element)
     
-    def _parse_html_paragraph_to_docx(self, doc, paragraph_html):
-        """Parse HTML paragraph with links and images to DOCX"""
-        import re
-        
-        # Create a new paragraph
-        paragraph = doc.add_paragraph()
-        
-        # Parse content with links and images
-        self._parse_html_content_with_formatting_regex(paragraph, paragraph_html)
     
-    def _parse_html_content_to_docx(self, doc, content_html, style=None):
-        """Parse HTML content with links and images to DOCX"""
-        import re
-        
-        # Create a new paragraph
-        if style:
-            paragraph = doc.add_paragraph(style=style)
-        else:
-            paragraph = doc.add_paragraph()
-        
-        # Parse content with links and images
-        self._parse_html_content_with_formatting_regex(paragraph, content_html)
     
     def _parse_html_content_with_formatting_bs4(self, paragraph, element):
         """Parse HTML content with BeautifulSoup and add formatting, links, and images"""
@@ -557,51 +457,6 @@ class FileGenerator:
             if text:
                 paragraph.add_run(text)
     
-    def _parse_html_content_with_formatting_regex(self, paragraph, html_content):
-        """Parse HTML content and add formatting, links, and images using regex"""
-        import re
-        
-        # Parse images first
-        img_pattern = r'<img[^>]*src=["\']([^"\']*)["\'][^>]*(?:alt=["\']([^"\']*)["\'])?[^>]*>'
-        images = re.findall(img_pattern, html_content, re.IGNORECASE)
-        
-        # Replace images with placeholders
-        for i, (src, alt) in enumerate(images):
-            placeholder = f"[IMAGE_{i}]"
-            html_content = re.sub(img_pattern, placeholder, html_content, count=1)
-        
-        # Parse links
-        link_pattern = r'<a[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>'
-        links = re.findall(link_pattern, html_content, re.IGNORECASE | re.DOTALL)
-        
-        # Replace links with placeholders
-        for i, (href, text) in enumerate(links):
-            placeholder = f"[LINK_{i}]"
-            html_content = re.sub(link_pattern, placeholder, html_content, count=1)
-        
-        # Remove remaining HTML tags
-        text_content = re.sub(r'<[^>]+>', '', html_content)
-        
-        # Process the text with placeholders
-        parts = re.split(r'(\[(?:IMAGE|LINK)_\d+\])', text_content)
-        
-        for part in parts:
-            if part.startswith('[IMAGE_'):
-                # Handle image
-                img_index = int(part.split('_')[1].rstrip(']'))
-                if img_index < len(images):
-                    src, alt = images[img_index]
-                    self._add_image_to_paragraph(paragraph, src, alt or 'Image')
-            elif part.startswith('[LINK_'):
-                # Handle link
-                link_index = int(part.split('_')[1].rstrip(']'))
-                if link_index < len(links):
-                    href, link_text = links[link_index]
-                    self._add_hyperlink_to_paragraph(paragraph, href, link_text)
-            else:
-                # Handle regular text
-                if part.strip():
-                    paragraph.add_run(part)
     
     def _add_hyperlink_to_paragraph(self, paragraph, url, text):
         """Add hyperlink to paragraph"""
