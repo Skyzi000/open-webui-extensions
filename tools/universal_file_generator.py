@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.8.0
+version: 0.9.0
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4
 description: Advanced file generator with WeasyPrint/reportlab PDF generation, Japanese font support, BeautifulSoup HTML parsing, and rich DOCX formatting
 """
@@ -2519,26 +2519,45 @@ class FileGenerator:
                 
         return None
 
-    def generate_zip(self, files: Dict[str, Any], **kwargs) -> bytes:
+    def generate_zip(self, files: Union[Dict[str, Any], List[Dict[str, str]]], **kwargs) -> bytes:
         """Generate ZIP content"""
         buffer = io.BytesIO()
         
         with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for filename, content in files.items():
-                if isinstance(content, str):
-                    zf.writestr(filename, content.encode('utf-8'))
-                elif isinstance(content, bytes):
-                    zf.writestr(filename, content)
-                else:
-                    # Try to generate as structured data
-                    file_ext = filename.split('.')[-1].lower() if '.' in filename else 'txt'
-                    try:
-                        file_content = self.generate_content(file_ext, content)
-                        if file_content:
-                            zf.writestr(filename, file_content)
-                    except:
-                        # Fallback to string representation
-                        zf.writestr(filename, str(content).encode('utf-8'))
+            # Handle list of {filename, url} format
+            if isinstance(files, list):
+                for file_info in files:
+                    if isinstance(file_info, dict) and 'filename' in file_info and 'url' in file_info:
+                        filename = file_info['filename']
+                        url = file_info['url']
+                        try:
+                            print(f"Downloading {filename} from {url}")
+                            response = requests.get(url, timeout=30)
+                            response.raise_for_status()
+                            zf.writestr(filename, response.content)
+                        except Exception as e:
+                            print(f"Failed to download {filename}: {str(e)}")
+                            # Add error file instead
+                            error_content = f"Failed to download {filename} from {url}\nError: {str(e)}"
+                            zf.writestr(f"ERROR_{filename}.txt", error_content.encode('utf-8'))
+            
+            # Handle original dict format
+            elif isinstance(files, dict):
+                for filename, content in files.items():
+                    if isinstance(content, str):
+                        zf.writestr(filename, content.encode('utf-8'))
+                    elif isinstance(content, bytes):
+                        zf.writestr(filename, content)
+                    else:
+                        # Try to generate as structured data
+                        file_ext = filename.split('.')[-1].lower() if '.' in filename else 'txt'
+                        try:
+                            file_content = self.generate_content(file_ext, content)
+                            if file_content:
+                                zf.writestr(filename, file_content)
+                        except:
+                            # Fallback to string representation
+                            zf.writestr(filename, str(content).encode('utf-8'))
         
         buffer.seek(0)
         return buffer.read()
@@ -2746,7 +2765,17 @@ class Tools:
         Uploads all files to Open WebUI file system
         
         :param file_type: Type of file to generate
-        :param data: Data to convert - for PDF and DOCX files, please provide data in HTML format
+        :param data: Data to convert - expected formats by file type:
+                    - CSV: List[Dict] (list of dictionaries), List[List] (list of lists), or str (CSV string)
+                    - JSON: Any JSON-serializable data (dict, list, str, int, etc.)
+                    - XML: Dict (dictionary/object structure)
+                    - TXT: str (plain text) or List[str] (list of strings)
+                    - HTML: str (HTML string) or Dict with keys: title, body, style
+                    - MD: str (markdown text) or similar to HTML format
+                    - DOCX: str (HTML format preferred for rich formatting)
+                    - PDF: str (HTML format preferred for rich formatting)
+                    - XLSX: List[Dict] (list of dictionaries) or tabular data
+                    - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {filename, url} objects for downloading files from URLs - local file paths are not supported)
         :param filename: Optional custom filename
         :param indent: JSON indentation level (default: 2)
         :param root_name: XML root element name (default: 'root')
@@ -2769,10 +2798,21 @@ class Tools:
                 if not filename.endswith(f'.{file_type}'):
                     filename += f'.{file_type}'
 
-            # Prepare kwargs for file generators
+            # Prepare kwargs for file generators - handle Field objects
+            # Extract actual values from Field objects if present
+            try:
+                actual_indent = indent.default if hasattr(indent, 'default') else indent
+            except:
+                actual_indent = 2  # fallback default
+            
+            try:
+                actual_root_name = root_name.default if hasattr(root_name, 'default') else root_name
+            except:
+                actual_root_name = "root"  # fallback default
+            
             kwargs = {
-                'indent': indent,
-                'root_name': root_name
+                'indent': actual_indent,
+                'root_name': actual_root_name
             }
 
             # Generate file content
