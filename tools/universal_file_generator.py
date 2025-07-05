@@ -1,9 +1,9 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 5.0.0
-requirements: fastapi, python-docx, pandas, openpyxl, reportlab
-description: Advanced file generator with Japanese font support, professional table rendering, and text wrapping
+version: 0.7.0
+requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint
+description: Advanced file generator with WeasyPrint/reportlab PDF generation, Japanese font support, and professional table rendering
 """
 
 import csv
@@ -32,16 +32,25 @@ except ImportError:
     PANDAS_AVAILABLE = False
 
 try:
+    from weasyprint import HTML, CSS
+    WEASYPRINT_AVAILABLE = True
+except ImportError:
+    WEASYPRINT_AVAILABLE = False
+
+try:
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib import colors
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.lib.fonts import addMapping
-    PDF_AVAILABLE = True
+    REPORTLAB_AVAILABLE = True
 except ImportError:
-    PDF_AVAILABLE = False
+    REPORTLAB_AVAILABLE = False
+
+PDF_AVAILABLE = WEASYPRINT_AVAILABLE or REPORTLAB_AVAILABLE
 
 
 class FileGenerator:
@@ -347,13 +356,1012 @@ class FileGenerator:
                 doc.add_paragraph(line)
 
     def generate_pdf(self, data: Union[str, Dict, List], **kwargs) -> bytes:
-        """Generate PDF content with flexible data structure support using canvas for Japanese"""
+        """Generate PDF content with flexible data structure support"""
         if not PDF_AVAILABLE:
-            raise ImportError("reportlab is required for PDF generation. Install with: pip install reportlab")
+            raise ImportError("PDF generation requires weasyprint or reportlab. Install with: pip install weasyprint or pip install reportlab")
         
-        # Try canvas approach for better Japanese font control
-        return self._generate_pdf_with_canvas(data)
+        # Prefer WeasyPrint for better HTML/CSS support
+        if WEASYPRINT_AVAILABLE:
+            return self._generate_pdf_with_weasyprint(data)
+        elif REPORTLAB_AVAILABLE:
+            return self._generate_pdf_with_html(data)
+        else:
+            raise ImportError("No PDF generation library available")
     
+    def _generate_pdf_with_weasyprint(self, data) -> bytes:
+        """Generate PDF using WeasyPrint for superior HTML/CSS rendering"""
+        # Ensure Japanese fonts are available
+        font_css = self._ensure_japanese_fonts_for_weasyprint()
+        
+        # Convert data to HTML
+        if isinstance(data, str):
+            # Assume it's already HTML
+            html_content = data
+        elif isinstance(data, dict):
+            html_content = self._dict_to_html_full(data)
+        elif isinstance(data, list):
+            html_content = self._list_to_html_full(data)
+        else:
+            html_content = f"<p>{str(data)}</p>"
+        
+        # Create complete HTML document with enhanced CSS
+        full_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                {font_css}
+                
+                @page {{
+                    size: A4;
+                    margin: 2cm;
+                }}
+                
+                body {{
+                    font-family: 'NotoSansJP', 'DejaVu Sans', sans-serif;
+                    font-size: 11px;
+                    line-height: 1.6;
+                    color: #333;
+                    margin: 0;
+                    padding: 0;
+                }}
+                
+                h1 {{
+                    font-size: 20px;
+                    color: #2c3e50;
+                    border-bottom: 3px solid #3498db;
+                    padding-bottom: 10px;
+                    margin-bottom: 25px;
+                    page-break-after: avoid;
+                }}
+                
+                h2 {{
+                    font-size: 16px;
+                    color: #34495e;
+                    margin-top: 30px;
+                    margin-bottom: 15px;
+                    page-break-after: avoid;
+                }}
+                
+                h3 {{
+                    font-size: 14px;
+                    color: #7f8c8d;
+                    margin-top: 20px;
+                    margin-bottom: 10px;
+                    page-break-after: avoid;
+                }}
+                
+                p {{
+                    margin-bottom: 12px;
+                    text-align: justify;
+                }}
+                
+                ul, ol {{
+                    margin-bottom: 15px;
+                    padding-left: 25px;
+                }}
+                
+                li {{
+                    margin-bottom: 6px;
+                }}
+                
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                    margin: 20px 0;
+                    page-break-inside: avoid;
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                }}
+                
+                th {{
+                    background-color: #34495e;
+                    color: white;
+                    padding: 12px;
+                    text-align: left;
+                    font-weight: bold;
+                    border: 1px solid #2c3e50;
+                }}
+                
+                td {{
+                    padding: 10px 12px;
+                    border: 1px solid #ecf0f1;
+                    vertical-align: top;
+                }}
+                
+                tr:nth-child(even) {{
+                    background-color: #f8f9fa;
+                }}
+                
+                strong {{
+                    color: #2c3e50;
+                    font-weight: bold;
+                }}
+                
+                .header {{
+                    text-align: center;
+                    margin-bottom: 40px;
+                }}
+                
+                .page-break {{
+                    page-break-before: always;
+                }}
+                
+                .no-break {{
+                    page-break-inside: avoid;
+                }}
+                
+                code {{
+                    background-color: #f4f4f4;
+                    padding: 2px 4px;
+                    border-radius: 3px;
+                    font-family: 'Courier New', monospace;
+                    font-size: 10px;
+                }}
+                
+                blockquote {{
+                    border-left: 4px solid #3498db;
+                    margin: 15px 0;
+                    padding-left: 15px;
+                    color: #555;
+                    font-style: italic;
+                }}
+            </style>
+        </head>
+        <body>
+            {html_content}
+        </body>
+        </html>
+        """
+        
+        try:
+            # Generate PDF using WeasyPrint with font subsetting disabled
+            html_doc = HTML(string=full_html)
+            
+            # Try with font configuration for newer versions
+            try:
+                from weasyprint.fonts import FontConfiguration
+                font_config = FontConfiguration()
+                # Disable font subsetting to preserve all Japanese glyphs
+                pdf_bytes = html_doc.write_pdf(
+                    font_config=font_config, 
+                    optimize_images=False,
+                    presentational_hints=True
+                )
+            except ImportError:
+                # Fallback for older WeasyPrint versions
+                print("Using older WeasyPrint version without FontConfiguration")
+                pdf_bytes = html_doc.write_pdf()
+            
+            return pdf_bytes
+        except Exception as e:
+            print(f"WeasyPrint error: {e}")
+            # Fallback to reportlab if available
+            if REPORTLAB_AVAILABLE:
+                print("Falling back to reportlab...")
+                return self._generate_pdf_with_html(data)
+            else:
+                raise e
+    
+    def _ensure_japanese_fonts_for_weasyprint(self) -> str:
+        """Setup Japanese fonts for WeasyPrint - try system fonts first, then download"""
+        import tempfile
+        import os
+        
+        # Try system fonts first (common in Docker containers)
+        system_fonts = [
+            "Noto Sans CJK JP",
+            "Noto Sans JP", 
+            "DejaVu Sans",
+            "Liberation Sans"
+        ]
+        
+        font_css = f"""
+            body, h1, h2, h3, h4, h5, h6, p, td, th, li {{
+                font-family: {', '.join([f"'{font}'" for font in system_fonts])}, sans-serif !important;
+            }}
+        """
+        
+        # Try to download a comprehensive Japanese font
+        temp_dir = tempfile.gettempdir()
+        font_path = os.path.join(temp_dir, 'NotoSansCJK-Regular.otf')
+        
+        # Check if font already exists
+        if os.path.exists(font_path):
+            print(f"✓ Japanese font already available: {font_path}")
+            font_css = f"""
+                @font-face {{
+                    font-family: 'NotoSansCJK';
+                    src: url('file://{font_path}') format('opentype');
+                    font-weight: normal;
+                    font-style: normal;
+                }}
+                
+                body, h1, h2, h3, h4, h5, h6, p, td, th, li {{
+                    font-family: 'NotoSansCJK', 'DejaVu Sans', sans-serif !important;
+                    font-feature-settings: normal;
+                }}
+            """
+            return font_css
+        
+        print("=== Downloading comprehensive Japanese font for WeasyPrint ===")
+        
+        # Try to download comprehensive CJK font - use smaller files for Docker
+        font_urls = [
+            "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf",
+            "https://fonts.gstatic.com/ea/notosansjapanese/v6/NotoSansJP-Regular.otf"
+        ]
+        
+        for i, font_url in enumerate(font_urls):
+            try:
+                print(f"Trying comprehensive font source {i+1}: {font_url}")
+                response = requests.get(font_url, timeout=30)
+                if response.status_code == 200:
+                    with open(font_path, 'wb') as f:
+                        f.write(response.content)
+                    
+                    print(f"✓ Comprehensive Japanese font downloaded: {font_path} ({len(response.content)} bytes)")
+                    
+                    # Create CSS with comprehensive font-face declaration
+                    font_css = f"""
+                        @font-face {{
+                            font-family: 'NotoSansCJK';
+                            src: url('file://{font_path}') format('opentype');
+                            font-weight: normal;
+                            font-style: normal;
+                        }}
+                        
+                        body, h1, h2, h3, h4, h5, h6, p, td, th, li {{
+                            font-family: 'NotoSansCJK', 'DejaVu Sans', sans-serif !important;
+                            font-feature-settings: normal;
+                        }}
+                    """
+                    return font_css
+                    
+            except Exception as e:
+                print(f"Comprehensive font source {i+1} failed: {e}")
+                continue
+        
+        print("✗ Could not download comprehensive Japanese font, using system fonts")
+        return font_css
+    
+    def _dict_to_html_full(self, data):
+        """Convert dictionary to complete HTML with better formatting"""
+        html_parts = []
+        
+        # Look for title
+        title_keys = ['title', 'タイトル', 'name', 'subject', 'heading']
+        for key in title_keys:
+            if key in data and data[key]:
+                html_parts.append(f'<div class="header"><h1>{data[key]}</h1></div>')
+                break
+        
+        # Process other content
+        processed_keys = set(title_keys)
+        
+        for key, value in data.items():
+            if key in processed_keys:
+                continue
+            
+            if isinstance(value, list):
+                html_parts.append(f"<h2>{key.replace('_', ' ').title()}</h2>")
+                
+                # Check if it's table data
+                if value and isinstance(value[0], dict) and len(value) > 1:
+                    # Table format
+                    html_parts.append(self._create_html_table(value))
+                else:
+                    # List format
+                    html_parts.append("<ul>")
+                    for item in value:
+                        if isinstance(item, dict):
+                            html_parts.append(f"<li>{self._dict_to_html_inline(item)}</li>")
+                        else:
+                            html_parts.append(f"<li>{item}</li>")
+                    html_parts.append("</ul>")
+            
+            elif isinstance(value, dict):
+                html_parts.append(f"<h2>{key.replace('_', ' ').title()}</h2>")
+                html_parts.append(self._dict_to_html_full(value))
+            
+            else:
+                if len(str(value)) > 50:
+                    html_parts.append(f"<h3>{key.replace('_', ' ').title()}</h3>")
+                    html_parts.append(f"<p>{value}</p>")
+                else:
+                    html_parts.append(f"<p><strong>{key.replace('_', ' ').title()}:</strong> {value}</p>")
+        
+        return '\n'.join(html_parts)
+    
+    def _list_to_html_full(self, data):
+        """Convert list to complete HTML"""
+        html_parts = []
+        
+        # Check if it's table data
+        if data and isinstance(data[0], dict) and len(data) > 1:
+            # Table format
+            html_parts.append(self._create_html_table(data))
+        else:
+            # List format
+            html_parts.append("<ul>")
+            for item in data:
+                if isinstance(item, dict):
+                    html_parts.append(f"<li>{self._dict_to_html_inline(item)}</li>")
+                else:
+                    html_parts.append(f"<li>{item}</li>")
+            html_parts.append("</ul>")
+        
+        return '\n'.join(html_parts)
+    
+    def _dict_to_html_inline(self, data):
+        """Convert dictionary to inline HTML"""
+        parts = []
+        for key, value in data.items():
+            if isinstance(value, (dict, list)):
+                continue  # Skip complex structures in inline mode
+            parts.append(f"<strong>{key.replace('_', ' ').title()}:</strong> {value}")
+        return " | ".join(parts)
+    
+    def _create_html_table(self, data):
+        """Create HTML table from list of dictionaries"""
+        if not data:
+            return ""
+        
+        # Get headers from first item
+        headers = list(data[0].keys())
+        
+        html = ["<table>"]
+        
+        # Add header row
+        html.append("<tr>")
+        for header in headers:
+            html.append(f"<th>{header.replace('_', ' ').title()}</th>")
+        html.append("</tr>")
+        
+        # Add data rows
+        for row in data:
+            html.append("<tr>")
+            for header in headers:
+                value = row.get(header, "")
+                html.append(f"<td>{value}</td>")
+            html.append("</tr>")
+        
+        html.append("</table>")
+        
+        return '\n'.join(html)
+
+    def _generate_pdf_with_html(self, data) -> bytes:
+        """Generate PDF using Platypus with HTML parsing"""
+        buffer = io.BytesIO()
+        
+        # Force download and register Japanese font
+        print("=== PDF Generation with HTML and Japanese Font Support ===")
+        font_registered = self._download_and_register_japanese_font()
+        self._font_registered = font_registered
+        
+        # Create document with Platypus
+        doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=50, bottomMargin=50, 
+                               leftMargin=50, rightMargin=50)
+        
+        # Get base styles
+        styles = getSampleStyleSheet()
+        
+        # Create custom styles with Japanese font support
+        if font_registered:
+            japanese_font = 'NotoSansJP'
+            print(f"✓ Using Japanese font: {japanese_font}")
+        else:
+            japanese_font = 'Helvetica'
+            print(f"✗ Japanese font failed, using: {japanese_font}")
+        
+        # Create custom styles
+        custom_styles = {
+            'Title': ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Title'],
+                fontName=japanese_font,
+                fontSize=18,
+                spaceAfter=20,
+                alignment=1,  # Center
+            ),
+            'Heading1': ParagraphStyle(
+                'CustomHeading1',
+                parent=styles['Heading1'],
+                fontName=japanese_font,
+                fontSize=14,
+                spaceAfter=12,
+                spaceBefore=12,
+            ),
+            'Heading2': ParagraphStyle(
+                'CustomHeading2',
+                parent=styles['Heading2'],
+                fontName=japanese_font,
+                fontSize=12,
+                spaceAfter=10,
+                spaceBefore=10,
+            ),
+            'Normal': ParagraphStyle(
+                'CustomNormal',
+                parent=styles['Normal'],
+                fontName=japanese_font,
+                fontSize=10,
+                spaceAfter=6,
+                wordWrap='CJK',
+            ),
+            'Bullet': ParagraphStyle(
+                'CustomBullet',
+                parent=styles['Normal'],
+                fontName=japanese_font,
+                fontSize=10,
+                spaceAfter=6,
+                leftIndent=20,
+                bulletIndent=10,
+                wordWrap='CJK',
+            ),
+        }
+        
+        # Create story (list of flowables)
+        story = []
+        
+        # Process data to create flowables
+        processed_data = self._process_html_data(data, custom_styles)
+        story.extend(processed_data)
+        
+        # Build the PDF
+        doc.build(story)
+        
+        # Get the PDF content
+        buffer.seek(0)
+        return buffer.read()
+    
+    def _process_html_data(self, data, styles):
+        """Process HTML data into Platypus flowables"""
+        flowables = []
+        
+        if isinstance(data, str):
+            # Handle HTML string
+            flowables.extend(self._parse_html_to_flowables(data, styles))
+        
+        elif isinstance(data, dict):
+            # Handle dictionary data - convert to HTML first
+            html_content = self._dict_to_html(data)
+            flowables.extend(self._parse_html_to_flowables(html_content, styles))
+        
+        elif isinstance(data, list):
+            # Handle list data - convert to HTML first
+            html_content = self._list_to_html(data)
+            flowables.extend(self._parse_html_to_flowables(html_content, styles))
+        
+        return flowables
+    
+    def _parse_html_to_flowables(self, html_text, styles):
+        """Parse HTML text into Platypus flowables"""
+        flowables = []
+        
+        # Simple HTML parsing - handle basic tags
+        import re
+        
+        # Replace common HTML tags with Platypus Paragraph styles
+        html_text = str(html_text)
+        
+        # Split by major block elements
+        blocks = re.split(r'(<h[1-6]>.*?</h[1-6]>|<p>.*?</p>|<ul>.*?</ul>|<ol>.*?</ol>|<table>.*?</table>)', html_text, flags=re.DOTALL)
+        
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+            
+            # Handle headings
+            if re.match(r'<h1>.*?</h1>', block, re.DOTALL):
+                text = re.sub(r'<h1>(.*?)</h1>', r'\1', block, flags=re.DOTALL)
+                flowables.append(Paragraph(text, styles['Title']))
+            elif re.match(r'<h[2-3]>.*?</h[2-3]>', block, re.DOTALL):
+                text = re.sub(r'<h[2-3]>(.*?)</h[2-3]>', r'\1', block, flags=re.DOTALL)
+                flowables.append(Paragraph(text, styles['Heading1']))
+            elif re.match(r'<h[4-6]>.*?</h[4-6]>', block, re.DOTALL):
+                text = re.sub(r'<h[4-6]>(.*?)</h[4-6]>', r'\1', block, flags=re.DOTALL)
+                flowables.append(Paragraph(text, styles['Heading2']))
+            
+            # Handle paragraphs
+            elif re.match(r'<p>.*?</p>', block, re.DOTALL):
+                text = re.sub(r'<p>(.*?)</p>', r'\1', block, flags=re.DOTALL)
+                flowables.append(Paragraph(text, styles['Normal']))
+            
+            # Handle lists
+            elif re.match(r'<ul>.*?</ul>', block, re.DOTALL):
+                list_items = re.findall(r'<li>(.*?)</li>', block, re.DOTALL)
+                for item in list_items:
+                    flowables.append(Paragraph(f"• {item.strip()}", styles['Bullet']))
+            
+            elif re.match(r'<ol>.*?</ol>', block, re.DOTALL):
+                list_items = re.findall(r'<li>(.*?)</li>', block, re.DOTALL)
+                for i, item in enumerate(list_items, 1):
+                    flowables.append(Paragraph(f"{i}. {item.strip()}", styles['Bullet']))
+            
+            # Handle tables
+            elif re.match(r'<table>.*?</table>', block, re.DOTALL):
+                table_flowable = self._parse_html_table(block)
+                if table_flowable:
+                    flowables.append(table_flowable)
+                    flowables.append(Spacer(1, 12))
+            
+            # Handle plain text
+            else:
+                if block.strip():
+                    flowables.append(Paragraph(block, styles['Normal']))
+        
+        return flowables
+    
+    def _parse_html_table(self, table_html):
+        """Parse HTML table into Table flowable"""
+        try:
+            import re
+            
+            # Extract table rows
+            rows = re.findall(r'<tr>(.*?)</tr>', table_html, re.DOTALL)
+            table_data = []
+            
+            for row in rows:
+                # Extract cells (th or td)
+                cells = re.findall(r'<(?:th|td)>(.*?)</(?:th|td)>', row, re.DOTALL)
+                if cells:
+                    table_data.append([cell.strip() for cell in cells])
+            
+            if table_data:
+                return self._create_table_flowable_from_data(table_data)
+            
+        except Exception as e:
+            print(f"Error parsing HTML table: {e}")
+            return None
+    
+    def _dict_to_html(self, data):
+        """Convert dictionary to HTML text"""
+        html_parts = []
+        
+        # Look for title
+        title_keys = ['title', 'タイトル', 'name', 'subject', 'heading']
+        for key in title_keys:
+            if key in data and data[key]:
+                html_parts.append(f"<h1>{data[key]}</h1>")
+                break
+        
+        # Process other content
+        processed_keys = set(title_keys)
+        
+        for key, value in data.items():
+            if key in processed_keys:
+                continue
+            
+            if isinstance(value, list):
+                html_parts.append(f"<h2>{key.replace('_', ' ').title()}</h2>")
+                html_parts.append("<ul>")
+                for item in value:
+                    if isinstance(item, dict):
+                        html_parts.append(f"<li>{self._dict_to_html(item)}</li>")
+                    else:
+                        html_parts.append(f"<li>{item}</li>")
+                html_parts.append("</ul>")
+            
+            elif isinstance(value, dict):
+                html_parts.append(f"<h2>{key.replace('_', ' ').title()}</h2>")
+                html_parts.append(self._dict_to_html(value))
+            
+            else:
+                if len(str(value)) > 50:
+                    html_parts.append(f"<h2>{key.replace('_', ' ').title()}</h2>")
+                    html_parts.append(f"<p>{value}</p>")
+                else:
+                    html_parts.append(f"<p><strong>{key.replace('_', ' ').title()}:</strong> {value}</p>")
+        
+        return '\n'.join(html_parts)
+    
+    def _list_to_html(self, data):
+        """Convert list to HTML text"""
+        html_parts = []
+        
+        html_parts.append("<ul>")
+        for item in data:
+            if isinstance(item, dict):
+                html_parts.append(f"<li>{self._dict_to_html(item)}</li>")
+            else:
+                html_parts.append(f"<li>{item}</li>")
+        html_parts.append("</ul>")
+        
+        return '\n'.join(html_parts)
+
+    def _generate_pdf_with_platypus_old(self, data) -> bytes:
+        """Generate PDF using Platypus for better document flow"""
+        buffer = io.BytesIO()
+        
+        # Force download and register Japanese font with detailed logging
+        print("=== PDF Generation with Platypus and Japanese Font Support ===")
+        font_registered = self._download_and_register_japanese_font()
+        self._font_registered = font_registered
+        
+        # Create document with Platypus
+        doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=50, bottomMargin=50, 
+                               leftMargin=50, rightMargin=50)
+        
+        # Get base styles
+        styles = getSampleStyleSheet()
+        
+        # Create custom styles with Japanese font support
+        if font_registered:
+            japanese_font = 'NotoSansJP'
+            print(f"✓ Using Japanese font: {japanese_font}")
+        else:
+            japanese_font = 'Helvetica'
+            print(f"✗ Japanese font failed, using: {japanese_font}")
+        
+        # Create custom styles
+        custom_styles = {
+            'Title': ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Title'],
+                fontName=japanese_font,
+                fontSize=18,
+                spaceAfter=20,
+                alignment=1,  # Center
+            ),
+            'Heading1': ParagraphStyle(
+                'CustomHeading1',
+                parent=styles['Heading1'],
+                fontName=japanese_font,
+                fontSize=14,
+                spaceAfter=12,
+                spaceBefore=12,
+            ),
+            'Heading2': ParagraphStyle(
+                'CustomHeading2',
+                parent=styles['Heading2'],
+                fontName=japanese_font,
+                fontSize=12,
+                spaceAfter=10,
+                spaceBefore=10,
+            ),
+            'Normal': ParagraphStyle(
+                'CustomNormal',
+                parent=styles['Normal'],
+                fontName=japanese_font,
+                fontSize=10,
+                spaceAfter=6,
+                wordWrap='CJK',
+            ),
+            'Bullet': ParagraphStyle(
+                'CustomBullet',
+                parent=styles['Normal'],
+                fontName=japanese_font,
+                fontSize=10,
+                spaceAfter=6,
+                leftIndent=20,
+                bulletIndent=10,
+                wordWrap='CJK',
+            ),
+        }
+        
+        # Create story (list of flowables)
+        story = []
+        
+        # Process data to create flowables
+        processed_data = self._process_data_for_platypus(data, custom_styles)
+        story.extend(processed_data)
+        
+        # Build the PDF
+        doc.build(story)
+        
+        # Get the PDF content
+        buffer.seek(0)
+        return buffer.read()
+    
+    def _process_data_for_platypus(self, data, styles):
+        """Process data into Platypus flowables - focused on Markdown parsing"""
+        flowables = []
+        
+        if isinstance(data, str):
+            # Handle Markdown text
+            flowables.extend(self._parse_markdown_to_flowables(data, styles))
+        
+        elif isinstance(data, dict):
+            # Handle dictionary data - convert to text first
+            text_content = self._dict_to_markdown(data)
+            flowables.extend(self._parse_markdown_to_flowables(text_content, styles))
+        
+        elif isinstance(data, list):
+            # Handle list data - convert to text first
+            text_content = self._list_to_markdown(data)
+            flowables.extend(self._parse_markdown_to_flowables(text_content, styles))
+        
+        return flowables
+    
+    def _parse_markdown_to_flowables(self, markdown_text, styles):
+        """Parse Markdown text into Platypus flowables"""
+        flowables = []
+        lines = markdown_text.split('\n')
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            if not line:
+                # Empty line - add small spacer
+                flowables.append(Spacer(1, 6))
+                i += 1
+                continue
+            
+            # Check for table (starts with |)
+            if line.startswith('|') and '|' in line[1:]:
+                # Parse table
+                table_lines = []
+                j = i
+                while j < len(lines) and lines[j].strip().startswith('|'):
+                    table_lines.append(lines[j].strip())
+                    j += 1
+                
+                if len(table_lines) > 1:
+                    # Find separator line (usually second line with |---|)
+                    separator_index = -1
+                    for idx, line in enumerate(table_lines):
+                        if '---' in line or '--' in line:
+                            separator_index = idx
+                            break
+                    
+                    if separator_index > 0:
+                        # Process table with separator
+                        headers = [cell.strip() for cell in table_lines[0].split('|')[1:-1]]
+                        data_rows = []
+                        for row_line in table_lines[separator_index + 1:]:
+                            row_data = [cell.strip() for cell in row_line.split('|')[1:-1]]
+                            data_rows.append(row_data)
+                        
+                        table_data = [headers] + data_rows
+                        table_flowable = self._create_table_flowable_from_data(table_data)
+                        if table_flowable:
+                            flowables.append(table_flowable)
+                            flowables.append(Spacer(1, 12))
+                    else:
+                        # Process table without separator (all rows are data)
+                        table_data = []
+                        for row_line in table_lines:
+                            row_data = [cell.strip() for cell in row_line.split('|')[1:-1]]
+                            table_data.append(row_data)
+                        
+                        table_flowable = self._create_table_flowable_from_data(table_data)
+                        if table_flowable:
+                            flowables.append(table_flowable)
+                            flowables.append(Spacer(1, 12))
+                    
+                    i = j
+                    continue
+            
+            # Handle headings
+            if line.startswith('# '):
+                flowables.append(Paragraph(line[2:], styles['Title']))
+            elif line.startswith('## '):
+                flowables.append(Paragraph(line[3:], styles['Heading1']))
+            elif line.startswith('### '):
+                flowables.append(Paragraph(line[4:], styles['Heading2']))
+            elif line.startswith('- ') or line.startswith('* '):
+                # Bullet point
+                flowables.append(Paragraph(line[2:], styles['Bullet']))
+            else:
+                # Normal text
+                flowables.append(Paragraph(line, styles['Normal']))
+            
+            i += 1
+        
+        return flowables
+    
+    def _create_table_flowable_from_data(self, table_data):
+        """Create a Table flowable from parsed table data"""
+        try:
+            # Create table with style (use Japanese font for table content)
+            # Make a copy to avoid modifying the original data
+            table_data_copy = [row[:] for row in table_data]
+            japanese_font = 'NotoSansJP' if self._font_registered else 'Helvetica'
+            
+            # Use HTML bold tags for Japanese font headers
+            if self._font_registered and table_data_copy:
+                # For Japanese font, use HTML bold tags in the header text
+                for i, header in enumerate(table_data_copy[0]):
+                    table_data_copy[0][i] = f"<b>{header}</b>"
+            
+            table = Table(table_data_copy)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), f'{japanese_font}-Bold' if japanese_font == 'Helvetica' else f'{japanese_font}'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('FONTNAME', (0, 1), (-1, -1), japanese_font),
+                ('FONTSIZE', (0, 1), (-1, -1), 10),
+                ('ALIGN', (0, 1), (-1, -1), 'LEFT'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
+            ]))
+            
+            return table
+            
+        except Exception as e:
+            print(f"Error creating table: {e}")
+            return None
+    
+    def _dict_to_markdown(self, data):
+        """Convert dictionary to Markdown text"""
+        lines = []
+        
+        # Look for title
+        title_keys = ['title', 'タイトル', 'name', 'subject', 'heading']
+        for key in title_keys:
+            if key in data and data[key]:
+                lines.append(f"# {data[key]}")
+                lines.append("")
+                break
+        
+        # Process other content
+        processed_keys = set(title_keys)
+        
+        for key, value in data.items():
+            if key in processed_keys:
+                continue
+            
+            if isinstance(value, list):
+                lines.append(f"## {key.replace('_', ' ').title()}")
+                lines.append("")
+                for item in value:
+                    if isinstance(item, dict):
+                        lines.append(self._dict_to_markdown(item))
+                    else:
+                        lines.append(f"- {item}")
+                lines.append("")
+            
+            elif isinstance(value, dict):
+                lines.append(f"## {key.replace('_', ' ').title()}")
+                lines.append("")
+                lines.append(self._dict_to_markdown(value))
+                lines.append("")
+            
+            else:
+                if len(str(value)) > 50:
+                    lines.append(f"## {key.replace('_', ' ').title()}")
+                    lines.append("")
+                    lines.append(str(value))
+                else:
+                    lines.append(f"**{key.replace('_', ' ').title()}:** {value}")
+                lines.append("")
+        
+        return '\n'.join(lines)
+    
+    def _list_to_markdown(self, data):
+        """Convert list to Markdown text"""
+        lines = []
+        
+        for item in data:
+            if isinstance(item, dict):
+                lines.append(self._dict_to_markdown(item))
+                lines.append("")
+            else:
+                lines.append(f"- {item}")
+        
+        return '\n'.join(lines)
+    
+    def _process_dict_for_platypus(self, data, flowables, styles):
+        """Process dictionary data into Platypus flowables"""
+        
+        # Look for title/heading
+        title_keys = ['title', 'タイトル', 'name', 'subject', 'heading']
+        for key in title_keys:
+            if key in data and data[key]:
+                flowables.append(Paragraph(str(data[key]), styles['Title']))
+                flowables.append(Spacer(1, 12))
+                break
+        
+        # Look for tables
+        if 'table' in data or 'tables' in data:
+            table_data = data.get('table') or data.get('tables')
+            if table_data:
+                table_flowable = self._create_table_flowable(table_data, styles)
+                if table_flowable:
+                    flowables.append(table_flowable)
+                    flowables.append(Spacer(1, 12))
+        
+        # Process other content
+        processed_keys = set(title_keys + ['table', 'tables'])
+        
+        for key, value in data.items():
+            if key in processed_keys:
+                continue
+            
+            if isinstance(value, list):
+                # Section heading
+                flowables.append(Paragraph(str(key).replace('_', ' ').title(), styles['Heading1']))
+                
+                # Process list items
+                for item in value:
+                    if isinstance(item, dict):
+                        self._process_dict_for_platypus(item, flowables, styles)
+                        flowables.append(Spacer(1, 6))
+                    else:
+                        flowables.append(Paragraph(f"• {str(item)}", styles['Bullet']))
+                
+                flowables.append(Spacer(1, 12))
+            
+            elif isinstance(value, dict):
+                # Subsection
+                flowables.append(Paragraph(str(key).replace('_', ' ').title(), styles['Heading1']))
+                self._process_dict_for_platypus(value, flowables, styles)
+                flowables.append(Spacer(1, 12))
+            
+            else:
+                # Key-value pair
+                if len(str(value)) > 50:
+                    # Long value - use as paragraph with key as heading
+                    flowables.append(Paragraph(str(key).replace('_', ' ').title(), styles['Heading2']))
+                    flowables.append(Paragraph(str(value), styles['Normal']))
+                else:
+                    # Short value - inline
+                    flowables.append(Paragraph(f"<b>{str(key).replace('_', ' ').title()}:</b> {str(value)}", styles['Normal']))
+                
+                flowables.append(Spacer(1, 6))
+    
+    def _create_table_flowable(self, table_data, styles):
+        """Create a Table flowable from table data"""
+        try:
+            if isinstance(table_data, dict):
+                # Convert dict to table format
+                if 'headers' in table_data and 'rows' in table_data:
+                    headers = table_data['headers']
+                    rows = table_data['rows']
+                    data = [headers] + rows
+                else:
+                    # Convert dict to two-column table
+                    data = [['Key', 'Value']]
+                    for key, value in table_data.items():
+                        data.append([str(key), str(value)])
+            
+            elif isinstance(table_data, list):
+                # List of lists or list of dicts
+                if table_data and isinstance(table_data[0], dict):
+                    # List of dicts - use keys as headers
+                    headers = list(table_data[0].keys())
+                    data = [headers]
+                    for row in table_data:
+                        data.append([str(row.get(key, '')) for key in headers])
+                else:
+                    # List of lists
+                    data = table_data
+            
+            else:
+                return None
+            
+            # Create table with style (use Japanese font for table content)
+            table = Table(data)
+            japanese_font = 'NotoSansJP' if hasattr(self, '_font_registered') and self._font_registered else 'Helvetica'
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), f'{japanese_font}-Bold' if japanese_font == 'Helvetica' else f'{japanese_font}'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('FONTNAME', (0, 1), (-1, -1), japanese_font),
+                ('FONTSIZE', (0, 1), (-1, -1), 10),
+                ('ALIGN', (0, 1), (-1, -1), 'LEFT'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
+            ]))
+            
+            return table
+            
+        except Exception as e:
+            print(f"Error creating table: {e}")
+            return None
+
     def _generate_pdf_with_canvas(self, data) -> bytes:
         """Generate PDF using canvas for direct font control"""
         buffer = io.BytesIO()
@@ -1300,7 +2308,7 @@ class Tools:
         Uploads all files to Open WebUI file system
         
         :param file_type: Type of file to generate
-        :param data: Data to convert (format varies by file type)
+        :param data: Data to convert - for PDF files, please provide data in HTML format
         :param filename: Optional custom filename
         :param indent: JSON indentation level (default: 2)
         :param root_name: XML root element name (default: 'root')
@@ -1376,7 +2384,7 @@ class Tools:
             'xlsx': '✅ Available' if PANDAS_AVAILABLE else '❌ Requires: pip install pandas openpyxl'
         }
         
-        result = "📋 **Universal File Generator v3.0 - Supported Formats:**\n\n"
+        result = "📋 **Universal File Generator - Supported Formats:**\n\n"
         for fmt, status in formats_info.items():
             result += f"• **{fmt.upper()}**: {status}\n"
         
@@ -1388,7 +2396,6 @@ class Tools:
         result += f"  filename='users.csv'\n"
         result += f")\n"
         result += f"```\n\n"
-        result += f"🎯 **New in v4.0:** Smart data parsing & external upload!\n"
         result += f"🚀 **All files:** Multi-service upload with delete tokens\n"
         result += f"🧠 **AI-friendly:** Flexible parsing for any data structure\n"
         result += f"📝 **Open WebUI optimized:** Clean Markdown output"
