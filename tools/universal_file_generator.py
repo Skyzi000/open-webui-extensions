@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: Skyzi000 & Claude
-version: 0.17.5
+version: 0.17.6
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2644,19 +2644,41 @@ class Tools:
                 if not filename.endswith(f'.{file_type}'):
                     filename += f'.{file_type}'
 
-            # Extract password for ZIP encryption if provided
+            # Handle password parameter
             kwargs = {}
-            if password and not hasattr(password, 'default'):  # Check if password is not a Field object
-                kwargs['password'] = password
+            actual_password = None
+            
+            # Extract password if provided (check if it's not a Field object)
+            if password and not hasattr(password, 'default'):
+                actual_password = password
             elif isinstance(data, dict) and 'password' in data:
                 # Legacy support: password in data dict
-                kwargs['password'] = data['password']
+                actual_password = data['password']
                 # Remove password from data to avoid including it in ZIP content
                 data = {k: v for k, v in data.items() if k != 'password'}
-            
+
             # Pass event_emitter for ZIP warnings
             if file_type == 'zip' and hasattr(self, 'event_emitter') and self.event_emitter:
                 kwargs['event_emitter'] = self.event_emitter
+                
+            # Check if password is provided for non-ZIP files
+            if actual_password and file_type != 'zip':
+                # Emit error notification for unsupported password protection
+                if hasattr(self, 'event_emitter') and self.event_emitter:
+                    await self.event_emitter({
+                        "type": "notification",
+                        "data": {
+                            "type": "error",
+                            "content": f"パスワード保護はZIPファイルにのみ対応しています: {file_type.upper()} ファイルではサポートされていません"
+                        }
+                    })
+                return f"❌ Error: Password protection is only supported for ZIP files, not for {file_type.upper()} files."
+            
+            # Add password to kwargs for ZIP files
+            if actual_password and file_type == 'zip':
+                kwargs['password'] = actual_password
+            
+
 
             # Generate file content
             try:
