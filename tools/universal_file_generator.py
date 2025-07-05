@@ -8,7 +8,7 @@ description: |
   
   ## Supported Formats
   - **Text**: All text-based formats (CSV, JSON, XML, TXT, HTML, Markdown, YAML, TOML, JavaScript, Python, SQL, etc.)
-  - **Binary**: DOCX (with rich formatting), XLSX (Excel), PDF (with Japanese fonts), ZIP (with URL downloading support)
+  - **Binary**: DOCX (with rich formatting), XLSX (Excel), PDF (with Japanese fonts), ZIP (with URL downloading and ZipCrypto encryption support)
   
   ## Key Features
   - Advanced PDF generation with WeasyPrint/ReportLab and Japanese font support
@@ -2796,6 +2796,7 @@ class Tools:
         result += '  "filename": "encrypted.zip"\n'
         result += "}\n"
         result += "```\n\n"
+        result += "⚠️ **Note**: Uses ZipCrypto (Traditional PKWARE) encryption - suitable for basic protection but not high-security scenarios.\n\n"
         
         # Rules
         result += "## 📋 **Rules**\n"
