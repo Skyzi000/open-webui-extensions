@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: Skyzi000 & Claude
-version: 0.17.8
+version: 0.17.9
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2417,22 +2417,16 @@ This will show you the supported format with examples."""
                 if 'content' in file_info:
                     content = file_info['content']
                     
-                    # Generate appropriate format based on file extension
+                    # Generate content using FileGenerator for all file types
                     file_ext = file_path.split('.')[-1].lower() if '.' in file_path else 'txt'
                     
-                    if file_ext in ['docx', 'pdf', 'xlsx'] and isinstance(content, str):
-                        # Generate binary format using the appropriate generator
-                        try:
-                            # Create a temporary FileGenerator instance to generate binary content
-                            temp_generator = FileGenerator()
-                            data = temp_generator.generate_content(file_ext, content)
-                        except Exception as e:
-                            # If generation fails, add as text file with error note
-                            error_note = f"Error generating {file_ext.upper()}: {str(e)}\n\nOriginal content:\n{content}"
-                            data = error_note.encode('utf-8')
-                            print(f"Warning: Failed to generate {file_ext.upper()} for {file_path}, added as text")
-                    else:
-                        # Handle as text or binary data
+                    try:
+                        # Use FileGenerator for consistent processing
+                        temp_generator = FileGenerator()
+                        data = temp_generator.generate_content(file_ext, content)
+                    except Exception as e:
+                        # If generation fails, fallback to raw content
+                        print(f"Warning: Failed to generate {file_ext.upper()} for {file_path}: {str(e)}")
                         if isinstance(content, str):
                             data = content.encode('utf-8')
                         else:
