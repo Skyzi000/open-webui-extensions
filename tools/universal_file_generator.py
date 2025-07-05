@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.17.3
+version: 0.17.4
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2611,13 +2611,13 @@ class Tools:
         Generate a file of specified type from provided data
         Uploads all files to a cloud service and returns download link
         
-        :param file_type: File extension (e.g., 'csv', 'pdf', 'zip' or '.csv', '.pdf', '.zip') - must be exact match
+        :param file_type: File extension (e.g., 'csv', 'pdf', 'zip' or '.csv', '.pdf', '.zip') - Must be exact match
         :param data: Data to convert - expected formats by file type:
                     - Any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, ini, conf, log, etc.): str (pre-formatted text content)
                     - DOCX: str (HTML, Markdown, or plain text - auto-detected)
                     - PDF: str (HTML, Markdown, or plain text - auto-detected)
                     - XLSX: List[Dict] (list of dictionaries) or tabular data
-                    - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {path, content/url} objects)
+                    - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {path, content/url} objects) - Call `list_zip_formats()` for detailed ZIP creation examples.
         :param filename: Optional custom filename
         :param password: Optional password for ZIP encryption (AES encryption via pyzipper)
         :return: Markdown with download information
@@ -2646,7 +2646,7 @@ class Tools:
 
             # Extract password for ZIP encryption if provided
             kwargs = {}
-            if password:
+            if password and not hasattr(password, 'default'):  # Check if password is not a Field object
                 kwargs['password'] = password
             elif isinstance(data, dict) and 'password' in data:
                 # Legacy support: password in data dict
