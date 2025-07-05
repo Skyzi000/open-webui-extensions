@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: Skyzi000 & Claude
-version: 0.17.10
+version: 0.18.0
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2357,6 +2357,9 @@ This will show you the simple formats available."""
                 # Check if content is a URL string
                 if isinstance(content, str) and (content.startswith('http://') or content.startswith('https://')):
                     path_files.append({"path": filename, "url": content})
+                elif isinstance(content, str) and content.startswith('data:'):
+                    # Handle Data URI
+                    path_files.append({"path": filename, "data_uri": content})
                 else:
                     path_files.append({"path": filename, "content": content})
             files = path_files
@@ -2453,11 +2456,34 @@ This will show you the supported format with examples."""
                         error_content = f"Error downloading {url}: {str(e)}"
                         zf.writestr(f"{file_path}.error", error_content)
                         print(f"Error downloading {url}: {str(e)}")
+                elif 'data_uri' in file_info:
+                    data_uri = file_info['data_uri']
+                    try:
+                        # Parse Data URI: data:[<mediatype>][;base64],<data>
+                        if ',' in data_uri:
+                            header, data_part = data_uri.split(',', 1)
+                            if ';base64' in header:
+                                # Base64 encoded data
+                                data = base64.b64decode(data_part)
+                            else:
+                                # URL encoded data (text)
+                                import urllib.parse
+                                data = urllib.parse.unquote(data_part).encode('utf-8')
+                            zf.writestr(file_path, data)
+                            print(f"Added Data URI file: {file_path}")
+                        else:
+                            error_content = f"Invalid Data URI format: {data_uri[:100]}..."
+                            zf.writestr(f"{file_path}.error", error_content)
+                            print(f"Error parsing Data URI for {file_path}")
+                    except Exception as e:
+                        error_content = f"Error processing Data URI: {str(e)}"
+                        zf.writestr(f"{file_path}.error", error_content)
+                        print(f"Error processing Data URI for {file_path}: {str(e)}")
             else:
                 # Invalid format
                 error_msg = """❌ ZIP Creation Error: Invalid file format.
 
-Each file must have 'path' and either 'content' or 'url'.
+Each file must have 'path' and either 'content', 'url', or 'data_uri'.
 
 Call list_zip_formats() for examples."""
                 raise ValueError(error_msg)
