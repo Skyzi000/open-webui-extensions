@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.10.0
+version: 0.11.0
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -23,9 +23,7 @@ description: |
   Each file type expects specific data formats - see generate_file() docstring for detailed specifications.
 """
 
-import csv
 import json
-import xml.etree.ElementTree as ET
 import io
 import zipfile
 import requests
@@ -82,21 +80,10 @@ class FileGenerator:
     
     def __init__(self):
         self.mime_types = {
-            'csv': 'text/csv',
-            'json': 'application/json',
-            'xml': 'application/xml',
-            'txt': 'text/plain',
-            'html': 'text/html',
-            'md': 'text/markdown',
-            'yaml': 'application/x-yaml',
-            'toml': 'application/toml',
             'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             'pdf': 'application/pdf',
             'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             'zip': 'application/zip',
-            'js': 'text/javascript',
-            'py': 'text/x-python',
-            'sql': 'application/sql',
         }
 
     def generate_content(self, file_type: str, data: Any, **kwargs) -> Optional[bytes]:
@@ -120,7 +107,7 @@ class FileGenerator:
 
     def get_mime_type(self, file_type: str) -> str:
         """Get MIME type for file format"""
-        return self.mime_types.get(file_type, 'application/octet-stream')
+        return self.mime_types.get(file_type, 'text/plain')
 
     def generate_text(self, data: Union[str, Any], **kwargs) -> bytes:
         """Generate text content from string data"""
@@ -130,136 +117,13 @@ class FileGenerator:
             # Fallback to string representation
             return str(data).encode('utf-8')
 
-    def generate_csv(self, data: Union[List[Dict], List[List], str], **kwargs) -> bytes:
-        """Generate CSV content"""
-        if not data:
-            raise ValueError("No data provided for CSV generation")
-        
-        # IMPORTANT: Check for string FIRST before any other operations
-        if isinstance(data, str):
-            return data.encode('utf-8')
-        
-        # If data is not a list, try to convert it
-        if not isinstance(data, list):
-            raise ValueError(f"CSV data must be a list of dictionaries, list of lists, or CSV string. Got: {type(data)}")
-        
-        # Check if list is empty
-        if len(data) == 0:
-            raise ValueError("CSV data list is empty")
-        
-        output = io.StringIO()
-        
-        if isinstance(data[0], dict):
-            # List of dictionaries
-            writer = csv.DictWriter(output, fieldnames=data[0].keys())
-            writer.writeheader()
-            writer.writerows(data)
-        elif isinstance(data[0], (list, tuple)):
-            # List of lists/tuples
-            writer = csv.writer(output)
-            writer.writerows(data)
-        else:
-            # Fallback: treat as simple values
-            writer = csv.writer(output)
-            writer.writerow(['value'])  # header
-            for item in data:
-                writer.writerow([item])
-        
-        return output.getvalue().encode('utf-8')
 
-    def generate_json(self, data: Any, **kwargs) -> bytes:
-        """Generate JSON content"""
-        indent = kwargs.get('indent', 2)
-        json_str = json.dumps(data, indent=indent, ensure_ascii=False, default=str)
-        return json_str.encode('utf-8')
 
-    def generate_xml(self, data: Dict, **kwargs) -> bytes:
-        """Generate XML content"""
-        root_name = kwargs.get('root_name', 'root')
-        
-        def dict_to_xml(d, parent):
-            if isinstance(d, dict):
-                for key, value in d.items():
-                    if isinstance(value, list):
-                        for item in value:
-                            elem = ET.SubElement(parent, key)
-                            dict_to_xml(item, elem)
-                    else:
-                        elem = ET.SubElement(parent, key)
-                        dict_to_xml(value, elem)
-            else:
-                parent.text = str(d)
-        
-        root = ET.Element(root_name)
-        dict_to_xml(data, root)
-        ET.indent(root, space="  ")
-        
-        return ET.tostring(root, encoding='utf-8', xml_declaration=True)
 
-    def generate_txt(self, data: Union[str, List[str]], **kwargs) -> bytes:
-        """Generate text content"""
-        if isinstance(data, list):
-            content = '\n'.join(str(item) for item in data)
-        else:
-            content = str(data)
-        return content.encode('utf-8')
 
-    def generate_html(self, data: Union[str, Dict], **kwargs) -> bytes:
-        """Generate HTML content"""
-        if isinstance(data, str):
-            html_content = data
-        else:
-            title = data.get('title', 'Generated Document')
-            body = data.get('body', data.get('content', ''))
-            style = data.get('style', 'body { font-family: Arial, sans-serif; margin: 2em; }')
-            
-            html_content = f"""<!DOCTYPE html>
-<html lang="ja">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{title}</title>
-    <style>{style}</style>
-</head>
-<body>
-    {body}
-</body>
-</html>"""
-        
-        return html_content.encode('utf-8')
 
-    def generate_markdown(self, data: Union[str, Dict], **kwargs) -> bytes:
-        """Generate Markdown content"""
-        if isinstance(data, str):
-            content = data
-        else:
-            content = ""
-            if 'title' in data:
-                content += f"# {data['title']}\n\n"
-            if 'sections' in data:
-                for section in data['sections']:
-                    content += f"## {section.get('title', '')}\n\n"
-                    content += f"{section.get('content', '')}\n\n"
-            elif 'content' in data:
-                content += data['content']
-        
-        return content.encode('utf-8')
 
-    def generate_yaml(self, data: Union[str, Any], **kwargs) -> bytes:
-        """Generate YAML content from pre-formatted string"""
-        if isinstance(data, str):
-            return data.encode('utf-8')
-        else:
-            # Fallback to string representation
-            return str(data).encode('utf-8')
 
-    def generate_toml(self, data: Union[str, Any], **kwargs) -> bytes:
-        """Generate TOML content from pre-formatted string"""
-        if isinstance(data, str):
-            return data.encode('utf-8')
-        else:
-            # Fallback to string representation
-            return str(data).encode('utf-8')
 
     def generate_docx(self, data: Union[str, Dict], **kwargs) -> bytes:
         """Generate DOCX content - for docx files, please provide data in HTML format"""
@@ -2590,43 +2454,8 @@ class FileGenerator:
         buffer.seek(0)
         return buffer.read()
 
-    def generate_javascript(self, data: Union[str, Dict], **kwargs) -> bytes:
-        """Generate JavaScript content"""
-        if isinstance(data, str):
-            content = data
-        else:
-            content = f"""// Generated JavaScript file
-// Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-{data.get('content', '')}
-"""
-        return content.encode('utf-8')
 
-    def generate_python(self, data: Union[str, Dict], **kwargs) -> bytes:
-        """Generate Python content"""
-        if isinstance(data, str):
-            content = data
-        else:
-            content = f"""#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# Generated Python file
-# Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-{data.get('content', '')}
-"""
-        return content.encode('utf-8')
-
-    def generate_sql(self, data: Union[str, Dict], **kwargs) -> bytes:
-        """Generate SQL content"""
-        if isinstance(data, str):
-            content = data
-        else:
-            content = f"""-- Generated SQL file
--- Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-{data.get('content', '')}
-"""
-        return content.encode('utf-8')
 
 
 def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: int) -> str:
