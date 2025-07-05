@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.11.1
+version: 0.11.3
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -28,6 +28,7 @@ import io
 import zipfile
 import requests
 import base64
+import mimetypes
 from typing import Dict, List, Any, Optional, Union
 from datetime import datetime
 from pydantic import BaseModel, Field
@@ -79,23 +80,7 @@ class FileGenerator:
     """Internal file generation engine - not exposed to AI"""
     
     def __init__(self):
-        self.mime_types = {
-            'csv': 'text/csv',
-            'json': 'application/json',
-            'xml': 'application/xml',
-            'txt': 'text/plain',
-            'html': 'text/html',
-            'md': 'text/markdown',
-            'yaml': 'application/x-yaml',
-            'toml': 'application/toml',
-            'js': 'text/javascript',
-            'py': 'text/x-python',
-            'sql': 'application/sql',
-            'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            'pdf': 'application/pdf',
-            'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'zip': 'application/zip',
-        }
+        pass
 
     def generate_content(self, file_type: str, data: Any, **kwargs) -> Optional[bytes]:
         """Generate file content based on type"""
@@ -117,8 +102,9 @@ class FileGenerator:
             raise Exception(f"Content generation failed: {str(e)}")
 
     def get_mime_type(self, file_type: str) -> str:
-        """Get MIME type for file format"""
-        return self.mime_types.get(file_type, 'text/plain')
+        """Get MIME type for file format using Python standard library"""
+        mime_type, _ = mimetypes.guess_type(f"dummy.{file_type}")
+        return mime_type or 'text/plain'
 
     def generate_text(self, data: Union[str, Any], **kwargs) -> bytes:
         """Generate text content from string data"""
