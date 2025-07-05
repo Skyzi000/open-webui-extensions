@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.17.2
+version: 0.17.3
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -122,7 +122,9 @@ class FileGenerator:
     def generate_text(self, data: Union[str, Any], **kwargs) -> bytes:
         """Generate text content from string data"""
         if isinstance(data, str):
-            return data.encode('utf-8')
+            # Convert escaped newlines to actual newlines
+            text = data.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+            return text.encode('utf-8')
         else:
             # Fallback to string representation
             return str(data).encode('utf-8')
