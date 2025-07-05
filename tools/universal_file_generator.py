@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: Skyzi000 & Claude
-version: 0.17.7
+version: 0.17.8
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2416,10 +2416,27 @@ This will show you the supported format with examples."""
                 # Handle content or URL
                 if 'content' in file_info:
                     content = file_info['content']
-                    if isinstance(content, str):
-                        data = content.encode('utf-8')
+                    
+                    # Generate appropriate format based on file extension
+                    file_ext = file_path.split('.')[-1].lower() if '.' in file_path else 'txt'
+                    
+                    if file_ext in ['docx', 'pdf', 'xlsx'] and isinstance(content, str):
+                        # Generate binary format using the appropriate generator
+                        try:
+                            # Create a temporary FileGenerator instance to generate binary content
+                            temp_generator = FileGenerator()
+                            data = temp_generator.generate_content(file_ext, content)
+                        except Exception as e:
+                            # If generation fails, add as text file with error note
+                            error_note = f"Error generating {file_ext.upper()}: {str(e)}\n\nOriginal content:\n{content}"
+                            data = error_note.encode('utf-8')
+                            print(f"Warning: Failed to generate {file_ext.upper()} for {file_path}, added as text")
                     else:
-                        data = content
+                        # Handle as text or binary data
+                        if isinstance(content, str):
+                            data = content.encode('utf-8')
+                        else:
+                            data = content
                     
                     zf.writestr(file_path, data)
                     print(f"Added file: {file_path}")
@@ -2659,14 +2676,15 @@ class Tools:
             kwargs = {}
             actual_password = None
             
-            # Extract password if provided (check if it's not a Field object)
-            if password and not hasattr(password, 'default'):
+            # Extract password if provided (check if it's not a Field object or None)
+            if password is not None and password and not hasattr(password, 'default'):
                 actual_password = password
             elif isinstance(data, dict) and 'password' in data:
                 # Legacy support: password in data dict
                 actual_password = data['password']
-                # Remove password from data to avoid including it in ZIP content
-                data = {k: v for k, v in data.items() if k != 'password'}
+                if actual_password is not None:  # Only process non-null passwords
+                    # Remove password from data to avoid including it in ZIP content
+                    data = {k: v for k, v in data.items() if k != 'password'}
 
             # Pass event_emitter for ZIP warnings
             if file_type == 'zip' and hasattr(self, 'event_emitter') and self.event_emitter:
