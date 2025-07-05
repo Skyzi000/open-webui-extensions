@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: Skyzi000 & Claude
-version: 0.17.9
+version: 0.17.10
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2354,7 +2354,11 @@ This will show you the simple formats available."""
             # Convert {"filename": "content"} to [{"path": "filename", "content": "content"}]
             path_files = []
             for filename, content in files.items():
-                path_files.append({"path": filename, "content": content})
+                # Check if content is a URL string
+                if isinstance(content, str) and (content.startswith('http://') or content.startswith('https://')):
+                    path_files.append({"path": filename, "url": content})
+                else:
+                    path_files.append({"path": filename, "content": content})
             files = path_files
         
         # Now files should be a list
