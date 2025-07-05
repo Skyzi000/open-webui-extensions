@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: Skyzi000 & Claude
-version: 0.17.6
+version: 0.17.7
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2340,6 +2340,17 @@ class FileGenerator:
         
         # Convert dictionary format to path-based format if needed
         if isinstance(files, dict):
+            # Check for unsupported nested structures
+            if 'files' in files or any(isinstance(v, (list, dict)) for v in files.values() if not isinstance(v, str)):
+                error_msg = """❌ ZIP Creation Error: Complex nested structures are not supported.
+
+For supported ZIP formats, call:
+
+📦 **list_zip_formats()**
+
+This will show you the simple formats available."""
+                raise ValueError(error_msg)
+            
             # Convert {"filename": "content"} to [{"path": "filename", "content": "content"}]
             path_files = []
             for filename, content in files.items():
