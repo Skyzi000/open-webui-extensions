@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.13.4
+version: 0.13.8
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2326,6 +2326,13 @@ class FileGenerator:
         """Generate ZIP content"""
         buffer = io.BytesIO()
         
+        # Handle nested structure - treat everything under data as folder structure
+        if isinstance(files, dict) and not self._is_file_list(files):
+            # Process as folder structure
+            folder_files = []
+            self._process_folder_structure(files, "", folder_files)
+            files = folder_files
+        
         with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             # Handle list of {filename, url} format
             if isinstance(files, list):
@@ -2354,21 +2361,62 @@ To create a ZIP file, please provide data in one of these formats:
   "file_type": "zip", 
   "data": [
     {"filename": "sample.csv", "url": "https://example.com/file.csv"},
-    {"filename": "sample.json", "url": "https://example.com/file.json"}
+    {"name": "sample.json", "url": "https://example.com/file.json"}
   ],
   "filename": "my_files.zip"
 }
 ```
 
+**Format 3: Folder structure (any key name)**
+```json
+{
+  "file_type": "zip",
+  "data": {
+    "documents": [
+      {"name": "file1.pdf", "url": "https://example.com/file1.pdf"},
+      {"name": "file2.docx", "url": "https://example.com/file2.docx"}
+    ],
+    "images": [
+      {"name": "image1.png", "url": "https://example.com/image1.png"}
+    ],
+    "project": {
+      "src": [
+        {"name": "main.py", "url": "https://example.com/main.py"}
+      ],
+      "config": [
+        {"name": "settings.json", "url": "https://example.com/settings.json"}
+      ],
+      "empty_folder": []
+    }
+  },
+  "filename": "organized_files.zip"
+}
+```
+
 - Dictionary format: filename as key, content or URL as value
-- List format: each element must contain 'filename' and 'url' keys
+- List format: each element must contain 'filename'/'name' and 'url' keys
+- Folder format: any key under 'data' becomes a folder, supports unlimited nesting
+- Empty folders: use empty arrays [] or empty objects {} to create empty directories
 - URLs will be automatically downloaded"""
                     raise ValueError(error_msg)
                 
                 for file_info in files:
-                    if isinstance(file_info, dict) and 'filename' in file_info and 'url' in file_info:
-                        filename = file_info['filename']
+                    # Handle empty folders
+                    if isinstance(file_info, dict) and file_info.get('is_empty_folder'):
+                        folder_path = file_info.get('filename', '')
+                        if folder_path:
+                            # Create empty directory in ZIP
+                            zf.writestr(folder_path, '')
+                            print(f"Created empty folder: {folder_path}")
+                        continue
+                    
+                    # Support both 'filename'/'name' keys
+                    if isinstance(file_info, dict) and 'url' in file_info:
+                        filename = file_info.get('filename') or file_info.get('name')
                         url = file_info['url']
+                        
+                        if not filename:
+                            continue
                         try:
                             print(f"Downloading {filename} from {url}")
                             response = requests.get(url, timeout=30)
@@ -2418,6 +2466,55 @@ To create a ZIP file, please provide data in one of these formats:
         
         buffer.seek(0)
         return buffer.read()
+    
+    def _process_folder_structure(self, folders: Dict[str, Any], current_path: str, folder_files: List[Dict]):
+        """Recursively process folder structure"""
+        for folder_name, folder_contents in folders.items():
+            # Build full path
+            if current_path:
+                full_path = f"{current_path.rstrip('/')}/{folder_name.rstrip('/')}"
+            else:
+                full_path = folder_name.rstrip('/')
+            
+            if isinstance(folder_contents, list):
+                if len(folder_contents) == 0:
+                    # Empty folder - create empty directory entry
+                    folder_files.append({
+                        'filename': f"{full_path}/",
+                        'url': None,
+                        'content': '',
+                        'is_empty_folder': True
+                    })
+                else:
+                    # This is a list of files
+                    for file_info in folder_contents:
+                        if isinstance(file_info, dict):
+                            # Add folder path to filename
+                            filename = file_info.get('filename') or file_info.get('name')
+                            if filename:
+                                folder_file = file_info.copy()
+                                folder_file['filename'] = f"{full_path}/{filename}"
+                                folder_files.append(folder_file)
+            elif isinstance(folder_contents, dict):
+                if len(folder_contents) == 0:
+                    # Empty folder - create empty directory entry
+                    folder_files.append({
+                        'filename': f"{full_path}/",
+                        'url': None,
+                        'content': '',
+                        'is_empty_folder': True
+                    })
+                else:
+                    # This is a nested folder structure
+                    self._process_folder_structure(folder_contents, full_path, folder_files)
+    
+    def _is_file_list(self, data: Dict[str, Any]) -> bool:
+        """Check if dictionary represents filename->content mapping vs folder structure"""
+        # If all values are strings or bytes, treat as filename->content mapping
+        for key, value in data.items():
+            if isinstance(value, (list, dict)) and not isinstance(value, (str, bytes)):
+                return False
+        return True
 
 
 
