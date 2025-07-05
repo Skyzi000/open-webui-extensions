@@ -1,14 +1,14 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.16.1
-requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown
+version: 0.17.0
+requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
   
   ## Supported Formats
   - **Text**: All text-based formats (CSV, JSON, XML, TXT, HTML, Markdown, YAML, TOML, JavaScript, Python, SQL, etc.)
-  - **Binary**: DOCX (with rich formatting), XLSX (Excel), PDF (with Japanese fonts), ZIP (with URL downloading and ZipCrypto encryption support)
+  - **Binary**: DOCX (with rich formatting), XLSX (Excel), PDF (with Japanese fonts), ZIP (with URL downloading and AES encryption support)
   
   ## Key Features
   - Advanced PDF generation with WeasyPrint/ReportLab and Japanese font support
@@ -79,6 +79,12 @@ try:
     MARKDOWN_AVAILABLE = True
 except ImportError:
     MARKDOWN_AVAILABLE = False
+
+try:
+    import pyzipper
+    PYZIPPER_AVAILABLE = True
+except ImportError:
+    PYZIPPER_AVAILABLE = False
 
 PDF_AVAILABLE = WEASYPRINT_AVAILABLE or REPORTLAB_AVAILABLE
 
@@ -2348,82 +2354,77 @@ To learn how to create ZIP files, call:
 This will show you the supported format with examples."""
             raise ValueError(error_msg)
         
-        with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            # Set password for encryption if provided
-            if password:
+        # Use pyzipper for encryption support if available and password provided
+        if password and PYZIPPER_AVAILABLE:
+            with pyzipper.AESZipFile(buffer, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
                 zf.setpassword(password.encode('utf-8'))
-            # Check if it's a list of strings (just filenames) - return error
-            if files and isinstance(files[0], str):
-                error_msg = """❌ ZIP Creation Error: Invalid data format provided.
+                self._add_files_to_zip(zf, files)
+        else:
+            if password and not PYZIPPER_AVAILABLE:
+                print("Warning: pyzipper not available. Creating unencrypted ZIP.")
+            with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                self._add_files_to_zip(zf, files)
+        
+        buffer.seek(0)
+        return buffer.read()
+    
+    def _add_files_to_zip(self, zf, files):
+        """Add files to ZIP archive (works with both zipfile and pyzipper)"""
+        # Check if it's a list of strings (just filenames) - return error
+        if files and isinstance(files[0], str):
+            error_msg = """❌ ZIP Creation Error: Invalid data format provided.
 
 To learn how to create ZIP files with the Universal File Generator, call:
 
 📦 **list_zip_formats()**
 
 This will show you the supported format with examples."""
-                raise ValueError(error_msg)
-            
-            for file_info in files:
-                # Handle {path, content} or {path, url} format
-                if isinstance(file_info, dict) and 'path' in file_info:
-                    file_path = file_info['path']
+            raise ValueError(error_msg)
+        
+        for file_info in files:
+            # Handle {path, content} or {path, url} format
+            if isinstance(file_info, dict) and 'path' in file_info:
+                file_path = file_info['path']
+                
+                # Handle empty folders (path ends with /)
+                if file_path.endswith('/'):
+                    zf.writestr(file_path, '')
+                    print(f"Created empty folder: {file_path}")
+                    continue
+                
+                # Handle content or URL
+                if 'content' in file_info:
+                    content = file_info['content']
+                    if isinstance(content, str):
+                        data = content.encode('utf-8')
+                    else:
+                        data = content
                     
-                    # Handle empty folders (path ends with /)
-                    if file_path.endswith('/'):
-                        zf.writestr(file_path, '')
-                        print(f"Created empty folder: {file_path}")
-                        continue
-                    
-                    # Handle content or URL
-                    if 'content' in file_info:
-                        content = file_info['content']
-                        if isinstance(content, str):
-                            data = content.encode('utf-8')
+                    zf.writestr(file_path, data)
+                    print(f"Added file: {file_path}")
+                elif 'url' in file_info:
+                    url = file_info['url']
+                    try:
+                        response = requests.get(url, timeout=30)
+                        if response.status_code == 200:
+                            zf.writestr(file_path, response.content)
+                            print(f"Downloaded and added: {file_path} from {url}")
                         else:
-                            data = content
-                        
-                        # Add with encryption if password provided
-                        if password:
-                            zf.writestr(file_path, data, pwd=password.encode('utf-8'))
-                        else:
-                            zf.writestr(file_path, data)
-                        print(f"Added file: {file_path}")
-                    elif 'url' in file_info:
-                        url = file_info['url']
-                        try:
-                            response = requests.get(url, timeout=30)
-                            if response.status_code == 200:
-                                # Add with encryption if password provided
-                                if password:
-                                    zf.writestr(file_path, response.content, pwd=password.encode('utf-8'))
-                                else:
-                                    zf.writestr(file_path, response.content)
-                                print(f"Downloaded and added: {file_path} from {url}")
-                            else:
-                                error_content = f"Error downloading {url}: HTTP {response.status_code}"
-                                if password:
-                                    zf.writestr(f"{file_path}.error", error_content, pwd=password.encode('utf-8'))
-                                else:
-                                    zf.writestr(f"{file_path}.error", error_content)
-                                print(f"Error downloading {url}: HTTP {response.status_code}")
-                        except Exception as e:
-                            error_content = f"Error downloading {url}: {str(e)}"
-                            if password:
-                                zf.writestr(f"{file_path}.error", error_content, pwd=password.encode('utf-8'))
-                            else:
-                                zf.writestr(f"{file_path}.error", error_content)
-                            print(f"Error downloading {url}: {str(e)}")
-                else:
-                    # Invalid format
-                    error_msg = """❌ ZIP Creation Error: Invalid file format.
+                            error_content = f"Error downloading {url}: HTTP {response.status_code}"
+                            zf.writestr(f"{file_path}.error", error_content)
+                            print(f"Error downloading {url}: HTTP {response.status_code}")
+                    except Exception as e:
+                        error_content = f"Error downloading {url}: {str(e)}"
+                        zf.writestr(f"{file_path}.error", error_content)
+                        print(f"Error downloading {url}: {str(e)}")
+            else:
+                # Invalid format
+                error_msg = """❌ ZIP Creation Error: Invalid file format.
 
 Each file must have 'path' and either 'content' or 'url'.
 
 Call list_zip_formats() for examples."""
-                    raise ValueError(error_msg)
-        
-        buffer.seek(0)
-        return buffer.read()
+                raise ValueError(error_msg)
 
 
 def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: int) -> str:
@@ -2608,7 +2609,7 @@ class Tools:
                     - XLSX: List[Dict] (list of dictionaries) or tabular data
                     - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {path, content/url} objects)
         :param filename: Optional custom filename
-        :param password: Optional password for ZIP encryption (ZipCrypto format)
+        :param password: Optional password for ZIP encryption (AES encryption via pyzipper)
         :return: Markdown with download information
         """
         
@@ -2789,8 +2790,8 @@ class Tools:
         result += "```\n\n"
         
         # Encryption format
-        result += "## 🔐 **Encrypted ZIP**\n"
-        result += "Add password protection to your ZIP files.\n\n"
+        result += "## 🔐 **Encrypted ZIP (AES)**\n"
+        result += "Add password protection to your ZIP files using AES encryption.\n\n"
         result += "```json\n"
         result += "{\n"
         result += '  "file_type": "zip",\n'
@@ -2802,7 +2803,7 @@ class Tools:
         result += '  "filename": "encrypted.zip"\n'
         result += "}\n"
         result += "```\n\n"
-        result += "⚠️ **Note**: Uses ZipCrypto (Traditional PKWARE) encryption - suitable for basic protection but not high-security scenarios.\n\n"
+        result += "⚠️ **Note**: Requires `pyzipper` library for AES encryption. Falls back to unencrypted ZIP if not available.\n\n"
         
         # Rules
         result += "## 📋 **Rules**\n"
@@ -2811,7 +2812,7 @@ class Tools:
         result += "- Empty folders: path ending with `/` and empty content\n"
         result += "- URLs are downloaded automatically\n"
         result += "- Forward slashes `/` create folder structures\n"
-        result += "- Encryption: add `password` parameter at top level (not in data)\n\n"
+        result += "- Encryption: add `password` parameter for AES encryption (requires pyzipper)\n\n"
         
         result += "**🚀 Try it now:** Use `generate_file()` with `file_type: \"zip\"` and either format!"
         
