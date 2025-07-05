@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.11.0
+version: 0.11.1
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -80,6 +80,17 @@ class FileGenerator:
     
     def __init__(self):
         self.mime_types = {
+            'csv': 'text/csv',
+            'json': 'application/json',
+            'xml': 'application/xml',
+            'txt': 'text/plain',
+            'html': 'text/html',
+            'md': 'text/markdown',
+            'yaml': 'application/x-yaml',
+            'toml': 'application/toml',
+            'js': 'text/javascript',
+            'py': 'text/x-python',
+            'sql': 'application/sql',
             'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             'pdf': 'application/pdf',
             'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
