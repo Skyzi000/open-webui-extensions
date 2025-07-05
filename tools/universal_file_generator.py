@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: Skyzi000 & Claude
-version: 0.18.0
+version: 0.19.0
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -9,12 +9,14 @@ description: |
   ## Supported Formats
   - **Text**: All text-based formats (CSV, JSON, XML, TXT, HTML, Markdown, YAML, TOML, JavaScript, Python, SQL, etc.)
   - **Binary**: DOCX (with rich formatting), XLSX (Excel), PDF (with Japanese fonts), ZIP (with URL downloading and AES encryption support)
+  - **Graphics**: SVG (scalable vector graphics with text, shapes, and structured elements)
   
   ## Key Features
   - Advanced PDF generation with WeasyPrint/ReportLab and Japanese font support
   - Rich DOCX formatting with HTML input support
+  - SVG generation with structured elements (text, shapes, custom graphics)
   - ZIP archive creation with remote file downloading from URLs
-  - Automatic cloud upload to multiple services (transfer.sh, 0x0.st, file.io)
+  - Automatic cloud upload to multiple services (transfer.sh, 0x0.st, file.io, litterbox)
   - Comprehensive error handling and service fallback
   - BeautifulSoup HTML parsing for clean document generation
   - Pandas integration for advanced data processing
@@ -108,6 +110,8 @@ class FileGenerator:
                 return self.generate_xlsx(data, **kwargs)
             elif file_type == 'zip':
                 return self.generate_zip(data, **kwargs)
+            elif file_type == 'svg':
+                return self.generate_svg(data, **kwargs)
             else:
                 # Default: treat as text-based format
                 return self.generate_text(data, **kwargs)
@@ -116,6 +120,10 @@ class FileGenerator:
 
     def get_mime_type(self, file_type: str) -> str:
         """Get MIME type for file format using Python standard library"""
+        # Special handling for SVG to ensure correct MIME type
+        if file_type.lower() == 'svg':
+            return 'image/svg+xml'
+        
         mime_type, _ = mimetypes.guess_type(f"dummy.{file_type}")
         return mime_type or 'text/plain'
 
@@ -564,6 +572,13 @@ class FileGenerator:
                 print(f"Downloading image from: {src}")
                 response = requests.get(src, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
                 if response.status_code == 200:
+                    # Check if it's SVG content
+                    content_type = response.headers.get('content-type', '').lower()
+                    if 'svg' in content_type or src.lower().endswith('.svg'):
+                        print(f"SVG images are not directly supported in DOCX: {alt_text}")
+                        paragraph.add_run(f"[SVG Image: {alt_text}] (SVG not supported in DOCX - URL: {src})")
+                        return
+                        
                     image_stream = io.BytesIO(response.content)
                     try:
                         # Add image to paragraph with size constraints
@@ -582,6 +597,12 @@ class FileGenerator:
                 try:
                     print(f"Processing base64 image: {alt_text}")
                     header, data = src.split(',', 1)
+                    # Check if it's SVG format
+                    if 'svg' in header.lower():
+                        print(f"SVG images are not directly supported in DOCX: {alt_text}")
+                        paragraph.add_run(f"[SVG Image: {alt_text}] (SVG not supported in DOCX)")
+                        return
+                    
                     image_data = base64.b64decode(data)
                     image_stream = io.BytesIO(image_data)
                     run = paragraph.add_run()
@@ -2488,9 +2509,81 @@ Each file must have 'path' and either 'content', 'url', or 'data_uri'.
 Call list_zip_formats() for examples."""
                 raise ValueError(error_msg)
 
+    def generate_svg(self, data: Union[str, Dict[str, Any]], **kwargs) -> bytes:
+        """Generate SVG content"""
+        if isinstance(data, str):
+            # If data is already SVG content, validate and return
+            if data.strip().startswith('<svg'):
+                return data.encode('utf-8')
+            else:
+                # Create a simple text-based SVG
+                svg_content = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300">
+  <rect width="400" height="300" fill="#f9f9f9" stroke="#333" stroke-width="2"/>
+  <text x="200" y="150" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#333">
+    {data.replace('<', '&lt;').replace('>', '&gt;').replace('&', '&amp;')}
+  </text>
+</svg>'''
+                return svg_content.encode('utf-8')
+        
+        elif isinstance(data, dict):
+            # Handle structured SVG data
+            width = data.get('width', 400)
+            height = data.get('height', 300)
+            background = data.get('background', '#f9f9f9')
+            
+            svg_content = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}">
+  <rect width="{width}" height="{height}" fill="{background}" stroke="#333" stroke-width="2"/>'''
+            
+            # Add elements
+            elements = data.get('elements', [])
+            for element in elements:
+                if element.get('type') == 'text':
+                    x = element.get('x', width // 2)
+                    y = element.get('y', height // 2)
+                    text = element.get('text', '').replace('<', '&lt;').replace('>', '&gt;').replace('&', '&amp;')
+                    font_size = element.get('font_size', 16)
+                    color = element.get('color', '#333')
+                    svg_content += f'''
+  <text x="{x}" y="{y}" text-anchor="middle" font-family="Arial, sans-serif" font-size="{font_size}" fill="{color}">
+    {text}
+  </text>'''
+                elif element.get('type') == 'rect':
+                    x = element.get('x', 0)
+                    y = element.get('y', 0)
+                    w = element.get('width', 100)
+                    h = element.get('height', 100)
+                    fill = element.get('fill', '#ccc')
+                    stroke = element.get('stroke', '#333')
+                    svg_content += f'''
+  <rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}" stroke="{stroke}" stroke-width="1"/>'''
+                elif element.get('type') == 'circle':
+                    cx = element.get('cx', width // 2)
+                    cy = element.get('cy', height // 2)
+                    r = element.get('r', 50)
+                    fill = element.get('fill', '#ccc')
+                    stroke = element.get('stroke', '#333')
+                    svg_content += f'''
+  <circle cx="{cx}" cy="{cy}" r="{r}" fill="{fill}" stroke="{stroke}" stroke-width="1"/>'''
+            
+            svg_content += '\n</svg>'
+            return svg_content.encode('utf-8')
+        
+        else:
+            # Fallback: convert to string and create simple SVG
+            text = str(data).replace('<', '&lt;').replace('>', '&gt;').replace('&', '&amp;')
+            svg_content = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300">
+  <rect width="400" height="300" fill="#f9f9f9" stroke="#333" stroke-width="2"/>
+  <text x="200" y="150" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#333">
+    {text}
+  </text>
+</svg>'''
+            return svg_content.encode('utf-8')
+
+
 
 def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: int) -> str:
     """Upload file using multiple services with fallback"""
+    
     
     # Check for zero-size files
     if file_size == 0 or len(file_content) == 0:
@@ -2523,6 +2616,12 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
             "url": "https://file.io",
             "method": "post", 
             "retention": "14 days (deleted after first download)"
+        },
+        {
+            "name": "litterbox",
+            "url": "https://litterbox.catbox.moe/resources/internals/api.php",
+            "method": "litterbox",
+            "retention": "1 hour (temporary file hosting)"
         }
     ]
     
@@ -2533,12 +2632,38 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
             # Add User-Agent header for all requests
             headers = {"User-Agent": "curl/7.68.0"}
             
-            if service["method"] == "put":
+            if service["method"] == "litterbox":
+                # litterbox.catbox.moe style
+                files = {"fileToUpload": (filename, file_content)}
+                data = {
+                    "reqtype": "fileupload",
+                    "time": "1h"  # 1 hour retention
+                }
+                response = requests.post(service["url"], files=files, data=data, headers=headers, timeout=15)
+            elif service["method"] == "put":
                 # transfer.sh style
-                response = requests.put(service["url"], data=file_content, headers=headers, timeout=15)
+                # Add Content-Type header for proper file type detection
+                import mimetypes
+                mime_type, _ = mimetypes.guess_type(filename)
+                if filename.lower().endswith('.svg'):
+                    mime_type = 'image/svg+xml'
+                elif not mime_type:
+                    mime_type = 'application/octet-stream'
+                
+                headers_with_content_type = headers.copy()
+                headers_with_content_type["Content-Type"] = mime_type
+                response = requests.put(service["url"], data=file_content, headers=headers_with_content_type, timeout=15)
             else:
                 # file.io and 0x0.st style (multipart form)
-                files = {"file": (filename, file_content)}
+                # Determine proper MIME type for file
+                import mimetypes
+                mime_type, _ = mimetypes.guess_type(filename)
+                if filename.lower().endswith('.svg'):
+                    mime_type = 'image/svg+xml'
+                elif not mime_type:
+                    mime_type = 'application/octet-stream'
+                
+                files = {"file": (filename, file_content, mime_type)}
                 data = {}
                 
                 # Add secret parameter for 0x0.st
@@ -2551,7 +2676,10 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
                 download_url = ""
                 delete_token = ""
                 
-                if service["name"] == "file.io":
+                if service["name"] == "litterbox":
+                    # litterbox returns plain text URL
+                    download_url = response.text.strip()
+                elif service["name"] == "file.io":
                     # file.io returns JSON - handle parsing errors
                     try:
                         result = response.json()
@@ -2630,7 +2758,7 @@ curl -F "token={delete_token}" -F "delete=" {download_url}
 {error_details}
 ```
 
-Attempted services: transfer.sh, 0x0.st, file.io
+Attempted services: transfer.sh, 0x0.st, file.io, litterbox
 
 Check the error details and retry in the correct format.
 """
