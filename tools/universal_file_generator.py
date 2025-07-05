@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.17.0
+version: 0.17.2
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2334,6 +2334,7 @@ class FileGenerator:
         
         # Get password for encryption if provided
         password = kwargs.get('password')
+        event_emitter = kwargs.get('event_emitter')
         
         # Convert dictionary format to path-based format if needed
         if isinstance(files, dict):
@@ -2354,14 +2355,21 @@ To learn how to create ZIP files, call:
 This will show you the supported format with examples."""
             raise ValueError(error_msg)
         
-        # Use pyzipper for encryption support if available and password provided
-        if password and PYZIPPER_AVAILABLE:
+        # Check if password is requested but pyzipper is not available
+        if password and not PYZIPPER_AVAILABLE:
+            raise ImportError(
+                "❌ ZIP暗号化エラー: パスワード保護が要求されましたが、pyzipperライブラリがインストールされていません。\n\n"
+                "解決方法:\n"
+                "pip install pyzipper\n\n"
+                "または、パスワードなしでZIPファイルを作成してください。"
+            )
+        
+        # Use pyzipper for encryption support if password provided
+        if password:
             with pyzipper.AESZipFile(buffer, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
                 zf.setpassword(password.encode('utf-8'))
                 self._add_files_to_zip(zf, files)
         else:
-            if password and not PYZIPPER_AVAILABLE:
-                print("Warning: pyzipper not available. Creating unencrypted ZIP.")
             with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                 self._add_files_to_zip(zf, files)
         
@@ -2643,6 +2651,10 @@ class Tools:
                 kwargs['password'] = data['password']
                 # Remove password from data to avoid including it in ZIP content
                 data = {k: v for k, v in data.items() if k != 'password'}
+            
+            # Pass event_emitter for ZIP warnings
+            if file_type == 'zip' and hasattr(self, 'event_emitter') and self.event_emitter:
+                kwargs['event_emitter'] = self.event_emitter
 
             # Generate file content
             try:
@@ -2803,7 +2815,7 @@ class Tools:
         result += '  "filename": "encrypted.zip"\n'
         result += "}\n"
         result += "```\n\n"
-        result += "⚠️ **Note**: Requires `pyzipper` library for AES encryption. Falls back to unencrypted ZIP if not available.\n\n"
+        result += "⚠️ **Note**: Requires `pyzipper` library for AES encryption. Will error if password specified but pyzipper not installed.\n\n"
         
         # Rules
         result += "## 📋 **Rules**\n"
