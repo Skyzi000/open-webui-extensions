@@ -1,8 +1,8 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.13.0
-requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests
+version: 0.13.4
+requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
   
@@ -29,10 +29,11 @@ import zipfile
 import requests
 import base64
 import mimetypes
-from typing import Dict, List, Any, Optional, Union
+import re
+from typing import Awaitable, Callable, Dict, List, Any, Optional, Union
 from datetime import datetime
 from pydantic import BaseModel, Field
-from fastapi import UploadFile
+from fastapi import Request, UploadFile
 
 
 # Optional dependencies with graceful fallback
@@ -72,6 +73,12 @@ try:
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
+
+try:
+    import markdown
+    MARKDOWN_AVAILABLE = True
+except ImportError:
+    MARKDOWN_AVAILABLE = False
 
 PDF_AVAILABLE = WEASYPRINT_AVAILABLE or REPORTLAB_AVAILABLE
 
@@ -123,16 +130,17 @@ class FileGenerator:
 
 
     def generate_docx(self, data: Union[str, Dict], **kwargs) -> bytes:
-        """Generate DOCX content - for docx files, please provide data in HTML format"""
+        """Generate DOCX content - accepts HTML, Markdown, or plain text"""
         if not DOCX_AVAILABLE:
             raise ImportError("python-docx is required for DOCX generation. Install with: pip install python-docx")
         
         doc = Document()
         
         if isinstance(data, str):
-            # Try to parse as HTML first
-            if data.strip().startswith('<') and '>' in data:
-                self._parse_html_to_docx(doc, data)
+            # Detect content type and convert to HTML if needed
+            html_content = self._convert_to_html(data)
+            if html_content:
+                self._parse_html_to_docx(doc, html_content)
             else:
                 self._add_text_content(doc, data)
         else:
@@ -142,6 +150,56 @@ class FileGenerator:
         doc.save(buffer)
         buffer.seek(0)
         return buffer.read()
+    
+    def _convert_to_html(self, content: str) -> str:
+        """Convert Markdown or plain text to HTML, or return HTML if already HTML"""
+        content = content.strip()
+        
+        # Already HTML
+        if content.startswith('<') and '>' in content:
+            return content
+        
+        # Detect Markdown patterns
+        markdown_patterns = [
+            r'^#+ ',  # Headers
+            r'^\* ',  # Bullet lists
+            r'^\d+\. ',  # Numbered lists
+            r'\*\*.*?\*\*',  # Bold
+            r'\*.*?\*',  # Italic
+            r'`.*?`',  # Code
+            r'^\|.*\|',  # Tables
+            r'^\> ',  # Blockquotes
+            r'```',  # Code blocks
+        ]
+        
+        import re
+        is_markdown = any(re.search(pattern, content, re.MULTILINE) for pattern in markdown_patterns)
+        
+        if is_markdown:
+            return self._markdown_to_html(content)
+        
+        # Plain text - wrap in paragraphs
+        lines = content.split('\n')
+        html_lines = []
+        for line in lines:
+            line = line.strip()
+            if line:
+                html_lines.append(f'<p>{line}</p>')
+            else:
+                html_lines.append('<br>')
+        
+        return '\n'.join(html_lines)
+    
+    def _markdown_to_html(self, markdown_content: str) -> str:
+        """Convert Markdown to HTML using markdown library"""
+        if not MARKDOWN_AVAILABLE:
+            raise ImportError("markdown library is required for Markdown conversion. Install with: pip install markdown")
+        
+        # Use proper markdown library with extensions
+        return markdown.markdown(
+            markdown_content,
+            extensions=['tables', 'fenced_code', 'toc', 'codehilite']
+        )
     
     def _parse_any_structure(self, doc, data):
         """Parse any dictionary structure intelligently"""
@@ -557,8 +615,8 @@ class FileGenerator:
         
         # Convert data to HTML
         if isinstance(data, str):
-            # Assume it's already HTML
-            html_content = data
+            # Detect content type and convert to HTML if needed
+            html_content = self._convert_to_html(data)
         elif isinstance(data, dict):
             html_content = self._dict_to_html_full(data)
         elif isinstance(data, list):
@@ -1001,8 +1059,9 @@ class FileGenerator:
         flowables = []
         
         if isinstance(data, str):
-            # Handle HTML string
-            flowables.extend(self._parse_html_to_flowables(data, styles))
+            # Detect content type and convert to HTML if needed
+            html_content = self._convert_to_html(data)
+            flowables.extend(self._parse_html_to_flowables(html_content, styles))
         
         elif isinstance(data, dict):
             # Handle dictionary data - convert to HTML first
@@ -2367,6 +2426,15 @@ To create a ZIP file, please provide data in one of these formats:
 def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: int) -> str:
     """Upload file using multiple services with fallback"""
     
+    # Check for zero-size files
+    if file_size == 0 or len(file_content) == 0:
+        return f"❌ **File Upload Error**: Generated file '{filename}' is empty (0 bytes)\n\n" \
+               f"This usually indicates:\n" \
+               f"- Empty or invalid input data\n" \
+               f"- File generation process failed\n" \
+               f"- Unsupported data format for {file_type} files\n\n" \
+               f"Please check your input data and try again."
+    
     import urllib.parse
     safe_filename = urllib.parse.quote(filename, safe='.-_')
     
@@ -2518,9 +2586,9 @@ class Tools:
         file_type: str = Field(..., description="File type (extension): any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, etc.) or binary format (docx, pdf, xlsx, zip)"),
         data: Any = Field(..., description="Data to convert to file format"),
         filename: Optional[str] = Field(None, description="Custom filename (optional)"),
-        __request__: object = None,
-        __user__: dict = {},
-        __event_emitter__: object = None
+        __request__: Optional[Request] = None,
+        __user__: Optional[BaseModel] = None,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
     ) -> str:
         """
         Generate a file of specified type from provided data
@@ -2528,9 +2596,9 @@ class Tools:
         
         :param file_type: Type of file to generate
         :param data: Data to convert - expected formats by file type:
-                    - Any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, etc.): str (pre-formatted text content)
-                    - DOCX: str (HTML format preferred for rich formatting)
-                    - PDF: str (HTML format preferred for rich formatting)
+                    - Any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, ini, conf, log, etc.): str (pre-formatted text content)
+                    - DOCX: str (HTML, Markdown, or plain text - auto-detected)
+                    - PDF: str (HTML, Markdown, or plain text - auto-detected)
                     - XLSX: List[Dict] (list of dictionaries) or tabular data
                     - ZIP: Dict[str, Any] (filename -> content mapping; if content is a URL string, it will be downloaded; if content is structured data, it will be generated as the appropriate file type) OR List[Dict] (list of {filename, url} objects for downloading files from URLs - local file paths are not supported)
         :param filename: Optional custom filename
