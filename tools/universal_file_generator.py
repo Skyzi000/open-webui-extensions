@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.16.0
+version: 0.16.1
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2591,6 +2591,7 @@ class Tools:
         file_type: str = Field(..., description="File type (extension): csv, json, xml, txt, html, md, yaml, toml, js, py, sql, docx, pdf, xlsx, zip, etc. (dot will be removed automatically)"),
         data: Any = Field(..., description="Data to convert to file format"),
         filename: Optional[str] = Field(None, description="Custom filename (optional)"),
+        password: Optional[str] = Field(None, description="Password for ZIP encryption (optional)"),
         __request__: Optional[Request] = None,
         __user__: Optional[BaseModel] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
@@ -2605,8 +2606,9 @@ class Tools:
                     - DOCX: str (HTML, Markdown, or plain text - auto-detected)
                     - PDF: str (HTML, Markdown, or plain text - auto-detected)
                     - XLSX: List[Dict] (list of dictionaries) or tabular data
-                    - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {path, content/url} objects). Optional 'password' parameter for encryption.
+                    - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {path, content/url} objects)
         :param filename: Optional custom filename
+        :param password: Optional password for ZIP encryption (ZipCrypto format)
         :return: Markdown with download information
         """
         
@@ -2633,7 +2635,10 @@ class Tools:
 
             # Extract password for ZIP encryption if provided
             kwargs = {}
-            if isinstance(data, dict) and 'password' in data:
+            if password:
+                kwargs['password'] = password
+            elif isinstance(data, dict) and 'password' in data:
+                # Legacy support: password in data dict
                 kwargs['password'] = data['password']
                 # Remove password from data to avoid including it in ZIP content
                 data = {k: v for k, v in data.items() if k != 'password'}
@@ -2778,6 +2783,7 @@ class Tools:
         result += '    {"path": "assets/logo.png", "url": "https://example.com/logo.png"},\n'
         result += '    {"path": "temp/", "content": ""}\n'
         result += "  ],\n"
+        result += '  "password": "mypassword",\n'
         result += '  "filename": "project.zip"\n'
         result += "}\n"
         result += "```\n\n"
@@ -2805,7 +2811,7 @@ class Tools:
         result += "- Empty folders: path ending with `/` and empty content\n"
         result += "- URLs are downloaded automatically\n"
         result += "- Forward slashes `/` create folder structures\n"
-        result += "- Encryption: add `password` parameter for protection\n\n"
+        result += "- Encryption: add `password` parameter at top level (not in data)\n\n"
         
         result += "**🚀 Try it now:** Use `generate_file()` with `file_type: \"zip\"` and either format!"
         
