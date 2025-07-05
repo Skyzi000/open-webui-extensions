@@ -1,7 +1,7 @@
 """
 title: Universal File Generator
 author: AI Assistant
-version: 0.15.1
+version: 0.16.0
 requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
@@ -2323,8 +2323,11 @@ class FileGenerator:
         return None
 
     def generate_zip(self, files: Union[Dict[str, Any], List[Dict[str, str]]], **kwargs) -> bytes:
-        """Generate ZIP content (supports dictionary and path-based formats)"""
+        """Generate ZIP content (supports dictionary and path-based formats, optional encryption)"""
         buffer = io.BytesIO()
+        
+        # Get password for encryption if provided
+        password = kwargs.get('password')
         
         # Convert dictionary format to path-based format if needed
         if isinstance(files, dict):
@@ -2346,6 +2349,9 @@ This will show you the supported format with examples."""
             raise ValueError(error_msg)
         
         with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Set password for encryption if provided
+            if password:
+                zf.setpassword(password.encode('utf-8'))
             # Check if it's a list of strings (just filenames) - return error
             if files and isinstance(files[0], str):
                 error_msg = """❌ ZIP Creation Error: Invalid data format provided.
@@ -2372,24 +2378,40 @@ This will show you the supported format with examples."""
                     if 'content' in file_info:
                         content = file_info['content']
                         if isinstance(content, str):
-                            zf.writestr(file_path, content.encode('utf-8'))
+                            data = content.encode('utf-8')
                         else:
-                            zf.writestr(file_path, content)
+                            data = content
+                        
+                        # Add with encryption if password provided
+                        if password:
+                            zf.writestr(file_path, data, pwd=password.encode('utf-8'))
+                        else:
+                            zf.writestr(file_path, data)
                         print(f"Added file: {file_path}")
                     elif 'url' in file_info:
                         url = file_info['url']
                         try:
                             response = requests.get(url, timeout=30)
                             if response.status_code == 200:
-                                zf.writestr(file_path, response.content)
+                                # Add with encryption if password provided
+                                if password:
+                                    zf.writestr(file_path, response.content, pwd=password.encode('utf-8'))
+                                else:
+                                    zf.writestr(file_path, response.content)
                                 print(f"Downloaded and added: {file_path} from {url}")
                             else:
                                 error_content = f"Error downloading {url}: HTTP {response.status_code}"
-                                zf.writestr(f"{file_path}.error", error_content)
+                                if password:
+                                    zf.writestr(f"{file_path}.error", error_content, pwd=password.encode('utf-8'))
+                                else:
+                                    zf.writestr(f"{file_path}.error", error_content)
                                 print(f"Error downloading {url}: HTTP {response.status_code}")
                         except Exception as e:
                             error_content = f"Error downloading {url}: {str(e)}"
-                            zf.writestr(f"{file_path}.error", error_content)
+                            if password:
+                                zf.writestr(f"{file_path}.error", error_content, pwd=password.encode('utf-8'))
+                            else:
+                                zf.writestr(f"{file_path}.error", error_content)
                             print(f"Error downloading {url}: {str(e)}")
                 else:
                     # Invalid format
@@ -2583,7 +2605,7 @@ class Tools:
                     - DOCX: str (HTML, Markdown, or plain text - auto-detected)
                     - PDF: str (HTML, Markdown, or plain text - auto-detected)
                     - XLSX: List[Dict] (list of dictionaries) or tabular data
-                    - ZIP: Dict[str, Any] (filename -> content mapping; if content is a URL string, it will be downloaded; if content is structured data, it will be generated as the appropriate file type) OR List[Dict] (list of {filename, url} objects for downloading files from URLs - local file paths are not supported)
+                    - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {path, content/url} objects). Optional 'password' parameter for encryption.
         :param filename: Optional custom filename
         :return: Markdown with download information
         """
@@ -2609,8 +2631,12 @@ class Tools:
                 if not filename.endswith(f'.{file_type}'):
                     filename += f'.{file_type}'
 
-            # No additional kwargs needed - all formats expect pre-formatted content
+            # Extract password for ZIP encryption if provided
             kwargs = {}
+            if isinstance(data, dict) and 'password' in data:
+                kwargs['password'] = data['password']
+                # Remove password from data to avoid including it in ZIP content
+                data = {k: v for k, v in data.items() if k != 'password'}
 
             # Generate file content
             try:
@@ -2756,13 +2782,29 @@ class Tools:
         result += "}\n"
         result += "```\n\n"
         
+        # Encryption format
+        result += "## 🔐 **Encrypted ZIP**\n"
+        result += "Add password protection to your ZIP files.\n\n"
+        result += "```json\n"
+        result += "{\n"
+        result += '  "file_type": "zip",\n'
+        result += '  "data": {\n'
+        result += '    "secret.txt": "Top secret content!",\n'
+        result += '    "private/data.json": "{\\"secret\\": \\"password123\\"}"\n'
+        result += "  },\n"
+        result += '  "password": "mypassword",\n'
+        result += '  "filename": "encrypted.zip"\n'
+        result += "}\n"
+        result += "```\n\n"
+        
         # Rules
         result += "## 📋 **Rules**\n"
         result += "- Dictionary: `\"filename\": \"content\"` pairs\n"
         result += "- Path format: `path` + `content` or `url`\n"
         result += "- Empty folders: path ending with `/` and empty content\n"
         result += "- URLs are downloaded automatically\n"
-        result += "- Forward slashes `/` create folder structures\n\n"
+        result += "- Forward slashes `/` create folder structures\n"
+        result += "- Encryption: add `password` parameter for protection\n\n"
         
         result += "**🚀 Try it now:** Use `generate_file()` with `file_type: \"zip\"` and either format!"
         
