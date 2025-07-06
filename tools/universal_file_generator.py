@@ -564,6 +564,7 @@ class FileGenerator:
             # Fallback: add as plain text with URL
             paragraph.add_run(f"{text} ({url})")
     
+
     def _add_image_to_paragraph(self, paragraph, src, alt_text):
         """Add image to paragraph"""
         try:
@@ -2793,10 +2794,12 @@ class Tools:
         
         :param file_type: File extension (e.g., 'csv', 'pdf', 'zip' or '.csv', '.pdf', '.zip') - Must be exact match
         :param data: Data to convert - expected formats by file type:
+                    **IMPORTANT: For DOCX and PDF, data should be STRING format (HTML/Markdown/text), NOT JSON/Dict objects**
                     - Any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, ini, conf, log, etc.): str (pre-formatted text content)
                     - DOCX: str (HTML, Markdown, or plain text - auto-detected)
-                    - PDF: str (HTML, Markdown, or plain text - auto-detected)
+                    - PDF: str (HTML, Markdown, or plain text - auto-detected)  
                     - XLSX: List[Dict] (list of dictionaries) or tabular data
+                    - SVG: str (SVG XML content)
                     - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {path, content/url} objects) - Call `list_zip_formats()` for detailed ZIP creation examples.
         :param filename: Optional custom filename
         :param password: Optional password for ZIP encryption (AES encryption via pyzipper)
