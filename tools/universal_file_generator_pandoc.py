@@ -1,7 +1,7 @@
 """
 title: Universal File Generator (Pandoc Edition)
 author: Skyzi000 & Claude
-version: 0.20.2-pandoc
+version: 0.20.3-pandoc
 requirements: fastapi, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool using Pandoc for superior document conversion.
@@ -551,33 +551,146 @@ class FileGeneratorPandoc:
                         except Exception as e:
                             raise RuntimeError(f"Failed to download URL {item['url']}: {str(e)}")
 
+    def list_supported_formats(
+        self,
+        __request__: object = None,
+        __user__: dict = {}
+    ) -> str:
+        """
+        List all supported file formats and their requirements
+        
+        :return: List of supported formats with availability status
+        """
+        
+        result = "📋 **Universal File Generator - Supported Formats (Pandoc Version):**\n\n"
+        result += "**Text Formats:** ✅ Any text-based format (unlimited support)\n"
+        result += "- Examples: csv, json, xml, txt, html, md, yaml, toml, js, py, sql, ini, conf, log, etc.\n\n"
+        result += "**Binary Formats:**\n"
+        result += f"- **DOCX**: {'✅ Available (via Pandoc)' if PANDOC_AVAILABLE else '❌ Requires: pandoc installation'}\n"
+        result += f"- **PDF**: {'✅ Available (via Pandoc+XeLaTeX)' if PANDOC_AVAILABLE else '❌ Requires: pandoc + texlive-xetex'}\n"
+        result += f"- **XLSX**: {'✅ Available' if PANDAS_AVAILABLE else '❌ Requires: pip install pandas openpyxl'}\n"
+        result += "- **ZIP**: ✅ Always available\n\n"
+        result += f"💡 **Usage example:**\n"
+        result += f"```\n"
+        result += f"generate_file(\n"
+        result += f"  file_type='csv',\n"
+        result += f"  data='name,age\\nAlice,25\\nBob,30',\n"
+        result += f"  filename='users.csv'\n"
+        result += f")\n"
+        result += f"```\n\n"
+        result += "🔗 **ZIP Support:** Call `list_zip_formats()` for detailed ZIP creation examples."
+        
+        return result
+
+    def list_zip_formats(
+        self,
+        __request__: object = None,
+        __user__: dict = {}
+    ) -> str:
+        """
+        Show ZIP creation format documentation (path-based only)
+        
+        :return: Simple ZIP format documentation with examples
+        """
+        
+        result = "📦 **ZIP File Creation - Supported Formats**\n\n"
+        result += "The Universal File Generator supports two simple formats for ZIP creation:\n\n"
+        
+        # Dictionary format
+        result += "## 📁 **Dictionary Format (simple)**\n"
+        result += "Simple filename → content mapping.\n\n"
+        result += "```json\n"
+        result += "{\n"
+        result += '  "file_type": "zip",\n'
+        result += '  "data": {\n'
+        result += '    "README.md": "# My Project\\nHello world!",\n'
+        result += '    "src/main.py": "print(\\"Hello!\\"))",\n'
+        result += '    "config/app.yaml": "app: demo\\nmode: dev"\n'
+        result += "  },\n"
+        result += '  "filename": "project.zip"\n'
+        result += "}\n"
+        result += "```\n\n"
+        
+        # Path format
+        result += "## 📋 **Path Format (advanced)**\n"
+        result += "Use list of objects with `path` and `content`/`url` fields.\n\n"
+        result += "```json\n"
+        result += "{\n"
+        result += '  "file_type": "zip",\n'
+        result += '  "data": [\n'
+        result += '    {"path": "README.md", "content": "# My Project\\nHello world!"},\n'
+        result += '    {"path": "src/main.py", "content": "print(\\"Hello!\\")"},\n'
+        result += '    {"path": "assets/logo.png", "url": "https://example.com/logo.png"},\n'
+        result += '    {"path": "temp/", "content": ""}\n'
+        result += "  ],\n"
+        result += '  "password": "mypassword",\n'
+        result += '  "filename": "project.zip"\n'
+        result += "}\n"
+        result += "```\n\n"
+        
+        # Encryption format
+        result += "## 🔐 **Encrypted ZIP (AES)**\n"
+        result += "Add password protection to your ZIP files using AES encryption.\n\n"
+        result += "```json\n"
+        result += "{\n"
+        result += '  "file_type": "zip",\n'
+        result += '  "data": {\n'
+        result += '    "secret.txt": "Top secret content!",\n'
+        result += '    "private/data.json": "{\\"secret\\": \\"password123\\"}"\n'
+        result += "  },\n"
+        result += '  "password": "mypassword",\n'
+        result += '  "filename": "encrypted.zip"\n'
+        result += "}\n"
+        result += "```\n\n"
+        result += "⚠️ **Note**: Requires `pyzipper` library for AES encryption. Will error if password specified but pyzipper not installed.\n\n"
+        
+        # Rules
+        result += "## 📋 **Rules**\n"
+        result += "- Dictionary: `\"filename\": \"content\"` pairs\n"
+        result += "- Path format: `path` + `content` or `url`\n"
+        result += "- Empty folders: path ending with `/` and empty content\n"
+        result += "- URLs are downloaded automatically\n"
+        result += "- Forward slashes `/` create folder structures\n"
+        result += "- Encryption: add `password` parameter for AES encryption (requires pyzipper)\n\n"
+        
+        result += "**🚀 Try it now:** Use `generate_file()` with `file_type: \"zip\"` and either format!"
+        
+        return result
+
 
 # Upload services configuration (same as original)
+# Self-hosted transfer.skyzi.jp is first priority, others commented out
 UPLOAD_SERVICES = [
     {
-        "name": "transfer.sh",
-        "url": "https://transfer.sh",
+        "name": "transfer.skyzi.jp",
+        "url": "https://transfer.skyzi.jp",
         "method": "put",
         "retention": "14 days"
     },
-    {
-        "name": "0x0.st",
-        "url": "https://0x0.st",
-        "method": "post",
-        "retention": "30 days to 1 year (depends on file size)"
-    },
-    {
-        "name": "file.io",
-        "url": "https://file.io",
-        "method": "post_with_form",
-        "retention": "1 download or 14 days"
-    },
-    {
-        "name": "litterbox",
-        "url": "https://litterbox.catbox.moe/resources/internals/api.php",
-        "method": "litterbox",
-        "retention": "1 hour (temporary file hosting)"
-    }
+    # {
+    #     "name": "transfer.sh",
+    #     "url": "https://transfer.sh",
+    #     "method": "put",
+    #     "retention": "14 days"
+    # },
+    # {
+    #     "name": "0x0.st",
+    #     "url": "https://0x0.st",
+    #     "method": "post",
+    #     "retention": "30 days to 1 year (depends on file size)"
+    # },
+    # {
+    #     "name": "file.io",
+    #     "url": "https://file.io",
+    #     "method": "post_with_form",
+    #     "retention": "1 download or 14 days"
+    # },
+    # {
+    #     "name": "litterbox",
+    #     "url": "https://litterbox.catbox.moe/resources/internals/api.php",
+    #     "method": "litterbox",
+    #     "retention": "1 hour (temporary file hosting)"
+    # }
 ]
 
 def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: int) -> str:
@@ -595,32 +708,38 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
     import urllib.parse
     safe_filename = urllib.parse.quote(filename, safe='.-_')
     
-    # Try multiple services in order
+    # Try self-hosted service first, others commented out
     services = [
         {
-            "name": "transfer.sh",
-            "url": f"https://transfer.sh/{safe_filename}",
+            "name": "transfer.skyzi.jp",
+            "url": f"https://transfer.skyzi.jp/{safe_filename}",
             "method": "put",
-            "retention": "Depends on service settings"
+            "retention": "14 days"
         },
-        {
-            "name": "0x0.st", 
-            "url": "https://0x0.st",
-            "method": "post",
-            "retention": "30 days to 1 year (depends on file size)"
-        },
-        {
-            "name": "file.io",
-            "url": "https://file.io",
-            "method": "post", 
-            "retention": "14 days (deleted after first download)"
-        },
-        {
-            "name": "litterbox",
-            "url": "https://litterbox.catbox.moe/resources/internals/api.php",
-            "method": "litterbox",
-            "retention": "1 hour (temporary file hosting)"
-        }
+        # {
+        #     "name": "transfer.sh",
+        #     "url": f"https://transfer.sh/{safe_filename}",
+        #     "method": "put",
+        #     "retention": "Depends on service settings"
+        # },
+        # {
+        #     "name": "0x0.st", 
+        #     "url": "https://0x0.st",
+        #     "method": "post",
+        #     "retention": "30 days to 1 year (depends on file size)"
+        # },
+        # {
+        #     "name": "file.io",
+        #     "url": "https://file.io",
+        #     "method": "post", 
+        #     "retention": "14 days (deleted after first download)"
+        # },
+        # {
+        #     "name": "litterbox",
+        #     "url": "https://litterbox.catbox.moe/resources/internals/api.php",
+        #     "method": "litterbox",
+        #     "retention": "1 hour (temporary file hosting)"
+        # }
     ]
     
     errors = []  # Initialize errors list
@@ -743,7 +862,7 @@ curl -F "token={delete_token}" -F "delete=" {download_url}
     # All services failed - show detailed errors
     error_details = "\n".join(errors) if errors else "Unknown details"
     
-    return f"""## ❌ Upload Failed on All Services
+    return f"""## ❌ Upload Failed on Self-Hosted Service
 
 **File:** `{filename}` ({file_size} bytes)
 
@@ -752,7 +871,7 @@ curl -F "token={delete_token}" -F "delete=" {download_url}
 {error_details}
 ```
 
-Attempted services: transfer.sh, 0x0.st, file.io, litterbox
+Attempted service: transfer.skyzi.jp
 
 Check the error details and retry in the correct format.
 """
@@ -768,7 +887,7 @@ class Tools:
     async def generate_file(
         self,
         file_type: str = Field(..., description="File type (extension): csv, json, xml, txt, html, md, yaml, toml, js, py, sql, docx, pdf, xlsx, zip, etc."),
-        data: Any = Field(..., description="Data to convert - STRING format preferred for DOCX/PDF (HTML/Markdown/text). Use Dict only for XLSX/ZIP."),
+        data: Any = Field(..., description="Data to convert - CRITICAL: Use STRING format for DOCX/PDF (HTML/Markdown/plain text), List[Dict] for XLSX, Dict or List[Dict] for ZIP. Do NOT use complex Dict objects for DOCX/PDF generation."),
         filename: Optional[str] = Field(None, description="Custom filename (optional)"),
         password: Optional[str] = Field(None, description="Password for ZIP encryption (optional)"),
         __request__: Optional[Request] = None,
@@ -776,12 +895,20 @@ class Tools:
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
     ) -> str:
         """
-        Generate a file using Pandoc for superior document conversion
+        Generate a file of specified type from provided data using Pandoc for superior document conversion
+        Uploads all files to a cloud service and returns download link
         
-        :param file_type: File extension (e.g., 'docx', 'pdf', 'zip')
-        :param data: Data to convert - STRING format preferred for DOCX/PDF
+        :param file_type: File extension (e.g., 'csv', 'pdf', 'zip' or '.csv', '.pdf', '.zip') - Must be exact match
+        :param data: Data to convert - expected formats by file type:
+                    **IMPORTANT: For DOCX and PDF, data should be STRING format (HTML/Markdown/text), NOT JSON/Dict objects**
+                    - Any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, ini, conf, log, etc.): str (pre-formatted text content)
+                    - DOCX: str (HTML, Markdown, or plain text - auto-detected) - Pandoc powered with native SVG support
+                    - PDF: str (HTML, Markdown, or plain text - auto-detected) - Pandoc powered with XeLaTeX and Japanese fonts
+                    - XLSX: List[Dict] (list of dictionaries) or tabular data
+                    - SVG: str (SVG XML content)
+                    - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {path, content/url} objects) - Call `list_zip_formats()` for detailed ZIP creation examples.
         :param filename: Optional custom filename
-        :param password: Optional password for ZIP encryption
+        :param password: Optional password for ZIP encryption (AES encryption via pyzipper)
         :return: Markdown with download information
         """
         
@@ -892,3 +1019,43 @@ class Tools:
                     }
                 })
             return f"❌ Unexpected error: {str(e)}"
+
+    def list_supported_formats(
+        self,
+        __request__: object = None,
+        __user__: dict = {}
+    ) -> str:
+        """
+        List all supported file formats and their requirements with detailed examples
+        
+        This method provides comprehensive documentation for AI systems on how to properly format data for each file type.
+        Essential for understanding proper data structures before calling generate_file().
+        
+        :return: Complete documentation of supported formats including:
+                - Text formats (csv, json, xml, txt, html, md, yaml, etc.) - expect string input
+                - Binary formats (docx, pdf) - expect STRING input (HTML/Markdown), NOT Dict objects
+                - Spreadsheet (xlsx) - expect List[Dict] format
+                - Archives (zip) - expect Dict or List[Dict] format
+                - Graphics (svg) - expect SVG XML string
+        """
+        return self.generator.list_supported_formats(__request__, __user__)
+
+    def list_zip_formats(
+        self,
+        __request__: object = None,
+        __user__: dict = {}
+    ) -> str:
+        """
+        Show detailed ZIP creation format documentation with multiple examples
+        
+        Essential reference for AI systems when creating ZIP files. Provides concrete examples
+        of proper data structures for ZIP creation with automatic binary conversion.
+        
+        :return: Comprehensive ZIP format documentation including:
+                - Dictionary format: {"filename": "content"} for simple file creation
+                - List format: [{"path": "file.txt", "content": "data"}] for advanced features
+                - URL downloading: [{"path": "file.ext", "url": "https://..."}]
+                - Binary conversion: automatic DOCX/PDF/XLSX generation from text content
+                - Encryption examples: password-protected ZIP files
+        """
+        return self.generator.list_zip_formats(__request__, __user__)
