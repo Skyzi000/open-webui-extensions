@@ -1,7 +1,7 @@
 """
 title: Universal File Generator (Pandoc Edition)
 author: Skyzi000 & Claude
-version: 0.20.0-pandoc
+version: 0.20.1-pandoc
 requirements: fastapi, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool using Pandoc for superior document conversion.
@@ -494,7 +494,30 @@ class FileGeneratorPandoc:
                         except:
                             zf.writestr(f"{filename}.txt", f"Failed to download: {content}")
                     else:
-                        zf.writestr(filename, content.encode('utf-8'))
+                        # Check if filename suggests binary format that needs conversion
+                        file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
+                        if file_ext in ['docx', 'pdf', 'xlsx']:
+                            try:
+                                print(f"Converting text content to {file_ext.upper()} for ZIP: {filename}")
+                                # Generate the binary content using our generator
+                                file_generator = FileGeneratorPandoc()
+                                binary_content = file_generator.generate_content(file_ext, content)
+                                if binary_content:
+                                    zf.writestr(filename, binary_content)
+                                    print(f"Successfully converted and added {file_ext.upper()}: {filename}")
+                                else:
+                                    # Fallback to text file with warning
+                                    fallback_name = f"{filename}.txt"
+                                    zf.writestr(fallback_name, f"Failed to convert to {file_ext.upper()}:\n\n{content}".encode('utf-8'))
+                                    print(f"Conversion failed, saved as text: {fallback_name}")
+                            except Exception as e:
+                                print(f"Error converting {filename} to {file_ext.upper()}: {e}")
+                                # Fallback to text file with error info
+                                fallback_name = f"{filename}.txt"
+                                zf.writestr(fallback_name, f"Conversion error for {file_ext.upper()}:\n{str(e)}\n\nOriginal content:\n{content}".encode('utf-8'))
+                        else:
+                            # Regular text file
+                            zf.writestr(filename, content.encode('utf-8'))
                 else:
                     zf.writestr(filename, str(content).encode('utf-8'))
         
@@ -505,7 +528,30 @@ class FileGeneratorPandoc:
                     if 'content' in item:
                         content = item['content']
                         if isinstance(content, str):
-                            zf.writestr(path, content.encode('utf-8'))
+                            # Check if path suggests binary format that needs conversion
+                            file_ext = path.lower().split('.')[-1] if '.' in path else ''
+                            if file_ext in ['docx', 'pdf', 'xlsx']:
+                                try:
+                                    print(f"Converting text content to {file_ext.upper()} for ZIP: {path}")
+                                    # Generate the binary content using our generator
+                                    file_generator = FileGeneratorPandoc()
+                                    binary_content = file_generator.generate_content(file_ext, content)
+                                    if binary_content:
+                                        zf.writestr(path, binary_content)
+                                        print(f"Successfully converted and added {file_ext.upper()}: {path}")
+                                    else:
+                                        # Fallback to text file with warning
+                                        fallback_name = f"{path}.txt"
+                                        zf.writestr(fallback_name, f"Failed to convert to {file_ext.upper()}:\n\n{content}".encode('utf-8'))
+                                        print(f"Conversion failed, saved as text: {fallback_name}")
+                                except Exception as e:
+                                    print(f"Error converting {path} to {file_ext.upper()}: {e}")
+                                    # Fallback to text file with error info
+                                    fallback_name = f"{path}.txt"
+                                    zf.writestr(fallback_name, f"Conversion error for {file_ext.upper()}:\n{str(e)}\n\nOriginal content:\n{content}".encode('utf-8'))
+                            else:
+                                # Regular text file
+                                zf.writestr(path, content.encode('utf-8'))
                         else:
                             zf.writestr(path, str(content).encode('utf-8'))
                     elif 'url' in item:
