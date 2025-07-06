@@ -1,0 +1,11 @@
+fastapi
+python-docx
+pandas
+openpyxl
+reportlab
+weasyprint
+beautifulsoup4
+requests
+markdown
+pyzipper
+cairosvg

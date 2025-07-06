@@ -1,8 +1,8 @@
 """
 title: Universal File Generator
 author: Skyzi000 & Claude
-version: 0.19.0
-requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
+version: 0.20.0
+requirements: fastapi, python-docx, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper, cairosvg
 description: |
   Universal file generation tool supporting unlimited text formats + binary formats with automatic cloud upload.
   
@@ -13,7 +13,7 @@ description: |
   
   ## Key Features
   - Advanced PDF generation with WeasyPrint/ReportLab and Japanese font support
-  - Rich DOCX formatting with HTML input support
+  - Rich DOCX formatting with HTML input support and SVG-to-PNG conversion
   - SVG generation with structured elements (text, shapes, custom graphics)
   - ZIP archive creation with remote file downloading from URLs
   - Automatic cloud upload to multiple services (transfer.sh, 0x0.st, file.io, litterbox)
@@ -88,6 +88,12 @@ try:
 except ImportError:
     PYZIPPER_AVAILABLE = False
 
+try:
+    import cairosvg
+    CAIROSVG_AVAILABLE = True
+except ImportError:
+    CAIROSVG_AVAILABLE = False
+
 PDF_AVAILABLE = WEASYPRINT_AVAILABLE or REPORTLAB_AVAILABLE
 
 
@@ -146,9 +152,14 @@ class FileGenerator:
 
 
     def generate_docx(self, data: Union[str, Dict], **kwargs) -> bytes:
-        """Generate DOCX content - accepts HTML, Markdown, or plain text"""
+        """Generate DOCX content - accepts HTML, Markdown, or plain text (STRING format only)"""
         if not DOCX_AVAILABLE:
             raise ImportError("python-docx is required for DOCX generation. Install with: pip install python-docx")
+        
+        # Reject complex Dict structures - only string input is supported
+        if isinstance(data, dict):
+            if any(key in data for key in ['sections', 'content', 'items', 'chapters', 'parts']):
+                raise ValueError("DOCX generation only supports string input (HTML/Markdown/plain text). Complex Dict structures with 'sections', 'content', etc. are not supported. Please convert your data to HTML or Markdown string format first.")
         
         doc = Document()
         
@@ -333,6 +344,12 @@ class FileGenerator:
         if not BS4_AVAILABLE:
             raise ImportError("BeautifulSoup4 is required for HTML parsing. Install with: pip install beautifulsoup4")
         
+        # Unescape HTML entities and fix escaped quotes
+        import html
+        html_content = html.unescape(html_content)
+        html_content = html_content.replace('\\"', '"')
+        # Debug: print(f"HTML content after unescaping: {html_content[:200]}...")
+        
         # Parse HTML with BeautifulSoup
         soup = BeautifulSoup(html_content, 'html.parser')
         
@@ -388,6 +405,32 @@ class FileGenerator:
                 # Create a paragraph for the image
                 paragraph = doc.add_paragraph()
                 self._add_image_to_paragraph(paragraph, src, alt)
+            else:
+                print(f"Found img element but no src attribute: {element}")
+        
+        elif element.name == 'svg':
+            # Handle inline SVG elements
+            print(f"Found inline SVG element: {element}")
+            print(f"SVG content: {str(element)}")
+            if CAIROSVG_AVAILABLE:
+                try:
+                    svg_content = str(element)
+                    print(f"Converting inline SVG to PNG for DOCX, SVG length: {len(svg_content)}")
+                    png_data = cairosvg.svg2png(bytestring=svg_content.encode('utf-8'))
+                    print(f"PNG conversion successful, PNG data length: {len(png_data)}")
+                    png_stream = io.BytesIO(png_data)
+                    paragraph = doc.add_paragraph()
+                    run = paragraph.add_run()
+                    from docx.shared import Inches
+                    run.add_picture(png_stream, width=Inches(4))
+                    print(f"Successfully converted and added inline SVG as PNG")
+                except Exception as e:
+                    print(f"Failed to convert inline SVG to PNG: {e}")
+                    print(f"SVG content that failed: {str(element)}")
+                    doc.add_paragraph(f"[SVG Image] (SVG conversion failed: {str(e)})")
+            else:
+                print(f"SVG conversion not available for inline SVG (CAIROSVG_AVAILABLE={CAIROSVG_AVAILABLE})")
+                doc.add_paragraph(f"[SVG Image] (SVG conversion not available)")
         
         elif element.name == 'br':
             # Handle line breaks
@@ -495,7 +538,10 @@ class FileGenerator:
                 src = element.get('src', '')
                 alt = element.get('alt', 'Image')
                 if src:
+                    print(f"Found inline image: src={src}, alt={alt}")
                     self._add_image_to_paragraph(paragraph, src, alt)
+                else:
+                    print(f"Found img element in paragraph but no src attribute: {element}")
             elif element.name == 'br':
                 # Handle line breaks
                 paragraph.add_run('\n')
@@ -573,11 +619,23 @@ class FileGenerator:
                 print(f"Downloading image from: {src}")
                 response = requests.get(src, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
                 if response.status_code == 200:
-                    # Check if it's SVG content
+                    # Check if it's SVG content and convert to PNG if possible
                     content_type = response.headers.get('content-type', '').lower()
                     if 'svg' in content_type or src.lower().endswith('.svg'):
-                        print(f"SVG images are not directly supported in DOCX: {alt_text}")
-                        paragraph.add_run(f"[SVG Image: {alt_text}] (SVG not supported in DOCX - URL: {src})")
+                        if CAIROSVG_AVAILABLE:
+                            try:
+                                print(f"Converting SVG to PNG for DOCX: {alt_text}")
+                                png_data = cairosvg.svg2png(bytestring=response.content)
+                                png_stream = io.BytesIO(png_data)
+                                run = paragraph.add_run()
+                                from docx.shared import Inches
+                                run.add_picture(png_stream, width=Inches(4))
+                                print(f"Successfully converted and added SVG as PNG: {alt_text}")
+                                return
+                            except Exception as e:
+                                print(f"Failed to convert SVG to PNG: {e}")
+                        print(f"SVG conversion not available: {alt_text}")
+                        paragraph.add_run(f"[SVG Image: {alt_text}] (SVG conversion not available - URL: {src})")
                         return
                         
                     image_stream = io.BytesIO(response.content)
@@ -598,10 +656,23 @@ class FileGenerator:
                 try:
                     print(f"Processing base64 image: {alt_text}")
                     header, data = src.split(',', 1)
-                    # Check if it's SVG format
+                    # Check if it's SVG format and convert to PNG if possible
                     if 'svg' in header.lower():
-                        print(f"SVG images are not directly supported in DOCX: {alt_text}")
-                        paragraph.add_run(f"[SVG Image: {alt_text}] (SVG not supported in DOCX)")
+                        if CAIROSVG_AVAILABLE:
+                            try:
+                                print(f"Converting base64 SVG to PNG for DOCX: {alt_text}")
+                                svg_data = base64.b64decode(data)
+                                png_data = cairosvg.svg2png(bytestring=svg_data)
+                                png_stream = io.BytesIO(png_data)
+                                run = paragraph.add_run()
+                                from docx.shared import Inches
+                                run.add_picture(png_stream, width=Inches(4))
+                                print(f"Successfully converted and added base64 SVG as PNG: {alt_text}")
+                                return
+                            except Exception as e:
+                                print(f"Failed to convert base64 SVG to PNG: {e}")
+                        print(f"SVG conversion not available: {alt_text}")
+                        paragraph.add_run(f"[SVG Image: {alt_text}] (SVG conversion not available)")
                         return
                     
                     image_data = base64.b64decode(data)
@@ -626,9 +697,14 @@ class FileGenerator:
             paragraph.add_run(f"[Image: {alt_text}]")
 
     def generate_pdf(self, data: Union[str, Dict, List], **kwargs) -> bytes:
-        """Generate PDF content with flexible data structure support"""
+        """Generate PDF content - accepts HTML, Markdown, or plain text (STRING format preferred)"""
         if not PDF_AVAILABLE:
             raise ImportError("PDF generation requires weasyprint or reportlab. Install with: pip install weasyprint or pip install reportlab")
+        
+        # Reject complex Dict structures - prefer string input
+        if isinstance(data, dict):
+            if any(key in data for key in ['sections', 'content', 'items', 'chapters', 'parts']):
+                raise ValueError("PDF generation prefers string input (HTML/Markdown/plain text). Complex Dict structures with 'sections', 'content', etc. are not recommended. Please convert your data to HTML or Markdown string format first.")
         
         # Prefer WeasyPrint for better HTML/CSS support
         if WEASYPRINT_AVAILABLE:
