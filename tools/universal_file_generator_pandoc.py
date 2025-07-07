@@ -1,7 +1,7 @@
 """
 title: Universal File Generator (Pandoc Edition)
 author: Skyzi000 & Claude
-version: 0.20.3-pandoc
+version: 0.20.4-pandoc
 requirements: fastapi, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool using Pandoc for superior document conversion.
@@ -663,7 +663,8 @@ class FileGeneratorPandoc:
 UPLOAD_SERVICES = [
     {
         "name": "transfer.skyzi.jp",
-        "url": "https://transfer.skyzi.jp",
+        "upload_url": "http://transfer-sh:8080",
+        "download_url": "https://transfer.skyzi.jp",
         "method": "put",
         "retention": "14 days"
     },
@@ -712,7 +713,9 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
     services = [
         {
             "name": "transfer.skyzi.jp",
-            "url": f"https://transfer.skyzi.jp/{safe_filename}",
+            "upload_url": f"http://transfer-sh:8080/{safe_filename}",
+            "upload_base": "http://transfer-sh:8080",
+            "download_base": "https://transfer.skyzi.jp",
             "method": "put",
             "retention": "14 days"
         },
@@ -767,7 +770,13 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
                 
                 headers_with_content_type = headers.copy()
                 headers_with_content_type["Content-Type"] = mime_type
-                response = requests.put(service["url"], data=file_content, headers=headers_with_content_type, timeout=15)
+                # Use upload_url for request, download_url for response
+                upload_url = service.get("upload_url", service.get("url", ""))
+                if not upload_url:
+                    error_info = f"{service['name']}: No upload URL configured"
+                    errors.append(error_info)
+                    continue
+                response = requests.put(upload_url, data=file_content, headers=headers_with_content_type, timeout=15)
             else:
                 # file.io and 0x0.st style (multipart form)
                 # Determine proper MIME type for file
@@ -804,8 +813,16 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
                         errors.append(error_info)
                         continue
                 else:
-                    # transfer.sh and 0x0.st return plain text URL
-                    download_url = response.text.strip()
+                    # transfer.sh style services
+                    response_url = response.text.strip()
+                    if service["name"] == "transfer.skyzi.jp" and "upload_base" in service and "download_base" in service:
+                        # Replace upload URL base with download URL base
+                        upload_base = service["upload_base"]
+                        download_base = service["download_base"]
+                        download_url = response_url.replace(upload_base, download_base)
+                    else:
+                        # transfer.sh and 0x0.st return plain text URL
+                        download_url = response_url
                     
                     # For 0x0.st, get the management token from X-Token header
                     if service["name"] == "0x0.st":
