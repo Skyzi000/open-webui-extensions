@@ -17,6 +17,12 @@ fully utilizing Open WebUI's native memory functionality.
 You don't need to enable the memory switch,
 as this tool only requires access to its database.
 
+Based on https://openwebui.com/t/cooksleep/memory
+  (MIT License)
+  
+Special thanks to cooksleep for the original implementation.
+Original concept by mhio: https://openwebui.com/t/mhio/met
+
 # Changelog
 0.0.3:Added confirmation dialog when updating memory
 0.0.2:Added confirmation dialog when deleting memory
