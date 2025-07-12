@@ -385,27 +385,128 @@ class FileGeneratorPandoc:
         buffer.seek(0)
         return buffer.read()
 
-    def generate_xlsx(self, data: List[Dict], **kwargs) -> bytes:
-        """Generate XLSX content using pandas"""
+    def generate_xlsx(self, data: Union[List[Dict], Dict, List[List]], **kwargs) -> bytes:
+        """Generate XLSX content with flexible data structure support"""
         if not PANDAS_AVAILABLE:
             raise ImportError("pandas and openpyxl are required for XLSX generation")
         
-        # Convert data to DataFrame
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            df = pd.DataFrame(data)
-        elif isinstance(data, dict):
-            df = pd.DataFrame([data])
-        else:
-            # Try to convert other formats
-            df = pd.DataFrame({'data': [str(data)]})
-        
-        # Write to bytes buffer
         buffer = io.BytesIO()
+        
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Sheet1')
+            if isinstance(data, dict):
+                # Handle multiple sheets or complex structure
+                sheets_written = False
+                
+                for key, value in data.items():
+                    # Skip metadata keys
+                    if key.startswith('_'):
+                        continue
+                        
+                    sheet_name = str(key)[:31]  # Excel sheet name limit
+                    
+                    try:
+                        if isinstance(value, list) and value:
+                            if isinstance(value[0], list):
+                                # List of lists - treat as raw data with first row as header
+                                df = pd.DataFrame(value[1:], columns=value[0] if value else [])
+                            elif isinstance(value[0], dict):
+                                # List of dictionaries
+                                df = pd.DataFrame(value)
+                            else:
+                                # Simple list - single column
+                                df = pd.DataFrame({sheet_name: value})
+                        elif isinstance(value, dict):
+                            # Look for table-like data in nested dict
+                            table_data = self._extract_table_from_dict(value)
+                            if table_data:
+                                # Found table data
+                                if len(table_data) > 1:
+                                    df = pd.DataFrame(table_data[1:], columns=table_data[0])
+                                else:
+                                    df = pd.DataFrame(table_data)
+                            else:
+                                # Convert dict to key-value pairs
+                                df = pd.DataFrame(list(value.items()), columns=['項目', '内容'])
+                        else:
+                            # Single value
+                            df = pd.DataFrame({sheet_name: [value]})
+                        
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        sheets_written = True
+                        
+                    except Exception:
+                        # If conversion fails, create simple sheet with the data
+                        simple_df = pd.DataFrame({sheet_name: [str(value)]})
+                        simple_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        sheets_written = True
+                
+                # If no sheets were written, create a default one
+                if not sheets_written:
+                    default_df = pd.DataFrame({'Data': ['No valid data found']})
+                    default_df.to_excel(writer, sheet_name='Sheet1', index=False)
+                    
+            elif isinstance(data, list):
+                # Handle list data
+                if data and isinstance(data[0], dict):
+                    # Check if it's sheet_name + values format
+                    if all('sheet_name' in item and 'values' in item for item in data):
+                        # Multiple sheets format: [{"sheet_name": "Sheet1", "values": [[...], [...]]}, ...]
+                        for sheet_data in data:
+                            sheet_name = str(sheet_data['sheet_name'])[:31]  # Excel sheet name limit
+                            values = sheet_data['values']
+                            
+                            if values and isinstance(values[0], list):
+                                # List of lists with first row as header
+                                if len(values) > 1:
+                                    df = pd.DataFrame(values[1:], columns=values[0])
+                                else:
+                                    df = pd.DataFrame(values)
+                            else:
+                                # Simple list
+                                df = pd.DataFrame({'Data': values})
+                            
+                            df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    else:
+                        # Regular list of dictionaries
+                        df = pd.DataFrame(data)
+                        df.to_excel(writer, sheet_name='Sheet1', index=False)
+                elif data and isinstance(data[0], list):
+                    # List of lists
+                    if len(data) > 1:
+                        df = pd.DataFrame(data[1:], columns=data[0])
+                    else:
+                        df = pd.DataFrame(data)
+                    df.to_excel(writer, sheet_name='Sheet1', index=False)
+                else:
+                    # Simple list
+                    df = pd.DataFrame({'Values': data})
+                    df.to_excel(writer, sheet_name='Sheet1', index=False)
+            else:
+                # Single value or other type
+                df = pd.DataFrame({'Data': [str(data)]})
+                df.to_excel(writer, sheet_name='Sheet1', index=False)
         
         buffer.seek(0)
         return buffer.read()
+
+    def _extract_table_from_dict(self, data: dict) -> Optional[List[List]]:
+        """Extract table-like data from nested dictionary"""
+        table_keys = ['table', 'テーブル', 'data', 'データ', 'rows', '行']
+        
+        for key in table_keys:
+            if key in data:
+                value = data[key]
+                if isinstance(value, list) and value:
+                    # Check if it's a proper table (list of lists)
+                    if isinstance(value[0], list):
+                        return value
+        
+        # Look for any list of lists in the dict values
+        for value in data.values():
+            if isinstance(value, list) and value and isinstance(value[0], list):
+                return value
+                
+        return None
 
     def generate_svg(self, data: Union[str, Dict[str, Any]], **kwargs) -> bytes:
         """Generate SVG content"""
@@ -921,7 +1022,12 @@ class Tools:
                     - Any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, ini, conf, log, etc.): str (pre-formatted text content)
                     - DOCX: str (HTML, Markdown, or plain text - auto-detected) - Pandoc powered with native SVG support
                     - PDF: str (HTML, Markdown, or plain text - auto-detected) - Pandoc powered with XeLaTeX and Japanese fonts
-                    - XLSX: List[Dict] (list of dictionaries) or tabular data
+                    - XLSX: Flexible format support:
+                        * List[Dict] - list of dictionaries (most common)
+                        * List[Dict] with sheet_name/values - multiple sheets: [{"sheet_name": "Sheet1", "values": [[...]]}, ...]
+                        * Dict - multiple sheets (keys as sheet names) or single sheet key-value pairs
+                        * List[List] - 2D array with first row as headers
+                        * Supports nested structures with automatic table extraction
                     - SVG: str (SVG XML content)
                     - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {path, content/url} objects) - Call `list_zip_formats()` for detailed ZIP creation examples.
         :param filename: Optional custom filename
