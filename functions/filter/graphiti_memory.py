@@ -277,7 +277,7 @@ class Filter:
         print(f"inlet:user:{__user__}")
         
         # Check if graphiti is initialized, retry if not
-        if not self._ensure_graphiti_initialized():
+        if not self._ensure_graphiti_initialized() or self.graphiti is None:
             print("Graphiti initialization failed. Skipping memory search.")
             if __user__ and __user__.get("valves", self.UserValves()).show_status:
                 await __event_emitter__(
@@ -353,47 +353,77 @@ class Filter:
         body: dict,
         __event_emitter__: Callable[[Any], Awaitable[None]],
         __user__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
     ) -> dict:
         # Check if graphiti is initialized, retry if not
-        if not self._ensure_graphiti_initialized():
+        if not self._ensure_graphiti_initialized() or self.graphiti is None:
             print("Graphiti initialization failed. Skipping memory addition.")
             return body
             
         if __user__ is None:
             print("User information is not available. Skipping memory addition.")
             return body
-            
+        chat_id = __metadata__.get('chat_id', 'unknown') if __metadata__ else 'unknown'
+        message_id = __metadata__.get('message_id', 'unknown') if __metadata__ else 'unknown'
+        print(f"outlet:{__name__}, chat_id:{chat_id}, message_id:{message_id}")
+
         user_valves: Filter.UserValves = __user__.get("valves", self.UserValves())
-        if len(body.get("messages", [])) == 0:
+        messages = body.get("messages", [])
+        if len(messages) == 0:
             return body
+        
+        # Determine which messages to save based on save_assistant_response setting
+        messages_to_save = []
+        
+        # Find the last user message
+        last_user_message = None
+        last_assistant_message = None
+        
+        for msg in reversed(messages):
+            if msg.get("role") == "user" and last_user_message is None:
+                last_user_message = msg
+            elif msg.get("role") == "assistant" and last_assistant_message is None:
+                last_assistant_message = msg
+            
+            if last_user_message and last_assistant_message:
+                break
+        
+        # Always save user messages
+        if last_user_message:
+            messages_to_save.append(("user", last_user_message["content"]))
+        
+        # Optionally save assistant responses
+        if self.valves.save_assistant_response and last_assistant_message:
+            messages_to_save.append(("assistant", last_assistant_message["content"]))
+        
+        if len(messages_to_save) == 0:
+            return body
+        
         if user_valves.show_status:
             await __event_emitter__(
                 {
                     "type": "status",
-                    "data": {"description": "Adding Graphiti memory...", "done": False},
+                    "data": {"description": f"Adding {len(messages_to_save)} message(s) to Graphiti memory...", "done": False},
                 }
             )
-        await self.graphiti.add_episode(
-
-            name=f"Chat_Message_{datetime.now().isoformat()}",
-
-            episode_body=(
-                body["messages"][-1]["content"]
-            ),
-
-            source=EpisodeType.message,
-
-            source_description="Chat Message",
-
-            reference_time=datetime.now(),
-            group_id=f"{__user__['id']}_chat",
-        )
+        
+        # Save each message as an episode
+        for role, content in messages_to_save:
+            await self.graphiti.add_episode(
+                name=f"Chat_{role.capitalize()}_Message_{chat_id}_{message_id}",
+                episode_body=content,
+                source=EpisodeType.message,
+                source_description=f"Chat {role.capitalize()} Message",
+                reference_time=datetime.now(),
+                group_id=f"{__user__['id']}_chat",
+            )
+            print(f"Added {role} message to Graphiti memory")
 
         if user_valves.show_status:
             await __event_emitter__(
                 {
                     "type": "status",
-                    "data": {"description": "Added Graphiti memory", "done": True},
+                    "data": {"description": f"Added {len(messages_to_save)} message(s) to Graphiti memory", "done": True},
                 }
             )
 
