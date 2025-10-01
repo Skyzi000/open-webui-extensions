@@ -161,6 +161,11 @@ class Filter:
             default=120,
             description="Timeout in seconds for adding episodes to memory. Set to 0 to disable timeout.",
         )
+        
+        semaphore_limit: int = Field(
+            default=10,
+            description="Maximum number of concurrent LLM operations in Graphiti. Default is 10 to prevent 429 rate limit errors. Increase for faster processing if your LLM provider allows higher throughput. Decrease if you encounter rate limit errors.",
+        )
 
     class UserValves(BaseModel):
         show_status: bool = Field(
@@ -200,6 +205,7 @@ class Filter:
         """
         try:
             os.environ['GRAPHITI_TELEMETRY_ENABLED'] = 'true' if self.valves.graphiti_telemetry_enabled else 'false'
+            os.environ['SEMAPHORE_LIMIT'] = str(self.valves.semaphore_limit)
             
             # Configure LLM client
             llm_config = LLMConfig(
