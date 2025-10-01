@@ -471,14 +471,30 @@ class Filter:
                         }
                     )
             except Exception as e:
-                print(f"Error adding {role} message to Graphiti memory: {e}")
-                import traceback
-                traceback.print_exc()
+                error_type = type(e).__name__
+                error_msg = str(e)
+                
+                # Provide more specific error messages for common issues
+                if "ValidationError" in error_type:
+                    print(f"Graphiti LLM response validation error for {role} message: {error_msg}")
+                    user_msg = "Graphiti: LLM response format error (will retry on next message)"
+                elif "ConnectionError" in error_type or "timeout" in error_msg.lower():
+                    print(f"Graphiti connection error adding {role} message: {error_msg}")
+                    user_msg = "Graphiti: Connection error (temporary)"
+                else:
+                    print(f"Graphiti error adding {role} message: {e}")
+                    user_msg = f"Graphiti: Memory save failed ({error_type})"
+                
+                # Only print full traceback for unexpected errors
+                if "ValidationError" not in error_type:
+                    import traceback
+                    traceback.print_exc()
+                
                 if user_valves.show_status:
                     await __event_emitter__(
                         {
                             "type": "status",
-                            "data": {"description": f"Warning: Failed to save {role} message", "done": False},
+                            "data": {"description": f"Warning: {user_msg}", "done": False},
                         }
                     )
         
