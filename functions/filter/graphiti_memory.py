@@ -28,6 +28,7 @@ import ast
 import json
 import os
 import time
+import asyncio
 from datetime import datetime
 from typing import Optional, Callable, Awaitable, Any
 
@@ -149,6 +150,16 @@ class Filter:
         save_assistant_response: bool = Field(
             default=False,
             description="Automatically save assistant responses as memories",
+        )
+        
+        update_communities: bool = Field(
+            default=False,
+            description="Update community detection when adding episodes using label propagation. EXPERIMENTAL: May cause errors with some Graphiti versions. Set to True to enable community updates.",
+        )
+        
+        add_episode_timeout: int = Field(
+            default=120,
+            description="Timeout in seconds for adding episodes to memory. Set to 0 to disable timeout.",
         )
 
     class UserValves(BaseModel):
@@ -321,7 +332,7 @@ class Filter:
 
         facts = []
         for result in results:
-
+            
             print(f'UUID: {result.uuid}')
 
             print(f'Fact: {result.fact}')
@@ -343,7 +354,7 @@ class Filter:
                 await __event_emitter__(
                     {
                         "type": "status",
-                        "data": {"description": f"Added {len(facts)} relevant memories to the conversation", "done": True},
+                        "data": {"description": f"{len(facts)} memories found: {', '.join([fact for fact, _, _ in facts])}", "done": True},
                     }
                 )
         return body
@@ -407,23 +418,75 @@ class Filter:
                 }
             )
         
-        # Save each message as an episode
+        # Save each message as an episode with timeout
+        group_id = f"{__user__['id']}_chat"
+        saved_count = 0
+        
         for role, content in messages_to_save:
-            await self.graphiti.add_episode(
-                name=f"Chat_{role.capitalize()}_Message_{chat_id}_{message_id}",
-                episode_body=content,
-                source=EpisodeType.message,
-                source_description=f"Chat {role.capitalize()} Message",
-                reference_time=datetime.now(),
-                group_id=f"{__user__['id']}_chat",
-            )
-            print(f"Added {role} message to Graphiti memory")
+            try:
+                # Apply timeout if configured
+                if self.valves.add_episode_timeout > 0:
+                    await asyncio.wait_for(
+                        self.graphiti.add_episode(
+                            name=f"Chat_{role.capitalize()}_Message_{chat_id}_{message_id}",
+                            episode_body=content,
+                            source=EpisodeType.message,
+                            source_description=f"Chat {role.capitalize()} Message",
+                            reference_time=datetime.now(),
+                            group_id=group_id,
+                            update_communities=self.valves.update_communities,
+                        ),
+                        timeout=self.valves.add_episode_timeout
+                    )
+                else:
+                    await self.graphiti.add_episode(
+                        name=f"Chat_{role.capitalize()}_Message_{chat_id}_{message_id}",
+                        episode_body=content,
+                        source=EpisodeType.message,
+                        source_description=f"Chat {role.capitalize()} Message",
+                        reference_time=datetime.now(),
+                        group_id=group_id,
+                        update_communities=self.valves.update_communities,
+                    )
+                print(f"Added {role} message to Graphiti memory")
+                saved_count += 1
+            except asyncio.TimeoutError:
+                print(f"Timeout adding {role} message to Graphiti memory after {self.valves.add_episode_timeout}s")
+                if user_valves.show_status:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {"description": f"Warning: Memory save timed out for {role} message", "done": False},
+                        }
+                    )
+            except Exception as e:
+                print(f"Error adding {role} message to Graphiti memory: {e}")
+                import traceback
+                traceback.print_exc()
+                if user_valves.show_status:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {"description": f"Warning: Failed to save {role} message", "done": False},
+                        }
+                    )
+        
+        # Only increment count for successfully saved messages
+        if saved_count > 0:
+            pass  # Successfully saved messages
 
         if user_valves.show_status:
+            if saved_count == 0:
+                status_msg = "Failed to save messages to Graphiti memory"
+            elif saved_count < len(messages_to_save):
+                status_msg = f"Added {saved_count}/{len(messages_to_save)} message(s) to Graphiti memory (some failed)"
+            else:
+                status_msg = f"Added {saved_count} message(s) to Graphiti memory"
+            
             await __event_emitter__(
                 {
                     "type": "status",
-                    "data": {"description": f"Added {len(messages_to_save)} message(s) to Graphiti memory", "done": True},
+                    "data": {"description": status_msg, "done": True},
                 }
             )
 
