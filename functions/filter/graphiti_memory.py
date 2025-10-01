@@ -194,7 +194,11 @@ class Filter:
     def __init__(self):
         self.valves = self.Valves()
         self.graphiti = None
-        self._initialize_graphiti()
+        # Try to initialize, but it's okay if it fails - will retry later
+        try:
+            self._initialize_graphiti()
+        except Exception as e:
+            print(f"Initial Graphiti initialization skipped (will retry on first use): {e}")
 
     def _initialize_graphiti(self) -> bool:
         """
@@ -265,9 +269,10 @@ class Filter:
             return True
             
         except Exception as e:
-            print(f"Error initializing Graphiti: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Graphiti initialization failed (will retry later if needed): {e}")
+            # Only print traceback in debug scenarios
+            # import traceback
+            # traceback.print_exc()
             self.graphiti = None
             return False
     
