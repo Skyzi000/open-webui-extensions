@@ -421,82 +421,89 @@ class Filter:
         if len(messages_to_save) == 0:
             return body
         
+        # Construct episode body in "User: {message}\nAssistant: {message}" format for EpisodeType.message
+        episode_parts = []
+        for role, content in messages_to_save:
+            role_label = "User" if role == "user" else "Assistant"
+            episode_parts.append(f"{role_label}: {content}")
+        
+        episode_body = "\n".join(episode_parts)
+        
         if user_valves.show_status:
             await __event_emitter__(
                 {
                     "type": "status",
-                    "data": {"description": f"Adding {len(messages_to_save)} message(s) to Graphiti memory...", "done": False},
+                    "data": {"description": f"Adding conversation to Graphiti memory...", "done": False},
                 }
             )
         
-        # Save each message as an episode with timeout
+        # Save the conversation as a single episode with timeout
         group_id = f"{__user__['id']}_chat"
         saved_count = 0
         
-        for role, content in messages_to_save:
-            try:
-                # Apply timeout if configured
-                if self.valves.add_episode_timeout > 0:
-                    await asyncio.wait_for(
-                        self.graphiti.add_episode(
-                            name=f"Chat_{role.capitalize()}_Message_{chat_id}_{message_id}",
-                            episode_body=content,
-                            source=EpisodeType.message,
-                            source_description=f"Chat {role.capitalize()} Message",
-                            reference_time=datetime.now(),
-                            group_id=group_id,
-                            update_communities=self.valves.update_communities,
-                        ),
-                        timeout=self.valves.add_episode_timeout
-                    )
-                else:
-                    await self.graphiti.add_episode(
-                        name=f"Chat_{role.capitalize()}_Message_{chat_id}_{message_id}",
-                        episode_body=content,
+        try:
+            # Apply timeout if configured
+            if self.valves.add_episode_timeout > 0:
+                await asyncio.wait_for(
+                    self.graphiti.add_episode(
+                        name=f"Chat_Interaction_{chat_id}_{message_id}",
+                        episode_body=episode_body,
                         source=EpisodeType.message,
-                        source_description=f"Chat {role.capitalize()} Message",
+                        source_description="Chat conversation",
                         reference_time=datetime.now(),
                         group_id=group_id,
                         update_communities=self.valves.update_communities,
-                    )
-                print(f"Added {role} message to Graphiti memory")
-                saved_count += 1
-            except asyncio.TimeoutError:
-                print(f"Timeout adding {role} message to Graphiti memory after {self.valves.add_episode_timeout}s")
-                if user_valves.show_status:
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {"description": f"Warning: Memory save timed out for {role} message", "done": False},
-                        }
-                    )
-            except Exception as e:
-                error_type = type(e).__name__
-                error_msg = str(e)
-                
-                # Provide more specific error messages for common issues
-                if "ValidationError" in error_type:
-                    print(f"Graphiti LLM response validation error for {role} message: {error_msg}")
-                    user_msg = "Graphiti: LLM response format error (will retry on next message)"
-                elif "ConnectionError" in error_type or "timeout" in error_msg.lower():
-                    print(f"Graphiti connection error adding {role} message: {error_msg}")
-                    user_msg = "Graphiti: Connection error (temporary)"
-                else:
-                    print(f"Graphiti error adding {role} message: {e}")
-                    user_msg = f"Graphiti: Memory save failed ({error_type})"
-                
-                # Only print full traceback for unexpected errors
-                if "ValidationError" not in error_type:
-                    import traceback
-                    traceback.print_exc()
-                
-                if user_valves.show_status:
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {"description": f"Warning: {user_msg}", "done": False},
-                        }
-                    )
+                    ),
+                    timeout=self.valves.add_episode_timeout
+                )
+            else:
+                await self.graphiti.add_episode(
+                    name=f"Chat_Interaction_{chat_id}_{message_id}",
+                    episode_body=episode_body,
+                    source=EpisodeType.message,
+                    source_description="Chat conversation",
+                    reference_time=datetime.now(),
+                    group_id=group_id,
+                    update_communities=self.valves.update_communities,
+                )
+            print(f"Added conversation to Graphiti memory: {episode_body[:100]}...")
+            saved_count = 1
+        except asyncio.TimeoutError:
+            print(f"Timeout adding conversation to Graphiti memory after {self.valves.add_episode_timeout}s")
+            if user_valves.show_status:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": f"Warning: Memory save timed out", "done": False},
+                    }
+                )
+        except Exception as e:
+            error_type = type(e).__name__
+            error_msg = str(e)
+            
+            # Provide more specific error messages for common issues
+            if "ValidationError" in error_type:
+                print(f"Graphiti LLM response validation error for conversation: {error_msg}")
+                user_msg = "Graphiti: LLM response format error (will retry on next message)"
+            elif "ConnectionError" in error_type or "timeout" in error_msg.lower():
+                print(f"Graphiti connection error adding conversation: {error_msg}")
+                user_msg = "Graphiti: Connection error (temporary)"
+            else:
+                print(f"Graphiti error adding conversation: {e}")
+                user_msg = f"Graphiti: Memory save failed ({error_type})"
+            
+            # Only print full traceback for unexpected errors
+            if "ValidationError" not in error_type:
+                import traceback
+                traceback.print_exc()
+            
+            if user_valves.show_status:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": f"Warning: {user_msg}", "done": False},
+                    }
+                )
         
         # Only increment count for successfully saved messages
         if saved_count > 0:
@@ -504,11 +511,9 @@ class Filter:
 
         if user_valves.show_status:
             if saved_count == 0:
-                status_msg = "Failed to save messages to Graphiti memory"
-            elif saved_count < len(messages_to_save):
-                status_msg = f"Added {saved_count}/{len(messages_to_save)} message(s) to Graphiti memory (some failed)"
+                status_msg = "Failed to save conversation to Graphiti memory"
             else:
-                status_msg = f"Added {saved_count} message(s) to Graphiti memory"
+                status_msg = f"Added conversation to Graphiti memory"
             
             await __event_emitter__(
                 {
@@ -516,5 +521,5 @@ class Filter:
                     "data": {"description": status_msg, "done": True},
                 }
             )
-
+        
         return body
