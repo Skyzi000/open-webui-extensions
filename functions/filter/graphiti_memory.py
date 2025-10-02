@@ -587,7 +587,7 @@ class Filter:
                 await __event_emitter__(
                     {
                         "type": "status",
-                        "data": {"description": f"{len(facts)} memories found", "done": True},
+                        "data": {"description": f"{len(facts)} memories found: {', '.join([fact for fact, _, _, _ in facts])}", "done": True},
                     }
                 )
         return body
