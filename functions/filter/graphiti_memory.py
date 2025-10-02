@@ -579,10 +579,26 @@ class Filter:
             # )
             
         if len(facts) > 0:
-            body['messages'].append({
-                "role": "system",
-                "content": f"Graphiti memories were found:\n" + "\n".join([f"- {name}: {fact} (valid_at: {valid_at}, invalid_at: {invalid_at})" for fact, valid_at, invalid_at, name in facts])
-            })
+            # Find the index of the last user message to insert memory before it
+            last_user_index = None
+            for i in range(len(body['messages']) - 1, -1, -1):
+                if body['messages'][i].get("role") == "user":
+                    last_user_index = i
+                    break
+            
+            # Insert memory before the last user message
+            if last_user_index is not None:
+                body['messages'].insert(last_user_index, {
+                    "role": "system",
+                    "content": f"Graphiti memories were found:\n" + "\n".join([f"- {name}: {fact} (valid_at: {valid_at}, invalid_at: {invalid_at})" for fact, valid_at, invalid_at, name in facts])
+                })
+            else:
+                # Fallback: append if no user message found (shouldn't happen, but safe)
+                body['messages'].append({
+                    "role": "system",
+                    "content": f"Graphiti memories were found:\n" + "\n".join([f"- {name}: {fact} (valid_at: {valid_at}, invalid_at: {invalid_at})" for fact, valid_at, invalid_at, name in facts])
+                })
+            
             if user_valves.show_status:
                 await __event_emitter__(
                     {
