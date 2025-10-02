@@ -171,6 +171,11 @@ class Filter:
             default=10000,
             description="Maximum length of user message to send to Graphiti search. Messages longer than this will be truncated (keeping first and last parts, dropping middle). Set to 0 to disable truncation.",
         )
+        
+        sanitize_search_query: bool = Field(
+            default=True,
+            description="Sanitize search queries to avoid FalkorDB/RediSearch syntax errors by removing special characters like @, :, \", (, ). Disable if you want to use raw queries or if using a different backend.",
+        )
 
     class UserValves(BaseModel):
         show_status: bool = Field(
@@ -324,6 +329,37 @@ class Filter:
                 return False
         
         return True
+    
+    def _sanitize_search_query(self, query: str) -> str:
+        """
+        Sanitize search query to avoid FalkorDB/RediSearch syntax errors.
+        
+        Only removes the most problematic characters that cause RediSearch errors.
+        Keeps most punctuation to preserve query meaning.
+        
+        Args:
+            query: The original search query
+            
+        Returns:
+            Sanitized query safe for FalkorDB search
+        """
+        import re
+        
+        # Only remove the most problematic RediSearch operators:
+        # ( ) - parentheses cause syntax errors with AND operator
+        # @ - field selector
+        # : - field separator  
+        # " - quote operator
+        # Keep: !, ?, ., ,, and other common punctuation
+        sanitized = re.sub(r'[@:"()]', ' ', query)
+        
+        # Replace multiple spaces with single space
+        sanitized = re.sub(r'\s+', ' ', sanitized)
+        
+        # Trim whitespace
+        sanitized = sanitized.strip()
+        
+        return sanitized
 
     async def inlet(
         self,
@@ -363,20 +399,32 @@ class Filter:
             print("No user message found. Skipping memory search.")
             return body
         
+        # Sanitize query for FalkorDB/RediSearch compatibility (before truncation)
+        sanitized_query = user_message
+        if self.valves.sanitize_search_query:
+            sanitized_query = self._sanitize_search_query(user_message)
+            if not sanitized_query:
+                print("Search query is empty after sanitization. Skipping memory search.")
+                return body
+            
+            if sanitized_query != user_message:
+                print(f"Search query sanitized: removed problematic characters")
+        
         # Truncate message if too long (keep first and last parts, drop middle)
+        original_length = len(sanitized_query)
         max_length = self.valves.max_search_message_length
-        if max_length > 0 and len(user_message) > max_length:
+        if max_length > 0 and len(sanitized_query) > max_length:
             keep_length = max_length // 2 - 25  # Leave room for separator
-            user_message = (
-                user_message[:keep_length] 
+            sanitized_query = (
+                sanitized_query[:keep_length] 
                 + "\n\n[...]\n\n" 
-                + user_message[-keep_length:]
+                + sanitized_query[-keep_length:]
             )
-            print(f"User message truncated from {original_length} to {len(user_message)} characters")
+            print(f"User message truncated from {original_length} to {len(sanitized_query)} characters")
             
         user_valves: Filter.UserValves = __user__.get("valves", self.UserValves())
         if user_valves.show_status:
-            preview = user_message[:100] + "..." if len(user_message) > 100 else user_message
+            preview = sanitized_query[:100] + "..." if len(sanitized_query) > 100 else sanitized_query
             await __event_emitter__(
                 {
                     "type": "status",
@@ -384,10 +432,38 @@ class Filter:
                 }
             )
         
-        results = await self.graphiti.search(
-            query=user_message,
-            group_ids=[f"{__user__['id']}_chat"],
-        )
+        # Use email as group_id to avoid UUID hyphen issues with RediSearch
+        user_email = __user__.get('email', __user__['id'])
+        group_id = f"{user_email}_chat"
+        
+        # Perform search with error handling for FalkorDB/RediSearch syntax issues
+        try:
+            results = await self.graphiti.search(
+                query=sanitized_query,
+                group_ids=[group_id],
+            )
+        except Exception as e:
+            error_msg = str(e)
+            if "Syntax error" in error_msg or "RediSearch" in error_msg:
+                print(f"FalkorDB/RediSearch syntax error during search: {error_msg}")
+                if user_valves.show_status:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {"description": "Memory search unavailable (syntax error)", "done": True},
+                        }
+                    )
+            else:
+                print(f"Unexpected error during Graphiti search: {e}")
+                if user_valves.show_status:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {"description": "Memory search failed", "done": True},
+                        }
+                    )
+            return body
+        
         if len(results) == 0:
             if user_valves.show_status:
                 await __event_emitter__(
