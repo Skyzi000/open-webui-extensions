@@ -13,12 +13,17 @@ Design:
 - Related components:
   - Graphiti: Knowledge graph memory system
   - FalkorDriver: FalkorDB backend driver for graph storage
-  - OpenAIGenericClient: LLM client for memory processing
+  - OpenAIClient: OpenAI client with JSON structured output support
+  - OpenAIGenericClient: Generic OpenAI-compatible client
   - OpenAIEmbedder: Embedding model for semantic search
   - OpenAIRerankerClient: Cross-encoder for result reranking
 
 Architecture:
 - Initialization: _initialize_graphiti() sets up the graph database connection
+- LLM Client Selection: Configurable client type selection
+  - OpenAI client: Better for some providers/models
+  - Generic client: Better for others
+  - Try both to see which works better for your setup
 - Lazy initialization: _ensure_graphiti_initialized() provides automatic retry
 - Memory search: inlet() retrieves relevant memories before chat processing
 - Memory storage: outlet() stores new information after chat completion
@@ -39,6 +44,7 @@ from pydantic import BaseModel, Field
 
 from graphiti_core import Graphiti
 from graphiti_core.llm_client.config import LLMConfig
+from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
@@ -84,6 +90,10 @@ class Filter:
     6. Extract and store new memories in graph database
     """
     class Valves(BaseModel):
+        llm_client_type: str = Field(
+            default="openai",
+            description="Type of LLM client to use: 'openai' for OpenAI client, 'generic' for OpenAI-compatible generic client. Try both to see which works better with your LLM provider.",
+        )
         openai_api_url: str = Field(
             default="https://api.openai.com",
             description="openai compatible endpoint",
@@ -230,7 +240,17 @@ class Filter:
                 base_url=self.valves.openai_api_url,
             )
 
-            llm_client = OpenAIGenericClient(config=llm_config)
+            # Select LLM client based on configuration
+            if self.valves.llm_client_type.lower() == "openai":
+                llm_client = OpenAIClient(config=llm_config)
+                print("Using OpenAI client")
+            elif self.valves.llm_client_type.lower() == "generic":
+                llm_client = OpenAIGenericClient(config=llm_config)
+                print("Using OpenAI-compatible generic client")
+            else:
+                # Default to OpenAI client for unknown values
+                llm_client = OpenAIClient(config=llm_config)
+                print(f"Unknown client type '{self.valves.llm_client_type}', defaulting to OpenAI client")
 
             falkor_driver = None
             if self.valves.graph_db_backend.lower() == "falkordb":
