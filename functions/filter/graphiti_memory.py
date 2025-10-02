@@ -484,9 +484,11 @@ class Filter:
                 }
             )
         
-        # Use email as group_id to avoid UUID hyphen issues with RediSearch
+        # Use email as group_id for consistency with outlet
+        # Sanitize email to meet Graphiti's group_id requirements (alphanumeric, dashes, underscores only)
         user_email = __user__.get('email', __user__['id'])
-        group_id = f"{user_email}_chat"
+        sanitized_email = user_email.replace('@', '_at_').replace('.', '_')
+        group_id = f"{sanitized_email}_chat"
         
         # Perform search with error handling for FalkorDB/RediSearch syntax issues
         try:
@@ -677,7 +679,10 @@ class Filter:
             )
         
         # Save the conversation as a single episode with timeout
-        group_id = f"{__user__['id']}_chat"
+        # Sanitize email to meet Graphiti's group_id requirements (alphanumeric, dashes, underscores only)
+        user_email = __user__.get('email', __user__['id'])
+        sanitized_email = user_email.replace('@', '_at_').replace('.', '_')
+        group_id = f"{sanitized_email}_chat"
         saved_count = 0
         
         try:
