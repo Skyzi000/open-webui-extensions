@@ -191,25 +191,11 @@ class Filter:
         show_status: bool = Field(
             default=True, description="Show status of the action."
         )
-        # openai_api_url: Optional[str] = Field(
-        #     default=None,
-        #     description="User-specific openai compatible endpoint (overrides global)",
-        # )
-        # model: Optional[str] = Field(
-        #     default=None,
-        #     description="User-specific model to use (overrides global). An intelligent model is highly recommended, as it will be able to better understand the context of the conversation.",
-        # )
-        # api_key: Optional[str] = Field(
-        #     default=None, description="User-specific API key (overrides global)"
-        # )
-        # use_legacy_mode: bool = Field(
-        #     default=False,
-        #     description="Use legacy mode for memory processing. This means using legacy prompts, and only analyzing the last User message.",
-        # )
-        # messages_to_consider: int = Field(
-        #     default=4,
-        #     description="Number of messages to consider for memory processing, starting from the last message. Includes assistant responses.",
-        # )
+        save_assistant_response: str = Field(
+            default="default",
+            description="Automatically save assistant responses as memories. Options: 'default' (use global setting), 'true' (always save), 'false' (never save).",
+        )
+
 
     def __init__(self):
         self.valves = self.Valves()
@@ -607,7 +593,19 @@ class Filter:
             messages_to_save.append(("user", last_user_message["content"]))
         
         # Optionally save assistant responses
-        if self.valves.save_assistant_response and last_assistant_message:
+        # Use UserValves setting if available, otherwise fall back to Valves setting
+        user_save_setting = user_valves.save_assistant_response.lower()
+        if user_save_setting == "default":
+            save_assistant = self.valves.save_assistant_response
+        elif user_save_setting == "true":
+            save_assistant = True
+        elif user_save_setting == "false":
+            save_assistant = False
+        else:
+            # Invalid value, use global setting as fallback
+            save_assistant = self.valves.save_assistant_response
+        
+        if save_assistant and last_assistant_message:
             messages_to_save.append(("assistant", last_assistant_message["content"]))
         
         if len(messages_to_save) == 0:
