@@ -166,6 +166,11 @@ class Filter:
             default=10,
             description="Maximum number of concurrent LLM operations in Graphiti. Default is 10 to prevent 429 rate limit errors. Increase for faster processing if your LLM provider allows higher throughput. Decrease if you encounter rate limit errors.",
         )
+        
+        max_search_message_length: int = Field(
+            default=10000,
+            description="Maximum length of user message to send to Graphiti search. Messages longer than this will be truncated (keeping first and last parts, dropping middle). Set to 0 to disable truncation.",
+        )
 
     class UserValves(BaseModel):
         show_status: bool = Field(
@@ -344,18 +349,43 @@ class Filter:
         if __user__ is None:
             print("User information is not available. Skipping memory search.")
             return body
+        
+        # Find the last user message (ignore assistant/tool messages)
+        user_message = None
+        original_length = 0
+        for msg in reversed(body.get("messages", [])):
+            if msg.get("role") == "user":
+                user_message = msg.get("content", "")
+                original_length = len(user_message)
+                break
+        
+        if not user_message:
+            print("No user message found. Skipping memory search.")
+            return body
+        
+        # Truncate message if too long (keep first and last parts, drop middle)
+        max_length = self.valves.max_search_message_length
+        if max_length > 0 and len(user_message) > max_length:
+            keep_length = max_length // 2 - 25  # Leave room for separator
+            user_message = (
+                user_message[:keep_length] 
+                + "\n\n[...]\n\n" 
+                + user_message[-keep_length:]
+            )
+            print(f"User message truncated from {original_length} to {len(user_message)} characters")
             
         user_valves: Filter.UserValves = __user__.get("valves", self.UserValves())
         if user_valves.show_status:
+            preview = user_message[:100] + "..." if len(user_message) > 100 else user_message
             await __event_emitter__(
                 {
                     "type": "status",
-                    "data": {"description": f"Searching Graphiti: {body['messages'][-1]['content']}", "done": False},
+                    "data": {"description": f"Searching Graphiti: {preview}", "done": False},
                 }
             )
         
         results = await self.graphiti.search(
-            query=body["messages"][-1]["content"],
+            query=user_message,
             group_ids=[f"{__user__['id']}_chat"],
         )
         if len(results) == 0:
