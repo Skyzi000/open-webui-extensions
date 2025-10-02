@@ -188,6 +188,10 @@ class Filter:
         )
 
     class UserValves(BaseModel):
+        enabled: bool = Field(
+            default=True,
+            description="Enable or disable Graphiti Memory feature for this user. When disabled, no memory search or storage will be performed.",
+        )
         show_status: bool = Field(
             default=True, description="Show status of the action."
         )
@@ -411,6 +415,13 @@ class Filter:
         print(f"inlet:{__name__}")
         print(f"inlet:user:{__user__}")
         
+        # Check if user has disabled the feature
+        if __user__:
+            user_valves: Filter.UserValves = __user__.get("valves", self.UserValves())
+            if not user_valves.enabled:
+                print("Graphiti Memory feature is disabled for this user.")
+                return body
+        
         # Check if graphiti is initialized, retry if not
         if not await self._ensure_graphiti_initialized() or self.graphiti is None:
             print("Graphiti initialization failed. Skipping memory search.")
@@ -555,6 +566,13 @@ class Filter:
         __user__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
     ) -> dict:
+        # Check if user has disabled the feature
+        if __user__:
+            user_valves: Filter.UserValves = __user__.get("valves", self.UserValves())
+            if not user_valves.enabled:
+                print("Graphiti Memory feature is disabled for this user.")
+                return body
+        
         # Check if graphiti is initialized, retry if not
         if not await self._ensure_graphiti_initialized() or self.graphiti is None:
             print("Graphiti initialization failed. Skipping memory addition.")
