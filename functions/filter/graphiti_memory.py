@@ -215,11 +215,37 @@ class Filter:
         self.valves = self.Valves()
         self.graphiti = None
         self._indices_built = False  # Track if indices have been built
+        self._last_config = None  # Track configuration for change detection
         # Try to initialize, but it's okay if it fails - will retry later
         try:
             self._initialize_graphiti()
         except Exception as e:
             print(f"Initial Graphiti initialization skipped (will retry on first use): {e}")
+    
+    def _get_config_hash(self) -> str:
+        """
+        Generate a hash of current configuration to detect changes.
+        
+        Returns:
+            str: Hash of relevant configuration values
+        """
+        import hashlib
+        config_str = f"{self.valves.llm_client_type}|{self.valves.openai_api_url}|{self.valves.model}|{self.valves.small_model}|{self.valves.embedding_model}|{self.valves.embedding_dim}|{self.valves.api_key}|{self.valves.graph_db_backend}|{self.valves.falkordb_host}|{self.valves.falkordb_port}|{self.valves.neo4j_uri}|{self.valves.semaphore_limit}"
+        return hashlib.md5(config_str.encode()).hexdigest()
+    
+    def _config_changed(self) -> bool:
+        """
+        Check if configuration has changed since last initialization.
+        
+        Returns:
+            bool: True if configuration changed, False otherwise
+        """
+        current_hash = self._get_config_hash()
+        if self._last_config != current_hash:
+            if self._last_config is not None:
+                print(f"Configuration change detected, will reinitialize Graphiti")
+            return True
+        return False
 
     def _initialize_graphiti(self) -> bool:
         """
@@ -296,6 +322,8 @@ class Filter:
                 print(f"Unsupported graph database backend: {self.valves.graph_db_backend}. Supported backends are 'neo4j' and 'falkordb'.")
                 return False
             
+            # Save current configuration hash after successful initialization
+            self._last_config = self._get_config_hash()
             print("Graphiti initialized successfully.")
             return True
             
@@ -334,10 +362,17 @@ class Filter:
     async def _ensure_graphiti_initialized(self) -> bool:
         """
         Ensure Graphiti is initialized and indices are built, attempting re-initialization if necessary.
+        Automatically reinitializes if configuration changes are detected.
         
         Returns:
             bool: True if Graphiti is ready to use, False otherwise
         """
+        # Check if configuration changed - if so, force reinitialization
+        if self._config_changed():
+            print("Configuration changed, reinitializing Graphiti...")
+            self.graphiti = None
+            self._indices_built = False
+        
         if self.graphiti is None:
             print("Graphiti not initialized. Attempting to initialize...")
             if not self._initialize_graphiti():
