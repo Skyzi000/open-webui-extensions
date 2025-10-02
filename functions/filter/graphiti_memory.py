@@ -95,15 +95,15 @@ class Filter:
             description="Type of LLM client to use: 'openai' for OpenAI client, 'generic' for OpenAI-compatible generic client. Try both to see which works better with your LLM provider.",
         )
         openai_api_url: str = Field(
-            default="https://api.openai.com",
+            default="https://api.openai.com/v1",
             description="openai compatible endpoint",
         )
         model: str = Field(
-            default="gpt-4.1",
+            default="gpt-5-mini",
             description="Model to use for memory processing.",
         )
         small_model: str = Field(
-            default="gpt-4.1-mini",
+            default="gpt-5-nano",
             description="Smaller model to use for memory processing in legacy mode.",
         )
         embedding_model: str = Field(
