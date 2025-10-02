@@ -194,6 +194,7 @@ class Filter:
     def __init__(self):
         self.valves = self.Valves()
         self.graphiti = None
+        self._indices_built = False  # Track if indices have been built
         # Try to initialize, but it's okay if it fails - will retry later
         try:
             self._initialize_graphiti()
@@ -276,18 +277,48 @@ class Filter:
             self.graphiti = None
             return False
     
-    def _ensure_graphiti_initialized(self) -> bool:
+    async def _build_indices(self) -> bool:
         """
-        Ensure Graphiti is initialized, attempting re-initialization if necessary.
+        Build database indices and constraints for Graphiti.
+        This should be called once after initialization and before the first query.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if self.graphiti is None:
+            return False
+            
+        if self._indices_built:
+            return True
+            
+        try:
+            print("Building Graphiti database indices and constraints...")
+            await self.graphiti.build_indices_and_constraints()
+            self._indices_built = True
+            print("Graphiti indices and constraints built successfully.")
+            return True
+        except Exception as e:
+            print(f"Failed to build Graphiti indices: {e}")
+            return False
+    
+    async def _ensure_graphiti_initialized(self) -> bool:
+        """
+        Ensure Graphiti is initialized and indices are built, attempting re-initialization if necessary.
         
         Returns:
             bool: True if Graphiti is ready to use, False otherwise
         """
-        if self.graphiti is not None:
-            return True
+        if self.graphiti is None:
+            print("Graphiti not initialized. Attempting to initialize...")
+            if not self._initialize_graphiti():
+                return False
         
-        print("Graphiti not initialized. Attempting to initialize...")
-        return self._initialize_graphiti()
+        # Build indices if not already built
+        if not self._indices_built:
+            if not await self._build_indices():
+                return False
+        
+        return True
 
     async def inlet(
         self,
@@ -299,7 +330,7 @@ class Filter:
         print(f"inlet:user:{__user__}")
         
         # Check if graphiti is initialized, retry if not
-        if not self._ensure_graphiti_initialized() or self.graphiti is None:
+        if not await self._ensure_graphiti_initialized() or self.graphiti is None:
             print("Graphiti initialization failed. Skipping memory search.")
             if __user__ and __user__.get("valves", self.UserValves()).show_status:
                 await __event_emitter__(
@@ -378,7 +409,7 @@ class Filter:
         __metadata__: Optional[dict] = None,
     ) -> dict:
         # Check if graphiti is initialized, retry if not
-        if not self._ensure_graphiti_initialized() or self.graphiti is None:
+        if not await self._ensure_graphiti_initialized() or self.graphiti is None:
             print("Graphiti initialization failed. Skipping memory addition.")
             return body
             
