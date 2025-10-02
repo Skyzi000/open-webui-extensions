@@ -531,30 +531,61 @@ class Filter:
         print('\nSearch Results:')
 
         facts = []
+        id = 0
+        
         for result in results:
             
             print(f'UUID: {result.uuid}')
 
-            print(f'Fact: {result.fact}')
+            print(f'Fact({result.name}): {result.fact}')
             if hasattr(result, 'valid_at') and result.valid_at:
                 print(f'Valid from: {result.valid_at}')
             if hasattr(result, 'invalid_at') and result.invalid_at:
                 print(f'Valid until: {result.invalid_at}')
 
-            facts.append((result.fact, result.valid_at, result.invalid_at))
+            facts.append((result.fact, result.valid_at, result.invalid_at, result.name))
 
             print('---')
+            # Emit citation for each memory
+            await __event_emitter__(
+                {
+                    "type": "citation",
+                    "data": {
+                        "source": {
+                            "name": "Graphiti Memory",
+                            "id": str(result.uuid),
+                        },
+                        "document": [result.fact],
+                        "metadata": [
+                            {
+                                "source": "Graphiti Memory",
+                                "parameters": {
+                                    "source": "Graphiti Memory",
+                                    "name": str(result.name),
+                                    "group_id": group_id,
+                                    "uuid": str(result.uuid),
+                                    "valid_at": str(result.valid_at) if hasattr(result, 'valid_at') and result.valid_at else None,
+                                    "invalid_at": str(result.invalid_at) if hasattr(result, 'invalid_at') and result.invalid_at else None,
+                                    "attributes": str(result.attributes) if hasattr(result, 'attributes') and result.attributes else None,
+                                    "source_node_uuid": str(result.source_node_uuid) if hasattr(result, 'source_node_uuid') and result.source_node_uuid else None,
+                                    "target_node_uuid": str(result.target_node_uuid) if hasattr(result, 'target_node_uuid') and result.target_node_uuid else None,
+                                }
+                            }
+                        ]
+                    }
+                }
+            )
             
         if len(facts) > 0:
             body['messages'].append({
                 "role": "system",
-                "content": f"Relevant memories were found:\n" + "\n".join([f"- {fact} (Valid from: {valid_at}, Valid until: {invalid_at})" for fact, valid_at, invalid_at in facts])
+                "content": f"Graphiti memories were found:\n" + "\n".join([f"- {name}: {fact} (valid_at: {valid_at}, invalid_at: {invalid_at})" for fact, valid_at, invalid_at, name in facts])
             })
             if user_valves.show_status:
                 await __event_emitter__(
                     {
                         "type": "status",
-                        "data": {"description": f"{len(facts)} memories found: {', '.join([fact for fact, _, _ in facts])}", "done": True},
+                        "data": {"description": f"{len(facts)} memories found", "done": True},
                     }
                 )
         return body
