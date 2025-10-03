@@ -579,10 +579,25 @@ class Filter:
             # )
             
         if len(facts) > 0:
-            body['messages'].append({
+            # Find the index of the last user message
+            last_user_msg_index = None
+            for i in range(len(body['messages']) - 1, -1, -1):
+                if body['messages'][i].get("role") == "user":
+                    last_user_msg_index = i
+                    break
+            
+            # Insert memory before the last user message
+            memory_message = {
                 "role": "system",
                 "content": f"Graphiti memories were found:\n" + "\n".join([f"- {name}: {fact} (valid_at: {valid_at}, invalid_at: {invalid_at})" for fact, valid_at, invalid_at, name in facts])
-            })
+            }
+            
+            if last_user_msg_index is not None:
+                body['messages'].insert(last_user_msg_index, memory_message)
+            else:
+                # Fallback: if no user message found (shouldn't happen), append to end
+                body['messages'].append(memory_message)
+            
             if user_valves.show_status:
                 await __event_emitter__(
                     {
