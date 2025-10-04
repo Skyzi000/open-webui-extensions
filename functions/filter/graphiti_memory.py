@@ -165,6 +165,16 @@ class Filter:
             description="Automatically save assistant responses as memories",
         )
         
+        inject_facts: bool = Field(
+            default=True,
+            description="Inject facts (EntityEdge/relationships) from memory search results into the conversation. Facts represent relationships and events with temporal validity.",
+        )
+        
+        inject_entities: bool = Field(
+            default=True,
+            description="Inject entities (EntityNode summaries) from memory search results into the conversation. Entities represent people, places, concepts with summarized information.",
+        )
+        
         update_communities: bool = Field(
             default=False,
             description="Update community detection when adding episodes using label propagation. EXPERIMENTAL: May cause errors with some Graphiti versions. Set to True to enable community updates.",
@@ -216,6 +226,16 @@ class Filter:
         save_assistant_response: str = Field(
             default="default",
             description="Automatically save assistant responses as memories. Options: 'default' (use global setting), 'true' (always save), 'false' (never save).",
+        )
+        
+        inject_facts: str = Field(
+            default="default",
+            description="Inject facts (EntityEdge/relationships) from memory search results. Options: 'default' (use global setting), 'true' (always inject), 'false' (never inject).",
+        )
+        
+        inject_entities: str = Field(
+            default="default",
+            description="Inject entities (EntityNode summaries) from memory search results. Options: 'default' (use global setting), 'true' (always inject), 'false' (never inject).",
         )
 
 
@@ -708,6 +728,30 @@ class Filter:
                 )
             return body
 
+        # Determine whether to inject facts and entities based on settings
+        # Use UserValves setting if available, otherwise fall back to Valves setting
+        user_inject_facts_setting = user_valves.inject_facts.lower()
+        if user_inject_facts_setting == "default":
+            should_inject_facts = self.valves.inject_facts
+        elif user_inject_facts_setting == "true":
+            should_inject_facts = True
+        elif user_inject_facts_setting == "false":
+            should_inject_facts = False
+        else:
+            # Invalid value, use global setting as fallback
+            should_inject_facts = self.valves.inject_facts
+        
+        user_inject_entities_setting = user_valves.inject_entities.lower()
+        if user_inject_entities_setting == "default":
+            should_inject_entities = self.valves.inject_entities
+        elif user_inject_entities_setting == "true":
+            should_inject_entities = True
+        elif user_inject_entities_setting == "false":
+            should_inject_entities = False
+        else:
+            # Invalid value, use global setting as fallback
+            should_inject_entities = self.valves.inject_entities
+
         # Print search results
 
         print('\nSearch Results:')
@@ -715,28 +759,35 @@ class Filter:
         facts = []
         entities = {}  # Dictionary to store unique entities: {name: summary}
         
-        # Process EntityEdge results (relations/facts)
-        for result in results.edges:
-            print(f'Edge UUID: {result.uuid}')
-            print(f'Fact({result.name}): {result.fact}')
-            if hasattr(result, 'valid_at') and result.valid_at:
-                print(f'Valid from: {result.valid_at}')
-            if hasattr(result, 'invalid_at') and result.invalid_at:
-                print(f'Valid until: {result.invalid_at}')
+        # Process EntityEdge results (relations/facts) only if enabled
+        if should_inject_facts:
+            for result in results.edges:
+                print(f'Edge UUID: {result.uuid}')
+                print(f'Fact({result.name}): {result.fact}')
+                if hasattr(result, 'valid_at') and result.valid_at:
+                    print(f'Valid from: {result.valid_at}')
+                if hasattr(result, 'invalid_at') and result.invalid_at:
+                    print(f'Valid until: {result.invalid_at}')
 
-            facts.append((result.fact, result.valid_at, result.invalid_at, result.name))
-            print('---')
+                facts.append((result.fact, result.valid_at, result.invalid_at, result.name))
+                print('---')
+        else:
+            print(f'Skipping {len(results.edges)} facts (inject_facts is disabled)')
         
-        # Process EntityNode results (entities with summaries)
-        for result in results.nodes:
-            print(f'Node UUID: {result.uuid}')
-            print(f'Entity({result.name}): {result.summary}')
+        # Process EntityNode results (entities with summaries) only if enabled
+        if should_inject_entities:
+            for result in results.nodes:
+                print(f'Node UUID: {result.uuid}')
+                print(f'Entity({result.name}): {result.summary}')
+                
+                # Store entity information
+                if result.name and result.summary:
+                    entities[result.name] = result.summary
+                
+                print('---')
+        else:
+            print(f'Skipping {len(results.nodes)} entities (inject_entities is disabled)')
             
-            # Store entity information
-            if result.name and result.summary:
-                entities[result.name] = result.summary
-            
-            print('---')
             # # Emit citation for each memory
             # await __event_emitter__(
             #     {
