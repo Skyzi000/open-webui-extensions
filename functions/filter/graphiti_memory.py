@@ -595,7 +595,7 @@ class Filter:
             if last_user_msg_index is not None:
                 body['messages'].insert(last_user_msg_index, memory_message)
             else:
-                # Fallback: if no user message found (shouldn't happen), append to end
+                # Fallback: if no user message found, append to end
                 body['messages'].append(memory_message)
             
             if user_valves.show_status:
