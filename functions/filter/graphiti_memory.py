@@ -450,7 +450,9 @@ class Filter:
                             base_url=self.valves.openai_api_url,
                         )
                     ),
-                    cross_encoder=OpenAIRerankerClient(client=llm_client, config=llm_config),
+                    # OpenAIRerankerClient requires AsyncOpenAI client, not LLMClient wrapper
+                    # Both OpenAIClient and OpenAIGenericClient have .client attribute (AsyncOpenAI instance)
+                    cross_encoder=OpenAIRerankerClient(client=llm_client.client, config=llm_config),  # type: ignore
                 )
             elif self.valves.graph_db_backend.lower() == "neo4j":
                 self.graphiti = Graphiti(
@@ -466,7 +468,9 @@ class Filter:
                             base_url=self.valves.openai_api_url,
                         )
                     ),
-                    cross_encoder=OpenAIRerankerClient(client=llm_client, config=llm_config),
+                    # OpenAIRerankerClient requires AsyncOpenAI client, not LLMClient wrapper
+                    # Both OpenAIClient and OpenAIGenericClient have .client attribute (AsyncOpenAI instance)
+                    cross_encoder=OpenAIRerankerClient(client=llm_client.client, config=llm_config),  # type: ignore
                 )
             else:
                 print(f"Unsupported graph database backend: {self.valves.graph_db_backend}. Supported backends are 'neo4j' and 'falkordb'.")
