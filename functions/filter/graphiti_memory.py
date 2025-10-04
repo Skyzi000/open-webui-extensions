@@ -186,10 +186,15 @@ class Filter:
             default=True,
             description="Sanitize search queries to avoid FalkorDB/RediSearch syntax errors by removing special characters like @, :, \", (, ). Disable if you want to use raw queries or if using a different backend.",
         )
-        
+
         group_id_format: str = Field(
-            default="{user_email}_chat",
-            description="Format string for group_id. Available placeholders: {user_id}, {user_email}, {user_name}. Email addresses are automatically sanitized (@ becomes _at_, . becomes _). Examples: '{user_email}_chat', '{user_id}_chat', 'user_{user_id}'. Set to empty string '' to disable group filtering (all users share the same memory space).",
+            default="{user_id}",
+            description="Format string for group_id. Available placeholders: {user_id}, {user_email}, {user_name}. Email addresses are automatically sanitized (@ becomes _at_, . becomes _). Examples: '{user_id}', '{user_id}_chat', 'user_{user_id}'. Set to 'none' to disable group filtering (all users share the same memory space). Recommended: Use {user_id} (default) as it's stable; email/name changes could cause memory access issues.",
+        )
+        
+        memory_message_role: str = Field(
+            default="system",
+            description="Role to use when injecting memory search results into the conversation. Options: 'system' (system message, more authoritative), 'user' (user message, more conversational). Default is 'system'.",
         )
 
     class UserValves(BaseModel):
@@ -389,10 +394,10 @@ class Filter:
             
         Returns:
             Sanitized group_id safe for Graphiti (alphanumeric, dashes, underscores only),
-            or None if group_id_format is empty (to disable group filtering)
+            or None if group_id_format is 'none' (to disable group filtering)
         """
-        # Return None if format is empty (disable group filtering)
-        if not self.valves.group_id_format or self.valves.group_id_format.strip() == "":
+        # Return None if format is 'none' (disable group filtering for shared memory space)
+        if self.valves.group_id_format.lower().strip() == "none":
             return None
         
         # Prepare replacement values
@@ -633,9 +638,15 @@ class Filter:
                     last_user_msg_index = i
                     break
             
+            # Determine the role to use for memory message (default to system if invalid value)
+            memory_role = self.valves.memory_message_role.lower()
+            if memory_role not in ["system", "user"]:
+                print(f"Invalid memory_message_role '{memory_role}', using 'system'")
+                memory_role = "system"
+            
             # Insert memory before the last user message
             memory_message = {
-                "role": "system",
+                "role": memory_role,
                 "content": f"Graphiti memories were found:\n" + "\n".join([f"- {name}: {fact} (valid_at: {valid_at}, invalid_at: {invalid_at})" for fact, valid_at, invalid_at, name in facts])
             }
             
