@@ -767,7 +767,7 @@ class Filter:
             await __event_emitter__(
                 {
                     "type": "status",
-                    "data": {"description": f"Searching Graphiti: {preview}", "done": False},
+                    "data": {"description": f"🔍 Searching Graphiti: {preview}", "done": False},
                 }
             )
         
@@ -867,7 +867,7 @@ class Filter:
         
         # Process EntityEdge results (relations/facts) only if enabled
         if should_inject_facts:
-            for result in results.edges:
+            for idx, result in enumerate(results.edges, 1):
                 if self.valves.debug_print:
                     print(f'Edge UUID: {result.uuid}')
                     print(f'Fact({result.name}): {result.fact}')
@@ -877,6 +877,16 @@ class Filter:
                         print(f'Valid until: {result.invalid_at}')
 
                 facts.append((result.fact, result.valid_at, result.invalid_at, result.name))
+                
+                # Emit status for each fact found
+                if user_valves.show_status:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {"description": f"📝 Fact {idx}/{len(results.edges)}: {result.fact}", "done": False},
+                        }
+                    )
+                
                 if self.valves.debug_print:
                     print('---')
         else:
@@ -885,7 +895,7 @@ class Filter:
         
         # Process EntityNode results (entities with summaries) only if enabled
         if should_inject_entities:
-            for result in results.nodes:
+            for idx, result in enumerate(results.nodes, 1):
                 if self.valves.debug_print:
                     print(f'Node UUID: {result.uuid}')
                     print(f'Entity({result.name}): {result.summary}')
@@ -893,6 +903,15 @@ class Filter:
                 # Store entity information
                 if result.name and result.summary:
                     entities[result.name] = result.summary
+                    
+                    # Emit status for each entity found
+                    if user_valves.show_status:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {"description": f"👤 Entity {idx}/{len(results.nodes)}: {result.name} - {result.summary}", "done": False},
+                            }
+                        )
                 
                 if self.valves.debug_print:
                     print('---')
