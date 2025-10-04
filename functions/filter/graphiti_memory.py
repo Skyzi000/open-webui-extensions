@@ -5,7 +5,7 @@ description: Automatically identify and store valuable information from chats as
 author_email: dev@skyzi.jp
 author_url: https://github.com/Skyzi000
 repository_url: https://github.com/Skyzi000/open-webui-extensions
-version: 0.1
+version: 0.2
 requirements: graphiti-core[falkordb]
 
 Design:
@@ -36,11 +36,14 @@ import time
 import asyncio
 from datetime import datetime
 from typing import Optional, Callable, Awaitable, Any
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp import ClientError
 from fastapi.requests import Request
 from pydantic import BaseModel, Field
+
+from openai import AsyncOpenAI
 
 from graphiti_core import Graphiti
 from graphiti_core.llm_client.config import LLMConfig
@@ -216,6 +219,7 @@ class Filter:
         self.graphiti = None
         self._indices_built = False  # Track if indices have been built
         self._last_config = None  # Track configuration for change detection
+        self._current_user_headers = {}  # Track current user info headers
         # Try to initialize, but it's okay if it fails - will retry later
         try:
             self._initialize_graphiti()
@@ -246,6 +250,77 @@ class Filter:
                 print(f"Configuration change detected, will reinitialize Graphiti")
             return True
         return False
+    
+    def _get_user_info_headers(self, user: Optional[dict] = None, chat_id: Optional[str] = None) -> dict:
+        """
+        Build user information headers dictionary.
+        
+        Args:
+            user: User dictionary containing 'id', 'email', 'name', 'role'
+            chat_id: Current chat ID
+            
+        Returns:
+            Dictionary of headers to send to OpenAI API
+        """
+        # Check environment variable ENABLE_FORWARD_USER_INFO_HEADERS
+        enable_forward = os.environ.get('ENABLE_FORWARD_USER_INFO_HEADERS', 'false').lower() == 'true'
+        if not enable_forward:
+            return {}
+        
+        headers = {}
+        if user:
+            if user.get('name'):
+                headers['X-OpenWebUI-User-Name'] = quote(str(user['name']), safe=" ")
+            if user.get('id'):
+                headers['X-OpenWebUI-User-Id'] = str(user['id'])
+            if user.get('email'):
+                headers['X-OpenWebUI-User-Email'] = str(user['email'])
+            if user.get('role'):
+                headers['X-OpenWebUI-User-Role'] = str(user['role'])
+        
+        if chat_id:
+            headers['X-OpenWebUI-Chat-Id'] = str(chat_id)
+        
+        return headers
+    
+    def _update_llm_client_headers(self, headers: dict) -> None:
+        """
+        Update LLM client with extra headers using AsyncOpenAI's copy() method.
+        
+        Args:
+            headers: Dictionary of headers to add to all requests
+        """
+        if not headers or self.graphiti is None or self.graphiti.llm_client is None:
+            return
+        
+        # Only update if headers changed
+        if headers == self._current_user_headers:
+            return
+        
+        self._current_user_headers = headers
+        
+        try:
+            llm_client = self.graphiti.llm_client
+            
+            # OpenAIClient and OpenAIGenericClient both have a 'client' attribute that is AsyncOpenAI
+            if hasattr(llm_client, 'client'):
+                old_client = llm_client.client  # type: ignore
+                
+                # Use AsyncOpenAI's copy() method to create a new client with additional headers
+                # This preserves all existing settings while adding our headers
+                new_client = old_client.copy(default_headers=headers)  # type: ignore
+                
+                # Replace the client
+                llm_client.client = new_client  # type: ignore
+                print(f"Updated OpenAI client with headers using copy(): {list(headers.keys())}")
+            else:
+                print("Warning: LLM client does not have 'client' attribute")
+        
+        except Exception as e:
+            print(f"Failed to update OpenAI client headers: {e}")
+            import traceback
+            traceback.print_exc()
+
 
     def _initialize_graphiti(self) -> bool:
         """
@@ -460,6 +535,7 @@ class Filter:
         body: dict,
         __event_emitter__: Callable[[Any], Awaitable[None]],
         __user__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
     ) -> dict:
         print(f"inlet:{__name__}")
         print(f"inlet:user:{__user__}")
@@ -482,6 +558,12 @@ class Filter:
                     }
                 )
             return body
+        
+        # Update LLM client headers with user info (before any API calls)
+        chat_id = __metadata__.get('chat_id') if __metadata__ else None
+        headers = self._get_user_info_headers(__user__, chat_id)
+        if headers:
+            self._update_llm_client_headers(headers)
         
         if __user__ is None:
             print("User information is not available. Skipping memory search.")
@@ -690,6 +772,12 @@ class Filter:
         chat_id = __metadata__.get('chat_id', 'unknown') if __metadata__ else 'unknown'
         message_id = __metadata__.get('message_id', 'unknown') if __metadata__ else 'unknown'
         print(f"outlet:{__name__}, chat_id:{chat_id}, message_id:{message_id}")
+        
+        # Update LLM client headers with user info (before any API calls)
+        headers = self._get_user_info_headers(__user__, chat_id)
+        if headers:
+            self._update_llm_client_headers(headers)
+
 
         user_valves: Filter.UserValves = __user__.get("valves", self.UserValves())
         messages = body.get("messages", [])
