@@ -24,6 +24,10 @@ Architecture:
   - OpenAI client: Better for some providers/models
   - Generic client: Better for others
   - Try both to see which works better for your setup
+- Search Strategy: Three performance/quality tradeoffs
+  - Fast: BM25 only (~100ms, no embedding calls)
+  - Balanced: BM25 + Cosine Similarity (~500ms, 1 embedding call) - DEFAULT
+  - Quality: + Cross-Encoder reranking (~1-5s, multiple LLM calls)
 - Lazy initialization: _ensure_graphiti_initialized() provides automatic retry
 - Memory search: inlet() retrieves relevant memories before chat processing
 - Memory storage: outlet() stores new information after chat completion
@@ -52,7 +56,22 @@ from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.nodes import EpisodeType
-from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
+from graphiti_core.search.search_config_recipes import (
+    COMBINED_HYBRID_SEARCH_RRF,
+    COMBINED_HYBRID_SEARCH_CROSS_ENCODER,
+)
+from graphiti_core.search.search_config import (
+    SearchConfig,
+    EdgeSearchConfig,
+    NodeSearchConfig,
+    EpisodeSearchConfig,
+    EdgeSearchMethod,
+    NodeSearchMethod,
+    EpisodeSearchMethod,
+    EdgeReranker,
+    NodeReranker,
+    EpisodeReranker,
+)
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 
 from open_webui.main import app as webui_app
@@ -199,6 +218,11 @@ class Filter:
             default=True,
             description="Sanitize search queries to avoid FalkorDB/RediSearch syntax errors by removing special characters like @, :, \", (, ). Disable if you want to use raw queries or if using a different backend.",
         )
+        
+        search_strategy: str = Field(
+        default="balanced",
+        description="Search strategy: 'fast' (BM25 only, ~0.1s), 'balanced' (BM25+Cosine, ~0.5s), 'quality' (Cross-Encoder, ~1-5s)",
+    )
 
         group_id_format: str = Field(
             default="{user_id}",
@@ -452,7 +476,7 @@ class Filter:
                     ),
                     # OpenAIRerankerClient requires AsyncOpenAI client, not LLMClient wrapper
                     # Both OpenAIClient and OpenAIGenericClient have .client attribute (AsyncOpenAI instance)
-                    cross_encoder=OpenAIRerankerClient(client=llm_client.client, config=llm_config),  # type: ignore
+                    cross_encoder=OpenAIRerankerClient(client=llm_client.client, config=llm_config),
                 )
             elif self.valves.graph_db_backend.lower() == "neo4j":
                 self.graphiti = Graphiti(
@@ -470,7 +494,7 @@ class Filter:
                     ),
                     # OpenAIRerankerClient requires AsyncOpenAI client, not LLMClient wrapper
                     # Both OpenAIClient and OpenAIGenericClient have .client attribute (AsyncOpenAI instance)
-                    cross_encoder=OpenAIRerankerClient(client=llm_client.client, config=llm_config),  # type: ignore
+                    cross_encoder=OpenAIRerankerClient(client=llm_client.client, config=llm_config),
                 )
             else:
                 print(f"Unsupported graph database backend: {self.valves.graph_db_backend}. Supported backends are 'neo4j' and 'falkordb'.")
@@ -582,6 +606,39 @@ class Filter:
         group_id = re.sub(r'[^a-zA-Z0-9_-]', '_', group_id)
         
         return group_id
+    
+    def _get_search_config(self):
+        """
+        Get search configuration based on the configured search strategy.
+        
+        Returns:
+            SearchConfig: Configured search strategy
+        """
+        strategy = self.valves.search_strategy.lower()
+        
+        if strategy == "fast":
+            # BM25 only - fastest, no embedding calls
+            return SearchConfig(
+                edge_config=EdgeSearchConfig(
+                    search_methods=[EdgeSearchMethod.bm25],
+                    reranker=EdgeReranker.rrf,
+                ),
+                node_config=NodeSearchConfig(
+                    search_methods=[NodeSearchMethod.bm25],
+                    reranker=NodeReranker.rrf,
+                ),
+                episode_config=EpisodeSearchConfig(
+                    search_methods=[EpisodeSearchMethod.bm25],
+                    reranker=EpisodeReranker.rrf,
+                ),
+            )
+        elif strategy == "quality":
+            # Cross-encoder - highest quality, slowest
+            return COMBINED_HYBRID_SEARCH_CROSS_ENCODER
+        else:
+            # Default: balanced (BM25 + Cosine Similarity + RRF)
+            # Best speed/quality tradeoff for most use cases
+            return COMBINED_HYBRID_SEARCH_RRF
     
     def _sanitize_search_query(self, query: str) -> str:
         """
@@ -698,6 +755,13 @@ class Filter:
                 print(f"User message truncated from {original_length} to {len(sanitized_query)} characters")
             
         user_valves: Filter.UserValves = __user__.get("valves", self.UserValves())
+        
+        # Get search configuration based on strategy
+        search_config = self._get_search_config()
+        
+        if self.valves.debug_print:
+            print(f"Using search strategy: {self.valves.search_strategy}")
+        
         if user_valves.show_status:
             preview = sanitized_query[:100] + "..." if len(sanitized_query) > 100 else sanitized_query
             await __event_emitter__(
@@ -711,39 +775,50 @@ class Filter:
         group_id = self._get_group_id(__user__)
         
         # Perform search with error handling for FalkorDB/RediSearch syntax issues
+        # Measure search time
+        import time
+        search_start_time = time.time()
+        
         try:
             # Use search_() for advanced search that returns SearchResults with nodes, edges, episodes, communities
-            # COMBINED_HYBRID_SEARCH_RRF searches both edges (facts) and nodes (entities)
+            # Search configuration is determined by search_strategy setting
             # Only pass group_ids if group_id is not None
             if group_id is not None:
                 results = await self.graphiti.search_(
                     query=sanitized_query,
                     group_ids=[group_id],
-                    config=COMBINED_HYBRID_SEARCH_RRF,  # Use combined hybrid search for both edges and nodes
+                    config=search_config,
                 )
             else:
                 results = await self.graphiti.search_(
                     query=sanitized_query,
-                    config=COMBINED_HYBRID_SEARCH_RRF,  # Use combined hybrid search for both edges and nodes
+                    config=search_config,
                 )
+            
+            # Calculate search duration
+            search_duration = time.time() - search_start_time
+            
+            if self.valves.debug_print:
+                print(f"Search completed in {search_duration:.2f}s")
         except Exception as e:
+            search_duration = time.time() - search_start_time
             error_msg = str(e)
             if "Syntax error" in error_msg or "RediSearch" in error_msg:
-                print(f"FalkorDB/RediSearch syntax error during search: {error_msg}")
+                print(f"FalkorDB/RediSearch syntax error during search (after {search_duration:.2f}s): {error_msg}")
                 if user_valves.show_status:
                     await __event_emitter__(
                         {
                             "type": "status",
-                            "data": {"description": "Memory search unavailable (syntax error)", "done": True},
+                            "data": {"description": f"Memory search unavailable (syntax error, {search_duration:.2f}s)", "done": True},
                         }
                     )
             else:
-                print(f"Unexpected error during Graphiti search: {e}")
+                print(f"Unexpected error during Graphiti search (after {search_duration:.2f}s): {e}")
                 if user_valves.show_status:
                     await __event_emitter__(
                         {
                             "type": "status",
-                            "data": {"description": "Memory search failed", "done": True},
+                            "data": {"description": f"Memory search failed ({search_duration:.2f}s)", "done": True},
                         }
                     )
             return body
@@ -754,7 +829,7 @@ class Filter:
                 await __event_emitter__(
                     {
                         "type": "status",
-                        "data": {"description": "No relevant memories found", "done": True},
+                        "data": {"description": f"No relevant memories found ({search_duration:.2f}s)", "done": True},
                     }
                 )
             return body
@@ -922,7 +997,7 @@ class Filter:
                 if len(entities) > 0:
                     status_parts.append(f"{len(entities)} entit{'ies' if len(entities) != 1 else 'y'}")
                 
-                status_msg = " and ".join(status_parts) + " found"
+                status_msg = " and ".join(status_parts) + f" found ({search_duration:.2f}s)"
                 
                 await __event_emitter__(
                     {
