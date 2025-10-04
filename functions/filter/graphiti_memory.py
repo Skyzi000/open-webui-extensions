@@ -214,6 +214,11 @@ class Filter:
             default="default",
             description="Forward user information headers (User-Name, User-Id, User-Email, User-Role, Chat-Id) to OpenAI API. Options: 'default' (follow environment variable ENABLE_FORWARD_USER_INFO_HEADERS, defaults to false if not set), 'true' (always forward), 'false' (never forward).",
         )
+        
+        debug_print: bool = Field(
+            default=False,
+            description="Enable debug printing to console. When enabled, prints detailed information about search results, memory injection, and processing steps. Useful for troubleshooting.",
+        )
 
     class UserValves(BaseModel):
         enabled: bool = Field(
@@ -249,7 +254,8 @@ class Filter:
         try:
             self._initialize_graphiti()
         except Exception as e:
-            print(f"Initial Graphiti initialization skipped (will retry on first use): {e}")
+            if self.valves.debug_print:
+                print(f"Initial Graphiti initialization skipped (will retry on first use): {e}")
     
     def _get_config_hash(self) -> str:
         """
@@ -272,7 +278,8 @@ class Filter:
         current_hash = self._get_config_hash()
         if self._last_config != current_hash:
             if self._last_config is not None:
-                print(f"Configuration change detected, will reinitialize Graphiti")
+                if self.valves.debug_print:
+                    print(f"Configuration change detected, will reinitialize Graphiti")
             return True
         return False
     
@@ -352,9 +359,11 @@ class Filter:
                     
                     # Replace the client
                     llm_client.client = new_client  # type: ignore
-                    print(f"Updated LLM client with headers using copy(): {list(headers.keys())}")
+                    if self.valves.debug_print:
+                        print(f"Updated LLM client with headers using copy(): {list(headers.keys())}")
                 else:
-                    print("Warning: LLM client does not have 'client' attribute")
+                    if self.valves.debug_print:
+                        print("Warning: LLM client does not have 'client' attribute")
         except Exception as e:
             print(f"Failed to update LLM client headers: {e}")
             import traceback
@@ -374,9 +383,11 @@ class Filter:
                     
                     # Replace the client
                     embedder.client = new_client  # type: ignore
-                    print(f"Updated Embedder client with headers using copy(): {list(headers.keys())}")
+                    if self.valves.debug_print:
+                        print(f"Updated Embedder client with headers using copy(): {list(headers.keys())}")
                 else:
-                    print("Warning: Embedder does not have 'client' attribute")
+                    if self.valves.debug_print:
+                        print("Warning: Embedder does not have 'client' attribute")
         except Exception as e:
             print(f"Failed to update Embedder headers: {e}")
             import traceback
@@ -405,14 +416,17 @@ class Filter:
             # Select LLM client based on configuration
             if self.valves.llm_client_type.lower() == "openai":
                 llm_client = OpenAIClient(config=llm_config)
-                print("Using OpenAI client")
+                if self.valves.debug_print:
+                    print("Using OpenAI client")
             elif self.valves.llm_client_type.lower() == "generic":
                 llm_client = OpenAIGenericClient(config=llm_config)
-                print("Using OpenAI-compatible generic client")
+                if self.valves.debug_print:
+                    print("Using OpenAI-compatible generic client")
             else:
                 # Default to OpenAI client for unknown values
                 llm_client = OpenAIClient(config=llm_config)
-                print(f"Unknown client type '{self.valves.llm_client_type}', defaulting to OpenAI client")
+                if self.valves.debug_print:
+                    print(f"Unknown client type '{self.valves.llm_client_type}', defaulting to OpenAI client")
 
             falkor_driver = None
             if self.valves.graph_db_backend.lower() == "falkordb":
@@ -460,7 +474,8 @@ class Filter:
             
             # Save current configuration hash after successful initialization
             self._last_config = self._get_config_hash()
-            print("Graphiti initialized successfully.")
+            if self.valves.debug_print:
+                print("Graphiti initialized successfully.")
             return True
             
         except Exception as e:
@@ -486,10 +501,12 @@ class Filter:
             return True
             
         try:
-            print("Building Graphiti database indices and constraints...")
+            if self.valves.debug_print:
+                print("Building Graphiti database indices and constraints...")
             await self.graphiti.build_indices_and_constraints()
             self._indices_built = True
-            print("Graphiti indices and constraints built successfully.")
+            if self.valves.debug_print:
+                print("Graphiti indices and constraints built successfully.")
             return True
         except Exception as e:
             print(f"Failed to build Graphiti indices: {e}")
@@ -505,12 +522,14 @@ class Filter:
         """
         # Check if configuration changed - if so, force reinitialization
         if self._config_changed():
-            print("Configuration changed, reinitializing Graphiti...")
+            if self.valves.debug_print:
+                print("Configuration changed, reinitializing Graphiti...")
             self.graphiti = None
             self._indices_built = False
         
         if self.graphiti is None:
-            print("Graphiti not initialized. Attempting to initialize...")
+            if self.valves.debug_print:
+                print("Graphiti not initialized. Attempting to initialize...")
             if not self._initialize_graphiti():
                 return False
         
@@ -598,19 +617,22 @@ class Filter:
         __user__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
     ) -> dict:
-        print(f"inlet:{__name__}")
-        print(f"inlet:user:{__user__}")
+        if self.valves.debug_print:
+            print(f"inlet:{__name__}")
+            print(f"inlet:user:{__user__}")
         
         # Check if user has disabled the feature
         if __user__:
             user_valves: Filter.UserValves = __user__.get("valves", self.UserValves())
             if not user_valves.enabled:
-                print("Graphiti Memory feature is disabled for this user.")
+                if self.valves.debug_print:
+                    print("Graphiti Memory feature is disabled for this user.")
                 return body
         
         # Check if graphiti is initialized, retry if not
         if not await self._ensure_graphiti_initialized() or self.graphiti is None:
-            print("Graphiti initialization failed. Skipping memory search.")
+            if self.valves.debug_print:
+                print("Graphiti initialization failed. Skipping memory search.")
             if __user__ and __user__.get("valves", self.UserValves()).show_status:
                 await __event_emitter__(
                     {
@@ -627,7 +649,8 @@ class Filter:
             self._update_llm_client_headers(headers)
         
         if __user__ is None:
-            print("User information is not available. Skipping memory search.")
+            if self.valves.debug_print:
+                print("User information is not available. Skipping memory search.")
             return body
         
         # Find the last user message (ignore assistant/tool messages)
@@ -640,7 +663,8 @@ class Filter:
                 break
         
         if not user_message:
-            print("No user message found. Skipping memory search.")
+            if self.valves.debug_print:
+                print("No user message found. Skipping memory search.")
             return body
         
         # Sanitize query for FalkorDB/RediSearch compatibility (before truncation)
@@ -648,11 +672,13 @@ class Filter:
         if self.valves.sanitize_search_query:
             sanitized_query = self._sanitize_search_query(user_message)
             if not sanitized_query:
-                print("Search query is empty after sanitization. Skipping memory search.")
+                if self.valves.debug_print:
+                    print("Search query is empty after sanitization. Skipping memory search.")
                 return body
             
             if sanitized_query != user_message:
-                print(f"Search query sanitized: removed problematic characters")
+                if self.valves.debug_print:
+                    print(f"Search query sanitized: removed problematic characters")
         
         # Truncate message if too long (keep first and last parts, drop middle)
         original_length = len(sanitized_query)
@@ -664,7 +690,8 @@ class Filter:
                 + "\n\n[...]\n\n" 
                 + sanitized_query[-keep_length:]
             )
-            print(f"User message truncated from {original_length} to {len(sanitized_query)} characters")
+            if self.valves.debug_print:
+                print(f"User message truncated from {original_length} to {len(sanitized_query)} characters")
             
         user_valves: Filter.UserValves = __user__.get("valves", self.UserValves())
         if user_valves.show_status:
@@ -752,9 +779,9 @@ class Filter:
             # Invalid value, use global setting as fallback
             should_inject_entities = self.valves.inject_entities
 
-        # Print search results
-
-        print('\nSearch Results:')
+        # Print search results (if debug mode enabled)
+        if self.valves.debug_print:
+            print('\nSearch Results:')
 
         facts = []
         entities = {}  # Dictionary to store unique entities: {name: summary}
@@ -762,31 +789,37 @@ class Filter:
         # Process EntityEdge results (relations/facts) only if enabled
         if should_inject_facts:
             for result in results.edges:
-                print(f'Edge UUID: {result.uuid}')
-                print(f'Fact({result.name}): {result.fact}')
-                if hasattr(result, 'valid_at') and result.valid_at:
-                    print(f'Valid from: {result.valid_at}')
-                if hasattr(result, 'invalid_at') and result.invalid_at:
-                    print(f'Valid until: {result.invalid_at}')
+                if self.valves.debug_print:
+                    print(f'Edge UUID: {result.uuid}')
+                    print(f'Fact({result.name}): {result.fact}')
+                    if hasattr(result, 'valid_at') and result.valid_at:
+                        print(f'Valid from: {result.valid_at}')
+                    if hasattr(result, 'invalid_at') and result.invalid_at:
+                        print(f'Valid until: {result.invalid_at}')
 
                 facts.append((result.fact, result.valid_at, result.invalid_at, result.name))
-                print('---')
+                if self.valves.debug_print:
+                    print('---')
         else:
-            print(f'Skipping {len(results.edges)} facts (inject_facts is disabled)')
+            if self.valves.debug_print:
+                print(f'Skipping {len(results.edges)} facts (inject_facts is disabled)')
         
         # Process EntityNode results (entities with summaries) only if enabled
         if should_inject_entities:
             for result in results.nodes:
-                print(f'Node UUID: {result.uuid}')
-                print(f'Entity({result.name}): {result.summary}')
+                if self.valves.debug_print:
+                    print(f'Node UUID: {result.uuid}')
+                    print(f'Entity({result.name}): {result.summary}')
                 
                 # Store entity information
                 if result.name and result.summary:
                     entities[result.name] = result.summary
                 
-                print('---')
+                if self.valves.debug_print:
+                    print('---')
         else:
-            print(f'Skipping {len(results.nodes)} entities (inject_entities is disabled)')
+            if self.valves.debug_print:
+                print(f'Skipping {len(results.nodes)} entities (inject_entities is disabled)')
             
             # # Emit citation for each memory
             # await __event_emitter__(
@@ -830,7 +863,8 @@ class Filter:
             # Determine the role to use for memory message (default to system if invalid value)
             memory_role = self.valves.memory_message_role.lower()
             if memory_role not in ["system", "user"]:
-                print(f"Invalid memory_message_role '{memory_role}', using 'system'")
+                if self.valves.debug_print:
+                    print(f"Invalid memory_message_role '{memory_role}', using 'system'")
                 memory_role = "system"
             
             # Format memory content with improved structure
@@ -905,20 +939,24 @@ class Filter:
         if __user__:
             user_valves: Filter.UserValves = __user__.get("valves", self.UserValves())
             if not user_valves.enabled:
-                print("Graphiti Memory feature is disabled for this user.")
+                if self.valves.debug_print:
+                    print("Graphiti Memory feature is disabled for this user.")
                 return body
         
         # Check if graphiti is initialized, retry if not
         if not await self._ensure_graphiti_initialized() or self.graphiti is None:
-            print("Graphiti initialization failed. Skipping memory addition.")
+            if self.valves.debug_print:
+                print("Graphiti initialization failed. Skipping memory addition.")
             return body
             
         if __user__ is None:
-            print("User information is not available. Skipping memory addition.")
+            if self.valves.debug_print:
+                print("User information is not available. Skipping memory addition.")
             return body
         chat_id = __metadata__.get('chat_id', 'unknown') if __metadata__ else 'unknown'
         message_id = __metadata__.get('message_id', 'unknown') if __metadata__ else 'unknown'
-        print(f"outlet:{__name__}, chat_id:{chat_id}, message_id:{message_id}")
+        if self.valves.debug_print:
+            print(f"outlet:{__name__}, chat_id:{chat_id}, message_id:{message_id}")
         
         # Update LLM client headers with user info (before any API calls)
         headers = self._get_user_info_headers(__user__, chat_id)
@@ -1038,7 +1076,8 @@ class Filter:
                         reference_time=datetime.now(),
                         update_communities=self.valves.update_communities,
                     )
-            print(f"Added conversation to Graphiti memory: {episode_body[:100]}...")
+            if self.valves.debug_print:
+                print(f"Added conversation to Graphiti memory: {episode_body[:100]}...")
             saved_count = 1
         except asyncio.TimeoutError:
             print(f"Timeout adding conversation to Graphiti memory after {self.valves.add_episode_timeout}s")
