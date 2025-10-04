@@ -303,12 +303,12 @@ class Filter:
     
     def _update_llm_client_headers(self, headers: dict) -> None:
         """
-        Update LLM client with extra headers using AsyncOpenAI's copy() method.
+        Update LLM client and embedder with extra headers using AsyncOpenAI's copy() method.
         
         Args:
             headers: Dictionary of headers to add to all requests
         """
-        if not headers or self.graphiti is None or self.graphiti.llm_client is None:
+        if not headers or self.graphiti is None:
             return
         
         # Only update if headers changed
@@ -317,25 +317,48 @@ class Filter:
         
         self._current_user_headers = headers
         
+        # Update LLM client
         try:
-            llm_client = self.graphiti.llm_client
-            
-            # OpenAIClient and OpenAIGenericClient both have a 'client' attribute that is AsyncOpenAI
-            if hasattr(llm_client, 'client'):
-                old_client = llm_client.client  # type: ignore
+            if self.graphiti.llm_client is not None:
+                llm_client = self.graphiti.llm_client
                 
-                # Use AsyncOpenAI's copy() method to create a new client with additional headers
-                # This preserves all existing settings while adding our headers
-                new_client = old_client.copy(default_headers=headers)  # type: ignore
-                
-                # Replace the client
-                llm_client.client = new_client  # type: ignore
-                print(f"Updated OpenAI client with headers using copy(): {list(headers.keys())}")
-            else:
-                print("Warning: LLM client does not have 'client' attribute")
-        
+                # OpenAIClient and OpenAIGenericClient both have a 'client' attribute that is AsyncOpenAI
+                if hasattr(llm_client, 'client'):
+                    old_client = llm_client.client  # type: ignore
+                    
+                    # Use AsyncOpenAI's copy() method to create a new client with additional headers
+                    # This preserves all existing settings while adding our headers
+                    new_client = old_client.copy(default_headers=headers)  # type: ignore
+                    
+                    # Replace the client
+                    llm_client.client = new_client  # type: ignore
+                    print(f"Updated LLM client with headers using copy(): {list(headers.keys())}")
+                else:
+                    print("Warning: LLM client does not have 'client' attribute")
         except Exception as e:
-            print(f"Failed to update OpenAI client headers: {e}")
+            print(f"Failed to update LLM client headers: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Update Embedder client
+        try:
+            if self.graphiti.embedder is not None:
+                embedder = self.graphiti.embedder
+                
+                # OpenAIEmbedder also has a 'client' attribute that is AsyncOpenAI
+                if hasattr(embedder, 'client'):
+                    old_client = embedder.client  # type: ignore
+                    
+                    # Use AsyncOpenAI's copy() method to create a new client with additional headers
+                    new_client = old_client.copy(default_headers=headers)  # type: ignore
+                    
+                    # Replace the client
+                    embedder.client = new_client  # type: ignore
+                    print(f"Updated Embedder client with headers using copy(): {list(headers.keys())}")
+                else:
+                    print("Warning: Embedder does not have 'client' attribute")
+        except Exception as e:
+            print(f"Failed to update Embedder headers: {e}")
             import traceback
             traceback.print_exc()
 
