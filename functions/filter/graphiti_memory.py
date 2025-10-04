@@ -640,6 +640,32 @@ class Filter:
             # Best speed/quality tradeoff for most use cases
             return COMBINED_HYBRID_SEARCH_RRF
     
+    def _get_content_from_message(self, message: dict) -> Optional[str]:
+        """
+        Extract text content from a message, handling both string and list formats.
+        
+        Open WebUI messages can have content as:
+        - Simple string: "Hello"
+        - List with text and images: [{"type": "text", "text": "Hello"}, {"type": "image_url", ...}]
+        
+        Args:
+            message: Message dictionary with 'content' field
+            
+        Returns:
+            Extracted text content, or None if no text content found
+        """
+        content = message.get("content")
+        
+        # Handle list format (with images)
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    return item.get("text", "")
+            return ""  # No text found in list
+        
+        # Handle string format
+        return content if isinstance(content, str) else ""
+    
     def _sanitize_search_query(self, query: str) -> str:
         """
         Sanitize search query to avoid FalkorDB/RediSearch syntax errors.
@@ -719,8 +745,9 @@ class Filter:
         original_length = 0
         for msg in reversed(body.get("messages", [])):
             if msg.get("role") == "user":
-                user_message = msg.get("content", "")
-                original_length = len(user_message)
+                # Extract text content from message (handles both string and list formats)
+                user_message = self._get_content_from_message(msg)
+                original_length = len(user_message) if user_message else 0
                 break
         
         if not user_message:
@@ -1083,9 +1110,11 @@ class Filter:
             if last_user_message and last_assistant_message:
                 break
         
-        # Always save user messages
+        # Always save user messages (extract text content)
         if last_user_message:
-            messages_to_save.append(("user", last_user_message["content"]))
+            user_content = self._get_content_from_message(last_user_message)
+            if user_content:
+                messages_to_save.append(("user", user_content))
         
         # Optionally save assistant responses
         # Use UserValves setting if available, otherwise fall back to Valves setting
@@ -1101,7 +1130,9 @@ class Filter:
             save_assistant = self.valves.save_assistant_response
         
         if save_assistant and last_assistant_message:
-            messages_to_save.append(("assistant", last_assistant_message["content"]))
+            assistant_content = self._get_content_from_message(last_assistant_message)
+            if assistant_content:
+                messages_to_save.append(("assistant", assistant_content))
         
         if len(messages_to_save) == 0:
             return body
