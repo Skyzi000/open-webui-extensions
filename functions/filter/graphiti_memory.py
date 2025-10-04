@@ -1251,9 +1251,9 @@ class Filter:
 
         if user_valves.show_status:
             if saved_count == 0:
-                status_msg = "Failed to save conversation to Graphiti memory"
+                status_msg = "❌ Failed to save conversation to Graphiti memory"
             else:
-                status_msg = f"Added conversation to Graphiti memory"
+                status_msg = f"✅ Added conversation to Graphiti memory"
             
             await __event_emitter__(
                 {
