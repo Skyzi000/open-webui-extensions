@@ -1043,7 +1043,7 @@ class Filter:
                 if len(entities) > 0:
                     status_parts.append(f"{len(entities)} entit{'ies' if len(entities) != 1 else 'y'}")
                 
-                status_msg = " and ".join(status_parts) + f" found ({search_duration:.2f}s)"
+                status_msg = "🧠 " + " and ".join(status_parts) + f" found ({search_duration:.2f}s)"
                 
                 await __event_emitter__(
                     {
@@ -1149,7 +1149,7 @@ class Filter:
             await __event_emitter__(
                 {
                     "type": "status",
-                    "data": {"description": f"Adding conversation to Graphiti memory...", "done": False},
+                    "data": {"description": f"✍️ Adding conversation to Graphiti memory...", "done": False},
                 }
             )
         
