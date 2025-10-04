@@ -199,6 +199,11 @@ class Filter:
             default="system",
             description="Role to use when injecting memory search results into the conversation. Options: 'system' (system message, more authoritative), 'user' (user message, more conversational). Default is 'system'.",
         )
+        
+        forward_user_info_headers: str = Field(
+            default="default",
+            description="Forward user information headers (User-Name, User-Id, User-Email, User-Role, Chat-Id) to OpenAI API. Options: 'default' (follow environment variable ENABLE_FORWARD_USER_INFO_HEADERS, defaults to false if not set), 'true' (always forward), 'false' (never forward).",
+        )
 
     class UserValves(BaseModel):
         enabled: bool = Field(
@@ -262,8 +267,21 @@ class Filter:
         Returns:
             Dictionary of headers to send to OpenAI API
         """
-        # Check environment variable ENABLE_FORWARD_USER_INFO_HEADERS
-        enable_forward = os.environ.get('ENABLE_FORWARD_USER_INFO_HEADERS', 'false').lower() == 'true'
+        # Check Valves setting first
+        valves_setting = self.valves.forward_user_info_headers.lower()
+        
+        if valves_setting == 'true':
+            enable_forward = True
+        elif valves_setting == 'false':
+            enable_forward = False
+        elif valves_setting == 'default':
+            # Use environment variable (defaults to false if not set)
+            env_setting = os.environ.get('ENABLE_FORWARD_USER_INFO_HEADERS', 'false').lower()
+            enable_forward = env_setting == 'true'
+        else:
+            # Invalid value, default to false
+            enable_forward = False
+        
         if not enable_forward:
             return {}
         
