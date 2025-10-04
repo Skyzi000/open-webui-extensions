@@ -186,6 +186,11 @@ class Filter:
             default=True,
             description="Sanitize search queries to avoid FalkorDB/RediSearch syntax errors by removing special characters like @, :, \", (, ). Disable if you want to use raw queries or if using a different backend.",
         )
+        
+        group_id_format: str = Field(
+            default="{user_email}_chat",
+            description="Format string for group_id. Available placeholders: {user_id}, {user_email}, {user_name}. Email addresses are automatically sanitized (@ becomes _at_, . becomes _). Examples: '{user_email}_chat', '{user_id}_chat', 'user_{user_id}'. Set to empty string '' to disable group filtering (all users share the same memory space).",
+        )
 
     class UserValves(BaseModel):
         enabled: bool = Field(
@@ -375,6 +380,45 @@ class Filter:
         
         return True
     
+    def _get_group_id(self, user: dict) -> Optional[str]:
+        """
+        Generate group_id for the user based on format string configuration.
+        
+        Args:
+            user: User dictionary containing 'id' and optionally 'email', 'name'
+            
+        Returns:
+            Sanitized group_id safe for Graphiti (alphanumeric, dashes, underscores only),
+            or None if group_id_format is empty (to disable group filtering)
+        """
+        # Return None if format is empty (disable group filtering)
+        if not self.valves.group_id_format or self.valves.group_id_format.strip() == "":
+            return None
+        
+        # Prepare replacement values
+        user_id = user.get('id', 'unknown')
+        user_email = user.get('email', user_id)
+        user_name = user.get('name', user_id)
+        
+        # Sanitize email to meet Graphiti's group_id requirements
+        sanitized_email = user_email.replace('@', '_at_').replace('.', '_')
+        
+        # Sanitize name (replace spaces and special characters)
+        import re
+        sanitized_name = re.sub(r'[^a-zA-Z0-9_-]', '_', user_name)
+        
+        # Format the group_id using the template
+        group_id = self.valves.group_id_format.format(
+            user_id=user_id,
+            user_email=sanitized_email,
+            user_name=sanitized_name,
+        )
+        
+        # Final sanitization to ensure only alphanumeric, dashes, underscores
+        group_id = re.sub(r'[^a-zA-Z0-9_-]', '_', group_id)
+        
+        return group_id
+    
     def _sanitize_search_query(self, query: str) -> str:
         """
         Sanitize search query to avoid FalkorDB/RediSearch syntax errors.
@@ -484,18 +528,21 @@ class Filter:
                 }
             )
         
-        # Use email as group_id for consistency with outlet
-        # Sanitize email to meet Graphiti's group_id requirements (alphanumeric, dashes, underscores only)
-        user_email = __user__.get('email', __user__['id'])
-        sanitized_email = user_email.replace('@', '_at_').replace('.', '_')
-        group_id = f"{sanitized_email}_chat"
+        # Generate group_id using configured method (email or user ID)
+        group_id = self._get_group_id(__user__)
         
         # Perform search with error handling for FalkorDB/RediSearch syntax issues
         try:
-            results = await self.graphiti.search(
-                query=sanitized_query,
-                group_ids=[group_id],
-            )
+            # Only pass group_ids if group_id is not None
+            if group_id is not None:
+                results = await self.graphiti.search(
+                    query=sanitized_query,
+                    group_ids=[group_id],
+                )
+            else:
+                results = await self.graphiti.search(
+                    query=sanitized_query,
+                )
         except Exception as e:
             error_msg = str(e)
             if "Syntax error" in error_msg or "RediSearch" in error_msg:
@@ -693,18 +740,41 @@ class Filter:
                 }
             )
         
-        # Save the conversation as a single episode with timeout
-        # Sanitize email to meet Graphiti's group_id requirements (alphanumeric, dashes, underscores only)
-        user_email = __user__.get('email', __user__['id'])
-        sanitized_email = user_email.replace('@', '_at_').replace('.', '_')
-        group_id = f"{sanitized_email}_chat"
+        # Generate group_id using configured method (email or user ID)
+        group_id = self._get_group_id(__user__)
         saved_count = 0
         
         try:
             # Apply timeout if configured
             if self.valves.add_episode_timeout > 0:
-                await asyncio.wait_for(
-                    self.graphiti.add_episode(
+                if group_id is not None:
+                    await asyncio.wait_for(
+                        self.graphiti.add_episode(
+                            name=f"Chat_Interaction_{chat_id}_{message_id}",
+                            episode_body=episode_body,
+                            source=EpisodeType.message,
+                            source_description="Chat conversation",
+                            reference_time=datetime.now(),
+                            group_id=group_id,
+                            update_communities=self.valves.update_communities,
+                        ),
+                        timeout=self.valves.add_episode_timeout
+                    )
+                else:
+                    await asyncio.wait_for(
+                        self.graphiti.add_episode(
+                            name=f"Chat_Interaction_{chat_id}_{message_id}",
+                            episode_body=episode_body,
+                            source=EpisodeType.message,
+                            source_description="Chat conversation",
+                            reference_time=datetime.now(),
+                            update_communities=self.valves.update_communities,
+                        ),
+                        timeout=self.valves.add_episode_timeout
+                    )
+            else:
+                if group_id is not None:
+                    await self.graphiti.add_episode(
                         name=f"Chat_Interaction_{chat_id}_{message_id}",
                         episode_body=episode_body,
                         source=EpisodeType.message,
@@ -712,19 +782,16 @@ class Filter:
                         reference_time=datetime.now(),
                         group_id=group_id,
                         update_communities=self.valves.update_communities,
-                    ),
-                    timeout=self.valves.add_episode_timeout
-                )
-            else:
-                await self.graphiti.add_episode(
-                    name=f"Chat_Interaction_{chat_id}_{message_id}",
-                    episode_body=episode_body,
-                    source=EpisodeType.message,
-                    source_description="Chat conversation",
-                    reference_time=datetime.now(),
-                    group_id=group_id,
-                    update_communities=self.valves.update_communities,
-                )
+                    )
+                else:
+                    await self.graphiti.add_episode(
+                        name=f"Chat_Interaction_{chat_id}_{message_id}",
+                        episode_body=episode_body,
+                        source=EpisodeType.message,
+                        source_description="Chat conversation",
+                        reference_time=datetime.now(),
+                        update_communities=self.valves.update_communities,
+                    )
             print(f"Added conversation to Graphiti memory: {episode_body[:100]}...")
             saved_count = 1
         except asyncio.TimeoutError:
