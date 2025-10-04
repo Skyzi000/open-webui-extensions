@@ -5,7 +5,7 @@ description: Automatically identify and store valuable information from chats as
 author_email: dev@skyzi.jp
 author_url: https://github.com/Skyzi000
 repository_url: https://github.com/Skyzi000/open-webui-extensions
-version: 0.2
+version: 0.3
 requirements: graphiti-core[falkordb]
 
 Design:
@@ -52,7 +52,7 @@ from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.nodes import EpisodeType
-from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
+from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 
 from open_webui.main import app as webui_app
@@ -661,15 +661,19 @@ class Filter:
         
         # Perform search with error handling for FalkorDB/RediSearch syntax issues
         try:
+            # Use search_() for advanced search that returns SearchResults with nodes, edges, episodes, communities
+            # COMBINED_HYBRID_SEARCH_RRF searches both edges (facts) and nodes (entities)
             # Only pass group_ids if group_id is not None
             if group_id is not None:
-                results = await self.graphiti.search(
+                results = await self.graphiti.search_(
                     query=sanitized_query,
                     group_ids=[group_id],
+                    config=COMBINED_HYBRID_SEARCH_RRF,  # Use combined hybrid search for both edges and nodes
                 )
             else:
-                results = await self.graphiti.search(
+                results = await self.graphiti.search_(
                     query=sanitized_query,
+                    config=COMBINED_HYBRID_SEARCH_RRF,  # Use combined hybrid search for both edges and nodes
                 )
         except Exception as e:
             error_msg = str(e)
@@ -693,7 +697,8 @@ class Filter:
                     )
             return body
         
-        if len(results) == 0:
+        # Check if any results were found
+        if len(results.edges) == 0 and len(results.nodes) == 0:
             if user_valves.show_status:
                 await __event_emitter__(
                     {
@@ -708,12 +713,11 @@ class Filter:
         print('\nSearch Results:')
 
         facts = []
-        id = 0
+        entities = {}  # Dictionary to store unique entities: {name: summary}
         
-        for result in results:
-            
-            print(f'UUID: {result.uuid}')
-
+        # Process EntityEdge results (relations/facts)
+        for result in results.edges:
+            print(f'Edge UUID: {result.uuid}')
             print(f'Fact({result.name}): {result.fact}')
             if hasattr(result, 'valid_at') and result.valid_at:
                 print(f'Valid from: {result.valid_at}')
@@ -721,7 +725,17 @@ class Filter:
                 print(f'Valid until: {result.invalid_at}')
 
             facts.append((result.fact, result.valid_at, result.invalid_at, result.name))
-
+            print('---')
+        
+        # Process EntityNode results (entities with summaries)
+        for result in results.nodes:
+            print(f'Node UUID: {result.uuid}')
+            print(f'Entity({result.name}): {result.summary}')
+            
+            # Store entity information
+            if result.name and result.summary:
+                entities[result.name] = result.summary
+            
             print('---')
             # # Emit citation for each memory
             # await __event_emitter__(
@@ -753,7 +767,8 @@ class Filter:
             #     }
             # )
             
-        if len(facts) > 0:
+        # Insert memory message if we have facts OR entities
+        if len(facts) > 0 or len(entities) > 0:
             # Find the index of the last user message
             last_user_msg_index = None
             for i in range(len(body['messages']) - 1, -1, -1):
@@ -767,10 +782,41 @@ class Filter:
                 print(f"Invalid memory_message_role '{memory_role}', using 'system'")
                 memory_role = "system"
             
+            # Format memory content with improved structure
+            memory_content = "FACTS and ENTITIES represent relevant context to the current conversation.\n"
+            
+            # Add facts section if any facts were found
+            if len(facts) > 0:
+                memory_content += "# These are the most relevant facts and their valid date ranges\n"
+                memory_content += "# format: FACT (Date range: from - to)\n"
+                memory_content += "<FACTS>\n"
+                
+                for fact, valid_at, invalid_at, name in facts:
+                    # Format date range
+                    valid_str = str(valid_at) if valid_at else "unknown"
+                    invalid_str = str(invalid_at) if invalid_at else "present"
+                    
+                    memory_content += f"  - {fact} ({valid_str} - {invalid_str})\n"
+                
+                memory_content += "</FACTS>"
+            
+            # Add entities section if any entities were found
+            if len(entities) > 0:
+                if len(facts) > 0:
+                    memory_content += "\n\n"  # Add spacing between sections
+                memory_content += "# These are the most relevant entities\n"
+                memory_content += "# ENTITY_NAME: entity summary\n"
+                memory_content += "<ENTITIES>\n"
+                
+                for entity_name, entity_summary in entities.items():
+                    memory_content += f"  - {entity_name}: {entity_summary}\n"
+                
+                memory_content += "</ENTITIES>"
+            
             # Insert memory before the last user message
             memory_message = {
                 "role": memory_role,
-                "content": f"Graphiti memories were found:\n" + "\n".join([f"- {name}: {fact} (valid_at: {valid_at}, invalid_at: {invalid_at})" for fact, valid_at, invalid_at, name in facts])
+                "content": memory_content
             }
             
             if last_user_msg_index is not None:
@@ -780,10 +826,19 @@ class Filter:
                 body['messages'].append(memory_message)
             
             if user_valves.show_status:
+                # Build status message showing what was found
+                status_parts = []
+                if len(facts) > 0:
+                    status_parts.append(f"{len(facts)} fact{'s' if len(facts) != 1 else ''}")
+                if len(entities) > 0:
+                    status_parts.append(f"{len(entities)} entit{'ies' if len(entities) != 1 else 'y'}")
+                
+                status_msg = " and ".join(status_parts) + " found"
+                
                 await __event_emitter__(
                     {
                         "type": "status",
-                        "data": {"description": f"{len(facts)} memories found: {', '.join([fact for fact, _, _, _ in facts])}", "done": True},
+                        "data": {"description": status_msg, "done": True},
                     }
                 )
         return body
