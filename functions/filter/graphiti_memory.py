@@ -872,33 +872,33 @@ class Filter:
                 memory_role = "system"
             
             # Format memory content with improved structure
-            memory_content = "FACTS and ENTITIES represent relevant context to the current conversation.\n"
+            memory_content = "FACTS and ENTITIES represent relevant context to the current conversation.  \n"
             
             # Add facts section if any facts were found
             if len(facts) > 0:
-                memory_content += "# These are the most relevant facts and their valid date ranges\n"
-                memory_content += "# format: FACT (Date range: from - to)\n"
-                memory_content += "<FACTS>\n"
+                memory_content += "# These are the most relevant facts and their valid date ranges  \n"
+                memory_content += "# format: FACT (Date range: from - to)  \n"
+                memory_content += "<FACTS>  \n"
                 
                 for fact, valid_at, invalid_at, name in facts:
                     # Format date range
                     valid_str = str(valid_at) if valid_at else "unknown"
                     invalid_str = str(invalid_at) if invalid_at else "present"
                     
-                    memory_content += f"  - {fact} ({valid_str} - {invalid_str})\n"
+                    memory_content += f"  - {fact} ({valid_str} - {invalid_str})  \n"
                 
                 memory_content += "</FACTS>"
             
             # Add entities section if any entities were found
             if len(entities) > 0:
                 if len(facts) > 0:
-                    memory_content += "\n\n"  # Add spacing between sections
-                memory_content += "# These are the most relevant entities\n"
-                memory_content += "# ENTITY_NAME: entity summary\n"
-                memory_content += "<ENTITIES>\n"
+                    memory_content += "  \n\n"  # Add spacing between sections
+                memory_content += "# These are the most relevant entities  \n"
+                memory_content += "# ENTITY_NAME: entity summary  \n"
+                memory_content += "<ENTITIES>  \n"
                 
                 for entity_name, entity_summary in entities.items():
-                    memory_content += f"  - {entity_name}: {entity_summary}\n"
+                    memory_content += f"  - {entity_name}: {entity_summary}  \n"
                 
                 memory_content += "</ENTITIES>"
             
