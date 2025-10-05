@@ -745,10 +745,19 @@ class Filter:
                 print("User information is not available. Skipping memory search.")
             return body
         
+        # Check if this is a "Continue Response" action
+        # When user clicks "Continue Response" button, the last message is an assistant message
+        # In this case, we should skip memory search to avoid injecting memories again
+        messages = body.get("messages", [])
+        if messages and messages[-1].get("role") == "assistant":
+            if self.valves.debug_print:
+                print("Detected 'Continue Response' action (last message is assistant). Skipping memory search.")
+            return body
+        
         # Find the last user message (ignore assistant/tool messages)
         user_message = None
         original_length = 0
-        for msg in reversed(body.get("messages", [])):
+        for msg in reversed(messages):
             if msg.get("role") == "user":
                 # Extract text content from message (handles both string and list formats)
                 user_message = self._get_content_from_message(msg)
