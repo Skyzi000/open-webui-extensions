@@ -1157,11 +1157,14 @@ class Filter:
         group_id = self._get_group_id(__user__)
         saved_count = 0
         
+        # Store add_episode results for detailed status display
+        add_results = None
+        
         try:
             # Apply timeout if configured
             if self.valves.add_episode_timeout > 0:
                 if group_id is not None:
-                    await asyncio.wait_for(
+                    add_results = await asyncio.wait_for(
                         self.graphiti.add_episode(
                             name=f"Chat_Interaction_{chat_id}_{message_id}",
                             episode_body=episode_body,
@@ -1174,7 +1177,7 @@ class Filter:
                         timeout=self.valves.add_episode_timeout
                     )
                 else:
-                    await asyncio.wait_for(
+                    add_results = await asyncio.wait_for(
                         self.graphiti.add_episode(
                             name=f"Chat_Interaction_{chat_id}_{message_id}",
                             episode_body=episode_body,
@@ -1187,7 +1190,7 @@ class Filter:
                     )
             else:
                 if group_id is not None:
-                    await self.graphiti.add_episode(
+                    add_results = await self.graphiti.add_episode(
                         name=f"Chat_Interaction_{chat_id}_{message_id}",
                         episode_body=episode_body,
                         source=EpisodeType.message,
@@ -1197,7 +1200,7 @@ class Filter:
                         update_communities=self.valves.update_communities,
                     )
                 else:
-                    await self.graphiti.add_episode(
+                    add_results = await self.graphiti.add_episode(
                         name=f"Chat_Interaction_{chat_id}_{message_id}",
                         episode_body=episode_body,
                         source=EpisodeType.message,
@@ -1207,7 +1210,31 @@ class Filter:
                     )
             if self.valves.debug_print:
                 print(f"Added conversation to Graphiti memory: {episode_body[:100]}...")
+                if add_results:
+                    print(f"Extracted {len(add_results.nodes)} entities and {len(add_results.edges)} relationships")
             saved_count = 1
+
+            # Display extracted entities and facts in status
+            if user_valves.show_status and add_results:
+                # Show all entities
+                if add_results.nodes:
+                    for idx, node in enumerate(add_results.nodes, 1):
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {"description": f"👤 Entity {idx}: {node.name}", "done": False},
+                            }
+                        )
+                
+                # Show all Facts
+                if add_results.edges:
+                    for idx, edge in enumerate(add_results.edges, 1):
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {"description": f"📝 Fact {idx}: {edge.fact}", "done": False},
+                            }
+                        )
         except asyncio.TimeoutError:
             print(f"Timeout adding conversation to Graphiti memory after {self.valves.add_episode_timeout}s")
             if user_valves.show_status:
@@ -1253,7 +1280,20 @@ class Filter:
             if saved_count == 0:
                 status_msg = "❌ Failed to save conversation to Graphiti memory"
             else:
-                status_msg = f"✅ Added conversation to Graphiti memory"
+                # Build detailed status message with entity and relationship counts
+                status_parts = ["✅ Added conversation to Graphiti memory"]
+                if add_results:
+                    detail_parts = []
+                    if add_results.nodes:
+                        detail_parts.append(f"{len(add_results.nodes)} entit{'ies' if len(add_results.nodes) != 1 else 'y'}")
+                    if add_results.edges:
+                        detail_parts.append(f"{len(add_results.edges)} relation{'s' if len(add_results.edges) != 1 else ''}")
+                    if detail_parts:
+                        status_msg = " - ".join(status_parts + [" and ".join(detail_parts) + " extracted"])
+                    else:
+                        status_msg = status_parts[0]
+                else:
+                    status_msg = status_parts[0]
             
             await __event_emitter__(
                 {
