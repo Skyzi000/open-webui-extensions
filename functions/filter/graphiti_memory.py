@@ -239,6 +239,11 @@ class Filter:
             description="Forward user information headers (User-Name, User-Id, User-Email, User-Role, Chat-Id) to OpenAI API. Options: 'default' (follow environment variable ENABLE_FORWARD_USER_INFO_HEADERS, defaults to false if not set), 'true' (always forward), 'false' (never forward).",
         )
         
+        use_user_name_in_episode: bool = Field(
+            default=False,
+            description="Use actual user name instead of 'User' label when saving conversations to memory. When enabled, episodes will be saved as '{user_name}: {message}' instead of 'User: {message}'.",
+        )
+        
         debug_print: bool = Field(
             default=False,
             description="Enable debug printing to console. When enabled, prints detailed information about search results, memory injection, and processing steps. Useful for troubleshooting.",
@@ -1140,7 +1145,14 @@ class Filter:
         # Construct episode body in "User: {message}\nAssistant: {message}" format for EpisodeType.message
         episode_parts = []
         for role, content in messages_to_save:
-            role_label = "User" if role == "user" else "Assistant"
+            if role == "user":
+                # Use actual user name if enabled, otherwise use "User"
+                if self.valves.use_user_name_in_episode and __user__.get('name'):
+                    role_label = __user__['name']
+                else:
+                    role_label = "User"
+            else:
+                role_label = "Assistant"
             episode_parts.append(f"{role_label}: {content}")
         
         episode_body = "\n".join(episode_parts)
