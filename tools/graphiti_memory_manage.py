@@ -1201,6 +1201,43 @@ class Tools:
                 if __event_call__:
                     return "🚫 User cancelled memory clearing"
             
+            # Require text input confirmation
+            if __event_call__:
+                try:
+                    if is_japanese:
+                        input_task = __event_call__(
+                            {
+                                "type": "input",
+                                "data": {
+                                    "title": "最終確認",
+                                    "message": f"本当に全メモリ({node_count + edge_count + episode_count}件)を削除しますか？\n確認のため 'CLEAR_ALL_MEMORY' と入力してください。\n⏰ {self.valves.confirmation_timeout}秒以内に入力しないと自動的にキャンセルされます。",
+                                    "placeholder": "CLEAR_ALL_MEMORY"
+                                }
+                            }
+                        )
+                    else:
+                        input_task = __event_call__(
+                            {
+                                "type": "input",
+                                "data": {
+                                    "title": "Final Confirmation",
+                                    "message": f"Are you sure you want to delete all memory ({node_count + edge_count + episode_count} items)?\nPlease type 'CLEAR_ALL_MEMORY' to confirm.\n⏰ Auto-cancel in {self.valves.confirmation_timeout} seconds if no input is provided.",
+                                    "placeholder": "CLEAR_ALL_MEMORY"
+                                }
+                            }
+                        )
+                    
+                    input_result = await asyncio.wait_for(input_task, timeout=self.valves.confirmation_timeout)
+                    
+                    if input_result != "CLEAR_ALL_MEMORY":
+                        return "🚫 確認文字列が一致しません。メモリ削除をキャンセルしました。" if is_japanese else "🚫 Confirmation text does not match. Memory clearing cancelled."
+                except asyncio.TimeoutError:
+                    return "🚫 入力タイムアウト。メモリ削除をキャンセルしました。" if is_japanese else "🚫 Input timeout. Memory clearing cancelled."
+                except Exception as e:
+                    if self.valves.debug_print:
+                        print(f"Input confirmation error: {e}")
+                    return "🚫 確認入力がキャンセルされました。" if is_japanese else "🚫 Input confirmation cancelled."
+            
             # Use Node.delete_by_group_id() - the correct method for clearing all data
             try:
                 if self.valves.debug_print:
