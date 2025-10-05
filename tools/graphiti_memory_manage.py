@@ -1043,22 +1043,73 @@ class Tools:
             return "❌ Error: Memory service is not available"
         
         try:
-            # Prepare preview items
+            # Prepare preview items with actual content from database
             preview_items = []
+            
+            # Fetch and display node information
             if node_uuids.strip():
                 uuids = [uuid.strip() for uuid in node_uuids.split(',') if uuid.strip()]
                 for i, uuid in enumerate(uuids, 1):
-                    preview_items.append(f"[Node {i}] UUID: {uuid}")
+                    try:
+                        # Fetch node details from database
+                        nodes = await EntityNode.get_by_uuids(self.helper.graphiti.driver, [uuid])
+                        if nodes:
+                            node = nodes[0]
+                            name = getattr(node, 'name', 'Unknown')
+                            summary = getattr(node, 'summary', 'No description')
+                            if len(summary) > 80:
+                                summary = summary[:80] + "..."
+                            preview_items.append(f"[Node {i}] {name}  \nUUID: {uuid}  \n概要: {summary}")
+                        else:
+                            preview_items.append(f"[Node {i}] ⚠️ Not found  \nUUID: {uuid}")
+                    except Exception as e:
+                        preview_items.append(f"[Node {i}] ⚠️ Error fetching details  \nUUID: {uuid}")
+                        if self.valves.debug_print:
+                            print(f"Error fetching node {uuid}: {e}")
             
+            # Fetch and display edge information
             if edge_uuids.strip():
                 uuids = [uuid.strip() for uuid in edge_uuids.split(',') if uuid.strip()]
                 for i, uuid in enumerate(uuids, 1):
-                    preview_items.append(f"[Edge {i}] UUID: {uuid}")
+                    try:
+                        # Fetch edge details from database
+                        edges = await EntityEdge.get_by_uuids(self.helper.graphiti.driver, [uuid])
+                        if edges:
+                            edge = edges[0]
+                            fact = getattr(edge, 'fact', 'Unknown relationship')
+                            if len(fact) > 80:
+                                fact = fact[:80] + "..."
+                            valid_at = getattr(edge, 'valid_at', 'unknown')
+                            invalid_at = getattr(edge, 'invalid_at', 'present')
+                            preview_items.append(f"[Edge {i}] {fact}  \nUUID: {uuid}  \n期間: {valid_at} → {invalid_at}")
+                        else:
+                            preview_items.append(f"[Edge {i}] ⚠️ Not found  \nUUID: {uuid}")
+                    except Exception as e:
+                        preview_items.append(f"[Edge {i}] ⚠️ Error fetching details  \nUUID: {uuid}")
+                        if self.valves.debug_print:
+                            print(f"Error fetching edge {uuid}: {e}")
             
+            # Fetch and display episode information
             if episode_uuids.strip():
                 uuids = [uuid.strip() for uuid in episode_uuids.split(',') if uuid.strip()]
                 for i, uuid in enumerate(uuids, 1):
-                    preview_items.append(f"[Episode {i}] UUID: {uuid}")
+                    try:
+                        # Fetch episode details from database
+                        episodes = await EpisodicNode.get_by_uuids(self.helper.graphiti.driver, [uuid])
+                        if episodes:
+                            episode = episodes[0]
+                            name = getattr(episode, 'name', 'Unknown episode')
+                            content = getattr(episode, 'content', '')
+                            if len(content) > 80:
+                                content = content[:80] + "..."
+                            created_at = getattr(episode, 'created_at', 'unknown')
+                            preview_items.append(f"[Episode {i}] {name}  \nUUID: {uuid}  \n内容: {content}  \n作成: {created_at}")
+                        else:
+                            preview_items.append(f"[Episode {i}] ⚠️ Not found  \nUUID: {uuid}")
+                    except Exception as e:
+                        preview_items.append(f"[Episode {i}] ⚠️ Error fetching details  \nUUID: {uuid}")
+                        if self.valves.debug_print:
+                            print(f"Error fetching episode {uuid}: {e}")
             
             if not preview_items:
                 return "ℹ️ No UUIDs provided for deletion"
