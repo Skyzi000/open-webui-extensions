@@ -540,7 +540,7 @@ class Tools:
                 
                 result += f"**{i}. {name}**\n"
                 result += f"   Summary: {summary}\n"
-                result += f"   UUID: `{uuid[:16]}...`\n\n"
+                result += f"   UUID: `{uuid}`\n\n"
             
             result += f"💡 To delete these entities, use `search_and_delete_entities` with the same query and limit."
             
@@ -613,7 +613,7 @@ class Tools:
                 
                 result += f"**{i}. {fact_text}**\n"
                 result += f"   Period: {valid_at} → {invalid_at}\n"
-                result += f"   UUID: `{uuid[:16]}...`\n\n"
+                result += f"   UUID: `{uuid}`\n\n"
             
             result += f"💡 To delete these facts, use `search_and_delete_facts` with the same query and limit."
             
@@ -693,7 +693,7 @@ class Tools:
                 result += f"**{i}. {name}**\n"
                 result += f"   Content: {content_preview}\n"
                 result += f"   Created: {created_at}\n"
-                result += f"   UUID: `{uuid[:16]}...`\n\n"
+                result += f"   UUID: `{uuid}`\n\n"
             
             result += f"💡 To delete these episodes, use `search_and_delete_episodes` with the same query and limit."
             
@@ -1048,17 +1048,17 @@ class Tools:
             if node_uuids.strip():
                 uuids = [uuid.strip() for uuid in node_uuids.split(',') if uuid.strip()]
                 for i, uuid in enumerate(uuids, 1):
-                    preview_items.append(f"[Node {i}] UUID: {uuid[:8]}...")
+                    preview_items.append(f"[Node {i}] UUID: {uuid}")
             
             if edge_uuids.strip():
                 uuids = [uuid.strip() for uuid in edge_uuids.split(',') if uuid.strip()]
                 for i, uuid in enumerate(uuids, 1):
-                    preview_items.append(f"[Edge {i}] UUID: {uuid[:8]}...")
+                    preview_items.append(f"[Edge {i}] UUID: {uuid}")
             
             if episode_uuids.strip():
                 uuids = [uuid.strip() for uuid in episode_uuids.split(',') if uuid.strip()]
                 for i, uuid in enumerate(uuids, 1):
-                    preview_items.append(f"[Episode {i}] UUID: {uuid[:8]}...")
+                    preview_items.append(f"[Episode {i}] UUID: {uuid}")
             
             if not preview_items:
                 return "ℹ️ No UUIDs provided for deletion"
