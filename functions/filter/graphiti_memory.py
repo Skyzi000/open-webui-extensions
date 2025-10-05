@@ -1216,23 +1216,27 @@ class Filter:
 
             # Display extracted entities and facts in status
             if user_valves.show_status and add_results:
-                # Show all entities
-                if add_results.nodes:
-                    for idx, node in enumerate(add_results.nodes, 1):
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {"description": f"👤 Entity {idx}: {node.name}", "done": False},
-                            }
-                        )
-                
                 # Show all Facts
                 if add_results.edges:
                     for idx, edge in enumerate(add_results.edges, 1):
                         await __event_emitter__(
                             {
                                 "type": "status",
-                                "data": {"description": f"📝 Fact {idx}: {edge.fact}", "done": False},
+                                "data": {"description": f"📝 Fact {idx}/{len(add_results.edges)}: {edge.fact}", "done": False},
+                            }
+                        )
+                
+                # Show all entities
+                if add_results.nodes:
+                    for idx, node in enumerate(add_results.nodes, 1):
+                        # Display entity name and summary (if available)
+                        entity_display = f"{node.name}"
+                        if hasattr(node, 'summary') and node.summary:
+                            entity_display += f" - {node.summary}"
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {"description": f"👤 Entity {idx}/{len(add_results.nodes)}: {entity_display}", "done": False},
                             }
                         )
         except asyncio.TimeoutError:
