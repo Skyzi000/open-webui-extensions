@@ -1043,6 +1043,10 @@ class Tools:
             return "❌ Error: Memory service is not available"
         
         try:
+            # Get user's language preference first
+            user_valves = __user__.get("valves")
+            is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
+            
             # Prepare preview items with actual content from database
             preview_items = []
             
@@ -1059,11 +1063,14 @@ class Tools:
                             summary = getattr(node, 'summary', 'No description')
                             if len(summary) > 80:
                                 summary = summary[:80] + "..."
-                            preview_items.append(f"[Node {i}] {name}  \nUUID: {uuid}  \n概要: {summary}")
+                            summary_label = "概要" if is_japanese else "Summary"
+                            preview_items.append(f"[Node {i}] {name}  \nUUID: {uuid}  \n{summary_label}: {summary}")
                         else:
-                            preview_items.append(f"[Node {i}] ⚠️ Not found  \nUUID: {uuid}")
+                            not_found_msg = "見つかりません" if is_japanese else "Not found"
+                            preview_items.append(f"[Node {i}] ⚠️ {not_found_msg}  \nUUID: {uuid}")
                     except Exception as e:
-                        preview_items.append(f"[Node {i}] ⚠️ Error fetching details  \nUUID: {uuid}")
+                        error_msg = "詳細取得エラー" if is_japanese else "Error fetching details"
+                        preview_items.append(f"[Node {i}] ⚠️ {error_msg}  \nUUID: {uuid}")
                         if self.valves.debug_print:
                             print(f"Error fetching node {uuid}: {e}")
             
@@ -1081,11 +1088,14 @@ class Tools:
                                 fact = fact[:80] + "..."
                             valid_at = getattr(edge, 'valid_at', 'unknown')
                             invalid_at = getattr(edge, 'invalid_at', 'present')
-                            preview_items.append(f"[Edge {i}] {fact}  \nUUID: {uuid}  \n期間: {valid_at} → {invalid_at}")
+                            period_label = "期間" if is_japanese else "Period"
+                            preview_items.append(f"[Edge {i}] {fact}  \nUUID: {uuid}  \n{period_label}: {valid_at} → {invalid_at}")
                         else:
-                            preview_items.append(f"[Edge {i}] ⚠️ Not found  \nUUID: {uuid}")
+                            not_found_msg = "見つかりません" if is_japanese else "Not found"
+                            preview_items.append(f"[Edge {i}] ⚠️ {not_found_msg}  \nUUID: {uuid}")
                     except Exception as e:
-                        preview_items.append(f"[Edge {i}] ⚠️ Error fetching details  \nUUID: {uuid}")
+                        error_msg = "詳細取得エラー" if is_japanese else "Error fetching details"
+                        preview_items.append(f"[Edge {i}] ⚠️ {error_msg}  \nUUID: {uuid}")
                         if self.valves.debug_print:
                             print(f"Error fetching edge {uuid}: {e}")
             
@@ -1103,11 +1113,15 @@ class Tools:
                             if len(content) > 80:
                                 content = content[:80] + "..."
                             created_at = getattr(episode, 'created_at', 'unknown')
-                            preview_items.append(f"[Episode {i}] {name}  \nUUID: {uuid}  \n内容: {content}  \n作成: {created_at}")
+                            content_label = "内容" if is_japanese else "Content"
+                            created_label = "作成" if is_japanese else "Created"
+                            preview_items.append(f"[Episode {i}] {name}  \nUUID: {uuid}  \n{content_label}: {content}  \n{created_label}: {created_at}")
                         else:
-                            preview_items.append(f"[Episode {i}] ⚠️ Not found  \nUUID: {uuid}")
+                            not_found_msg = "見つかりません" if is_japanese else "Not found"
+                            preview_items.append(f"[Episode {i}] ⚠️ {not_found_msg}  \nUUID: {uuid}")
                     except Exception as e:
-                        preview_items.append(f"[Episode {i}] ⚠️ Error fetching details  \nUUID: {uuid}")
+                        error_msg = "詳細取得エラー" if is_japanese else "Error fetching details"
+                        preview_items.append(f"[Episode {i}] ⚠️ {error_msg}  \nUUID: {uuid}")
                         if self.valves.debug_print:
                             print(f"Error fetching episode {uuid}: {e}")
             
@@ -1226,18 +1240,25 @@ class Tools:
                 episode_count = 0
             
             if node_count == 0 and edge_count == 0 and episode_count == 0:
-                return "ℹ️ メモリは既に空です"
+                return "ℹ️ Memory is already empty"
             
             # Get user's language preference
             user_valves = __user__.get("valves")
             is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
             
             # Show confirmation dialog
-            preview_items = [
-                f"エンティティ(Entity): {node_count}個",
-                f"関係性(Fact): {edge_count}個",
-                f"エピソード(Episode): {episode_count}個",
-            ]
+            if is_japanese:
+                preview_items = [
+                    f"エンティティ(Entity): {node_count}個",
+                    f"関係性(Fact): {edge_count}個",
+                    f"エピソード(Episode): {episode_count}個",
+                ]
+            else:
+                preview_items = [
+                    f"Entities: {node_count} items",
+                    f"Facts: {edge_count} items",
+                    f"Episodes: {episode_count} items",
+                ]
             
             confirmed = await self.helper.show_confirmation_dialog(
                 title="⚠️ 全メモリ削除の最終確認" if is_japanese else "⚠️ Final Confirmation: Clear All Memory",
@@ -1281,13 +1302,13 @@ class Tools:
                     input_result = await asyncio.wait_for(input_task, timeout=self.valves.confirmation_timeout)
                     
                     if input_result != "CLEAR_ALL_MEMORY":
-                        return "🚫 確認文字列が一致しません。メモリ削除をキャンセルしました。" if is_japanese else "🚫 Confirmation text does not match. Memory clearing cancelled."
+                        return "🚫 Confirmation text does not match. Memory clearing cancelled."
                 except asyncio.TimeoutError:
-                    return "🚫 入力タイムアウト。メモリ削除をキャンセルしました。" if is_japanese else "🚫 Input timeout. Memory clearing cancelled."
+                    return "🚫 Input timeout. Memory clearing cancelled."
                 except Exception as e:
                     if self.valves.debug_print:
                         print(f"Input confirmation error: {e}")
-                    return "🚫 確認入力がキャンセルされました。" if is_japanese else "🚫 Input confirmation cancelled."
+                    return "🚫 Input confirmation cancelled."
             
             # Use Node.delete_by_group_id() - the correct method for clearing all data
             try:
@@ -1296,10 +1317,10 @@ class Tools:
                 
                 await EntityNode.delete_by_group_id(self.helper.graphiti.driver, group_id)
                 
-                result = f"🗑️ 全メモリを削除しました:\n"
-                result += f"  - {node_count} エンティティ削除\n"
-                result += f"  - {edge_count} 関係性削除\n"
-                result += f"  - {episode_count} エピソード削除"
+                result = f"🗑️ All memory cleared:\n"
+                result += f"  - {node_count} entities deleted\n"
+                result += f"  - {edge_count} facts deleted\n"
+                result += f"  - {episode_count} episodes deleted"
                 
                 return result
             except Exception as e:
