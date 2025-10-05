@@ -670,6 +670,7 @@ class Tools:
         self,
         query: str,
         limit: int = 10,
+        show_uuid: bool = False,
         __user__: dict = {},
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> str:
@@ -681,6 +682,7 @@ class Tools:
         
         :param query: Search query to find entities (e.g., "John Smith", "Python programming")
         :param limit: Maximum number of entities to return (default: 10, max: 100)
+        :param show_uuid: Whether to display UUID in search results (default: False). Set to True if you need to see UUIDs for debugging or manual deletion.
         :return: List of found entities with their details
         
         Note: __user__ and __event_emitter__ are automatically injected by the system.
@@ -725,7 +727,9 @@ class Tools:
                 
                 result += f"**{i}. {name}**\n"
                 result += f"   Summary: {summary}\n"
-                result += f"   UUID: `{uuid}`\n\n"
+                if show_uuid:
+                    result += f"   UUID: `{uuid}`\n"
+                result += "\n"
             
             result += f"💡 To delete these entities, use `search_and_delete_entities` with the same query and limit."
             
@@ -742,6 +746,7 @@ class Tools:
         self,
         query: str,
         limit: int = 10,
+        show_uuid: bool = False,
         __user__: dict = {},
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> str:
@@ -753,6 +758,7 @@ class Tools:
         
         :param query: Search query to find relationships (e.g., "works at", "friends with")
         :param limit: Maximum number of facts to return (default: 10, max: 100)
+        :param show_uuid: Whether to display UUID in search results (default: False). Set to True if you need to see UUIDs for debugging or manual deletion.
         :return: List of found facts with their details
         
         Note: __user__ and __event_emitter__ are automatically injected by the system.
@@ -798,7 +804,9 @@ class Tools:
                 
                 result += f"**{i}. {fact_text}**\n"
                 result += f"   Period: {valid_at} → {invalid_at}\n"
-                result += f"   UUID: `{uuid}`\n\n"
+                if show_uuid:
+                    result += f"   UUID: `{uuid}`\n"
+                result += "\n"
             
             result += f"💡 To delete these facts, use `search_and_delete_facts` with the same query and limit."
             
@@ -815,6 +823,7 @@ class Tools:
         self,
         query: str,
         limit: int = 10,
+        show_uuid: bool = False,
         __user__: dict = {},
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> str:
@@ -826,6 +835,7 @@ class Tools:
         
         :param query: Search query to find episodes (e.g., "conversation about Python")
         :param limit: Maximum number of episodes to return (default: 10, max: 100)
+        :param show_uuid: Whether to display UUID in search results (default: False). Set to True if you need to see UUIDs for debugging or manual deletion.
         :return: List of found episodes with their details
         
         Note: __user__ and __event_emitter__ are automatically injected by the system.
@@ -878,7 +888,9 @@ class Tools:
                 result += f"**{i}. {name}**\n"
                 result += f"   Content: {content_preview}\n"
                 result += f"   Created: {created_at}\n"
-                result += f"   UUID: `{uuid}`\n\n"
+                if show_uuid:
+                    result += f"   UUID: `{uuid}`\n"
+                result += "\n"
             
             result += f"💡 To delete these episodes, use `search_and_delete_episodes` with the same query and limit."
             
