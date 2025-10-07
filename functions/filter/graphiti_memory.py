@@ -140,7 +140,7 @@ class Filter:
         )
 
         graph_db_backend: str = Field(
-            default="falkordb",
+            default="neo4j",
             description="Graph database backend to use (e.g., 'neo4j', 'falkordb')",
         )
 
@@ -200,7 +200,7 @@ class Filter:
         )
         
         add_episode_timeout: int = Field(
-            default=120,
+            default=240,
             description="Timeout in seconds for adding episodes to memory. Set to 0 to disable timeout.",
         )
         
@@ -210,8 +210,8 @@ class Filter:
         )
         
         max_search_message_length: int = Field(
-            default=10000,
-            description="Maximum length of user message to send to Graphiti search. Messages longer than this will be truncated (keeping first and last parts, dropping middle). Set to 0 to disable truncation.",
+            default=5000,
+            description="Maximum length of user message to send to Graphiti search. Messages longer than this will be truncated (keeping first and last parts, dropping middle). Set to 0 to disable truncation. Note: This should be set to a size that the embedding model can handle to avoid errors.",
         )
         
         sanitize_search_query: bool = Field(
@@ -222,7 +222,7 @@ class Filter:
         search_strategy: str = Field(
         default="balanced",
         description="Search strategy: 'fast' (BM25 only, ~0.1s), 'balanced' (BM25+Cosine, ~0.5s), 'quality' (Cross-Encoder, ~1-5s)",
-    )
+        )
 
         group_id_format: str = Field(
             default="{user_id}",
@@ -240,7 +240,7 @@ class Filter:
         )
         
         use_user_name_in_episode: bool = Field(
-            default=False,
+            default=True,
             description="Use actual user name instead of 'User' label when saving conversations to memory. When enabled, episodes will be saved as '{user_name}: {message}' instead of 'User: {message}'.",
         )
         
