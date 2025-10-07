@@ -33,21 +33,17 @@ Architecture:
 - Memory storage: outlet() stores new information after chat completion
 """
 
-import ast
-import json
-import os
-import time
 import asyncio
+import hashlib
+import os
+import re
+import time
+import traceback
 from datetime import datetime
 from typing import Optional, Callable, Awaitable, Any
 from urllib.parse import quote
 
-import aiohttp
-from aiohttp import ClientError
-from fastapi.requests import Request
 from pydantic import BaseModel, Field
-
-from openai import AsyncOpenAI
 
 from graphiti_core import Graphiti
 from graphiti_core.llm_client.config import LLMConfig
@@ -74,15 +70,15 @@ from graphiti_core.search.search_config import (
 )
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 
-from open_webui.main import app as webui_app
-from open_webui.models.users import Users, UserModel
-from open_webui.routers.memories import (
-    add_memory,
-    AddMemoryForm,
-    delete_memory_by_id,
-    query_memory,
-    QueryMemoryForm,
-)
+# from open_webui.main import app as webui_app
+# from open_webui.models.users import Users, UserModel
+# from open_webui.routers.memories import (
+#     add_memory,
+#     AddMemoryForm,
+#     delete_memory_by_id,
+#     query_memory,
+#     QueryMemoryForm,
+# )
 
 
 class Filter:
@@ -293,7 +289,6 @@ class Filter:
         Returns:
             str: Hash of relevant configuration values
         """
-        import hashlib
         config_str = f"{self.valves.llm_client_type}|{self.valves.openai_api_url}|{self.valves.model}|{self.valves.small_model}|{self.valves.embedding_model}|{self.valves.embedding_dim}|{self.valves.api_key}|{self.valves.graph_db_backend}|{self.valves.falkordb_host}|{self.valves.falkordb_port}|{self.valves.neo4j_uri}|{self.valves.semaphore_limit}"
         return hashlib.md5(config_str.encode()).hexdigest()
     
@@ -395,7 +390,6 @@ class Filter:
                         print("Warning: LLM client does not have 'client' attribute")
         except Exception as e:
             print(f"Failed to update LLM client headers: {e}")
-            import traceback
             traceback.print_exc()
         
         # Update Embedder client
@@ -419,7 +413,6 @@ class Filter:
                         print("Warning: Embedder does not have 'client' attribute")
         except Exception as e:
             print(f"Failed to update Embedder headers: {e}")
-            import traceback
             traceback.print_exc()
 
 
@@ -597,7 +590,6 @@ class Filter:
         sanitized_email = user_email.replace('@', '_at_').replace('.', '_')
         
         # Sanitize name (replace spaces and special characters)
-        import re
         sanitized_name = re.sub(r'[^a-zA-Z0-9_-]', '_', user_name)
         
         # Format the group_id using the template
@@ -684,8 +676,6 @@ class Filter:
         Returns:
             Sanitized query safe for FalkorDB search
         """
-        import re
-        
         # Only remove the most problematic RediSearch operators:
         # ( ) - parentheses cause syntax errors with AND operator
         # @ - field selector
@@ -817,7 +807,6 @@ class Filter:
         
         # Perform search with error handling for FalkorDB/RediSearch syntax issues
         # Measure search time
-        import time
         search_start_time = time.time()
         
         try:
@@ -1288,7 +1277,6 @@ class Filter:
             
             # Only print full traceback for unexpected errors
             if "ValidationError" not in error_type:
-                import traceback
                 traceback.print_exc()
             
             if user_valves.show_status:
