@@ -101,7 +101,16 @@ class GraphitiHelper:
     def get_config_hash(self) -> str:
         """Generate configuration hash for change detection."""
         import hashlib
-        config_str = f"{self.valves.llm_client_type}|{self.valves.openai_api_url}|{self.valves.model}|{self.valves.embedding_model}|{self.valves.api_key}|{self.valves.graph_db_backend}|{self.valves.falkordb_host}|{self.valves.falkordb_port}"
+        # Get all valve values as dict, excluding non-config fields
+        valve_dict = self.valves.model_dump(
+            exclude={
+                'debug_print',  # Debugging settings don't affect initialization
+                'group_id_format',  # Group ID format doesn't affect Graphiti init
+                'confirmation_timeout',  # UI timeout doesn't affect Graphiti init
+            }
+        )
+        # Sort keys for consistent hashing
+        config_str = '|'.join(f"{k}={v}" for k, v in sorted(valve_dict.items()))
         return hashlib.md5(config_str.encode()).hexdigest()
     
     def config_changed(self) -> bool:

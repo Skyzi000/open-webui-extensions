@@ -289,7 +289,17 @@ class Filter:
         Returns:
             str: Hash of relevant configuration values
         """
-        config_str = f"{self.valves.llm_client_type}|{self.valves.openai_api_url}|{self.valves.model}|{self.valves.small_model}|{self.valves.embedding_model}|{self.valves.embedding_dim}|{self.valves.api_key}|{self.valves.graph_db_backend}|{self.valves.falkordb_host}|{self.valves.falkordb_port}|{self.valves.neo4j_uri}|{self.valves.semaphore_limit}"
+        # Get all valve values as dict, excluding non-config fields
+        valve_dict = self.valves.model_dump(
+            exclude={
+                'debug_print',  # Debugging settings don't affect initialization
+                'group_id_format',  # Group ID format doesn't affect Graphiti init
+                'search_strategy',  # Search strategy doesn't affect Graphiti init
+                'inlet_context_length',  # Context settings don't affect Graphiti init
+            }
+        )
+        # Sort keys for consistent hashing
+        config_str = '|'.join(f"{k}={v}" for k, v in sorted(valve_dict.items()))
         return hashlib.md5(config_str.encode()).hexdigest()
     
     def _config_changed(self) -> bool:
