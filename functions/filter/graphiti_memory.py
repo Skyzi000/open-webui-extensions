@@ -220,8 +220,8 @@ class Filter:
         )
         
         search_strategy: str = Field(
-        default="balanced",
-        description="Search strategy: 'fast' (BM25 only, ~0.1s), 'balanced' (BM25+Cosine, ~0.5s), 'quality' (Cross-Encoder, ~1-5s)",
+            default="balanced",
+            description="Search strategy: 'fast' (BM25 only, ~0.1s), 'balanced' (BM25+Cosine, ~0.5s), 'quality' (Cross-Encoder, ~1-5s)",
         )
 
         group_id_format: str = Field(
