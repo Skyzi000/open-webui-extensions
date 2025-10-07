@@ -62,6 +62,42 @@ class GraphitiHelper:
         """Always get fresh valves from Tools instance."""
         return self.tools.valves
     
+    @staticmethod
+    def validate_message_format(content: str) -> tuple[bool, Optional[str]]:
+        """
+        Validate message format content.
+        
+        :param content: Content to validate
+        :return: Tuple of (is_valid, error_message). error_message is None if valid.
+        """
+        if ':' not in content:
+            error_msg = (
+                "❌ Error: For source='message', content must be in 'speaker: content' format.\n"
+                "Example: 'user: Hello' or 'assistant: How can I help?'\n"
+                "Each line should start with a speaker name followed by a colon."
+            )
+            return False, error_msg
+        
+        # Check if at least one line follows the format
+        lines = content.strip().split('\n')
+        valid_format = False
+        for line in lines:
+            if ':' in line and line.split(':', 1)[0].strip():
+                valid_format = True
+                break
+        
+        if not valid_format:
+            error_msg = (
+                "❌ Error: For source='message', at least one line must follow 'speaker: content' format.\n"
+                "Provided content does not have any valid message lines.\n"
+                "Example format:\n"
+                "user: What's the weather?\n"
+                "assistant: It's sunny today."
+            )
+            return False, error_msg
+        
+        return True, None
+    
     def get_config_hash(self) -> str:
         """Generate configuration hash for change detection."""
         import hashlib
@@ -535,18 +571,10 @@ class Tools:
                 source_type = EpisodeType.text
             elif source_lower == "message":
                 source_type = EpisodeType.message
-                # Validate message format: must contain "speaker: content" format
-                if ':' not in content:
-                    return f"❌ Error: For source='message', content must be in 'speaker: content' format.\nExample: 'user: Hello' or 'assistant: How can I help?'\nEach line should start with a speaker name followed by a colon."
-                # Check if at least one line follows the format
-                lines = content.strip().split('\n')
-                valid_format = False
-                for line in lines:
-                    if ':' in line and line.split(':', 1)[0].strip():
-                        valid_format = True
-                        break
-                if not valid_format:
-                    return f"❌ Error: For source='message', at least one line must follow 'speaker: content' format.\nProvided content does not have any valid message lines.\nExample format:\nuser: What's the weather?\nassistant: It's sunny today."
+                # Validate message format using helper method
+                is_valid, error_msg = GraphitiHelper.validate_message_format(content)
+                if not is_valid:
+                    return error_msg if error_msg else "❌ Error: Invalid message format"
             elif source_lower == "json":
                 source_type = EpisodeType.json
                 # Validate JSON format
