@@ -445,7 +445,7 @@ class Tools:
         )
         
         graph_db_backend: str = Field(
-            default="falkordb",
+            default="neo4j",
             description="Graph database backend to use (e.g., 'neo4j', 'falkordb')",
         )
         
