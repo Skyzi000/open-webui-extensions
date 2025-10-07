@@ -259,6 +259,21 @@ class GraphitiHelper:
         
         return group_id
     
+    def is_japanese_preferred(self, user: dict) -> bool:
+        """
+        Check if user prefers Japanese language based on UserValves settings.
+        
+        Args:
+            user: User dictionary containing 'valves' with message_language setting
+            
+        Returns:
+            True if user prefers Japanese (ja), False otherwise (default: English)
+        """
+        user_valves = user.get("valves")
+        if user_valves and hasattr(user_valves, 'message_language'):
+            return user_valves.message_language.lower() == 'ja'
+        return False
+    
     async def delete_nodes_by_uuids(self, uuids: List[str], group_id: Optional[str] = None) -> int:
         """Delete nodes by UUIDs using EntityNode.delete_by_uuids()."""
         if not uuids or not self.graphiti:
@@ -369,12 +384,7 @@ class GraphitiHelper:
         preview_text = "  \n".join(items)
         
         # Get user's language preference from UserValves
-        user_valves = __user__.get("valves")
-        if user_valves and hasattr(user_valves, 'message_language'):
-            is_japanese = user_valves.message_language.lower() == 'ja'
-        else:
-            # Default to English if UserValves not set
-            is_japanese = False
+        is_japanese = self.is_japanese_preferred(__user__)
         
         if is_japanese:
             confirmation_message = f"""以下の項目を削除しますか？  
@@ -995,8 +1005,7 @@ class Tools:
                 preview_items.append(f"[{i}] {node.name}:  \n{summary}")
             
             # Get user's language preference
-            user_valves = __user__.get("valves")
-            is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
+            is_japanese = self.helper.is_japanese_preferred(__user__)
             
             # Show confirmation dialog
             confirmed = await self.helper.show_confirmation_dialog(
@@ -1087,8 +1096,7 @@ class Tools:
             total_count = len(edges)
             
             # Get user's language preference
-            user_valves = __user__.get("valves")
-            is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
+            is_japanese = self.helper.is_japanese_preferred(__user__)
             
             fact_list = []
             preview_items = []
@@ -1191,8 +1199,7 @@ class Tools:
             total_count = len(episodes)
             
             # Get user's language preference
-            user_valves = __user__.get("valves")
-            is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
+            is_japanese = self.helper.is_japanese_preferred(__user__)
             
             episode_list = []
             preview_items = []
@@ -1271,8 +1278,7 @@ class Tools:
         
         try:
             # Get user's language preference first
-            user_valves = __user__.get("valves")
-            is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
+            is_japanese = self.helper.is_japanese_preferred(__user__)
             
             # Prepare preview items with actual content from database
             preview_items = []
@@ -1354,10 +1360,6 @@ class Tools:
             
             if not preview_items:
                 return "ℹ️ No UUIDs provided for deletion"
-            
-            # Get user's language preference
-            user_valves = __user__.get("valves")
-            is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
             
             # Show confirmation dialog
             confirmed = await self.helper.show_confirmation_dialog(
@@ -1470,8 +1472,7 @@ class Tools:
                 return "ℹ️ Memory is already empty"
             
             # Get user's language preference
-            user_valves = __user__.get("valves")
-            is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
+            is_japanese = self.helper.is_japanese_preferred(__user__)
             
             # Show confirmation dialog
             if is_japanese:
