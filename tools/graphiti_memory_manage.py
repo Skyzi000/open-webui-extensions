@@ -372,7 +372,7 @@ class GraphitiHelper:
         timeout: int,
         __user__: dict = {},
         __event_call__: Optional[Callable[[dict], Any]] = None,
-    ) -> bool:
+    ) -> tuple[bool, str]:
         """
         Show confirmation dialog and wait for user response.
         Helper method for Tools class - not exposed to AI.
@@ -383,12 +383,14 @@ class GraphitiHelper:
         :param timeout: Timeout in seconds
         :param __user__: User information dictionary
         :param __event_call__: Event caller for confirmation dialog
-        :return: True if confirmed, False if cancelled or timeout
+        :return: Tuple of (confirmed, error_message) where:
+                 - confirmed: True if user confirmed, False otherwise
+                 - error_message: Empty string if confirmed, error message otherwise
         """
         import asyncio
         
         if not __event_call__:
-            return True  # If no event_call, proceed without confirmation
+            return False, "❌ Error: Confirmation dialog is not available. Cannot perform deletion without user confirmation."
         
         preview_text = "  \n".join(items)
         
@@ -425,11 +427,14 @@ class GraphitiHelper:
             
             try:
                 result = await asyncio.wait_for(confirmation_task, timeout=timeout)
-                return bool(result)
+                if result:
+                    return True, ""
+                else:
+                    return False, "🚫 User cancelled the operation"
             except asyncio.TimeoutError:
-                return False
+                return False, "⏰ Operation timed out - user did not respond within the time limit"
         except Exception:
-            return False
+            return False, "❌ Error: Failed to show confirmation dialog"
 
 
 class Tools:
@@ -1017,7 +1022,7 @@ class Tools:
             is_japanese = self.helper.is_japanese_preferred(__user__)
             
             # Show confirmation dialog
-            confirmed = await self.helper.show_confirmation_dialog(
+            confirmed, error_msg = await self.helper.show_confirmation_dialog(
                 title=f"エンティティの削除確認 ({total_count}件)" if is_japanese else f"Confirm Entity Deletion ({total_count} items)",
                 items=preview_items,
                 warning_message="⚠️ この操作は取り消すことができません。関連する関係性も削除されます。" if is_japanese else "⚠️ This operation cannot be undone. Related relationships will also be deleted.",
@@ -1027,8 +1032,7 @@ class Tools:
             )
             
             if not confirmed:
-                if __event_call__:
-                    return "🚫 User cancelled entity deletion"
+                return error_msg
             
             # Show compact result message (list only first 10)
             result_list = entity_list[:10]
@@ -1120,7 +1124,7 @@ class Tools:
                 preview_items.append(f"[{i}] {fact_text}  \n{period_label}: {valid_at} - {invalid_at}")
             
             # Show confirmation dialog
-            confirmed = await self.helper.show_confirmation_dialog(
+            confirmed, error_msg = await self.helper.show_confirmation_dialog(
                 title=f"関係性の削除確認 ({total_count}件)" if is_japanese else f"Confirm Fact Deletion ({total_count} items)",
                 items=preview_items,
                 warning_message="⚠️ この操作は取り消すことができません。" if is_japanese else "⚠️ This operation cannot be undone.",
@@ -1130,8 +1134,7 @@ class Tools:
             )
             
             if not confirmed:
-                if __event_call__:
-                    return "🚫 User cancelled fact deletion"
+                return error_msg
             
             # Show compact result message (list only first 10)
             result_list = fact_list[:10]
@@ -1225,7 +1228,7 @@ class Tools:
                 preview_items.append(f"[{i}] {name}  \n{content_preview}  \n{created_label}: {created_at}")
             
             # Show confirmation dialog
-            confirmed = await self.helper.show_confirmation_dialog(
+            confirmed, error_msg = await self.helper.show_confirmation_dialog(
                 title=f"エピソードの削除確認 ({total_count}件)" if is_japanese else f"Confirm Episode Deletion ({total_count} items)",
                 items=preview_items,
                 warning_message="⚠️ この操作は取り消すことができません。関連するエンティティと関係性も削除されます。" if is_japanese else "⚠️ This operation cannot be undone. Related entities and relationships will also be deleted.",
@@ -1235,8 +1238,7 @@ class Tools:
             )
             
             if not confirmed:
-                if __event_call__:
-                    return "🚫 User cancelled episode deletion"
+                return error_msg
             
             # Show compact result message (list only first 10)
             result_list = episode_list[:10]
@@ -1371,7 +1373,7 @@ class Tools:
                 return "ℹ️ No UUIDs provided for deletion"
             
             # Show confirmation dialog
-            confirmed = await self.helper.show_confirmation_dialog(
+            confirmed, error_msg = await self.helper.show_confirmation_dialog(
                 title="UUID指定削除の確認" if is_japanese else "Confirm UUID-based Deletion",
                 items=preview_items,
                 warning_message="⚠️ この操作は取り消すことができません。UUIDを直接指定しての削除は慎重に行ってください。" if is_japanese else "⚠️ This operation cannot be undone. Please be careful when deleting by UUID.",
@@ -1381,8 +1383,7 @@ class Tools:
             )
             
             if not confirmed:
-                if __event_call__:
-                    return "🚫 User cancelled UUID-based deletion"
+                return error_msg
             
             results = []
             
@@ -1497,7 +1498,7 @@ class Tools:
                     f"Episodes: {episode_count} items",
                 ]
             
-            confirmed = await self.helper.show_confirmation_dialog(
+            confirmed, error_msg = await self.helper.show_confirmation_dialog(
                 title="⚠️ 全メモリ削除の最終確認" if is_japanese else "⚠️ Final Confirmation: Clear All Memory",
                 items=preview_items,
                 warning_message="🔥 この操作は完全に元に戻せません！全てのメモリデータが永久に失われます。" if is_japanese else "🔥 This operation is completely irreversible! All memory data will be permanently lost.",
@@ -1507,8 +1508,7 @@ class Tools:
             )
             
             if not confirmed:
-                if __event_call__:
-                    return "🚫 User cancelled memory clearing"
+                return error_msg
             
             # Require text input confirmation
             if __event_call__:
