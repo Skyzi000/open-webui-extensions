@@ -921,10 +921,11 @@ class Filter:
                 
                 # Emit status for each fact found
                 if user_valves.show_status:
+                    emoji = "🚫" if result.invalid_at else "✅"
                     await __event_emitter__(
                         {
                             "type": "status",
-                            "data": {"description": f"📝 Fact {idx}/{len(results.edges)}: {result.fact}", "done": False},
+                            "data": {"description": f"{emoji} Fact {idx}/{len(results.edges)}: {result.fact}", "done": False},
                         }
                     )
                 
@@ -1240,10 +1241,11 @@ class Filter:
                 # Show all Facts
                 if add_results.edges:
                     for idx, edge in enumerate(add_results.edges, 1):
+                        emoji = "🚫" if edge.invalid_at else "✅"
                         await __event_emitter__(
                             {
                                 "type": "status",
-                                "data": {"description": f"📝 Fact {idx}/{len(add_results.edges)}: {edge.fact}", "done": False},
+                                "data": {"description": f"{emoji} Fact {idx}/{len(add_results.edges)}: {edge.fact}", "done": False},
                             }
                         )
                 
