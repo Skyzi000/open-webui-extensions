@@ -1086,8 +1086,13 @@ class Tools:
             # Show all facts for confirmation (no limit - user must see everything being deleted)
             total_count = len(edges)
             
+            # Get user's language preference
+            user_valves = __user__.get("valves")
+            is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
+            
             fact_list = []
             preview_items = []
+            period_label = "期間" if is_japanese else "Period"
             for i, edge in enumerate(edges, 1):
                 fact_text = getattr(edge, 'fact', 'Unknown relationship')
                 if len(fact_text) > 80:
@@ -1095,11 +1100,7 @@ class Tools:
                 valid_at = getattr(edge, 'valid_at', 'unknown')
                 invalid_at = getattr(edge, 'invalid_at', 'present')
                 fact_list.append(f"{i}. {fact_text} ({valid_at} - {invalid_at})")
-                preview_items.append(f"[{i}] {fact_text}  \n期間: {valid_at} - {invalid_at}")
-            
-            # Get user's language preference
-            user_valves = __user__.get("valves")
-            is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
+                preview_items.append(f"[{i}] {fact_text}  \n{period_label}: {valid_at} - {invalid_at}")
             
             # Show confirmation dialog
             confirmed = await self.helper.show_confirmation_dialog(
@@ -1189,8 +1190,13 @@ class Tools:
             # Show all episodes for confirmation (no limit - user must see everything being deleted)
             total_count = len(episodes)
             
+            # Get user's language preference
+            user_valves = __user__.get("valves")
+            is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
+            
             episode_list = []
             preview_items = []
+            created_label = "作成日時" if is_japanese else "Created"
             for i, episode in enumerate(episodes, 1):
                 name = getattr(episode, 'name', 'Unknown episode')
                 content = getattr(episode, 'content', '')
@@ -1200,11 +1206,7 @@ class Tools:
                     content_preview = content
                 created_at = getattr(episode, 'created_at', 'unknown')
                 episode_list.append(f"{i}. {name}: {content_preview} (created: {created_at})")
-                preview_items.append(f"[{i}] {name}  \n{content_preview}  \n作成日時: {created_at}")
-            
-            # Get user's language preference
-            user_valves = __user__.get("valves")
-            is_japanese = user_valves and hasattr(user_valves, 'message_language') and user_valves.message_language.lower() == 'ja'
+                preview_items.append(f"[{i}] {name}  \n{content_preview}  \n{created_label}: {created_at}")
             
             # Show confirmation dialog
             confirmed = await self.helper.show_confirmation_dialog(
