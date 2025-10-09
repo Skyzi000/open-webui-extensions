@@ -295,7 +295,16 @@ class Filter:
                 'debug_print',  # Debugging settings don't affect initialization
                 'group_id_format',  # Group ID format doesn't affect Graphiti init
                 'search_strategy',  # Search strategy doesn't affect Graphiti init
-                'inlet_context_length',  # Context settings don't affect Graphiti init
+                'save_assistant_response',  # Message saving behavior doesn't affect Graphiti init
+                'inject_facts',  # Memory injection settings don't affect Graphiti init
+                'inject_entities',  # Memory injection settings don't affect Graphiti init
+                'update_communities',  # Community update setting doesn't affect Graphiti init
+                'add_episode_timeout',  # Timeout settings don't affect Graphiti init
+                'max_search_message_length',  # Message truncation doesn't affect Graphiti init
+                'sanitize_search_query',  # Query sanitization doesn't affect Graphiti init
+                'memory_message_role',  # Message role doesn't affect Graphiti init
+                'forward_user_info_headers',  # Header forwarding doesn't affect Graphiti init
+                'use_user_name_in_episode',  # Episode formatting doesn't affect Graphiti init
             }
         )
         # Sort keys for consistent hashing
