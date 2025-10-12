@@ -32,8 +32,12 @@ Related Filter:
 
 import os
 import re
+import json
+import copy
 import asyncio
-from datetime import datetime
+import hashlib
+import traceback
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Callable
 from urllib.parse import quote
 
@@ -100,7 +104,6 @@ class GraphitiHelper:
     
     def get_config_hash(self) -> str:
         """Generate configuration hash for change detection."""
-        import hashlib
         # Get all valve values as dict, excluding non-config fields
         valve_dict = self.valves.model_dump(
             exclude={
@@ -144,7 +147,6 @@ class GraphitiHelper:
             small_model=self.valves.small_model,
             base_url=self.valves.openai_api_url,
         )
-
         # Select LLM client based on configuration
         if self.valves.llm_client_type.lower() == "openai":
             llm_client = OpenAIClient(config=llm_config)
@@ -159,7 +161,6 @@ class GraphitiHelper:
             llm_client = OpenAIClient(config=llm_config)
             if self.valves.debug_print:
                 print(f"Unknown client type '{self.valves.llm_client_type}', defaulting to OpenAI client")
-
         # Initialize embedder
         embedder = OpenAIEmbedder(
             config=OpenAIEmbedderConfig(
@@ -186,7 +187,6 @@ class GraphitiHelper:
                 username=self.valves.falkordb_username,
                 password=self.valves.falkordb_password,
             )
-
         # Initialize Graphiti
         if falkor_driver:
             if self.valves.debug_print:
@@ -231,7 +231,6 @@ class GraphitiHelper:
             except Exception as e:
                 print(f"Failed to initialize Graphiti: {e}")
                 if self.valves.debug_print:
-                    import traceback
                     traceback.print_exc()
                 return False
         return True
@@ -304,7 +303,6 @@ class GraphitiHelper:
         except Exception as e:
             print(f"Failed to delete nodes: {e}")
             if self.valves.debug_print:
-                import traceback
                 traceback.print_exc()
             return 0
     
@@ -329,7 +327,6 @@ class GraphitiHelper:
         except Exception as e:
             print(f"Failed to delete edges: {e}")
             if self.valves.debug_print:
-                import traceback
                 traceback.print_exc()
             return 0
     
@@ -356,7 +353,6 @@ class GraphitiHelper:
             except Exception as e:
                 print(f"Failed to delete episode {uuid}: {e}")
                 if self.valves.debug_print:
-                    import traceback
                     traceback.print_exc()
         
         if self.valves.debug_print:
@@ -387,8 +383,6 @@ class GraphitiHelper:
                  - confirmed: True if user confirmed, False otherwise
                  - error_message: Empty string if confirmed, error message otherwise
         """
-        import asyncio
-        
         if not __event_call__:
             return False, "❌ Error: Confirmation dialog is not available. Cannot perform deletion without user confirmation."
         
@@ -435,7 +429,6 @@ class GraphitiHelper:
                 return False, "⏰ Operation timed out - user did not respond within the time limit"
         except Exception:
             return False, "❌ Error: Failed to show confirmation dialog"
-
 
 class Tools:
     class Valves(BaseModel):
@@ -533,7 +526,6 @@ class Tools:
             default="en",
             description="Language for confirmation dialog messages: 'en' (English) or 'ja' (Japanese)",
         )
-
     def __init__(self):
         self.valves = self.Valves()
         self.helper = GraphitiHelper(self)
@@ -585,7 +577,6 @@ class Tools:
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
         
-        import json
         source_type = None  # Initialize for error handling scope
         
         try:
@@ -603,7 +594,6 @@ class Tools:
                 source_type = EpisodeType.json
                 # Validate JSON format
                 try:
-                    import json
                     json.loads(content)
                 except json.JSONDecodeError as e:
                     return f"❌ Error: Invalid JSON content: {str(e)}\nPlease ensure the content is a valid JSON string."
@@ -623,7 +613,6 @@ class Tools:
                 print(f"Content length: {len(content)} chars")
             
             # Add episode using Graphiti's add_episode method
-            from datetime import timezone
             result = await self.helper.graphiti.add_episode(
                 name=name,
                 episode_body=content,
@@ -662,7 +651,6 @@ class Tools:
             return response
             
         except Exception as e:
-            import traceback
             error_type = type(e).__name__
             error_str = str(e)
             
@@ -739,7 +727,6 @@ class Tools:
         
         Note: __user__ and __event_emitter__ are automatically injected by the system.
         """
-        import copy
         
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
@@ -790,7 +777,6 @@ class Tools:
         except Exception as e:
             error_msg = f"❌ Error searching entities: {str(e)}"
             if self.valves.debug_print:
-                import traceback
                 traceback.print_exc()
             return error_msg
     
@@ -815,7 +801,6 @@ class Tools:
         
         Note: __user__ and __event_emitter__ are automatically injected by the system.
         """
-        import copy
         
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
@@ -867,7 +852,6 @@ class Tools:
         except Exception as e:
             error_msg = f"❌ Error searching facts: {str(e)}"
             if self.valves.debug_print:
-                import traceback
                 traceback.print_exc()
             return error_msg
     
@@ -892,7 +876,6 @@ class Tools:
         
         Note: __user__ and __event_emitter__ are automatically injected by the system.
         """
-        import copy
         
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
@@ -951,7 +934,6 @@ class Tools:
         except Exception as e:
             error_msg = f"❌ Error searching episodes: {str(e)}"
             if self.valves.debug_print:
-                import traceback
                 traceback.print_exc()
             return error_msg
     
@@ -977,8 +959,6 @@ class Tools:
         
         Note: __user__, __event_emitter__, and __event_call__ are automatically injected by the system.
         """
-        import asyncio
-        import copy
         
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
@@ -1050,7 +1030,6 @@ class Tools:
         except Exception as e:
             error_msg = f"❌ Error searching/deleting entities: {str(e)}"
             if self.valves.debug_print:
-                import traceback
                 traceback.print_exc()
             return error_msg
     
@@ -1076,8 +1055,6 @@ class Tools:
         
         Note: __user__, __event_emitter__, and __event_call__ are automatically injected by the system.
         """
-        import asyncio
-        import copy
         
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
@@ -1152,7 +1129,6 @@ class Tools:
         except Exception as e:
             error_msg = f"❌ Error searching/deleting facts: {str(e)}"
             if self.valves.debug_print:
-                import traceback
                 traceback.print_exc()
             return error_msg
     
@@ -1178,8 +1154,6 @@ class Tools:
         
         Note: __user__, __event_emitter__, and __event_call__ are automatically injected by the system.
         """
-        import asyncio
-        import copy
         
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
@@ -1256,7 +1230,6 @@ class Tools:
         except Exception as e:
             error_msg = f"❌ Error searching/deleting episodes: {str(e)}"
             if self.valves.debug_print:
-                import traceback
                 traceback.print_exc()
             return error_msg
     
@@ -1422,7 +1395,6 @@ class Tools:
         except Exception as e:
             error_msg = f"❌ Error deleting by UUIDs: {str(e)}"
             if self.valves.debug_print:
-                import traceback
                 traceback.print_exc()
             return error_msg
     
@@ -1563,13 +1535,11 @@ class Tools:
             except Exception as e:
                 error_msg = f"❌ Error deleting memory: {str(e)}"
                 if self.valves.debug_print:
-                    import traceback
                     traceback.print_exc()
                 return error_msg
             
         except Exception as e:
             error_msg = f"❌ Error clearing memory: {str(e)}"
             if self.valves.debug_print:
-                import traceback
                 traceback.print_exc()
             return error_msg
