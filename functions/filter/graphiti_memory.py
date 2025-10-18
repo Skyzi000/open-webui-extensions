@@ -270,6 +270,11 @@ class Filter:
             description="Enable Graphiti telemetry",
         )
 
+        save_user_message: bool = Field(
+            default=True,
+            description="Automatically save user messages as memories",
+        )
+        
         save_assistant_response: bool = Field(
             default=False,
             description="Automatically save assistant responses as memories",
@@ -347,6 +352,10 @@ class Filter:
         )
         show_status: bool = Field(
             default=True, description="Show status of the action."
+        )
+        save_user_message: str = Field(
+            default="default",
+            description="Automatically save user messages as memories. Options: 'default' (use global setting), 'true' (always save), 'false' (never save).",
         )
         save_assistant_response: str = Field(
             default="default",
@@ -1122,7 +1131,7 @@ class Filter:
         if len(messages) == 0:
             return body
         
-        # Determine which messages to save based on save_assistant_response setting
+        # Determine which messages to save based on settings
         messages_to_save = []
         
         # Find the last user message
@@ -1138,20 +1147,32 @@ class Filter:
             if last_user_message and last_assistant_message:
                 break
         
-        # Always save user messages (extract text content)
-        if last_user_message:
+        # Save user messages based on setting
+        # Use UserValves setting if available, otherwise fall back to Valves setting
+        user_save_user_setting = user_valves.save_user_message.lower()
+        if user_save_user_setting == "default":
+            save_user = self.valves.save_user_message
+        elif user_save_user_setting == "true":
+            save_user = True
+        elif user_save_user_setting == "false":
+            save_user = False
+        else:
+            # Invalid value, use global setting as fallback
+            save_user = self.valves.save_user_message
+        
+        if save_user and last_user_message:
             user_content = self._get_content_from_message(last_user_message)
             if user_content:
                 messages_to_save.append(("user", user_content))
         
-        # Optionally save assistant responses
+        # Save assistant responses based on setting
         # Use UserValves setting if available, otherwise fall back to Valves setting
-        user_save_setting = user_valves.save_assistant_response.lower()
-        if user_save_setting == "default":
+        user_save_assistant_setting = user_valves.save_assistant_response.lower()
+        if user_save_assistant_setting == "default":
             save_assistant = self.valves.save_assistant_response
-        elif user_save_setting == "true":
+        elif user_save_assistant_setting == "true":
             save_assistant = True
-        elif user_save_setting == "false":
+        elif user_save_assistant_setting == "false":
             save_assistant = False
         else:
             # Invalid value, use global setting as fallback
