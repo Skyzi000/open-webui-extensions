@@ -269,31 +269,6 @@ class Filter:
             default=False,
             description="Enable Graphiti telemetry",
         )
-
-        save_user_message: bool = Field(
-            default=True,
-            description="Automatically save user messages as memories",
-        )
-        
-        save_assistant_response: bool = Field(
-            default=False,
-            description="Automatically save assistant responses (latest) as memories",
-        )
-        
-        save_previous_assistant_message: bool = Field(
-            default=True,
-            description="Save the assistant message that the user is responding to (the one before the latest user message). This provides context about what the user is replying to.",
-        )
-        
-        inject_facts: bool = Field(
-            default=True,
-            description="Inject facts (EntityEdge/relationships) from memory search results into the conversation. Facts represent relationships and events with temporal validity.",
-        )
-        
-        inject_entities: bool = Field(
-            default=True,
-            description="Inject entities (EntityNode summaries) from memory search results into the conversation. Entities represent people, places, concepts with summarized information.",
-        )
         
         update_communities: bool = Field(
             default=False,
@@ -358,28 +333,28 @@ class Filter:
         show_status: bool = Field(
             default=True, description="Show status of the action."
         )
-        save_user_message: str = Field(
-            default="default",
-            description="Automatically save user messages as memories. Options: 'default' (use global setting), 'true' (always save), 'false' (never save).",
+        save_user_message: bool = Field(
+            default=True,
+            description="Automatically save user messages as memories.",
         )
-        save_assistant_response: str = Field(
-            default="default",
-            description="Automatically save assistant responses (latest) as memories. Options: 'default' (use global setting), 'true' (always save), 'false' (never save).",
-        )
-        
-        save_previous_assistant_message: str = Field(
-            default="default",
-            description="Save the assistant message that the user is responding to (the one before the latest user message). Options: 'default' (use global setting), 'true' (always save), 'false' (never save).",
+        save_assistant_response: bool = Field(
+            default=False,
+            description="Automatically save assistant responses (latest) as memories.",
         )
         
-        inject_facts: str = Field(
-            default="default",
-            description="Inject facts (EntityEdge/relationships) from memory search results. Options: 'default' (use global setting), 'true' (always inject), 'false' (never inject).",
+        save_previous_assistant_message: bool = Field(
+            default=True,
+            description="Save the assistant message that the user is responding to (the one before the latest user message).",
         )
         
-        inject_entities: str = Field(
-            default="default",
-            description="Inject entities (EntityNode summaries) from memory search results. Options: 'default' (use global setting), 'true' (always inject), 'false' (never inject).",
+        inject_facts: bool = Field(
+            default=True,
+            description="Inject facts (EntityEdge/relationships) from memory search results.",
+        )
+        
+        inject_entities: bool = Field(
+            default=True,
+            description="Inject entities (EntityNode summaries) from memory search results.",
         )
 
 
@@ -934,30 +909,6 @@ class Filter:
                 )
             return body
 
-        # Determine whether to inject facts and entities based on settings
-        # Use UserValves setting if available, otherwise fall back to Valves setting
-        user_inject_facts_setting = user_valves.inject_facts.lower()
-        if user_inject_facts_setting == "default":
-            should_inject_facts = self.valves.inject_facts
-        elif user_inject_facts_setting == "true":
-            should_inject_facts = True
-        elif user_inject_facts_setting == "false":
-            should_inject_facts = False
-        else:
-            # Invalid value, use global setting as fallback
-            should_inject_facts = self.valves.inject_facts
-        
-        user_inject_entities_setting = user_valves.inject_entities.lower()
-        if user_inject_entities_setting == "default":
-            should_inject_entities = self.valves.inject_entities
-        elif user_inject_entities_setting == "true":
-            should_inject_entities = True
-        elif user_inject_entities_setting == "false":
-            should_inject_entities = False
-        else:
-            # Invalid value, use global setting as fallback
-            should_inject_entities = self.valves.inject_entities
-
         # Print search results (if debug mode enabled)
         if self.valves.debug_print:
             print('\nSearch Results:')
@@ -966,7 +917,7 @@ class Filter:
         entities = {}  # Dictionary to store unique entities: {name: summary}
         
         # Process EntityEdge results (relations/facts) only if enabled
-        if should_inject_facts:
+        if user_valves.inject_facts:
             for idx, result in enumerate(results.edges, 1):
                 if self.valves.debug_print:
                     print(f'Edge UUID: {result.uuid}')
@@ -995,7 +946,7 @@ class Filter:
                 print(f'Skipping {len(results.edges)} facts (inject_facts is disabled)')
         
         # Process EntityNode results (entities with summaries) only if enabled
-        if should_inject_entities:
+        if user_valves.inject_entities:
             for idx, result in enumerate(results.nodes, 1):
                 if self.valves.debug_print:
                     print(f'Node UUID: {result.uuid}')
@@ -1163,56 +1114,18 @@ class Filter:
                         previous_assistant_message = msg
                         break  # We found everything we need
         
-        # Save previous assistant message based on setting (the one user is responding to)
-        # Use UserValves setting if available, otherwise fall back to Valves setting
-        user_save_previous_assistant_setting = user_valves.save_previous_assistant_message.lower()
-        if user_save_previous_assistant_setting == "default":
-            save_previous_assistant = self.valves.save_previous_assistant_message
-        elif user_save_previous_assistant_setting == "true":
-            save_previous_assistant = True
-        elif user_save_previous_assistant_setting == "false":
-            save_previous_assistant = False
-        else:
-            # Invalid value, use global setting as fallback
-            save_previous_assistant = self.valves.save_previous_assistant_message
-        
-        if save_previous_assistant and previous_assistant_message:
+        # Build messages_to_save list based on UserValves settings
+        if user_valves.save_previous_assistant_message and previous_assistant_message:
             previous_assistant_content = self._get_content_from_message(previous_assistant_message)
             if previous_assistant_content:
                 messages_to_save.append(("previous_assistant", previous_assistant_content))
         
-        # Save user messages based on setting
-        # Use UserValves setting if available, otherwise fall back to Valves setting
-        user_save_user_setting = user_valves.save_user_message.lower()
-        if user_save_user_setting == "default":
-            save_user = self.valves.save_user_message
-        elif user_save_user_setting == "true":
-            save_user = True
-        elif user_save_user_setting == "false":
-            save_user = False
-        else:
-            # Invalid value, use global setting as fallback
-            save_user = self.valves.save_user_message
-        
-        if save_user and last_user_message:
+        if user_valves.save_user_message and last_user_message:
             user_content = self._get_content_from_message(last_user_message)
             if user_content:
                 messages_to_save.append(("user", user_content))
         
-        # Save assistant responses based on setting
-        # Use UserValves setting if available, otherwise fall back to Valves setting
-        user_save_assistant_setting = user_valves.save_assistant_response.lower()
-        if user_save_assistant_setting == "default":
-            save_assistant = self.valves.save_assistant_response
-        elif user_save_assistant_setting == "true":
-            save_assistant = True
-        elif user_save_assistant_setting == "false":
-            save_assistant = False
-        else:
-            # Invalid value, use global setting as fallback
-            save_assistant = self.valves.save_assistant_response
-        
-        if save_assistant and last_assistant_message:
+        if user_valves.save_assistant_response and last_assistant_message:
             assistant_content = self._get_content_from_message(last_assistant_message)
             if assistant_content:
                 messages_to_save.append(("assistant", assistant_content))
