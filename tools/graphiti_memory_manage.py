@@ -2,10 +2,9 @@
 title: Graphiti Memory Manage Tool
 author: Skyzi000
 description: Manage specific entities, relationships, or episodes in Graphiti knowledge graph memory.
-author_email: dev@skyzi.jp
 author_url: https://github.com/Skyzi000
 repository_url: https://github.com/Skyzi000/open-webui-extensions
-version: 0.1
+version: 0.2
 requirements: graphiti-core[falkordb]
 
 Design:
@@ -35,6 +34,7 @@ import re
 import json
 import copy
 import asyncio
+import contextvars
 import hashlib
 import traceback
 from datetime import datetime, timezone
@@ -53,6 +53,121 @@ from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RR
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
 from graphiti_core.edges import EntityEdge
+from openai import AsyncOpenAI
+
+# Context variable to store user-specific headers for each async request
+# This ensures complete isolation between concurrent requests without locks
+user_headers_context = contextvars.ContextVar('user_headers', default={})
+
+
+class MultiUserOpenAIClient(OpenAIClient):
+    """
+    Custom OpenAI LLM client that retrieves user-specific headers from context variables.
+    This allows a single Graphiti instance to safely handle concurrent requests from multiple users.
+    
+    Overrides self.client property to inject user headers dynamically without copying parent logic.
+    This ensures automatic compatibility with future Graphiti updates.
+    """
+    
+    def __init__(self, config: LLMConfig | None = None, cache: bool = False, **kwargs):
+        if config is None:
+            config = LLMConfig()
+        
+        # Store base client for dynamic header injection
+        self._base_client = AsyncOpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+        )
+        
+        # Initialize parent with our base client and any additional kwargs
+        super().__init__(config, cache, self._base_client, **kwargs)
+    
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Dynamically return client with user-specific headers from context"""
+        headers = user_headers_context.get()
+        if headers:
+            return self._base_client.with_options(default_headers=headers)
+        return self._base_client
+    
+    @client.setter
+    def client(self, value: AsyncOpenAI):
+        """Store base client for future header injection"""
+        self._base_client = value
+
+
+class MultiUserOpenAIGenericClient(OpenAIGenericClient):
+    """
+    Custom OpenAI-compatible generic LLM client that retrieves user-specific headers from context variables.
+    
+    Overrides self.client property to inject user headers dynamically without copying parent logic.
+    This ensures automatic compatibility with future Graphiti updates.
+    """
+    
+    def __init__(self, config: LLMConfig | None = None, cache: bool = False, **kwargs):
+        if config is None:
+            config = LLMConfig()
+        
+        # Store base client for dynamic header injection
+        self._base_client = AsyncOpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+        )
+        
+        # Initialize parent with our base client and any additional kwargs
+        super().__init__(config, cache, self._base_client)
+    
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Dynamically return client with user-specific headers from context"""
+        headers = user_headers_context.get()
+        if headers:
+            return self._base_client.with_options(default_headers=headers)
+        return self._base_client
+    
+    @client.setter
+    def client(self, value: AsyncOpenAI):
+        """Store base client for future header injection"""
+        self._base_client = value
+
+
+class MultiUserOpenAIEmbedder(OpenAIEmbedder):
+    """
+    Custom OpenAI embedder that retrieves user-specific headers from context variables.
+    
+    Overrides self.client property to inject user headers dynamically without copying parent logic.
+    This ensures automatic compatibility with future Graphiti updates.
+    """
+    
+    def __init__(
+        self,
+        config: OpenAIEmbedderConfig | None = None,
+        client: AsyncOpenAI | None = None,
+    ):
+        if config is None:
+            config = OpenAIEmbedderConfig()
+        
+        # Store base client for dynamic header injection
+        if client is not None:
+            self._base_client = client
+        else:
+            self._base_client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
+        
+        # Initialize parent with our base client
+        super().__init__(config, self._base_client)
+    
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Dynamically return client with user-specific headers from context"""
+        headers = user_headers_context.get()
+        if headers:
+            return self._base_client.with_options(default_headers=headers)
+        return self._base_client
+    
+    @client.setter
+    def client(self, value: AsyncOpenAI):
+        """Store base client for future header injection"""
+        self._base_client = value
 
 
 class GraphitiHelper:
@@ -147,22 +262,22 @@ class GraphitiHelper:
             small_model=self.valves.small_model,
             base_url=self.valves.openai_api_url,
         )
-        # Select LLM client based on configuration
+        # Select LLM client based on configuration - use multi-user versions
         if self.valves.llm_client_type.lower() == "openai":
-            llm_client = OpenAIClient(config=llm_config)
+            llm_client = MultiUserOpenAIClient(config=llm_config)
             if self.valves.debug_print:
-                print("Using OpenAI client")
+                print("Using Multi-User OpenAI client")
         elif self.valves.llm_client_type.lower() == "generic":
-            llm_client = OpenAIGenericClient(config=llm_config)
+            llm_client = MultiUserOpenAIGenericClient(config=llm_config)
             if self.valves.debug_print:
-                print("Using OpenAI-compatible generic client")
+                print("Using Multi-User OpenAI-compatible generic client")
         else:
             # Default to OpenAI client for unknown values
-            llm_client = OpenAIClient(config=llm_config)
+            llm_client = MultiUserOpenAIClient(config=llm_config)
             if self.valves.debug_print:
-                print(f"Unknown client type '{self.valves.llm_client_type}', defaulting to OpenAI client")
+                print(f"Unknown client type '{self.valves.llm_client_type}', defaulting to Multi-User OpenAI client")
         # Initialize embedder
-        embedder = OpenAIEmbedder(
+        embedder = MultiUserOpenAIEmbedder(
             config=OpenAIEmbedderConfig(
                 api_key=self.valves.api_key,
                 base_url=self.valves.openai_api_url,
@@ -195,9 +310,9 @@ class GraphitiHelper:
                 graph_driver=falkor_driver,
                 llm_client=llm_client,
                 embedder=embedder,
-                # OpenAIRerankerClient requires AsyncOpenAI client, not LLMClient wrapper
-                # Both OpenAIClient and OpenAIGenericClient have .client attribute (AsyncOpenAI instance)
-                cross_encoder=OpenAIRerankerClient(client=llm_client.client, config=llm_config),
+                # OpenAIRerankerClient requires AsyncOpenAI client
+                # Use _base_client from our custom multi-user client
+                cross_encoder=OpenAIRerankerClient(client=llm_client._base_client, config=llm_config),
             )
         elif self.valves.graph_db_backend.lower() == "neo4j":
             if self.valves.debug_print:
@@ -208,9 +323,9 @@ class GraphitiHelper:
                 self.valves.neo4j_password,
                 llm_client=llm_client,
                 embedder=embedder,
-                # OpenAIRerankerClient requires AsyncOpenAI client, not LLMClient wrapper
-                # Both OpenAIClient and OpenAIGenericClient have .client attribute (AsyncOpenAI instance)
-                cross_encoder=OpenAIRerankerClient(client=llm_client.client, config=llm_config),
+                # OpenAIRerankerClient requires AsyncOpenAI client
+                # Use _base_client from our custom multi-user client
+                cross_encoder=OpenAIRerankerClient(client=llm_client._base_client, config=llm_config),
             )
         else:
             raise ValueError(f"Unsupported graph database backend: {self.valves.graph_db_backend}. Supported backends are 'neo4j' and 'falkordb'.")
@@ -511,6 +626,11 @@ class Tools:
             description="Format string for group_id. Available placeholders: {user_id}, {user_email}, {user_name}. Set to 'none' to disable group filtering.",
         )
         
+        forward_user_info_headers: str = Field(
+            default="default",
+            description="Forward user information headers (User-Name, User-Id, User-Email, User-Role, Chat-Id) to OpenAI API. Options: 'default' (follow environment variable ENABLE_FORWARD_USER_INFO_HEADERS, defaults to false if not set), 'true' (always forward), 'false' (never forward).",
+        )
+        
         debug_print: bool = Field(
             default=False,
             description="Enable debug printing to console",
@@ -532,6 +652,51 @@ class Tools:
         
         # Don't initialize here - Valves may not be loaded yet
         # Initialization happens lazily on first use via ensure_graphiti_initialized()
+    
+    def _get_user_info_headers(self, user: Optional[dict] = None, chat_id: Optional[str] = None) -> dict:
+        """
+        Build user information headers dictionary.
+        
+        Args:
+            user: User dictionary containing 'id', 'email', 'name', 'role'
+            chat_id: Current chat ID
+            
+        Returns:
+            Dictionary of headers to send to OpenAI API
+        """
+        # Check Valves setting first
+        valves_setting = self.valves.forward_user_info_headers.lower()
+        
+        if valves_setting == 'true':
+            enable_forward = True
+        elif valves_setting == 'false':
+            enable_forward = False
+        elif valves_setting == 'default':
+            # Use environment variable (defaults to false if not set)
+            env_setting = os.environ.get('ENABLE_FORWARD_USER_INFO_HEADERS', 'false').lower()
+            enable_forward = env_setting == 'true'
+        else:
+            # Invalid value, default to false
+            enable_forward = False
+        
+        if not enable_forward:
+            return {}
+        
+        headers = {}
+        if user:
+            if user.get('name'):
+                headers['X-OpenWebUI-User-Name'] = quote(str(user['name']), safe=" ")
+            if user.get('id'):
+                headers['X-OpenWebUI-User-Id'] = str(user['id'])
+            if user.get('email'):
+                headers['X-OpenWebUI-User-Email'] = str(user['email'])
+            if user.get('role'):
+                headers['X-OpenWebUI-User-Role'] = str(user['role'])
+        
+        if chat_id:
+            headers['X-OpenWebUI-Chat-Id'] = str(chat_id)
+        
+        return headers
     
     async def add_memory(
         self,
@@ -576,6 +741,14 @@ class Tools:
         """
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
+        
+        
+        # Set user headers in context variable (before any API calls)
+        headers = self._get_user_info_headers(__user__, None)
+        if headers:
+            user_headers_context.set(headers)
+            if self.valves.debug_print:
+                print(f"Set user headers in context: {list(headers.keys())}")
         
         source_type = None  # Initialize for error handling scope
         
@@ -731,6 +904,13 @@ class Tools:
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
         
+        
+        # Set user headers in context variable (before any API calls)
+        headers = self._get_user_info_headers(__user__, None)
+        if headers:
+            user_headers_context.set(headers)
+            if self.valves.debug_print:
+                print(f"Set user headers in context: {list(headers.keys())}")
         # Validate and clamp limit
         limit = max(1, min(100, limit))
         
@@ -805,6 +985,13 @@ class Tools:
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
         
+        
+        # Set user headers in context variable (before any API calls)
+        headers = self._get_user_info_headers(__user__, None)
+        if headers:
+            user_headers_context.set(headers)
+            if self.valves.debug_print:
+                print(f"Set user headers in context: {list(headers.keys())}")
         # Validate and clamp limit
         limit = max(1, min(100, limit))
         
@@ -880,6 +1067,13 @@ class Tools:
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
         
+        
+        # Set user headers in context variable (before any API calls)
+        headers = self._get_user_info_headers(__user__, None)
+        if headers:
+            user_headers_context.set(headers)
+            if self.valves.debug_print:
+                print(f"Set user headers in context: {list(headers.keys())}")
         # Validate and clamp limit
         limit = max(1, min(100, limit))
         
@@ -963,6 +1157,13 @@ class Tools:
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
         
+        
+        # Set user headers in context variable (before any API calls)
+        headers = self._get_user_info_headers(__user__, None)
+        if headers:
+            user_headers_context.set(headers)
+            if self.valves.debug_print:
+                print(f"Set user headers in context: {list(headers.keys())}")
         # Validate and clamp limit
         limit = max(1, min(100, limit))
         
@@ -1059,6 +1260,13 @@ class Tools:
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
         
+        
+        # Set user headers in context variable (before any API calls)
+        headers = self._get_user_info_headers(__user__, None)
+        if headers:
+            user_headers_context.set(headers)
+            if self.valves.debug_print:
+                print(f"Set user headers in context: {list(headers.keys())}")
         # Validate and clamp limit
         limit = max(1, min(100, limit))
         
@@ -1158,6 +1366,13 @@ class Tools:
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
         
+        
+        # Set user headers in context variable (before any API calls)
+        headers = self._get_user_info_headers(__user__, None)
+        if headers:
+            user_headers_context.set(headers)
+            if self.valves.debug_print:
+                print(f"Set user headers in context: {list(headers.keys())}")
         # Validate and clamp limit
         limit = max(1, min(100, limit))
         
@@ -1259,6 +1474,14 @@ class Tools:
         """
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
+        
+        
+        # Set user headers in context variable (before any API calls)
+        headers = self._get_user_info_headers(__user__, None)
+        if headers:
+            user_headers_context.set(headers)
+            if self.valves.debug_print:
+                print(f"Set user headers in context: {list(headers.keys())}")
         
         try:
             # Get user's language preference first
@@ -1419,6 +1642,13 @@ class Tools:
         if not await self.helper.ensure_graphiti_initialized() or self.helper.graphiti is None:
             return "❌ Error: Memory service is not available"
         
+        
+        # Set user headers in context variable (before any API calls)
+        headers = self._get_user_info_headers(__user__, None)
+        if headers:
+            user_headers_context.set(headers)
+            if self.valves.debug_print:
+                print(f"Set user headers in context: {list(headers.keys())}")
         try:
             group_id = self.helper.get_group_id(__user__)
             

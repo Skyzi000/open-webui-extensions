@@ -2,10 +2,9 @@
 title: Graphiti Memory
 author: Skyzi000
 description: Automatically identify and store valuable information from chats as Memories.
-author_email: dev@skyzi.jp
 author_url: https://github.com/Skyzi000
 repository_url: https://github.com/Skyzi000/open-webui-extensions
-version: 0.3
+version: 0.4
 requirements: graphiti-core[falkordb]
 
 Design:
@@ -34,6 +33,7 @@ Architecture:
 """
 
 import asyncio
+import contextvars
 import hashlib
 import os
 import re
@@ -52,6 +52,7 @@ from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.nodes import EpisodeType
+from openai import AsyncOpenAI
 from graphiti_core.search.search_config_recipes import (
     COMBINED_HYBRID_SEARCH_RRF,
     COMBINED_HYBRID_SEARCH_CROSS_ENCODER,
@@ -70,16 +71,110 @@ from graphiti_core.search.search_config import (
 )
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 
-# from open_webui.main import app as webui_app
-# from open_webui.models.users import Users, UserModel
-# from open_webui.routers.memories import (
-#     add_memory,
-#     AddMemoryForm,
-#     delete_memory_by_id,
-#     query_memory,
-#     QueryMemoryForm,
-# )
+# Context variable to store user-specific headers for each async request
+# This ensures complete isolation between concurrent requests without locks
+user_headers_context = contextvars.ContextVar('user_headers', default={})
 
+
+class MultiUserOpenAIClient(OpenAIClient):
+    """
+    Custom OpenAI LLM client that retrieves user-specific headers from context variables.
+    This allows a single Graphiti instance to safely handle concurrent requests from multiple users.
+    """
+    
+    def __init__(self, config: LLMConfig | None = None, cache: bool = False, **kwargs):
+        if config is None:
+            config = LLMConfig()
+        
+        # Store base client for dynamic header injection
+        self._base_client = AsyncOpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+        )
+        
+        # Initialize parent with our base client and any additional kwargs
+        super().__init__(config, cache, self._base_client, **kwargs)
+    
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Dynamically return client with user-specific headers from context"""
+        headers = user_headers_context.get()
+        if headers:
+            return self._base_client.with_options(default_headers=headers)
+        return self._base_client
+    
+    @client.setter
+    def client(self, value: AsyncOpenAI):
+        """Store base client for future header injection"""
+        self._base_client = value
+
+
+class MultiUserOpenAIGenericClient(OpenAIGenericClient):
+    """
+    Custom OpenAI-compatible generic LLM client that retrieves user-specific headers from context variables.
+    """
+    
+    def __init__(self, config: LLMConfig | None = None, cache: bool = False):
+        if config is None:
+            config = LLMConfig()
+        
+        # Store base client for dynamic header injection
+        self._base_client = AsyncOpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+        )
+        
+        # Initialize parent with our base client
+        super().__init__(config, cache, self._base_client)
+    
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Dynamically return client with user-specific headers from context"""
+        headers = user_headers_context.get()
+        if headers:
+            return self._base_client.with_options(default_headers=headers)
+        return self._base_client
+    
+    @client.setter
+    def client(self, value: AsyncOpenAI):
+        """Store base client for future header injection"""
+        self._base_client = value
+
+
+class MultiUserOpenAIEmbedder(OpenAIEmbedder):
+    """
+    Custom OpenAI embedder that retrieves user-specific headers from context variables.
+    """
+    
+    def __init__(
+        self,
+        config: OpenAIEmbedderConfig | None = None,
+        client: AsyncOpenAI | None = None,
+    ):
+        if config is None:
+            config = OpenAIEmbedderConfig()
+        
+        # Store base client for dynamic header injection
+        if client is not None:
+            self._base_client = client
+        else:
+            self._base_client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
+        
+        # Initialize parent with our base client
+        super().__init__(config, self._base_client)
+    
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Dynamically return client with user-specific headers from context"""
+        headers = user_headers_context.get()
+        if headers:
+            return self._base_client.with_options(default_headers=headers)
+        return self._base_client
+    
+    @client.setter
+    def client(self, value: AsyncOpenAI):
+        """Store base client for future header injection"""
+        self._base_client = value
 
 class Filter:
     """
@@ -274,7 +369,6 @@ class Filter:
         self.graphiti = None
         self._indices_built = False  # Track if indices have been built
         self._last_config = None  # Track configuration for change detection
-        self._current_user_headers = {}  # Track current user info headers
         # Try to initialize, but it's okay if it fails - will retry later
         try:
             self._initialize_graphiti()
@@ -371,70 +465,6 @@ class Filter:
         
         return headers
     
-    def _update_llm_client_headers(self, headers: dict) -> None:
-        """
-        Update LLM client and embedder with extra headers using AsyncOpenAI's copy() method.
-        
-        Args:
-            headers: Dictionary of headers to add to all requests
-        """
-        if not headers or self.graphiti is None:
-            return
-        
-        # Only update if headers changed
-        if headers == self._current_user_headers:
-            return
-        
-        self._current_user_headers = headers
-        
-        # Update LLM client
-        try:
-            if self.graphiti.llm_client is not None:
-                llm_client = self.graphiti.llm_client
-                
-                # OpenAIClient and OpenAIGenericClient both have a 'client' attribute that is AsyncOpenAI
-                if hasattr(llm_client, 'client'):
-                    old_client = llm_client.client  # type: ignore
-                    
-                    # Use AsyncOpenAI's copy() method to create a new client with additional headers
-                    # This preserves all existing settings while adding our headers
-                    new_client = old_client.copy(default_headers=headers)  # type: ignore
-                    
-                    # Replace the client
-                    llm_client.client = new_client  # type: ignore
-                    if self.valves.debug_print:
-                        print(f"Updated LLM client with headers using copy(): {list(headers.keys())}")
-                else:
-                    if self.valves.debug_print:
-                        print("Warning: LLM client does not have 'client' attribute")
-        except Exception as e:
-            print(f"Failed to update LLM client headers: {e}")
-            traceback.print_exc()
-        
-        # Update Embedder client
-        try:
-            if self.graphiti.embedder is not None:
-                embedder = self.graphiti.embedder
-                
-                # OpenAIEmbedder also has a 'client' attribute that is AsyncOpenAI
-                if hasattr(embedder, 'client'):
-                    old_client = embedder.client  # type: ignore
-                    
-                    # Use AsyncOpenAI's copy() method to create a new client with additional headers
-                    new_client = old_client.copy(default_headers=headers)  # type: ignore
-                    
-                    # Replace the client
-                    embedder.client = new_client  # type: ignore
-                    if self.valves.debug_print:
-                        print(f"Updated Embedder client with headers using copy(): {list(headers.keys())}")
-                else:
-                    if self.valves.debug_print:
-                        print("Warning: Embedder does not have 'client' attribute")
-        except Exception as e:
-            print(f"Failed to update Embedder headers: {e}")
-            traceback.print_exc()
-
-
     def _initialize_graphiti(self) -> bool:
         """
         Initialize Graphiti instance with configured backend.
@@ -454,20 +484,20 @@ class Filter:
                 base_url=self.valves.openai_api_url,
             )
 
-            # Select LLM client based on configuration
+            # Select LLM client based on configuration - use multi-user versions
             if self.valves.llm_client_type.lower() == "openai":
-                llm_client = OpenAIClient(config=llm_config)
+                llm_client = MultiUserOpenAIClient(config=llm_config)
                 if self.valves.debug_print:
-                    print("Using OpenAI client")
+                    print("Using Multi-User OpenAI client")
             elif self.valves.llm_client_type.lower() == "generic":
-                llm_client = OpenAIGenericClient(config=llm_config)
+                llm_client = MultiUserOpenAIGenericClient(config=llm_config)
                 if self.valves.debug_print:
-                    print("Using OpenAI-compatible generic client")
+                    print("Using Multi-User OpenAI-compatible generic client")
             else:
                 # Default to OpenAI client for unknown values
-                llm_client = OpenAIClient(config=llm_config)
+                llm_client = MultiUserOpenAIClient(config=llm_config)
                 if self.valves.debug_print:
-                    print(f"Unknown client type '{self.valves.llm_client_type}', defaulting to OpenAI client")
+                    print(f"Unknown client type '{self.valves.llm_client_type}', defaulting to Multi-User OpenAI client")
 
             falkor_driver = None
             if self.valves.graph_db_backend.lower() == "falkordb":
@@ -483,7 +513,7 @@ class Filter:
                 self.graphiti = Graphiti(
                     graph_driver=falkor_driver,
                     llm_client=llm_client,
-                    embedder=OpenAIEmbedder(
+                    embedder=MultiUserOpenAIEmbedder(
                         config=OpenAIEmbedderConfig(
                             api_key=self.valves.api_key,
                             embedding_model=self.valves.embedding_model,
@@ -491,9 +521,9 @@ class Filter:
                             base_url=self.valves.openai_api_url,
                         )
                     ),
-                    # OpenAIRerankerClient requires AsyncOpenAI client, not LLMClient wrapper
-                    # Both OpenAIClient and OpenAIGenericClient have .client attribute (AsyncOpenAI instance)
-                    cross_encoder=OpenAIRerankerClient(client=llm_client.client, config=llm_config),
+                    # OpenAIRerankerClient requires AsyncOpenAI client
+                    # Use base_client from our custom multi-user client
+                    cross_encoder=OpenAIRerankerClient(client=llm_client._base_client, config=llm_config),
                 )
             elif self.valves.graph_db_backend.lower() == "neo4j":
                 self.graphiti = Graphiti(
@@ -501,7 +531,7 @@ class Filter:
                     self.valves.neo4j_user,
                     self.valves.neo4j_password,
                     llm_client=llm_client,
-                    embedder=OpenAIEmbedder(
+                    embedder=MultiUserOpenAIEmbedder(
                         config=OpenAIEmbedderConfig(
                             api_key=self.valves.api_key,
                             embedding_model=self.valves.embedding_model,
@@ -509,9 +539,9 @@ class Filter:
                             base_url=self.valves.openai_api_url,
                         )
                     ),
-                    # OpenAIRerankerClient requires AsyncOpenAI client, not LLMClient wrapper
-                    # Both OpenAIClient and OpenAIGenericClient have .client attribute (AsyncOpenAI instance)
-                    cross_encoder=OpenAIRerankerClient(client=llm_client.client, config=llm_config),
+                    # OpenAIRerankerClient requires AsyncOpenAI client
+                    # Use base_client from our custom multi-user client
+                    cross_encoder=OpenAIRerankerClient(client=llm_client._base_client, config=llm_config),
                 )
             else:
                 print(f"Unsupported graph database backend: {self.valves.graph_db_backend}. Supported backends are 'neo4j' and 'falkordb'.")
@@ -743,11 +773,13 @@ class Filter:
                 )
             return body
         
-        # Update LLM client headers with user info (before any API calls)
+        # Set user headers in context variable (before any API calls)
         chat_id = __metadata__.get('chat_id') if __metadata__ else None
         headers = self._get_user_info_headers(__user__, chat_id)
         if headers:
-            self._update_llm_client_headers(headers)
+            user_headers_context.set(headers)
+            if self.valves.debug_print:
+                print(f"Set user headers in context: {list(headers.keys())}")
         
         if __user__ is None:
             if self.valves.debug_print:
@@ -968,36 +1000,7 @@ class Filter:
         else:
             if self.valves.debug_print:
                 print(f'Skipping {len(results.nodes)} entities (inject_entities is disabled)')
-            
-            # # Emit citation for each memory
-            # await __event_emitter__(
-            #     {
-            #         "type": "citation",
-            #         "data": {
-            #             "source": {
-            #                 "name": "Graphiti Memory",
-            #                 "id": str(result.uuid),
-            #             },
-            #             "document": [result.fact],
-            #             "metadata": [
-            #                 {
-            #                     "source": "Graphiti Memory",
-            #                     "parameters": {
-            #                         "source": "Graphiti Memory",
-            #                         "name": str(result.name),
-            #                         "group_id": group_id,
-            #                         "uuid": str(result.uuid),
-            #                         "valid_at": str(result.valid_at) if hasattr(result, 'valid_at') and result.valid_at else None,
-            #                         "invalid_at": str(result.invalid_at) if hasattr(result, 'invalid_at') and result.invalid_at else None,
-            #                         "attributes": str(result.attributes) if hasattr(result, 'attributes') and result.attributes else None,
-            #                         "source_node_uuid": str(result.source_node_uuid) if hasattr(result, 'source_node_uuid') and result.source_node_uuid else None,
-            #                         "target_node_uuid": str(result.target_node_uuid) if hasattr(result, 'target_node_uuid') and result.target_node_uuid else None,
-            #                     }
-            #                 }
-            #             ]
-            #         }
-            #     }
-            # )
+
             
         # Insert memory message if we have facts OR entities
         if len(facts) > 0 or len(entities) > 0:
@@ -1106,10 +1109,12 @@ class Filter:
         if self.valves.debug_print:
             print(f"outlet:{__name__}, chat_id:{chat_id}, message_id:{message_id}")
         
-        # Update LLM client headers with user info (before any API calls)
+        # Set user headers in context variable (before any API calls)
         headers = self._get_user_info_headers(__user__, chat_id)
         if headers:
-            self._update_llm_client_headers(headers)
+            user_headers_context.set(headers)
+            if self.valves.debug_print:
+                print(f"Set user headers in context: {list(headers.keys())}")
 
 
         user_valves: Filter.UserValves = __user__.get("valves", self.UserValves())
