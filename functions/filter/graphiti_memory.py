@@ -4,7 +4,7 @@ author: Skyzi000
 description: Automatically identify and store valuable information from chats as Memories.
 author_url: https://github.com/Skyzi000
 repository_url: https://github.com/Skyzi000/open-webui-extensions
-version: 0.4
+version: 0.5
 requirements: graphiti-core[falkordb]
 
 Design:
@@ -277,7 +277,12 @@ class Filter:
         
         save_assistant_response: bool = Field(
             default=False,
-            description="Automatically save assistant responses as memories",
+            description="Automatically save assistant responses (latest) as memories",
+        )
+        
+        save_previous_assistant_message: bool = Field(
+            default=True,
+            description="Save the assistant message that the user is responding to (the one before the latest user message). This provides context about what the user is replying to.",
         )
         
         inject_facts: bool = Field(
@@ -359,7 +364,12 @@ class Filter:
         )
         save_assistant_response: str = Field(
             default="default",
-            description="Automatically save assistant responses as memories. Options: 'default' (use global setting), 'true' (always save), 'false' (never save).",
+            description="Automatically save assistant responses (latest) as memories. Options: 'default' (use global setting), 'true' (always save), 'false' (never save).",
+        )
+        
+        save_previous_assistant_message: str = Field(
+            default="default",
+            description="Save the assistant message that the user is responding to (the one before the latest user message). Options: 'default' (use global setting), 'true' (always save), 'false' (never save).",
         )
         
         inject_facts: str = Field(
@@ -1134,18 +1144,42 @@ class Filter:
         # Determine which messages to save based on settings
         messages_to_save = []
         
-        # Find the last user message
+        # Find the last user message, last assistant message, and previous assistant message
         last_user_message = None
         last_assistant_message = None
+        previous_assistant_message = None
         
         for msg in reversed(messages):
             if msg.get("role") == "user" and last_user_message is None:
                 last_user_message = msg
-            elif msg.get("role") == "assistant" and last_assistant_message is None:
-                last_assistant_message = msg
-            
-            if last_user_message and last_assistant_message:
-                break
+            elif msg.get("role") == "assistant":
+                if last_user_message is None:
+                    # This is after the last user message (the latest assistant response)
+                    if last_assistant_message is None:
+                        last_assistant_message = msg
+                else:
+                    # This is before the last user message (the assistant message user is responding to)
+                    if previous_assistant_message is None:
+                        previous_assistant_message = msg
+                        break  # We found everything we need
+        
+        # Save previous assistant message based on setting (the one user is responding to)
+        # Use UserValves setting if available, otherwise fall back to Valves setting
+        user_save_previous_assistant_setting = user_valves.save_previous_assistant_message.lower()
+        if user_save_previous_assistant_setting == "default":
+            save_previous_assistant = self.valves.save_previous_assistant_message
+        elif user_save_previous_assistant_setting == "true":
+            save_previous_assistant = True
+        elif user_save_previous_assistant_setting == "false":
+            save_previous_assistant = False
+        else:
+            # Invalid value, use global setting as fallback
+            save_previous_assistant = self.valves.save_previous_assistant_message
+        
+        if save_previous_assistant and previous_assistant_message:
+            previous_assistant_content = self._get_content_from_message(previous_assistant_message)
+            if previous_assistant_content:
+                messages_to_save.append(("previous_assistant", previous_assistant_content))
         
         # Save user messages based on setting
         # Use UserValves setting if available, otherwise fall back to Valves setting
@@ -1186,7 +1220,11 @@ class Filter:
         if len(messages_to_save) == 0:
             return body
         
-        # Construct episode body in "User: {message}\nAssistant: {message}" format for EpisodeType.message
+        # Construct episode body in "Assistant: {message}\nUser: {message}\nAssistant: {message}" format for EpisodeType.message
+        # Sort messages to maintain chronological order: previous_assistant -> user -> assistant
+        role_order = {"previous_assistant": 0, "user": 1, "assistant": 2}
+        messages_to_save.sort(key=lambda x: role_order.get(x[0], 99))
+        
         episode_parts = []
         for role, content in messages_to_save:
             if role == "user":
@@ -1195,8 +1233,10 @@ class Filter:
                     role_label = __user__['name']
                 else:
                     role_label = "User"
-            else:
+            elif role in ("assistant", "previous_assistant"):
                 role_label = "Assistant"
+            else:
+                role_label = role.capitalize()
             episode_parts.append(f"{role_label}: {content}")
         
         episode_body = "\n".join(episode_parts)
