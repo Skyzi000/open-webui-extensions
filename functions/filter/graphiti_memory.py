@@ -970,7 +970,7 @@ class Filter:
                 
                 # Emit status for each fact found
                 if user_valves.show_status:
-                    emoji = "🚫" if result.invalid_at else "✅"
+                    emoji = "🔚" if result.invalid_at else "🔛"
                     await __event_emitter__(
                         {
                             "type": "status",
@@ -1275,7 +1275,7 @@ class Filter:
                 # Show all Facts
                 if add_results.edges:
                     for idx, edge in enumerate(add_results.edges, 1):
-                        emoji = "⏹️" if edge.invalid_at else "▶️"
+                        emoji = "🔚" if edge.invalid_at else "🔛"
                         await __event_emitter__(
                             {
                                 "type": "status",
