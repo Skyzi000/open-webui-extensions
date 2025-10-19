@@ -1,0 +1,3 @@
+[submodule "references/open-webui"]
+	path = references/open-webui
+	url = https://github.com/open-webui/open-webui.git
