@@ -1,0 +1,10 @@
+[project]
+name = "open-webui-extensions"
+version = "0.1.0"
+description = "A collection of extensions for Open WebUI."
+readme = "README.md"
+requires-python = ">=3.11, <3.13.0"
+dependencies = [
+    "aiohttp>=3.12.15",
+    "graphiti-core[falkordb]>=0.20.4",
+]
