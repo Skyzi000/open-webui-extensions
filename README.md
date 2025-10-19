@@ -2,24 +2,17 @@
 
 このリポジトリは、Open WebUI用の個人的なツール・拡張機能を含んでいます。
 
-## 重要な注意事項
-
-**このプロジェクトは個人的な使用のために開発されたものです。**
+## 注意事項
 
 - 他の人が使用することは現状想定していません
-- 環境依存性、設定の複雑さ、ドキュメント不足などの問題があります
-- サポートやメンテナンスは個人的な必要に応じて行われます
 
-## 含まれているツール
+## 含まれているもの
 
 - **Memory**: Open WebUIのメモリ機能を拡張するツール
 - **Universal File Generator**: 様々な形式のファイル生成ツール（Pandoc版含む）
+- **Graphiti Memory**: [Graphiti](https://github.com/getzep/graphiti)を利用したナレッジグラフベースのメモリ拡張機能（[Filter](functions/filter/graphiti_memory.py), [Tool](tools/graphiti_memory_manage.py), [Action](functions/action/add_graphiti_memory_action.py)）
 
 ## ライセンス
+※Skyzi000が作成したコード部分にのみ適用されます。
 
 MIT License
-
-## 免責事項
-
-このソフトウェアは現状のまま提供され、いかなる保証もありません。
-個人的な学習・実験目的で使用してください。
