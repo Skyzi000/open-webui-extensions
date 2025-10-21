@@ -4,7 +4,7 @@ author: Skyzi000
 description: Automatically identify and store valuable information from chats as Memories.
 author_url: https://github.com/Skyzi000
 repository_url: https://github.com/Skyzi000/open-webui-extensions
-version: 0.5
+version: 0.7
 requirements: graphiti-core[falkordb]
 
 Design:
@@ -30,6 +30,7 @@ Architecture:
 - Lazy initialization: _ensure_graphiti_initialized() provides automatic retry
 - Memory search: inlet() retrieves relevant memories before chat processing
 - Memory storage: outlet() stores new information after chat completion
+- RAG context ingestion: outlet() captures retrieval-augmented context returned by Open WebUI so referenced material is persisted in memory alongside the conversation.
 """
 
 import asyncio
@@ -345,6 +346,10 @@ class Filter:
         save_previous_assistant_message: bool = Field(
             default=True,
             description="Save the assistant message that the user is responding to (the one before the latest user message).",
+        )
+        merge_retrieved_context: bool = Field(
+            default=True,
+            description="Merge RAG retrieved context (e.g., file attachments, knowledge base hits) into the user message before saving to memory.",
         )
         
         inject_facts: bool = Field(
@@ -705,6 +710,55 @@ class Filter:
         
         # Handle string format
         return content if isinstance(content, str) else ""
+    
+    def _extract_rag_sources_text(
+        self,
+        message: Optional[dict],
+    ) -> str:
+        """
+        Build a readable text block from RAG retrieval sources attached to a message.
+        """
+        if not message:
+            return ""
+        
+        sources = (
+            message.get("sources")
+            or message.get("citations")
+        )
+        if not sources:
+            return ""
+
+        sections: list[str] = []
+        for idx, source in enumerate(sources, 1):
+            source_info = source.get("source") or {}
+            base_label = (
+                source_info.get("name")
+                or source_info.get("id")
+                or f"Source {idx}"
+            )
+            documents = source.get("document") or []
+            metadatas = source.get("metadata") or []
+            
+            for doc_index, document_text in enumerate(documents, 1):
+                if not isinstance(document_text, str):
+                    continue
+                
+                metadata = (
+                    metadatas[doc_index - 1]
+                    if doc_index - 1 < len(metadatas)
+                    else {}
+                )
+                title = (
+                    metadata.get("name")
+                    or metadata.get("source")
+                    or metadata.get("file_id")
+                    or f"{base_label}#{doc_index}"
+                )
+                
+                heading = f"[{base_label} #{doc_index}] {title}".strip()
+                sections.append(f"{heading}\n{document_text.strip()}")
+        
+        return "\n\n".join(section for section in sections if section.strip())
     
     def _sanitize_search_query(self, query: str) -> str:
         """
@@ -1120,10 +1174,22 @@ class Filter:
             if previous_assistant_content:
                 messages_to_save.append(("previous_assistant", previous_assistant_content))
         
+        user_content_block = ""
         if user_valves.save_user_message and last_user_message:
-            user_content = self._get_content_from_message(last_user_message)
-            if user_content:
-                messages_to_save.append(("user", user_content))
+            user_content_block = self._get_content_from_message(last_user_message) or ""
+            if user_valves.merge_retrieved_context:
+                rag_context_block = self._extract_rag_sources_text(last_assistant_message)
+                if rag_context_block:
+                    if user_content_block.strip():
+                        user_content_block = (
+                            f"{user_content_block.strip()}\n\nRetrieved Context:\n{rag_context_block}"
+                        )
+                    else:
+                        user_content_block = f"Retrieved Context:\n{rag_context_block}"
+        
+        if user_valves.save_user_message and last_user_message:
+            if user_content_block:
+                messages_to_save.append(("user", user_content_block))
         
         if user_valves.save_assistant_response and last_assistant_message:
             assistant_content = self._get_content_from_message(last_assistant_message)
