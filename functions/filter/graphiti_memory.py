@@ -351,6 +351,10 @@ class Filter:
             default=True,
             description="Merge RAG retrieved context (e.g., file attachments, knowledge base hits) into the user message before saving to memory.",
         )
+        allowed_rag_source_types: str | None = Field(
+            default="file",
+            description="Comma-separated list of retrieval source types to merge (e.g., 'file, web_search'). Leave blank to disable merging.",
+        )
         
         inject_facts: bool = Field(
             default=True,
@@ -714,6 +718,7 @@ class Filter:
     def _extract_rag_sources_text(
         self,
         message: Optional[dict],
+        allowed_types: Optional[set[str]] = None,
     ) -> str:
         """
         Build a readable text block from RAG retrieval sources attached to a message.
@@ -731,6 +736,13 @@ class Filter:
         sections: list[str] = []
         for idx, source in enumerate(sources, 1):
             source_info = source.get("source") or {}
+            source_type = str(source_info.get("type", "")).lower().strip()
+            if allowed_types is not None:
+                if source_type == "":
+                    if "" not in allowed_types:
+                        continue
+                elif source_type not in allowed_types:
+                    continue
             base_label = (
                 source_info.get("name")
                 or source_info.get("id")
@@ -759,6 +771,40 @@ class Filter:
                 sections.append(f"{heading}\n{document_text.strip()}")
         
         return "\n\n".join(section for section in sections if section.strip())
+    
+    @staticmethod
+    def _parse_allowed_source_types(value: Any) -> Optional[set[str]]:
+        """
+        Normalize user-configured RAG source type filters to a lowercase set.
+        Returns:
+            set[str]: Allowed types; empty set disables merging; None permits all.
+        """
+        if value is None:
+            return None
+        
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8", errors="ignore")
+
+        if isinstance(value, str):
+            candidates = value.split(",")
+        elif isinstance(value, list):
+            # Backward compatibility for older list-based valves
+            candidates = value
+        else:
+            candidates = [value]
+
+        normalized: set[str] = set()
+        for item in candidates:
+            if isinstance(item, (bytes, bytearray)):
+                item = item.decode("utf-8", errors="ignore")
+            elif not isinstance(item, str):
+                item = str(item)
+
+            item = item.strip()
+            if item:
+                normalized.add(item.lower())
+
+        return normalized
     
     def _sanitize_search_query(self, query: str) -> str:
         """
@@ -1178,7 +1224,14 @@ class Filter:
         if user_valves.save_user_message and last_user_message:
             user_content_block = self._get_content_from_message(last_user_message) or ""
             if user_valves.merge_retrieved_context:
-                rag_context_block = self._extract_rag_sources_text(last_assistant_message)
+                allowed_types_set = self._parse_allowed_source_types(
+                    getattr(user_valves, "allowed_rag_source_types", None)
+                )
+
+                rag_context_block = self._extract_rag_sources_text(
+                    last_assistant_message,
+                    allowed_types_set,
+                )
                 if rag_context_block:
                     if user_content_block.strip():
                         user_content_block = (
