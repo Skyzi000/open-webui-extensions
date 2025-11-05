@@ -352,7 +352,7 @@ class Filter:
             description="Merge RAG retrieved context (e.g., file attachments, knowledge base hits) into the user message before saving to memory.",
         )
         allowed_rag_source_types: str | None = Field(
-            default="file",
+            default="file,text",
             description="Comma-separated list of retrieval source types to merge (e.g., 'file, web_search'). Leave blank to disable merging.",
         )
         
