@@ -14,9 +14,9 @@
   - 別リポジトリ [open-webui-graphiti-memory](https://github.com/Skyzi000/open-webui-graphiti-memory) として管理
   - このリポジトリでは `graphiti/` サブモジュールから参照
   - ファイル:
-    - Filter: [graphiti/functions/filter/graphiti_memory.py](graphiti/functions/filter/graphiti_memory.py)
-    - Tool: [graphiti/tools/graphiti_memory_manage.py](graphiti/tools/graphiti_memory_manage.py)
-    - Action: [graphiti/functions/action/add_graphiti_memory_action.py](graphiti/functions/action/add_graphiti_memory_action.py)
+    - Filter: [graphiti_memory.py](https://github.com/Skyzi000/open-webui-graphiti-memory/blob/main/functions/filter/graphiti_memory.py)
+    - Tool: [graphiti_memory_manage.py](https://github.com/Skyzi000/open-webui-graphiti-memory/blob/main/tools/graphiti_memory_manage.py)
+    - Action: [add_graphiti_memory_action.py](https://github.com/Skyzi000/open-webui-graphiti-memory/blob/main/functions/action/add_graphiti_memory_action.py)
 
 ## セットアップ
 
