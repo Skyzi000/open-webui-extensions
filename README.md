@@ -35,14 +35,6 @@ git submodule update
 git clone --recurse-submodules https://github.com/Skyzi000/open-webui-extensions.git
 ```
 
-### Open WebUIへの追加
-
-Graphiti拡張機能を使用する場合は、サブモジュール内のファイルを直接参照してください:
-
-- `graphiti/functions/filter/graphiti_memory.py`
-- `graphiti/functions/action/add_graphiti_memory_action.py`
-- `graphiti/tools/graphiti_memory_manage.py`
-
 ## ライセンス
 
 ※Skyzi000が作成したコード部分にのみ適用されます。
