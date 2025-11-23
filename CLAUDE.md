@@ -1,114 +1,103 @@
-# Claude開発メモ
+# Claude Development Guidelines
 
-## Universal File Generator 開発記録
+## Repository Structure
 
-### 重要な学習事項・課題解決記録
+This repository contains Open WebUI extensions, with some components managed as Git submodules.
 
-#### 1. ZIP内バイナリファイル自動変換機能 (重要)
-**問題**: ZIP作成時に `{"sample.docx": "# Markdown text"}` のような入力で、Markdownテキストがそのまま.docxファイル名で保存されてしまい、有効なDOCXファイルにならない
+### Submodules
 
-**解決**: 
-- ファイル拡張子（.docx, .pdf, .xlsx）を検出して自動でバイナリ変換
-- FileGeneratorを使ってテキスト内容を適切な形式に変換
-- ~~変換失敗時は.txtファイルとしてフォールバック~~ → **削除済み（v0.20.2-pandoc）**
+- `graphiti/` - Graphiti memory system extensions (separate repository)
+- `open-webui/` - Reference submodule
 
-**実装場所**: `_add_files_to_zip()` 関数内
-- 元ファイル: 既に対応済み (List形式→Dict形式変換後にFileGenerator使用)
-- Pandoc版: 新たに実装
+## Commit Message Rules
 
-**注意**: 新しいバージョンを作る時は、この機能を最初から組み込むこと
+### Important: Check Submodule Commit Style First
 
-#### 2. SVG画像のDOCX埋め込み対応
-**問題**: SVGファイルがDOCXに直接埋め込めない
+Before committing to a submodule, **always check the existing commit history** using:
 
-**解決**: 
-- CairoSVGでSVG→PNG変換
-- HTMLエスケープ文字の自動解除
-- インラインSVG（`<svg>`タグ）とimg要素の両対応
+```bash
+git log -5 --format=medium
+```
 
-**実装**: v0.20.0で対応完了
+Each submodule may have its own commit message style. Follow the existing pattern.
 
-#### 3. 日本語フォント問題
-**PDF生成で日本語が表示されない問題**
+### Graphiti Submodule Style
 
-**解決策の変遷**:
-1. 最初: フォント自動ダウンロード機能実装
-2. システム環境整備後: システムフォント使用に変更
-   - `texlive-lang-japanese`
-   - `fonts-noto-cjk`
+Uses **Conventional Commits** format:
 
-**Pandoc版**: XeLaTeX + システム日本語フォント使用
+```text
+type(scope): short description
 
-#### 4. データ形式の明確化
-**問題**: DOCX/PDF生成時にJSON/Dictオブジェクトが渡されて期待通りに動作しない
+Optional detailed description explaining what and why.
+- Bullet points for multiple changes
+- Keep each point concise
+```
 
-**解決**: 
-- 関数説明にSTRING形式推奨の警告を追加
-- 複雑なDict構造の入力エラーチェック実装
+**Types:**
 
-### 開発方針・ルール
+- `feat` - New feature
+- `fix` - Bug fix
+- `chore` - Maintenance (version updates, dependencies, etc.)
+- `docs` - Documentation only
+- `refactor` - Code refactoring without feature changes
+- `test` - Adding or updating tests
 
-1. **新バージョン作成時の注意**:
-   - 既存の課題解決機能を忘れずに組み込む
-   - このCLAUDE.mdの内容を参照して漏れを防ぐ
+**Scopes:**
 
-2. **重要な機能**:
-   - ZIP内自動バイナリ変換は必須機能
-   - SVG→PNG変換（DOCX用）
-   - 日本語フォント対応
+- `filter` - Filter components
+- `tools` - Tools components
+- `pipeline` - Pipeline components
+- `action` - Action components
 
-3. **エラーハンドリング方針** (v0.20.2-pandoc～):
-   - **安易なフォールバック機能は実装しない**
-   - エラー発生時は適切なエラーメッセージと共に例外を発生させる
-   - AIが問題を理解して対処できるよう、具体的で建設的なエラー情報を提供する
-   - 無駄な手数を増やすだけの.txtフォールバックなどは禁止
+**Examples:**
 
-4. **AI向けドキュメント方針** (重要):
-   - **使用者はAI、実行環境はDocker上のOpenWebUI**
-   - AIはToolsクラスのメソッドドキュメントと戻り値しか見えない
-   - 全ての重要情報をToolsクラスのdocstringに含める必要がある
-   - 内部実装クラス（FileGenerator等）のドキュメントは参考程度
-   - Field descriptionでデータ形式要件を明確に記載
-   - CRITICALな情報は強調表示で記載
+```text
+feat(tools): add get_recent_episodes method for chronological episode retrieval
 
-5. **テスト項目**:
-   - `{"sample.docx": "# Test"}` → 有効なDOCXファイル生成
-   - SVG画像のDOCX埋め込み
-   - 日本語テキストのPDF生成
+- Add get_recent_episodes() method with limit/offset pagination
+- Sort episodes by created_at in descending order (newest first)
+- Optimize database queries to fetch only offset+limit episodes
+- Update version to 0.3
+```
 
-### アーキテクチャ比較
+```text
+fix(filter): Fix null pointer exception in D3.js graph tick handler
 
-#### オリジナル版 (v0.20.0)
-- 詳細なHTML解析とSVG→PNG変換
-- フォント自動ダウンロード→システムフォント使用
-- CairoSVG, BeautifulSoup使用
+Add null checks before calling getBBox() on text nodes in the force
+simulation tick event.
+```
 
-#### Pandoc版 (v0.20.0-pandoc)
-- Pandocによるシンプルな変換
-- XeLaTeX + システム日本語フォント
-- ネイティブSVG対応（pandoc処理）
+### Root Repository Style
 
-### 今後の課題
+Uses Japanese, simple descriptive messages:
 
-1. **メモリ効率**: 大きなファイル処理時の最適化
-2. **エラーハンドリング**: より詳細なエラー情報
-3. **テスト自動化**: 重要機能の回帰テスト
-4. **TODO: 入出力形式の明示化**:
-   - Universal File Generatorで入力ファイル形式と出力ファイル形式をAIに明示的に入力させる
-   - 現在は拡張子から自動推測しているが、AIが意図する形式を引数として受け取るように改善
-   - 例: `input_format="markdown"`, `output_format="docx"` のような明示的指定
-5. **TODO: 個人ドメイン設定可能化**:
-   - 現在ハードコーディングされている個人ドメインを設定可能にする予定
-   - ファイルアップロード機能等で使用されるドメインをユーザーが設定できるように改善
-6. **TODO: CLAUDE.md自体の整備**:
-   - このCLAUDE.mdファイルをしっかりと管理し、開発メモを適切に記録する
+```text
+サブモジュールを更新
+フルコンテキストモードトグルフィルターを追加
+```
 
-### 開発メモ方針
+## Development Guidelines
 
-- 適切に分割して開発に役立つ情報や指示とかを含めていきたい
+### General Principles
 
----
+1. **Version Management**
+   - Update version numbers when adding features or fixing bugs
+   - Follow semantic versioning principles
 
-## 注意事項
+2. **Before Committing**
+   - Verify changes work correctly
+   - Check for linting errors
+   - Review the commit message style of the target repository/submodule
 
-このファイルは開発過程で学んだ重要事項を記録し、同じ課題を繰り返さないために維持される
+### OpenWebUI Tools Development
+
+1. **Error Handling**
+   - Do not implement fallbacks without clear necessity
+   - Return clear, actionable error messages
+   - Provide specific information for AI to understand and address issues
+
+2. **Documentation for AI Users**
+   - Target audience is AI, running in Docker on OpenWebUI
+   - AI only sees Tools class method docstrings and return values
+   - Include all critical information in Tools class docstrings
+   - Use Field descriptions to clarify data format requirements
