@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: lint-tools-class
+        name: Check Tools class for helper methods
+        entry: python scripts/lint_tools_class.py
+        language: python
+        files: \.py$
+        pass_filenames: true
