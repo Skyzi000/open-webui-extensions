@@ -3,7 +3,7 @@ title: Current DateTime Injector
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Injects current date/time as a system message just before the user's latest prompt. This preserves prompt caching for the main system prompt while still providing dynamic time information.
-version: 1.0.0
+version: 1.0.1
 license: MIT
 """
 
@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 class Filter:
     class Valves(BaseModel):
         priority: int = Field(
-            default=10,
+            default=50,
             description="Priority level for the filter operations. Higher values run later.",
         )
         pass
