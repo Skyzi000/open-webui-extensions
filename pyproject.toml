@@ -8,3 +8,27 @@ dependencies = [
     "aiohttp>=3.12.15",
     "graphiti-core[falkordb]>=0.20.4",
 ]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = [".", "references/open-webui/backend"]
+
+[tool.pyright]
+extraPaths = ["references/open-webui/backend"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+
+[tool.uv.sources]
+open-webui = { path = "references/open-webui", editable = true }
+
+[dependency-groups]
+dev = [
+    "open-webui",
+]

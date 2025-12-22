@@ -1,0 +1,67 @@
+name: Test Extensions
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly check for Open WebUI compatibility
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+    inputs:
+      open_webui_branch:
+        description: "Open WebUI version to test against"
+        type: choice
+        default: "main"
+        options:
+          - "pinned"  # Use submodule commit
+          - "main"
+          - "dev"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Update Open WebUI to latest
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.open_webui_branch != 'pinned')
+        run: |
+          cd references/open-webui
+          BRANCH="${{ inputs.open_webui_branch || 'main' }}"
+          git fetch origin "$BRANCH"
+          git checkout "origin/$BRANCH"
+          echo "Updated to Open WebUI $BRANCH:"
+          git log -1 --format='%H %s (%ci)'
+
+      - name: Install dependencies (including Open WebUI)
+        run: uv sync --extra test --group dev
+
+      - name: Run all tests
+        run: uv run pytest tests/ -v --tb=short
+        env:
+          ENV: dev
+          WEBUI_SECRET_KEY: test-secret-key
+          DATABASE_URL: sqlite:///./test.db
+          ENABLE_OLLAMA_API: "false"
+          ENABLE_OPENAI_API: "false"
+
+      - name: Report Open WebUI version
+        run: |
+          cd references/open-webui
+          echo "Open WebUI commit: $(git rev-parse HEAD)"
+          echo "Open WebUI date: $(git log -1 --format=%ci)"
