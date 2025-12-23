@@ -289,6 +289,75 @@ class TestUserModel:
         except ImportError as e:
             pytest.fail(import_error_message("open_webui.models.users.UserModel") + f"\n{e}")
 
+    def test_user_model_dump_output(self, user_model_class):
+        """Verify UserModel.model_dump() produces expected output structure.
+
+        This is the critical integration test - even if type annotations are correct,
+        we verify that actual serialization produces a dict with the expected fields.
+        Extensions receive __user__ as UserModel.model_dump() output.
+        """
+        # Get required fields from model
+        required_fields = list(user_model_class.model_fields.keys())
+
+        # Build minimal test data with all required fields
+        test_data = {}
+        for field_name, field_info in user_model_class.model_fields.items():
+            annotation = field_info.annotation
+            origin = get_origin(annotation)
+            # Handle Optional types
+            if origin is not None:
+                args = get_args(annotation)
+                if type(None) in args:
+                    # Optional field - use None or a test value
+                    non_none_types = [a for a in args if a is not type(None)]
+                    if non_none_types:
+                        base_type = non_none_types[0]
+                        if base_type is str:
+                            test_data[field_name] = f"test_{field_name}"
+                        elif base_type is int:
+                            test_data[field_name] = 123
+                        elif base_type is bool:
+                            test_data[field_name] = True
+                        else:
+                            test_data[field_name] = None
+                    else:
+                        test_data[field_name] = None
+            elif annotation is str:
+                test_data[field_name] = f"test_{field_name}"
+            elif annotation is int:
+                test_data[field_name] = 123
+            elif annotation is bool:
+                test_data[field_name] = True
+            else:
+                # For complex types, try None if allowed or skip
+                if field_info.default is not None:
+                    continue  # Use default
+                test_data[field_name] = None
+
+        # Create instance
+        try:
+            user = user_model_class(**test_data)
+        except Exception as e:
+            pytest.fail(f"Cannot instantiate UserModel with test data: {e}")
+
+        # Get model_dump output
+        dumped = user.model_dump()
+
+        # Verify critical fields are present in dump output
+        critical_fields = ["id", "name", "role"]
+        for field in critical_fields:
+            assert field in dumped, \
+                f"UserModel.model_dump() missing '{field}' field. " \
+                f"Extensions expect __user__['{field}']."
+
+        # Verify types in dump output
+        assert isinstance(dumped.get("id"), str), \
+            f"UserModel.model_dump()['id'] should be str. Got: {type(dumped.get('id'))}"
+        assert isinstance(dumped.get("name"), str), \
+            f"UserModel.model_dump()['name'] should be str. Got: {type(dumped.get('name'))}"
+        assert isinstance(dumped.get("role"), str), \
+            f"UserModel.model_dump()['role'] should be str. Got: {type(dumped.get('role'))}"
+
     def test_user_model_has_id_field(self, user_model_class):
         """Verify UserModel has 'id' field."""
         assert hasattr(user_model_class, "model_fields"), \
