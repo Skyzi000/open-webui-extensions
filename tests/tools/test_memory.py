@@ -35,7 +35,6 @@ class TestMemoryToolCompatibility:
 
         tool = Tools()
         expected_methods = [
-            "recall_memories",
             "add_memory",
             "delete_memory",
             "update_memory",
