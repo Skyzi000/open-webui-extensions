@@ -1,7 +1,7 @@
 """
-title: Sub-Agent
+title: Sub Agent
 author: skyzi000
-version: 0.1.0
+version: 0.1.1
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -74,6 +74,11 @@ VALVE_TO_CATEGORY = {
     "ENABLE_CHANNELS_TOOLS": "channels",
 }
 
+# Tools that generate citation sources
+# NOTE: Update this set when new citation-capable tools are added to Open WebUI.
+# See open_webui/utils/middleware.py:get_citation_source_from_tool_result() for supported tools.
+CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files"}
+
 
 # ============================================================================
 # Helper functions (outside class - AI cannot invoke these)
@@ -84,6 +89,7 @@ async def execute_tool_call(
     tool_call: dict,
     tools_dict: dict,
     extra_params: dict,
+    event_emitter: Optional[Callable] = None,
 ) -> dict:
     """Execute a single tool call and return the result.
 
@@ -91,6 +97,7 @@ async def execute_tool_call(
         tool_call: The tool call dict with id, function.name, function.arguments
         tools_dict: Dict of available tools {name: {callable, spec, ...}}
         extra_params: Extra parameters to pass to tool functions
+        event_emitter: Optional event emitter for citation/source events
 
     Returns:
         Dict with tool_call_id and content (result)
@@ -154,6 +161,24 @@ async def execute_tool_call(
             tool_result = json.dumps(tool_result, ensure_ascii=False, default=str)
         except Exception:
             tool_result = str(tool_result)
+
+    # Extract and emit citation sources for tools that generate them
+    # This enables proper source attribution in the UI (e.g., web search results, KB documents)
+    if event_emitter and tool_result and tool_function_name in CITATION_TOOLS:
+        try:
+            from open_webui.utils.middleware import get_citation_source_from_tool_result
+
+            tool_id = tools_dict.get(tool_function_name, {}).get("tool_id", "")
+            citation_sources = get_citation_source_from_tool_result(
+                tool_name=tool_function_name,
+                tool_params=tool_function_params,
+                tool_result=tool_result,
+                tool_id=tool_id,
+            )
+            for source in citation_sources:
+                await event_emitter({"type": "source", "data": source})
+        except Exception as e:
+            log.warning(f"Error extracting citation sources from {tool_function_name}: {e}")
 
     return {
         "tool_call_id": tool_call_id,
@@ -375,6 +400,7 @@ async def run_sub_agent_loop(
                         **extra_params,
                         "__messages__": current_messages,
                     },
+                    event_emitter=event_emitter,
                 )
 
                 # Emit status with tool result
