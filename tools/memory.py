@@ -96,62 +96,62 @@ class Tools:
         """Initialize the memory management tool."""
         self.valves = self.Valves()
 
-    async def recall_memories(
-        self, __user__: dict = None, __event_emitter__: Callable[[dict], Any] = None # type: ignore
-    ) -> str:
-        """
-        Retrieves all stored memories from the user's memory vault.
-
-        IMPORTANT: Proactively check memories to enhance your responses!
-        Don't wait for users to ask what you remember.
-
-        Returns memories in chronological order with index numbers.
-        Use when you need to check stored information, reference previous
-        preferences, or build context for responses.
-
-        :param __user__: User dictionary containing the user ID
-        :param __event_emitter__: Optional event emitter for tracking status
-        :return: JSON string with indexed memories list
-        """
-        emitter = EventEmitter(__event_emitter__)
-
-        if not __user__:
-            message = "User ID not provided."
-            await emitter.emit(description=message, status="missing_user_id", done=True)
-            return json.dumps({"message": message}, ensure_ascii=False)
-
-        user_id = __user__.get("id")
-        if not user_id:
-            message = "User ID not provided."
-            await emitter.emit(description=message, status="missing_user_id", done=True)
-            return json.dumps({"message": message}, ensure_ascii=False)
-
-        await emitter.emit(
-            description="Retrieving stored memories.",
-            status="recall_in_progress",
-            done=False,
-        )
-
-        user_memories = Memories.get_memories_by_user_id(user_id)
-        if not user_memories:
-            message = "No memory stored."
-            await emitter.emit(description=message, status="recall_complete", done=True)
-            return json.dumps({"message": message}, ensure_ascii=False)
-
-        content_list = [
-            f"{index}. {memory.content}"
-            for index, memory in enumerate(
-                sorted(user_memories, key=lambda m: m.created_at), start=1
-            )
-        ]
-
-        await emitter.emit(
-            description=f"{len(user_memories)} memories loaded",
-            status="recall_complete",
-            done=True,
-        )
-
-        return f"Memories from the users memory vault: {content_list}"
+#    async def recall_memories(
+#        self, __user__: dict = None, __event_emitter__: Callable[[dict], Any] = None # type: ignore
+#    ) -> str:
+#        """
+#        Retrieves all stored memories from the user's memory vault.
+#
+#        IMPORTANT: Proactively check memories to enhance your responses!
+#        Don't wait for users to ask what you remember.
+#
+#        Returns memories in chronological order with index numbers.
+#        Use when you need to check stored information, reference previous
+#        preferences, or build context for responses.
+#
+#        :param __user__: User dictionary containing the user ID
+#        :param __event_emitter__: Optional event emitter for tracking status
+#        :return: JSON string with indexed memories list
+#        """
+#        emitter = EventEmitter(__event_emitter__)
+#
+#        if not __user__:
+#            message = "User ID not provided."
+#            await emitter.emit(description=message, status="missing_user_id", done=True)
+#            return json.dumps({"message": message}, ensure_ascii=False)
+#
+#        user_id = __user__.get("id")
+#        if not user_id:
+#            message = "User ID not provided."
+#            await emitter.emit(description=message, status="missing_user_id", done=True)
+#            return json.dumps({"message": message}, ensure_ascii=False)
+#
+#        await emitter.emit(
+#            description="Retrieving stored memories.",
+#            status="recall_in_progress",
+#            done=False,
+#        )
+#
+#        user_memories = Memories.get_memories_by_user_id(user_id)
+#        if not user_memories:
+#            message = "No memory stored."
+#            await emitter.emit(description=message, status="recall_complete", done=True)
+#            return json.dumps({"message": message}, ensure_ascii=False)
+#
+#        content_list = [
+#            f"{index}. {memory.content}"
+#            for index, memory in enumerate(
+#                sorted(user_memories, key=lambda m: m.created_at), start=1
+#            )
+#        ]
+#
+#        await emitter.emit(
+#            description=f"{len(user_memories)} memories loaded",
+#            status="recall_complete",
+#            done=True,
+#        )
+#
+#        return f"Memories from the users memory vault: {content_list}"
 
     async def add_memory(
         self,
