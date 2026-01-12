@@ -1,18 +1,26 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.1.1
+version: 0.2.0
 license: MIT
 required_open_webui_version: 0.7.0
+description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
 
-A tool that launches sub-agents to autonomously complete complex tasks.
-Sub-agents run in isolated contexts with access to the same tools as the main agent,
-executing tool calls in a loop until completion, then returning only the final result.
+Open WebUI v0.7 introduced powerful builtin tools (web search, memory, notes,
+knowledge bases, etc.), making complex multi-step tasks possible. However,
+heavy tool usage can hit context window limits, causing conversations to fail
+silently without returning a response.
 
-This design prevents context pollution in the main conversation by delegating
-deep research or multi-step operations to separate contexts.
+This tool solves that problem by delegating tool-heavy tasks to sub-agents
+running in isolated contexts. The sub-agent executes tools autonomously,
+then returns only the final result - keeping your main conversation clean
+and efficient.
 
-Inspired by VS Code's runSubagent functionality.
+Requirements:
+- Native Function Calling must be enabled for the model
+  (Model settings > Parameters > Function Calling: native)
+
+Inspired by VS Code's runSubagent functionality, this tool was developed from scratch specifically for Open WebUI to ensure seamless integration and optimal performance.
 """
 
 import ast
@@ -299,10 +307,20 @@ async def run_sub_agent_loop(
                 }
             )
 
+        # Build iteration context message
+        iteration_info = f"[Iteration {iteration}/{max_iterations}]"
+        if iteration == max_iterations:
+            iteration_info += " This is your FINAL tool call opportunity."
+
+        # Add iteration info as a system message for context
+        messages_with_context = current_messages + [
+            {"role": "system", "content": iteration_info}
+        ]
+
         # Prepare request
         form_data = {
             "model": model_id,
-            "messages": current_messages,
+            "messages": messages_with_context,
             "stream": False,
             "metadata": {
                 "task": "sub_agent",
@@ -551,13 +569,33 @@ class Tools:
         )
         pass
 
+    class UserValves(BaseModel):
+        SYSTEM_PROMPT: str = Field(
+            default="""\
+You are a sub-agent operating autonomously to complete a delegated task.
+
+CRITICAL RULES:
+1. You MUST complete the task fully without asking the user for confirmation or clarification.
+2. Continue working autonomously until the task is 100% complete.
+3. Use available tools proactively to gather information and perform actions.
+4. If you encounter obstacles, try alternative approaches before giving up.
+5. You have a limited number of tool call iterations. Complete the task before reaching the limit.
+
+RESPONSE REQUIREMENTS:
+- Provide a comprehensive final answer to the main agent.
+- Include evidence and reasoning that supports your conclusions.
+- If the task cannot be completed, explain what was attempted, why it failed, and provide actionable next steps the main agent should take.""",
+            description="System prompt for sub-agent tasks.",
+        )
+        pass
+
     def __init__(self):
         self.valves = self.Valves()
 
     async def run_sub_agent(
         self,
-        task: str,
-        system_prompt: str = "You are a helpful assistant. Complete the given task using available tools. Be thorough and provide a comprehensive final answer.",
+        description: str,
+        prompt: str,
         __user__: dict = None,
         __request__: Request = None,
         __model__: dict = None,
@@ -571,17 +609,22 @@ class Tools:
         """
         Launch a sub-agent to autonomously complete a complex task.
 
+        IMPORTANT: Use this tool proactively to prevent context window overflow.
+        Instead of performing multi-step tasks yourself, delegate them to sub-agents.
+        You may call this tool multiple times in succession.
+
         The sub-agent runs in an isolated context with access to the same tools
-        as the main conversation. It will execute tools as needed in a loop
-        until it completes the task, then return only the final result.
+        as the main conversation. It executes tools as needed in a loop until
+        task completion, then returns only the final result - keeping the main
+        conversation context clean and efficient.
 
-        Use this for:
-        - Complex multi-step research tasks
-        - Tasks requiring multiple tool calls
-        - Operations that would pollute the main conversation context
+        When to use this tool:
+        - Complex research tasks with several steps
+        - Any task requiring 3+ tool calls to complete
+        - When you need to explore multiple approaches
 
-        :param task: Clear description of the task for the sub-agent to complete
-        :param system_prompt: System prompt for the sub-agent (optional, has default)
+        :param description: Brief description of the task (shown to user as status)
+        :param prompt: Detailed instructions for the sub-agent to complete
         :return: The sub-agent's final response after completing the task
         """
         if __request__ is None:
@@ -600,12 +643,17 @@ class Tools:
 
         user = UserModel(**__user__)
 
+        # Get user valves
+        user_valves = self.UserValves.model_validate(
+            (__user__ or {}).get("valves", {})
+        )
+
         if __event_emitter__:
             await __event_emitter__(
                 {
                     "type": "status",
                     "data": {
-                        "description": "Starting sub-agent...",
+                        "description": f"Starting sub-agent: {description}",
                         "done": False,
                     },
                 }
@@ -782,8 +830,8 @@ class Tools:
 
         # Build initial messages
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": task},
+            {"role": "system", "content": user_valves.SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
         ]
 
         if __event_emitter__:
@@ -830,10 +878,16 @@ class Tools:
                 {
                     "type": "status",
                     "data": {
-                        "description": "Sub-agent completed",
+                        "description": f"Sub-agent completed: {description}",
                         "done": True,
                     },
                 }
             )
 
-        return result
+        return json.dumps(
+            {
+                "note": "The user does NOT see this result directly - only you (the main agent) can see it.",
+                "result": result,
+            },
+            ensure_ascii=False,
+        )
