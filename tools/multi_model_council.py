@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.2
+version: 0.1.3
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -10,7 +10,7 @@ required_open_webui_version: 0.7.0
 import ast
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 from fastapi import Request
 from pydantic import BaseModel, Field
@@ -133,6 +133,21 @@ def truncate_text(value: str, limit: int = 200) -> str:
     if len(value) <= limit:
         return value
     return value[: limit - 3] + "..."
+
+
+def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseModel:
+    if isinstance(raw_valves, valves_cls):
+        return raw_valves
+    if hasattr(raw_valves, "model_dump"):
+        try:
+            data = raw_valves.model_dump()
+        except Exception:
+            data = {}
+    elif isinstance(raw_valves, dict):
+        data = raw_valves
+    else:
+        data = {}
+    return valves_cls.model_validate(data)
 
 
 def parse_model_ids(value: Any) -> List[str]:
@@ -951,7 +966,8 @@ CRITICAL RULES:
         user = UserModel(**__user__)
         request = __request__
         metadata = __metadata__ or {}
-        user_valves = self.UserValves.model_validate((__user__ or {}).get("valves", {}))
+        raw_user_valves = (__user__ or {}).get("valves", {})
+        user_valves = coerce_user_valves(raw_user_valves, self.UserValves)
 
         include_sources = bool(user_valves.INCLUDE_SOURCES)
 
