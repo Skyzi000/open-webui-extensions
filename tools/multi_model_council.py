@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.1
+version: 0.1.2
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -949,6 +949,8 @@ CRITICAL RULES:
 
         from open_webui.models.users import UserModel
         user = UserModel(**__user__)
+        request = __request__
+        metadata = __metadata__ or {}
         user_valves = self.UserValves.model_validate((__user__ or {}).get("valves", {}))
 
         include_sources = bool(user_valves.INCLUDE_SOURCES)
@@ -1029,18 +1031,18 @@ CRITICAL RULES:
             "__user__": __user__,
             "__event_emitter__": __event_emitter__,
             "__event_call__": __event_call__,
-            "__request__": __request__,
+            "__request__": request,
             "__model__": __model__,
-            "__metadata__": __metadata__ or {},
+            "__metadata__": metadata,
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
-            "__files__": (__metadata__ or {}).get("files", []),
+            "__files__": metadata.get("files", []),
         }
 
         # Determine tool IDs (same flow as sub_agent, but MAGI-style execution)
         available_tool_ids = []
-        if __metadata__ and __metadata__.get("tool_ids"):
-            available_tool_ids = list(__metadata__.get("tool_ids", []))
+        if metadata.get("tool_ids"):
+            available_tool_ids = list(metadata.get("tool_ids", []))
 
         if self.valves.AVAILABLE_TOOL_IDS.strip():
             tool_id_list = [
@@ -1062,17 +1064,6 @@ CRITICAL RULES:
         if __id__:
             excluded_tool_ids.add(__id__)
 
-        tools_dict = await build_tools_dict(
-            request=__request__,
-            model=__model__ or {},
-            metadata=__metadata__ or {},
-            user=user,
-            valves=self.valves,
-            extra_params=extra_params,
-            tool_id_list=tool_id_list,
-            excluded_tool_ids=excluded_tool_ids,
-        )
-
         base_system_prompt = build_council_system_prompt(
             base_prompt=user_valves.SYSTEM_PROMPT,
             include_sources=include_sources,
@@ -1085,9 +1076,32 @@ CRITICAL RULES:
             done=False,
         )
 
+        tools_cache: Dict[str, dict] = {}
+
         async def run_single_member(member_model_id: str) -> Tuple[str, str, dict]:
             """Run one council member and return (model_id, raw_output, parsed_result)."""
             system_prompt = base_system_prompt
+            member_model = {}
+            member_model = request.app.state.MODELS.get(member_model_id, {})
+
+            member_extra_params = {
+                **extra_params,
+                "__model__": member_model,
+            }
+
+            tools_dict = tools_cache.get(member_model_id)
+            if tools_dict is None:
+                tools_dict = await build_tools_dict(
+                    request=request,
+                    model=member_model,
+                    metadata=metadata,
+                    user=user,
+                    valves=self.valves,
+                    extra_params=member_extra_params,
+                    tool_id_list=tool_id_list,
+                    excluded_tool_ids=excluded_tool_ids,
+                )
+                tools_cache[member_model_id] = tools_dict
 
             content = await run_agent_loop(
                 request=__request__,
@@ -1099,7 +1113,7 @@ CRITICAL RULES:
                 ],
                 tools_dict=tools_dict,
                 max_iterations=self.valves.MAX_ITERATIONS,
-                extra_params=extra_params,
+                extra_params=member_extra_params,
                 apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
                 agent_name=member_model_id,
                 event_emitter=__event_emitter__,
