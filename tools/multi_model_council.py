@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.0
+version: 0.1.1
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -64,6 +64,11 @@ VALVE_TO_CATEGORY = {
     "ENABLE_NOTES_TOOLS": "notes",
     "ENABLE_CHANNELS_TOOLS": "channels",
 }
+
+# Tools that generate citation sources
+# NOTE: Update this set when new citation-capable tools are added to Open WebUI.
+# See open_webui/utils/middleware.py:get_citation_source_from_tool_result() for supported tools.
+CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files"}
 
 
 # ============================================================================
@@ -271,6 +276,7 @@ async def execute_tool_call(
     tool_call: dict,
     tools_dict: dict,
     extra_params: dict,
+    event_emitter: Optional[Callable] = None,
 ) -> dict:
     tool_call_id = tool_call.get("id", "")
     tool_function_name = tool_call.get("function", {}).get("name", "")
@@ -331,6 +337,25 @@ async def execute_tool_call(
             tool_result = json.dumps(tool_result, ensure_ascii=False, default=str)
         except Exception:
             tool_result = str(tool_result)
+
+    # Extract and emit citation sources for tools that generate them
+    if event_emitter and tool_result and tool_function_name in CITATION_TOOLS:
+        try:
+            from open_webui.utils.middleware import get_citation_source_from_tool_result
+
+            tool_id = tools_dict.get(tool_function_name, {}).get("tool_id", "")
+            citation_sources = get_citation_source_from_tool_result(
+                tool_name=tool_function_name,
+                tool_params=tool_function_params,
+                tool_result=tool_result,
+                tool_id=tool_id,
+            )
+            for source in citation_sources:
+                await event_emitter({"type": "source", "data": source})
+        except Exception as exc:
+            log.warning(
+                f"Error extracting citation sources from {tool_function_name}: {exc}"
+            )
 
     return {
         "tool_call_id": tool_call_id,
@@ -546,6 +571,7 @@ async def run_agent_loop(
                         **extra_params,
                         "__messages__": current_messages,
                     },
+                    event_emitter=event_emitter,
                 )
 
                 # Emit status with tool result preview
