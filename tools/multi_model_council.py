@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.3
+version: 0.1.4
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -1010,8 +1010,25 @@ CRITICAL RULES:
             return json.dumps(
                 {
                     "error": "No model IDs provided.",
-                    "action": "Provide models[] or set DEFAULT_MODELS in Valves.",
+                    "action": "Provide two or more model IDs in models.",
                     "available_models": available_ids,
+                },
+                ensure_ascii=False,
+            )
+
+        if len(model_ids) < 2:
+            try:
+                available_models = await get_available_models(__request__, user)
+                available_ids = extract_model_ids(available_models)
+            except Exception:
+                available_ids = []
+
+            return json.dumps(
+                {
+                    "error": "At least two model IDs are required.",
+                    "provided_models": model_ids,
+                    "available_models": available_ids,
+                    "action": "Provide two or more model IDs in models.",
                 },
                 ensure_ascii=False,
             )
