@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.2.0
+version: 0.2.1
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -27,7 +27,7 @@ import ast
 import json
 import logging
 import uuid
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Type
 
 from fastapi import Request
 from pydantic import BaseModel, Field
@@ -91,6 +91,21 @@ CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files"}
 # ============================================================================
 # Helper functions (outside class - AI cannot invoke these)
 # ============================================================================
+
+
+def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseModel:
+    """Normalize raw user valves into the target valves class."""
+    if isinstance(raw_valves, valves_cls):
+        return raw_valves
+    if isinstance(raw_valves, BaseModel):
+        try:
+            data = raw_valves.model_dump()
+        except Exception:
+            data = {}
+        return valves_cls.model_validate(data)
+    if isinstance(raw_valves, dict):
+        return valves_cls.model_validate(raw_valves)
+    return valves_cls.model_validate({})
 
 
 async def execute_tool_call(
@@ -220,6 +235,11 @@ async def apply_inlet_filters_if_enabled(
         from open_webui.models.functions import Functions
         from open_webui.utils.filter import get_sorted_filter_ids, process_filter_functions
 
+        # Isolate __user__ so filter UserValves injection doesn't leak out.
+        local_extra_params = dict(extra_params or {})
+        if isinstance(local_extra_params.get("__user__"), dict):
+            local_extra_params["__user__"] = dict(local_extra_params["__user__"])
+
         filter_ids = get_sorted_filter_ids(
             request, model, form_data.get("metadata", {}).get("filter_ids", [])
         )
@@ -231,7 +251,7 @@ async def apply_inlet_filters_if_enabled(
             filter_functions=filter_functions,
             filter_type="inlet",
             form_data=form_data,
-            extra_params=extra_params,
+            extra_params=local_extra_params,
         )
     except Exception as e:
         log.warning(f"Error applying inlet filters: {e}")
@@ -607,25 +627,19 @@ RESPONSE REQUIREMENTS:
         __message_id__: str = None,
     ) -> str:
         """
-        Launch a sub-agent to autonomously complete a complex task.
+        Delegate a task to a sub-agent for autonomous completion.
 
-        IMPORTANT: Use this tool proactively to prevent context window overflow.
-        Instead of performing multi-step tasks yourself, delegate them to sub-agents.
-        You may call this tool multiple times in succession.
+        MANDATORY: If a task requires 3+ steps of investigation or complex analysis,
+        you MUST NOT perform it yourself. Delegate to this tool immediately.
+        Only handle simple 1-2 tool call tasks yourself. When in doubt, delegate.
 
-        The sub-agent runs in an isolated context with access to the same tools
-        as the main conversation. It executes tools as needed in a loop until
-        task completion, then returns only the final result - keeping the main
-        conversation context clean and efficient.
+        The sub-agent runs in an isolated context with access to the same tools.
+        It executes tools in a loop until completion, returning only the final result
+        to keep the main conversation context clean.
 
-        When to use this tool:
-        - Complex research tasks with several steps
-        - Any task requiring 3+ tool calls to complete
-        - When you need to explore multiple approaches
-
-        :param description: Brief description of the task (shown to user as status)
-        :param prompt: Detailed instructions for the sub-agent to complete
-        :return: The sub-agent's final response after completing the task
+        :param description: Brief task summary (shown to user as status)
+        :param prompt: Detailed instructions for the sub-agent
+        :return: Sub-agent's final response after task completion
         """
         if __request__ is None:
             return json.dumps(
@@ -644,9 +658,8 @@ RESPONSE REQUIREMENTS:
         user = UserModel(**__user__)
 
         # Get user valves
-        user_valves = self.UserValves.model_validate(
-            (__user__ or {}).get("valves", {})
-        )
+        raw_user_valves = (__user__ or {}).get("valves", {})
+        user_valves = coerce_user_valves(raw_user_valves, self.UserValves)
 
         if __event_emitter__:
             await __event_emitter__(
