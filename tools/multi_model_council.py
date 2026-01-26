@@ -1,8 +1,8 @@
 """
 title: Multi Model Council
-description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
+description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning. Also supports LLM Review collaborative writing with cross-feedback.
 author: https://github.com/skyzi000
-version: 0.1.4
+version: 0.2.0
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -69,6 +69,37 @@ VALVE_TO_CATEGORY = {
 # NOTE: Update this set when new citation-capable tools are added to Open WebUI.
 # See open_webui/utils/middleware.py:get_citation_source_from_tool_result() for supported tools.
 CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files"}
+
+# ============================================================================
+# Default personas for LLM Review
+# ============================================================================
+
+DEFAULT_PERSONAS = [
+    {
+        "name": "Analytical Thinker",
+        "description": (
+            "You approach topics with rigorous logical analysis and systematic thinking. "
+            "You value clarity, precision, and evidence-based reasoning. "
+            "You excel at identifying assumptions, evaluating arguments, and structuring complex ideas coherently."
+        ),
+    },
+    {
+        "name": "Creative Visionary",
+        "description": (
+            "You bring imaginative and innovative perspectives to any topic. "
+            "You value originality, narrative engagement, and thought-provoking ideas. "
+            "You excel at finding unexpected connections and presenting ideas in compelling ways."
+        ),
+    },
+    {
+        "name": "Practical Strategist",
+        "description": (
+            "You focus on real-world applicability and actionable insights. "
+            "You value practicality, feasibility, and concrete outcomes. "
+            "You excel at considering implementation challenges and stakeholder perspectives."
+        ),
+    },
+]
 
 
 # ============================================================================
@@ -220,6 +251,271 @@ def build_council_user_prompt(
         "2. If the decision is unclear or information is insufficient, abstain.\n"
         "3. Provide your final JSON response."
     )
+
+
+# ============================================================================
+# LLM Review helper functions
+# ============================================================================
+
+
+def build_compose_system_prompt(
+    base_prompt: str,
+    persona: dict,
+    include_sources: bool,
+) -> str:
+    sources_note = (
+        "Include all sources from your research in the sources array."
+        if include_sources
+        else "If you did not use external sources, leave sources as an empty array."
+    )
+
+    persona_name = persona.get("name", "Writer")
+    persona_desc = persona.get("description", "")
+
+    compose_prompt = (
+        f"You are '{persona_name}', an independent writing agent.\n"
+        f"PERSONA: {persona_desc}\n\n"
+        "CRITICAL RULES:\n"
+        "1. Write independently according to your unique perspective and persona.\n"
+        "2. Use available tools proactively if they help your research and writing.\n"
+        "3. Maintain your distinct voice throughout all revisions.\n"
+        "4. Return ONLY a JSON object as your final response.\n"
+        "5. You have limited tool call iterations. Use them wisely.\n\n"
+        "FINAL RESPONSE FORMAT (JSON only):\n"
+        "- draft: your complete written response to the topic\n"
+        "- approach: brief explanation of your writing approach (2-3 sentences)\n"
+        "- sources: array of {title, url} objects\n\n"
+        f"{sources_note}"
+    )
+
+    base_prompt = normalize_text(base_prompt)
+    if base_prompt:
+        return f"{base_prompt}\n\n{compose_prompt}"
+    return compose_prompt
+
+
+def build_compose_user_prompt(
+    topic: str,
+    requirements: str,
+) -> str:
+    return (
+        "Writing Task:\n"
+        f"- Topic: {topic}\n"
+        f"- Requirements: {requirements or 'None specified'}\n\n"
+        "Instructions:\n"
+        "1. Research the topic using available tools if needed.\n"
+        "2. Write a comprehensive draft that reflects your unique perspective.\n"
+        "3. Provide your final JSON response with draft, approach, and sources."
+    )
+
+
+def build_review_system_prompt(
+    base_prompt: str,
+    persona: dict,
+) -> str:
+    persona_name = persona.get("name", "Reviewer")
+    persona_desc = persona.get("description", "")
+
+    review_prompt = (
+        f"You are '{persona_name}', providing feedback on a peer's draft.\n"
+        f"PERSONA: {persona_desc}\n\n"
+        "CRITICAL RULES:\n"
+        "1. Provide constructive, specific feedback from your unique perspective.\n"
+        "2. Focus on helping the author improve while respecting their voice.\n"
+        "3. Be direct but supportive in your critique.\n"
+        "4. Return ONLY a JSON object as your final response.\n\n"
+        "FINAL RESPONSE FORMAT (JSON only):\n"
+        "- strengths: array of specific strengths in the draft\n"
+        "- improvements: array of specific, actionable suggestions\n"
+        "- key_feedback: one paragraph summarizing your most important feedback"
+    )
+
+    base_prompt = normalize_text(base_prompt)
+    if base_prompt:
+        return f"{base_prompt}\n\n{review_prompt}"
+    return review_prompt
+
+
+def build_review_user_prompt(
+    topic: str,
+    author_persona_name: str,
+    draft: str,
+) -> str:
+    return (
+        f"Review the following draft written by '{author_persona_name}':\n\n"
+        f"TOPIC: {topic}\n\n"
+        f"DRAFT:\n{draft}\n\n"
+        "Provide your feedback in the required JSON format."
+    )
+
+
+def build_revise_system_prompt(
+    base_prompt: str,
+    persona: dict,
+    include_sources: bool,
+) -> str:
+    sources_note = (
+        "Update sources if you conducted additional research."
+        if include_sources
+        else "If you did not use external sources, leave sources as an empty array."
+    )
+
+    persona_name = persona.get("name", "Writer")
+    persona_desc = persona.get("description", "")
+
+    revise_prompt = (
+        f"You are '{persona_name}', revising your draft based on peer feedback.\n"
+        f"PERSONA: {persona_desc}\n\n"
+        "CRITICAL RULES:\n"
+        "1. Consider the feedback carefully but maintain your unique voice.\n"
+        "2. You may use tools to gather additional information if needed.\n"
+        "3. Accept suggestions that improve your work; respectfully decline others.\n"
+        "4. Return ONLY a JSON object as your final response.\n\n"
+        "FINAL RESPONSE FORMAT (JSON only):\n"
+        "- draft: your revised draft\n"
+        "- changes_made: array of specific changes you made based on feedback\n"
+        "- feedback_declined: array of suggestions you chose not to incorporate (with reasons)\n"
+        "- sources: array of {title, url} objects\n\n"
+        f"{sources_note}"
+    )
+
+    base_prompt = normalize_text(base_prompt)
+    if base_prompt:
+        return f"{base_prompt}\n\n{revise_prompt}"
+    return revise_prompt
+
+
+def build_revise_user_prompt(
+    topic: str,
+    original_draft: str,
+    feedbacks: List[dict],
+) -> str:
+    feedback_text = ""
+    for fb in feedbacks:
+        reviewer_name = fb.get("reviewer", "Anonymous")
+        key_feedback = fb.get("key_feedback", "No summary provided.")
+        strengths = fb.get("strengths", [])
+        improvements = fb.get("improvements", [])
+
+        feedback_text += f"\n--- Feedback from '{reviewer_name}' ---\n"
+        feedback_text += f"Key Feedback: {key_feedback}\n"
+        if strengths:
+            feedback_text += "Strengths:\n"
+            for s in strengths:
+                feedback_text += f"  - {s}\n"
+        if improvements:
+            feedback_text += "Suggested Improvements:\n"
+            for imp in improvements:
+                feedback_text += f"  - {imp}\n"
+
+    return (
+        f"TOPIC: {topic}\n\n"
+        f"YOUR PREVIOUS DRAFT:\n{original_draft}\n\n"
+        f"PEER FEEDBACK:{feedback_text}\n\n"
+        "Revise your draft based on this feedback. "
+        "Maintain your unique perspective while incorporating valuable suggestions. "
+        "Provide your response in the required JSON format."
+    )
+
+
+def normalize_draft_result(parsed: Optional[dict], fallback_text: str) -> dict:
+    if not isinstance(parsed, dict):
+        return {
+            "draft": fallback_text,
+            "approach": "",
+            "sources": [],
+        }
+
+    draft = normalize_text(parsed.get("draft")) or fallback_text
+    approach = normalize_text(parsed.get("approach")) or ""
+
+    sources = parsed.get("sources", [])
+    normalized_sources = []
+    if isinstance(sources, list):
+        for source in sources:
+            if isinstance(source, dict):
+                title = normalize_text(source.get("title"))
+                url = normalize_text(source.get("url"))
+                if title or url:
+                    normalized_sources.append({"title": title, "url": url})
+
+    return {
+        "draft": draft,
+        "approach": approach,
+        "sources": normalized_sources,
+    }
+
+
+def normalize_review_result(parsed: Optional[dict], fallback_feedback: str) -> dict:
+    if not isinstance(parsed, dict):
+        return {
+            "strengths": [],
+            "improvements": [],
+            "key_feedback": fallback_feedback,
+        }
+
+    strengths = parsed.get("strengths", [])
+    if not isinstance(strengths, list):
+        strengths = []
+    else:
+        strengths = [normalize_text(s) for s in strengths if normalize_text(s)]
+
+    improvements = parsed.get("improvements", [])
+    if not isinstance(improvements, list):
+        improvements = []
+    else:
+        improvements = [normalize_text(i) for i in improvements if normalize_text(i)]
+
+    key_feedback = normalize_text(parsed.get("key_feedback")) or fallback_feedback
+
+    return {
+        "strengths": strengths,
+        "improvements": improvements,
+        "key_feedback": key_feedback,
+    }
+
+
+def normalize_revise_result(parsed: Optional[dict], fallback_draft: str) -> dict:
+    if not isinstance(parsed, dict):
+        return {
+            "draft": fallback_draft,
+            "changes_made": [],
+            "feedback_declined": [],
+            "sources": [],
+        }
+
+    draft = normalize_text(parsed.get("draft")) or fallback_draft
+
+    changes_made = parsed.get("changes_made", [])
+    if not isinstance(changes_made, list):
+        changes_made = []
+    else:
+        changes_made = [normalize_text(c) for c in changes_made if normalize_text(c)]
+
+    feedback_declined = parsed.get("feedback_declined", [])
+    if not isinstance(feedback_declined, list):
+        feedback_declined = []
+    else:
+        feedback_declined = [
+            normalize_text(f) for f in feedback_declined if normalize_text(f)
+        ]
+
+    sources = parsed.get("sources", [])
+    normalized_sources = []
+    if isinstance(sources, list):
+        for source in sources:
+            if isinstance(source, dict):
+                title = normalize_text(source.get("title"))
+                url = normalize_text(source.get("url"))
+                if title or url:
+                    normalized_sources.append({"title": title, "url": url})
+
+    return {
+        "draft": draft,
+        "changes_made": changes_made,
+        "feedback_declined": feedback_declined,
+        "sources": normalized_sources,
+    }
 
 
 def normalize_member_result(parsed: Optional[dict], fallback_reason: str) -> dict:
@@ -837,6 +1133,23 @@ CRITICAL RULES:
             default=True,
             description="Include sources in member outputs when web research is used.",
         )
+        LLM_REVIEW_SYSTEM_PROMPT: str = Field(
+            default="""\
+You are a collaborative writing agent participating in a multi-agent review process.
+
+CRITICAL RULES:
+1. Maintain your unique perspective and writing voice throughout.
+2. Use tools when they help research and improve your writing.
+3. Respond ONLY with the required JSON format.
+4. Be open to feedback but don't lose your distinctive style.""",
+            description="Base system prompt for LLM Review agents.",
+        )
+        LLM_REVIEW_ROUNDS: int = Field(
+            default=3,
+            ge=1,
+            le=5,
+            description="Number of review-revise rounds (1-5).",
+        )
         pass
 
     def __init__(self):
@@ -1219,5 +1532,505 @@ CRITICAL RULES:
 
         if self.valves.DEBUG:
             response_payload["raw_outputs"] = raw_outputs
+
+        return json.dumps(response_payload, ensure_ascii=False)
+
+    async def llm_review(
+        self,
+        topic: str,
+        requirements: Optional[str] = None,
+        models: Optional[str] = None,
+        personas: Optional[str] = None,
+        __user__: Optional[dict] = None,
+        __request__: Optional[Request] = None,
+        __model__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
+        __event_emitter__: Callable[[dict], Any] = None,  # type: ignore
+        __event_call__: Callable[[dict], Any] = None,  # type: ignore
+        __chat_id__: Optional[str] = None,
+        __message_id__: Optional[str] = None,
+    ) -> str:
+        """
+        Run an LLM Review collaborative writing process with cross-feedback.
+
+        This implements the LLM Review methodology where multiple agents with
+        distinct personas independently write drafts, exchange feedback, and
+        revise their work over multiple rounds.
+
+        Args:
+            topic: The writing topic or prompt (required).
+            requirements: Optional specific requirements or constraints.
+            models: Optional model ID list as a comma-separated string.
+                - Example: "gpt-5.2, claude-4-5-sonnet, gemini-2.5-pro"
+                - Exactly 3 models are required for the review process.
+                - If omitted, DEFAULT_MODELS (Valves) is used.
+            personas: Optional JSON string with custom personas.
+                - Format: [{"name": "...", "description": "..."}, ...]
+                - If omitted, default personas (Analytical, Creative, Practical) are used.
+
+        Returns a JSON string with:
+        - rounds: array of round results with drafts and feedback
+        - final_drafts: the final draft from each agent
+        - agents: mapping of model_id to persona name
+        """
+        emitter = EventEmitter(__event_emitter__)
+
+        if __request__ is None:
+            return json.dumps(
+                {
+                    "error": "Request context not available.",
+                    "action": "Ensure __request__ is provided by Open WebUI.",
+                },
+                ensure_ascii=False,
+            )
+
+        if __user__ is None:
+            return json.dumps(
+                {
+                    "error": "User context not available.",
+                    "action": "Ensure __user__ is provided by Open WebUI.",
+                },
+                ensure_ascii=False,
+            )
+
+        from open_webui.models.users import UserModel
+
+        user = UserModel(**__user__)
+        request = __request__
+        metadata = __metadata__ or {}
+        raw_user_valves = (__user__ or {}).get("valves", {})
+        user_valves = coerce_user_valves(raw_user_valves, self.UserValves)
+
+        include_sources = bool(user_valves.INCLUDE_SOURCES)
+        num_rounds = int(user_valves.LLM_REVIEW_ROUNDS)
+        base_system_prompt = str(user_valves.LLM_REVIEW_SYSTEM_PROMPT)
+
+        # Normalize inputs
+        topic_text = normalize_text(topic)
+        requirements_text = normalize_text(requirements)
+
+        if not topic_text:
+            return json.dumps(
+                {
+                    "error": "Missing required field: topic.",
+                    "action": "Provide the topic parameter for LLM Review.",
+                },
+                ensure_ascii=False,
+            )
+
+        # Parse personas
+        agent_personas: List[dict] = []
+        if personas:
+            personas_text = normalize_text(personas)
+            if personas_text:
+                parsed_personas = safe_json_loads(personas_text)
+                if isinstance(parsed_personas, list):
+                    for p in parsed_personas:
+                        if isinstance(p, dict) and p.get("name"):
+                            agent_personas.append(p)
+
+        if len(agent_personas) < 3:
+            agent_personas = list(DEFAULT_PERSONAS)
+
+        # Resolve model IDs
+        provided_models = parse_model_ids(models)
+        default_models = parse_model_ids(self.valves.DEFAULT_MODELS)
+
+        model_ids = provided_models or default_models
+        if len(model_ids) < 3:
+            try:
+                available_models = await get_available_models(__request__, user)
+                available_ids = extract_model_ids(available_models)
+            except Exception:
+                available_ids = []
+
+            return json.dumps(
+                {
+                    "error": "Exactly 3 model IDs are required for LLM Review.",
+                    "provided_models": model_ids,
+                    "available_models": available_ids,
+                    "action": "Provide exactly 3 model IDs in models parameter.",
+                },
+                ensure_ascii=False,
+            )
+
+        # Use exactly 3 models
+        model_ids = model_ids[:3]
+
+        # Validate model IDs
+        try:
+            available_models = await get_available_models(__request__, user)
+            available_ids = set(extract_model_ids(available_models))
+        except Exception as exc:
+            log.exception(f"Error checking available models: {exc}")
+            return json.dumps(
+                {
+                    "error": "Failed to validate model IDs.",
+                    "detail": str(exc),
+                    "action": "Retry or check server logs for details.",
+                },
+                ensure_ascii=False,
+            )
+
+        unknown_ids = [mid for mid in model_ids if mid not in available_ids]
+        if unknown_ids:
+            return json.dumps(
+                {
+                    "error": "Unknown model IDs.",
+                    "unknown_models": unknown_ids,
+                    "available_models": sorted(list(available_ids)),
+                    "action": "Pick model IDs from available_models or call list_models().",
+                },
+                ensure_ascii=False,
+            )
+
+        extra_params = {
+            "__user__": __user__,
+            "__event_emitter__": __event_emitter__,
+            "__event_call__": __event_call__,
+            "__request__": request,
+            "__model__": __model__,
+            "__metadata__": metadata,
+            "__chat_id__": __chat_id__,
+            "__message_id__": __message_id__,
+            "__files__": metadata.get("files", []),
+        }
+
+        # Build tools dict
+        available_tool_ids = []
+        if metadata.get("tool_ids"):
+            available_tool_ids = list(metadata.get("tool_ids", []))
+
+        if self.valves.AVAILABLE_TOOL_IDS.strip():
+            tool_id_list = [
+                tid.strip()
+                for tid in self.valves.AVAILABLE_TOOL_IDS.split(",")
+                if tid.strip()
+            ]
+        else:
+            tool_id_list = available_tool_ids
+
+        excluded_tool_ids = set()
+        if self.valves.EXCLUDED_TOOL_IDS.strip():
+            excluded_tool_ids = {
+                tid.strip()
+                for tid in self.valves.EXCLUDED_TOOL_IDS.split(",")
+                if tid.strip()
+            }
+
+        if __id__:
+            excluded_tool_ids.add(__id__)
+
+        # Assign personas to models
+        agents = {model_ids[i]: agent_personas[i] for i in range(3)}
+
+        await emitter.emit(
+            description=f"LLM Review Starting: {truncate_text(topic_text, 50)}",
+            status="review_starting",
+            done=False,
+        )
+
+        import asyncio
+
+        tools_cache: Dict[str, dict] = {}
+        rounds_data: List[dict] = []
+
+        # Current drafts for each agent
+        current_drafts: Dict[str, dict] = {}
+
+        # Phase 1: Initial Composition
+        await emitter.emit(
+            description="Phase 1: Initial Composition",
+            status="composing",
+            done=False,
+        )
+
+        async def compose_draft(model_id: str) -> Tuple[str, str, dict]:
+            """Have an agent compose their initial draft."""
+            persona = agents[model_id]
+            member_model = request.app.state.MODELS.get(model_id, {})
+
+            member_extra_params = {
+                **extra_params,
+                "__model__": member_model,
+            }
+
+            tools_dict = tools_cache.get(model_id)
+            if tools_dict is None:
+                tools_dict = await build_tools_dict(
+                    request=request,
+                    model=member_model,
+                    metadata=metadata,
+                    user=user,
+                    valves=self.valves,
+                    extra_params=member_extra_params,
+                    tool_id_list=tool_id_list,
+                    excluded_tool_ids=excluded_tool_ids,
+                )
+                tools_cache[model_id] = tools_dict
+
+            system_prompt = build_compose_system_prompt(
+                base_system_prompt, persona, include_sources
+            )
+            user_prompt = build_compose_user_prompt(topic_text, requirements_text)
+
+            content = await run_agent_loop(
+                request=request,
+                user=user,
+                model_id=model_id,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                tools_dict=tools_dict,
+                max_iterations=self.valves.MAX_ITERATIONS,
+                extra_params=member_extra_params,
+                apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                agent_name=f"{persona['name']}",
+                event_emitter=__event_emitter__,
+            )
+
+            parsed = safe_json_loads(content)
+            return model_id, content, parsed or {}
+
+        compose_tasks = [compose_draft(mid) for mid in model_ids]
+        compose_results = await asyncio.gather(*compose_tasks, return_exceptions=True)
+
+        for idx, result in enumerate(compose_results):
+            model_id = model_ids[idx]
+            if isinstance(result, BaseException):
+                log.exception(f"Compose failed ({model_id}): {result}")
+                current_drafts[model_id] = normalize_draft_result(
+                    None, f"Composition failed: {truncate_text(str(result), 180)}"
+                )
+                continue
+
+            mid, content, parsed = result
+            current_drafts[mid] = normalize_draft_result(
+                parsed, f"Non-JSON response: {truncate_text(content, 180)}"
+            )
+
+        # Store initial drafts
+        rounds_data.append(
+            {
+                "round": 0,
+                "phase": "initial_composition",
+                "drafts": {
+                    mid: {
+                        "persona": agents[mid]["name"],
+                        "draft": current_drafts[mid]["draft"],
+                        "approach": current_drafts[mid].get("approach", ""),
+                    }
+                    for mid in model_ids
+                },
+            }
+        )
+
+        # Rounds of Review and Revision
+        for round_num in range(1, num_rounds + 1):
+            await emitter.emit(
+                description=f"Round {round_num}/{num_rounds}: Cross-Review",
+                status="reviewing",
+                done=False,
+            )
+
+            # Phase 2: Cross-Review
+            # Each agent reviews the other two drafts
+            all_reviews: Dict[str, Dict[str, dict]] = {mid: {} for mid in model_ids}
+
+            async def review_draft(
+                reviewer_id: str, author_id: str
+            ) -> Tuple[str, str, str, dict]:
+                """Have reviewer provide feedback on author's draft."""
+                reviewer_persona = agents[reviewer_id]
+                author_persona = agents[author_id]
+                author_draft = current_drafts[author_id]["draft"]
+
+                member_model = request.app.state.MODELS.get(reviewer_id, {})
+                member_extra_params = {
+                    **extra_params,
+                    "__model__": member_model,
+                }
+
+                system_prompt = build_review_system_prompt(
+                    base_system_prompt, reviewer_persona
+                )
+                user_prompt = build_review_user_prompt(
+                    topic_text, author_persona["name"], author_draft
+                )
+
+                # Reviews don't need tools - just analysis
+                content = await run_agent_loop(
+                    request=request,
+                    user=user,
+                    model_id=reviewer_id,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    tools_dict={},  # No tools for review
+                    max_iterations=2,  # Quick review, minimal iterations
+                    extra_params=member_extra_params,
+                    apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                    agent_name=f"{reviewer_persona['name']}→{author_persona['name']}",
+                    event_emitter=__event_emitter__,
+                )
+
+                parsed = safe_json_loads(content)
+                return reviewer_id, author_id, content, parsed or {}
+
+            # Generate all review tasks (each agent reviews the other two)
+            review_tasks = []
+            for reviewer_id in model_ids:
+                for author_id in model_ids:
+                    if reviewer_id != author_id:
+                        review_tasks.append(review_draft(reviewer_id, author_id))
+
+            review_results = await asyncio.gather(*review_tasks, return_exceptions=True)
+
+            for result in review_results:
+                if isinstance(result, BaseException):
+                    log.exception(f"Review failed: {result}")
+                    continue
+
+                reviewer_id, author_id, content, parsed = result
+                normalized = normalize_review_result(
+                    parsed, f"Review parsing failed: {truncate_text(content, 100)}"
+                )
+                normalized["reviewer"] = agents[reviewer_id]["name"]
+                all_reviews[author_id][reviewer_id] = normalized
+
+            # Phase 3: Revision
+            await emitter.emit(
+                description=f"Round {round_num}/{num_rounds}: Revision",
+                status="revising",
+                done=False,
+            )
+
+            async def revise_draft(model_id: str) -> Tuple[str, str, dict]:
+                """Have an agent revise their draft based on feedback."""
+                persona = agents[model_id]
+                original_draft = current_drafts[model_id]["draft"]
+
+                # Collect feedback from the other two agents
+                feedbacks = []
+                for reviewer_id, review in all_reviews[model_id].items():
+                    feedbacks.append(review)
+
+                member_model = request.app.state.MODELS.get(model_id, {})
+                member_extra_params = {
+                    **extra_params,
+                    "__model__": member_model,
+                }
+
+                tools_dict = tools_cache.get(model_id, {})
+
+                system_prompt = build_revise_system_prompt(
+                    base_system_prompt, persona, include_sources
+                )
+                user_prompt = build_revise_user_prompt(
+                    topic_text, original_draft, feedbacks
+                )
+
+                content = await run_agent_loop(
+                    request=request,
+                    user=user,
+                    model_id=model_id,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    tools_dict=tools_dict,
+                    max_iterations=self.valves.MAX_ITERATIONS,
+                    extra_params=member_extra_params,
+                    apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                    agent_name=f"{persona['name']}",
+                    event_emitter=__event_emitter__,
+                )
+
+                parsed = safe_json_loads(content)
+                return model_id, content, parsed or {}
+
+            revise_tasks = [revise_draft(mid) for mid in model_ids]
+            revise_results = await asyncio.gather(*revise_tasks, return_exceptions=True)
+
+            revised_drafts: Dict[str, dict] = {}
+            for idx, result in enumerate(revise_results):
+                model_id = model_ids[idx]
+                if isinstance(result, BaseException):
+                    log.exception(f"Revision failed ({model_id}): {result}")
+                    revised_drafts[model_id] = normalize_revise_result(
+                        None, current_drafts[model_id]["draft"]
+                    )
+                    continue
+
+                mid, content, parsed = result
+                revised_drafts[mid] = normalize_revise_result(
+                    parsed, current_drafts[mid]["draft"]
+                )
+
+            # Update current drafts with revisions
+            for mid in model_ids:
+                current_drafts[mid] = {
+                    "draft": revised_drafts[mid]["draft"],
+                    "approach": current_drafts[mid].get("approach", ""),
+                    "sources": revised_drafts[mid].get("sources", []),
+                }
+
+            # Store round data
+            rounds_data.append(
+                {
+                    "round": round_num,
+                    "reviews": {
+                        mid: {
+                            reviewer_id: {
+                                "reviewer": review["reviewer"],
+                                "key_feedback": review["key_feedback"],
+                                "strengths": review["strengths"],
+                                "improvements": review["improvements"],
+                            }
+                            for reviewer_id, review in all_reviews[mid].items()
+                        }
+                        for mid in model_ids
+                    },
+                    "revisions": {
+                        mid: {
+                            "persona": agents[mid]["name"],
+                            "draft": revised_drafts[mid]["draft"],
+                            "changes_made": revised_drafts[mid].get("changes_made", []),
+                            "feedback_declined": revised_drafts[mid].get(
+                                "feedback_declined", []
+                            ),
+                        }
+                        for mid in model_ids
+                    },
+                }
+            )
+
+        await emitter.emit(
+            description="LLM Review Complete",
+            status="complete",
+            done=True,
+        )
+
+        # Compile final response
+        final_drafts = {
+            mid: {
+                "persona": agents[mid]["name"],
+                "draft": current_drafts[mid]["draft"],
+                "sources": current_drafts[mid].get("sources", []),
+            }
+            for mid in model_ids
+        }
+
+        response_payload = {
+            "topic": topic_text,
+            "requirements": requirements_text,
+            "num_rounds": num_rounds,
+            "agents": {mid: agents[mid]["name"] for mid in model_ids},
+            "final_drafts": final_drafts,
+            "rounds": rounds_data,
+        }
 
         return json.dumps(response_payload, ensure_ascii=False)
