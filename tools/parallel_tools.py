@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.1
+version: 0.1.2
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -16,6 +16,11 @@ For example, you can spawn several research sub-agents simultaneously,
 each investigating a different topic, and get all results at once.
 
 Watch out for rate limits on web search APIs, LLM providers, etc.!
+
+Limitations:
+- Requires a high-capability model (e.g., GPT-5.2, Claude Opus 4.5) to correctly
+  invoke this tool. Smaller/mid-tier models may fail to pass the tool_calls
+  parameter in the expected format.
 """
 
 import asyncio
@@ -59,6 +64,10 @@ async def execute_single_tool(
     Returns:
         Dict with tool_name and result (any JSON-serializable value)
     """
+    # Strip "functions." prefix if present (OpenAI models sometimes add this)
+    if tool_name.startswith("functions."):
+        tool_name = tool_name[len("functions.") :]
+
     if tool_name not in tools_dict:
         return {
             "tool_name": tool_name,
@@ -94,16 +103,25 @@ async def execute_single_tool(
         if tool_type == "external" and isinstance(result, tuple) and len(result) == 2:
             result = result[0]  # Extract data, discard headers
 
-        # Keep result as-is for proper JSON serialization (avoid double-encoding)
-        # If result is already a string, it stays a string
-        # If result is a dict/list, it will be serialized once at the end
+        # Try to parse JSON string results to avoid double-encoding
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except json.JSONDecodeError:
+                pass  # Keep as string if not valid JSON
 
         # Extract and emit citation sources for tools that generate them
         if event_emitter and result and tool_name in CITATION_TOOLS:
             # For citation extraction, we need a string representation
-            result_str = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+            result_str = (
+                result
+                if isinstance(result, str)
+                else json.dumps(result, ensure_ascii=False, default=str)
+            )
             try:
-                from open_webui.utils.middleware import get_citation_source_from_tool_result
+                from open_webui.utils.middleware import (
+                    get_citation_source_from_tool_result,
+                )
 
                 tool_id = tools_dict.get(tool_name, {}).get("tool_id", "")
                 citation_sources = get_citation_source_from_tool_result(
@@ -158,7 +176,7 @@ class Tools:
 
     async def run_tools_parallel(
         self,
-        tool_calls: str,
+        tool_calls: list,
         __user__: dict = None,
         __request__: Request = None,
         __model__: dict = None,
@@ -172,24 +190,27 @@ class Tools:
         __messages__: Optional[List[dict]] = None,
     ) -> str:
         """
-        Execute multiple tool calls in parallel to avoid slow sequential execution.
+        Execute multiple independent tool calls in parallel.
 
-        CRITICAL: Open WebUI executes tool calls sequentially by default. When you call
-        multiple tools separately, each one waits for the previous to complete, causing
-        significant delays. The user has enabled this tool specifically to solve this problem.
+        IMPORTANT - Read carefully:
+        Open WebUI executes tool calls sequentially by default. When you call multiple
+        tools separately, each one waits for the previous to complete, causing significant
+        delays. Even if you use multi_tool_use.parallel or return multiple tool calls at
+        once, Open WebUI will process them one by one - NOT in parallel.
 
-        ALWAYS USE THIS TOOL when you need to call 2+ independent tools. Batch them together
-        in a single call to run concurrently. This dramatically reduces wait time.
+        The user has enabled this tool specifically to solve this problem. Use this tool
+        when you need to call 2+ independent tools. Batch them together in a single call
+        to run concurrently. This dramatically reduces wait time.
 
         Example scenario:
         - BAD: Call search_web("Python"), wait, call search_web("FastAPI"), wait → slow
-        - GOOD: Call run_tools_parallel with both searches → both run at the same time
+        - BAD: Use multi_tool_use.parallel → still sequential in Open WebUI
+        - GOOD: Call run_tools_parallel with both searches → true parallel execution
 
-        :param tool_calls: JSON array of tool calls. Each item must have "name" (tool name) and "arguments" (dict of args).
-                          Example: [{"name": "search_web", "arguments": {"query": "Python"}}, {"name": "search_web", "arguments": {"query": "FastAPI"}}]
+        :param tool_calls: MUST be a raw JSON array, NOT a stringified/escaped JSON string.
+                          Each item must have "name" (tool name) and "args" (dict of arguments).
+                          Example: [{"name": "search_web", "args": {"query": "Python"}}, {"name": "search_web", "args": {"query": "FastAPI"}}]
         :return: JSON object with results for each tool call
-
-        Note: Only batch tools that don't depend on each other's results.
         """
         if __request__ is None:
             return json.dumps({"error": "Request context not available."})
@@ -197,7 +218,6 @@ class Tools:
         if __user__ is None:
             return json.dumps({"error": "User context not available."})
 
-        # Parse tool_calls (may already be parsed by Open WebUI)
         if isinstance(tool_calls, list):
             calls = tool_calls
         elif isinstance(tool_calls, str):
@@ -207,20 +227,26 @@ class Tools:
                 try:
                     calls = json.loads(tool_calls)
                 except Exception as e:
-                    return json.dumps({
-                        "error": f"Failed to parse tool_calls: {e}",
-                        "expected_format": '[{"name": "tool_name", "arguments": {"arg1": "value1"}}]',
-                    })
+                    return json.dumps(
+                        {
+                            "error": f"Failed to parse tool_calls: {e}",
+                            "expected_format": '[{"name": "tool_name", "arguments": {"arg1": "value1"}}]',
+                        }
+                    )
         else:
-            return json.dumps({
-                "error": f"tool_calls must be a list or JSON string, got {type(tool_calls).__name__}",
-            })
+            return json.dumps(
+                {
+                    "error": f"tool_calls must be a list or JSON string, got {type(tool_calls).__name__}",
+                }
+            )
 
         if not isinstance(calls, list):
-            return json.dumps({
-                "error": "tool_calls must be a JSON array",
-                "expected_format": '[{"name": "tool_name", "arguments": {"arg1": "value1"}}]',
-            })
+            return json.dumps(
+                {
+                    "error": "tool_calls must be a JSON array",
+                    "expected_format": '[{"name": "tool_name", "arguments": {"arg1": "value1"}}]',
+                }
+            )
 
         if not calls:
             return json.dumps({"error": "tool_calls array is empty"})
@@ -231,8 +257,21 @@ class Tools:
                 return json.dumps({"error": f"tool_calls[{i}] must be an object"})
             if "name" not in call:
                 return json.dumps({"error": f"tool_calls[{i}] missing 'name' field"})
-            if "arguments" not in call:
-                calls[i]["arguments"] = {}
+            # Accept "args", "arguments", and "parameters" keys
+            if "args" in call:
+                calls[i]["arguments"] = call["args"]
+            elif "arguments" not in call:
+                if "parameters" in call:
+                    calls[i]["arguments"] = call["parameters"]
+                else:
+                    calls[i]["arguments"] = {}
+
+            # Parse arguments if it's a JSON string
+            if isinstance(calls[i].get("arguments"), str):
+                try:
+                    calls[i]["arguments"] = json.loads(calls[i]["arguments"])
+                except json.JSONDecodeError:
+                    pass  # Keep as-is if not valid JSON
 
         # Import here to avoid issues when not running in Open WebUI
         from open_webui.models.users import UserModel
@@ -374,10 +413,12 @@ class Tools:
         processed_results = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                processed_results.append({
-                    "tool_name": calls[i].get("name", "unknown"),
-                    "result": f"Error: {result}",
-                })
+                processed_results.append(
+                    {
+                        "tool_name": calls[i].get("name", "unknown"),
+                        "result": f"Error: {result}",
+                    }
+                )
             else:
                 processed_results.append(result)
 
