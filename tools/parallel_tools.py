@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.2
+version: 0.1.3
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -272,6 +272,10 @@ class Tools:
                     calls[i]["arguments"] = json.loads(calls[i]["arguments"])
                 except json.JSONDecodeError:
                     pass  # Keep as-is if not valid JSON
+
+            # Ensure arguments is a dict (handle null/None and other invalid types)
+            if not isinstance(calls[i].get("arguments"), dict):
+                calls[i]["arguments"] = {}
 
         # Import here to avoid issues when not running in Open WebUI
         from open_webui.models.users import UserModel
