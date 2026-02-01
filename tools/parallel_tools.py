@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.0
+version: 0.1.1
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -87,6 +87,12 @@ async def execute_single_tool(
 
         result = await tool_function(**filtered_args)
 
+        # Handle OpenAPI/external tool results that return (data, headers) tuple
+        # Headers (CIMultiDictProxy) are not JSON-serializable, so extract just the data
+        tool_type = tool.get("type", "")
+        if tool_type == "external" and isinstance(result, tuple) and len(result) == 2:
+            result = result[0]  # Extract data, discard headers
+
         # Keep result as-is for proper JSON serialization (avoid double-encoding)
         # If result is already a string, it stays a string
         # If result is a dict/list, it will be serialized once at the end
@@ -162,6 +168,7 @@ class Tools:
         __chat_id__: str = None,
         __message_id__: str = None,
         __oauth_token__: Optional[dict] = None,
+        __messages__: Optional[List[dict]] = None,
     ) -> str:
         """
         Execute multiple tool calls in parallel to avoid slow sequential execution.
@@ -344,7 +351,7 @@ class Tools:
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
-            "__messages__": [],
+            "__messages__": __messages__ or [],
             "__files__": __metadata__.get("files", []) if __metadata__ else [],
         }
 
