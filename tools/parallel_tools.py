@@ -11,6 +11,7 @@ independent tools need to run. This tool allows you to batch independent tool
 calls and execute them concurrently using asyncio.gather.
 
 Tip: Combine with the Sub Agent tool to run multiple sub-agents in parallel.
+https://github.com/Skyzi000/open-webui-extensions/blob/main/tools/sub_agent.py
 For example, you can spawn several research sub-agents simultaneously,
 each investigating a different topic, and get all results at once.
 
