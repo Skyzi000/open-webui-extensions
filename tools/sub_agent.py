@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.2.1
+version: 0.2.2
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -625,6 +625,7 @@ RESPONSE REQUIREMENTS:
         __event_call__: Callable[[dict], Any] = None,
         __chat_id__: str = None,
         __message_id__: str = None,
+        __oauth_token__: Optional[dict] = None,
     ) -> str:
         """
         Delegate a task to a sub-agent for autonomous completion.
@@ -754,6 +755,7 @@ RESPONSE REQUIREMENTS:
                     "__metadata__": __metadata__,
                     "__chat_id__": __chat_id__,
                     "__message_id__": __message_id__,
+                    "__oauth_token__": __oauth_token__,
                     "__files__": __metadata__.get("files", []) if __metadata__ else [],
                 }
 
@@ -791,6 +793,7 @@ RESPONSE REQUIREMENTS:
                 "__event_emitter__": __event_emitter__,
                 "__chat_id__": __chat_id__,
                 "__message_id__": __message_id__,
+                "__oauth_token__": __oauth_token__,
             }
 
             all_builtin_tools = get_builtin_tools(
@@ -878,6 +881,7 @@ RESPONSE REQUIREMENTS:
                     "__event_call__": __event_call__,
                     "__chat_id__": __chat_id__,
                     "__message_id__": __message_id__,
+                    "__oauth_token__": __oauth_token__,
                     "__files__": __metadata__.get("files", []) if __metadata__ else [],
                 },
                 apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
