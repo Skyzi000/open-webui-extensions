@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.2.2
+version: 0.2.3
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -21,6 +21,9 @@ Requirements:
   (Model settings > Parameters > Function Calling: native)
 
 Inspired by VS Code's runSubagent functionality, this tool was developed from scratch specifically for Open WebUI to ensure seamless integration and optimal performance.
+
+💡 Need to run multiple sub-agents in parallel? Check out "Parallel Tools"!
+   https://github.com/Skyzi000/open-webui-extensions/blob/main/tools/parallel_tools.py
 """
 
 import ast
@@ -169,6 +172,12 @@ async def execute_tool_call(
             )
 
             tool_result = await tool_function(**tool_function_params)
+
+            # Handle OpenAPI/external tool results that return (data, headers) tuple
+            # Headers (CIMultiDictProxy) are not JSON-serializable
+            tool_type = tool.get("type", "")
+            if tool_type == "external" and isinstance(tool_result, tuple) and len(tool_result) == 2:
+                tool_result = tool_result[0]  # Extract data, discard headers
 
         except Exception as e:
             log.exception(f"Error executing tool {tool_function_name}: {e}")
