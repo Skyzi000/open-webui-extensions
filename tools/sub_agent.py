@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.2.3
+version: 0.2.4
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -33,6 +33,7 @@ import uuid
 from typing import Any, Callable, List, Optional, Type
 
 from fastapi import Request
+from starlette.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
@@ -378,6 +379,15 @@ async def run_sub_agent_loop(
             return f"Error during sub-agent execution: {e}"
 
         # Handle response
+        # Handle JSONResponse (returned on HTTP errors like 400+)
+        if isinstance(response, JSONResponse):
+            try:
+                error_data = json.loads(bytes(response.body).decode("utf-8"))
+                error_msg = error_data.get("error", {}).get("message", str(error_data))
+                return f"API error: {error_msg}"
+            except Exception:
+                return f"API error (status {response.status_code}): Failed to parse response"
+
         if isinstance(response, dict):
             choices = response.get("choices", [])
             if not choices:
