@@ -95,6 +95,44 @@ CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files"}
 # ============================================================================
 # Helper functions (outside class - AI cannot invoke these)
 # ============================================================================
+def resolve_model_id(request: Request, candidate: str) -> str:
+    """
+    Accepts either a model ID (key in MODELS) or a display/name value.
+    Returns a valid model ID if it can be resolved, else "".
+    """
+    if not candidate:
+        return ""
+
+    models = request.app.state.MODELS or {}
+
+    # 1) Already an ID
+    if candidate in models:
+        return candidate
+
+    # 2) Try exact match on common name fields
+    def fields(m: dict) -> list[str]:
+        return [
+            m.get("name", ""),
+            m.get("display_name", ""),
+            m.get("model", ""),
+            m.get("id", ""),
+        ]
+
+    exact = [mid for mid, m in models.items() if candidate in fields(m)]
+    if len(exact) == 1:
+        return exact[0]
+
+    # 3) Case-insensitive match
+    cand_l = candidate.lower()
+    ci = [
+        mid
+        for mid, m in models.items()
+        if any((f or "").lower() == cand_l for f in fields(m))
+    ]
+    if len(ci) == 1:
+        return ci[0]
+
+    return ""
 
 
 def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseModel:
@@ -692,10 +730,25 @@ RESPONSE REQUIREMENTS:
                 }
             )
 
-        # Determine model ID
-        model_id = self.valves.DEFAULT_MODEL
-        if not model_id and __model__:
-            model_id = __model__.get("id", "")
+        # Determine model ID (prefer explicit valve, then chat model from metadata, then __model__)
+        requested = (self.valves.DEFAULT_MODEL or "").strip()
+
+        chat_model_id = ""
+        if __metadata__:
+            m = __metadata__.get("model")
+            if isinstance(m, dict):
+                chat_model_id = (m.get("id") or m.get("name") or "").strip()
+            elif isinstance(m, str):
+                chat_model_id = m.strip()
+
+        task_model_id = ((__model__ or {}).get("id") or "").strip()
+
+        # pick in priority order
+        candidate = requested or chat_model_id or task_model_id
+
+        # (optional but recommended) resolve display name -> internal id
+        candidate = resolve_model_id(__request__, candidate) or candidate
+        model_id = candidate
 
         if not model_id:
             return json.dumps(
