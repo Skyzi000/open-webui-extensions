@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.3.0
+version: 0.3.1
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -864,14 +864,17 @@ RESPONSE REQUIREMENTS:
             )
 
         # Determine model ID
+        # Priority: DEFAULT_MODEL (valve) > chat model (metadata) > task model (__model__)
         model_id = self.valves.DEFAULT_MODEL
+        if not model_id and __metadata__:
+            model_id = (__metadata__.get("model") or {}).get("id", "")
         if not model_id and __model__:
             model_id = __model__.get("id", "")
 
         if not model_id:
             return json.dumps(
                 {
-                    "error": "No model ID available. Please set DEFAULT_MODEL in Valves or ensure __model__ is provided."
+                    "error": "No model ID available. Set DEFAULT_MODEL in Valves if the issue persists."
                 }
             )
 
@@ -1084,14 +1087,17 @@ RESPONSE REQUIREMENTS:
         user_valves = coerce_user_valves(raw_user_valves, self.UserValves)
 
         # Determine model ID
+        # Priority: DEFAULT_MODEL (valve) > chat model (metadata) > task model (__model__)
         model_id = self.valves.DEFAULT_MODEL
+        if not model_id and __metadata__:
+            model_id = (__metadata__.get("model") or {}).get("id", "")
         if not model_id and __model__:
             model_id = __model__.get("id", "")
 
         if not model_id:
             return json.dumps(
                 {
-                    "error": "No model ID available. Please set DEFAULT_MODEL in Valves or ensure __model__ is provided."
+                    "error": "No model ID available. Set DEFAULT_MODEL in Valves if the issue persists."
                 },
                 ensure_ascii=False,
             )
