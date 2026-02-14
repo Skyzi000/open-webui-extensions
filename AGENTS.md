@@ -90,12 +90,7 @@ simulation tick event.
 
 ### Root Repository Style
 
-Uses Japanese, simple descriptive messages:
-
-```text
-サブモジュールを更新
-フルコンテキストモードトグルフィルターを追加
-```
+Uses **Conventional Commits** format with English descriptions.
 
 ## Development Guidelines
 
