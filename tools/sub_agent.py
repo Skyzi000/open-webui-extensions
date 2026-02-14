@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.3.2
+version: 0.3.3
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -178,6 +178,7 @@ async def execute_tool_call(
                     "__messages__": extra_params.get("__messages__", []),
                     "__files__": extra_params.get("__files__", []),
                     "__event_emitter__": extra_params.get("__event_emitter__"),
+                    "__event_call__": extra_params.get("__event_call__"),
                 },
             )
 
@@ -1218,7 +1219,8 @@ RESPONSE REQUIREMENTS:
                 log.exception(
                     f"Error in parallel sub-agent [{task_index}] {task_description}: {e}"
                 )
-                return {"description": task_description, "error": str(e)}
+                error_msg = str(e) or type(e).__name__
+                return {"description": task_description, "error": error_msg}
 
         task_coroutines = [
             run_single_task(i + 1, task) for i, task in enumerate(validated_tasks)
