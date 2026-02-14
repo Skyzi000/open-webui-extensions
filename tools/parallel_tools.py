@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.3
+version: 0.1.4
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -361,6 +361,8 @@ class Tools:
             builtin_extra_params = {
                 "__user__": __user__,
                 "__event_emitter__": __event_emitter__,
+                "__event_call__": __event_call__,
+                "__metadata__": __metadata__,
                 "__chat_id__": __chat_id__,
                 "__message_id__": __message_id__,
                 "__oauth_token__": __oauth_token__,

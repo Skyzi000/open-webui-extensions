@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.4
+version: 0.1.5
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -51,6 +51,7 @@ BUILTIN_TOOL_CATEGORIES = {
         "view_channel_thread",
         "view_channel_message",
     },
+    "code_interpreter": {"execute_code"},
 }
 
 # Mapping from Valves field names to category names
@@ -63,6 +64,7 @@ VALVE_TO_CATEGORY = {
     "ENABLE_MEMORY_TOOLS": "memory",
     "ENABLE_NOTES_TOOLS": "notes",
     "ENABLE_CHANNELS_TOOLS": "channels",
+    "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
 }
 
 # Tools that generate citation sources
@@ -702,8 +704,11 @@ async def build_tools_dict(
         extra_params={
             "__user__": extra_params.get("__user__"),
             "__event_emitter__": extra_params.get("__event_emitter__"),
+            "__event_call__": extra_params.get("__event_call__"),
+            "__metadata__": extra_params.get("__metadata__"),
             "__chat_id__": extra_params.get("__chat_id__"),
             "__message_id__": extra_params.get("__message_id__"),
+            "__oauth_token__": extra_params.get("__oauth_token__"),
         },
         features=features,
         model=model,
@@ -815,6 +820,10 @@ class Tools:
             default=True,
             description="Enable channels tools (search_channels, search_channel_messages, etc.).",
         )
+        ENABLE_CODE_INTERPRETER_TOOLS: bool = Field(
+            default=True,
+            description="Enable code interpreter tools (execute_code).",
+        )
         DEBUG: bool = Field(
             default=False,
             description="Enable debug logging and raw outputs.",
@@ -924,6 +933,7 @@ CRITICAL RULES:
         __event_call__: Callable[[dict], Any] = None,  # type: ignore
         __chat_id__: Optional[str] = None,
         __message_id__: Optional[str] = None,
+        __oauth_token__: Optional[dict] = None,
     ) -> str:
         """
         Run a multi-model council decision with majority vote.
@@ -1069,6 +1079,7 @@ CRITICAL RULES:
             "__metadata__": metadata,
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
+            "__oauth_token__": __oauth_token__,
             "__files__": metadata.get("files", []),
         }
 

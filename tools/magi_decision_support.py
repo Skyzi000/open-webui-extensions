@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.0
+version: 0.2.1
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -633,8 +633,11 @@ async def build_tools_dict(
         extra_params={
             "__user__": extra_params.get("__user__"),
             "__event_emitter__": extra_params.get("__event_emitter__"),
+            "__event_call__": extra_params.get("__event_call__"),
+            "__metadata__": extra_params.get("__metadata__"),
             "__chat_id__": extra_params.get("__chat_id__"),
             "__message_id__": extra_params.get("__message_id__"),
+            "__oauth_token__": extra_params.get("__oauth_token__"),
         },
         features=features,
         model=model,
@@ -718,6 +721,7 @@ class Tools:
         __event_call__: Callable[[dict], Any] = None,  # type: ignore
         __chat_id__: str = None,
         __message_id__: str = None,
+        __oauth_token__: Optional[dict] = None,
     ) -> str:
         """
         Run MAGI decision support with three independent perspectives and majority vote.
@@ -804,6 +808,7 @@ class Tools:
             "__metadata__": __metadata__ or {},
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
+            "__oauth_token__": __oauth_token__,
             "__files__": (__metadata__ or {}).get("files", []),
         }
 

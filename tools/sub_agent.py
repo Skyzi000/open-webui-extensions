@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.3.1
+version: 0.3.2
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -76,6 +76,7 @@ BUILTIN_TOOL_CATEGORIES = {
         "view_channel_thread",
         "view_channel_message",
     },
+    "code_interpreter": {"execute_code"},
 }
 
 # Mapping from Valves field names to category names
@@ -88,6 +89,7 @@ VALVE_TO_CATEGORY = {
     "ENABLE_MEMORY_TOOLS": "memory",
     "ENABLE_NOTES_TOOLS": "notes",
     "ENABLE_CHANNELS_TOOLS": "channels",
+    "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
 }
 
 # Tools that generate citation sources
@@ -651,6 +653,8 @@ async def load_sub_agent_tools(
         builtin_extra_params = {
             "__user__": extra_params.get("__user__"),
             "__event_emitter__": event_emitter,
+            "__event_call__": extra_params.get("__event_call__"),
+            "__metadata__": extra_params.get("__metadata__"),
             "__chat_id__": extra_params.get("__chat_id__"),
             "__message_id__": extra_params.get("__message_id__"),
             "__oauth_token__": extra_params.get("__oauth_token__"),
@@ -769,6 +773,10 @@ class Tools:
         ENABLE_CHANNELS_TOOLS: bool = Field(
             default=True,
             description="Enable channels tools (search_channels, search_channel_messages, etc.).",
+        )
+        ENABLE_CODE_INTERPRETER_TOOLS: bool = Field(
+            default=True,
+            description="Enable code interpreter tools (execute_code).",
         )
         MAX_PARALLEL_AGENTS: int = Field(
             default=5,
