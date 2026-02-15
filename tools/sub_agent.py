@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.3.3
+version: 0.4.0
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -77,6 +77,7 @@ BUILTIN_TOOL_CATEGORIES = {
         "view_channel_message",
     },
     "code_interpreter": {"execute_code"},
+    "skills": {"view_skill"},
 }
 
 # Mapping from Valves field names to category names
@@ -90,6 +91,7 @@ VALVE_TO_CATEGORY = {
     "ENABLE_NOTES_TOOLS": "notes",
     "ENABLE_CHANNELS_TOOLS": "channels",
     "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
+    "ENABLE_SKILLS_TOOLS": "skills",
 }
 
 # Tools that generate citation sources
@@ -549,6 +551,110 @@ async def run_sub_agent_loop(
     return "Sub-agent reached maximum iterations without providing a final response."
 
 
+_SKILLS_MANIFEST_START = "<available_skills>"
+_SKILLS_MANIFEST_END = "</available_skills>"
+
+
+def _find_manifest_in_text(text: str) -> str:
+    """Return the <available_skills>…</available_skills> substring, or ""."""
+    start = text.find(_SKILLS_MANIFEST_START)
+    if start == -1:
+        return ""
+    end = text.find(_SKILLS_MANIFEST_END, start)
+    if end == -1:
+        return ""
+    return text[start : end + len(_SKILLS_MANIFEST_END)]
+
+
+def extract_skill_manifest(messages: Optional[list]) -> str:
+    """Extract the <available_skills> manifest from the parent conversation's
+    system message.
+
+    Open WebUI's middleware injects the manifest into the system message but
+    does NOT pass __skill_ids__ to regular tool extra_params.  By reading the
+    manifest from the parent messages (__messages__), we can propagate the
+    exact same skills to the sub-agent.
+
+    Handles both plain-string content and list-of-parts content
+    (``[{"type": "text", "text": "..."}]``).
+
+    Args:
+        messages: The parent conversation messages (__messages__).
+
+    Returns:
+        The manifest XML string, or empty string if not found.
+    """
+    if not messages:
+        return ""
+    for msg in messages:
+        if msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            result = _find_manifest_in_text(content)
+            if result:
+                return result
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    result = _find_manifest_in_text(part.get("text") or "")
+                    if result:
+                        return result
+    return ""
+
+
+def register_view_skill(
+    tools_dict: dict,
+    request: Request,
+    extra_params: dict,
+) -> None:
+    """Manually register the view_skill builtin tool in tools_dict.
+
+    This is needed because get_builtin_tools only registers view_skill when
+    __skill_ids__ is non-empty, which is never the case for regular tools.
+
+    Args:
+        tools_dict: The tools dict to add view_skill to (modified in-place).
+        request: FastAPI request object.
+        extra_params: Extra parameters for tool binding.
+    """
+    if "view_skill" in tools_dict:
+        return
+
+    try:
+        from open_webui.tools.builtin import view_skill
+        from open_webui.utils.tools import (
+            get_async_tool_function_and_apply_extra_params,
+            convert_function_to_pydantic_model,
+            convert_pydantic_model_to_openai_function_spec,
+        )
+
+        callable_fn = get_async_tool_function_and_apply_extra_params(
+            view_skill,
+            {
+                "__request__": request,
+                "__user__": extra_params.get("__user__", {}),
+                "__event_emitter__": extra_params.get("__event_emitter__"),
+                "__event_call__": extra_params.get("__event_call__"),
+                "__metadata__": extra_params.get("__metadata__"),
+                "__chat_id__": extra_params.get("__chat_id__"),
+                "__message_id__": extra_params.get("__message_id__"),
+            },
+        )
+
+        pydantic_model = convert_function_to_pydantic_model(view_skill)
+        spec = convert_pydantic_model_to_openai_function_spec(pydantic_model)
+
+        tools_dict["view_skill"] = {
+            "tool_id": "builtin:view_skill",
+            "callable": callable_fn,
+            "spec": spec,
+            "type": "builtin",
+        }
+    except Exception as e:
+        log.warning(f"Failed to register view_skill: {e}")
+
+
 async def load_sub_agent_tools(
     request: Request,
     user: Any,
@@ -651,6 +757,10 @@ async def load_sub_agent_tools(
         # Get features from metadata (for memory, etc.)
         features = metadata.get("features", {})
 
+        # NOTE: view_skill is NOT registered here (requires __skill_ids__
+        # which middleware doesn't inject into tool extra_params).
+        # Instead, it's registered manually via register_view_skill() when
+        # the parent conversation's skill manifest is detected.
         builtin_extra_params = {
             "__user__": extra_params.get("__user__"),
             "__event_emitter__": event_emitter,
@@ -779,6 +889,10 @@ class Tools:
             default=True,
             description="Enable code interpreter tools (execute_code).",
         )
+        ENABLE_SKILLS_TOOLS: bool = Field(
+            default=True,
+            description="Enable skills tools (view_skill). When enabled and the parent conversation has skills, the sub-agent can view skill contents.",
+        )
         MAX_PARALLEL_AGENTS: int = Field(
             default=5,
             description="Maximum number of sub-agents to run in parallel via run_parallel_sub_agents. To fully disable parallel execution, comment out the run_parallel_sub_agents method.",
@@ -826,6 +940,7 @@ RESPONSE REQUIREMENTS:
         __chat_id__: str = None,
         __message_id__: str = None,
         __oauth_token__: Optional[dict] = None,
+        __messages__: Optional[list] = None,
     ) -> str:
         """
         Delegate a task to a sub-agent for autonomous completion.
@@ -860,6 +975,12 @@ RESPONSE REQUIREMENTS:
         # Get user valves
         raw_user_valves = (__user__ or {}).get("valves", {})
         user_valves = coerce_user_valves(raw_user_valves, self.UserValves)
+
+        # Extract skill manifest from parent conversation messages.
+        # The middleware injects <available_skills> into the system message
+        # but does NOT pass __skill_ids__ to tool extra_params.
+        # __messages__ is injected via get_tools/get_updated_tool_function.
+        skill_manifest = extract_skill_manifest(__messages__)
 
         if __event_emitter__:
             await __event_emitter__(
@@ -923,9 +1044,17 @@ RESPONSE REQUIREMENTS:
             self_tool_id=__id__,
         )
 
+        # Register view_skill and inject manifest if skills are available
+        if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
+            register_view_skill(tools_dict, __request__, common_extra_params)
+
         # Build initial messages
+        system_content = user_valves.SYSTEM_PROMPT
+        if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
+            system_content += "\n\n" + skill_manifest
+
         messages = [
-            {"role": "system", "content": user_valves.SYSTEM_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": prompt},
         ]
 
@@ -990,6 +1119,7 @@ RESPONSE REQUIREMENTS:
         __chat_id__: str = None,
         __message_id__: str = None,
         __oauth_token__: Optional[dict] = None,
+        __messages__: Optional[list] = None,
     ) -> str:
         """
         Run multiple independent sub-agent tasks in parallel (concurrently).
@@ -1095,6 +1225,9 @@ RESPONSE REQUIREMENTS:
         raw_user_valves = (__user__ or {}).get("valves", {})
         user_valves = coerce_user_valves(raw_user_valves, self.UserValves)
 
+        # Extract skill manifest from parent conversation (same as run_sub_agent)
+        skill_manifest = extract_skill_manifest(__messages__)
+
         # Determine model ID
         # Priority: DEFAULT_MODEL (valve) > chat model (metadata) > task model (__model__)
         model_id = self.valves.DEFAULT_MODEL
@@ -1156,6 +1289,14 @@ RESPONSE REQUIREMENTS:
             self_tool_id=__id__,
         )
 
+        # Register view_skill and build system content with manifest
+        if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
+            register_view_skill(tools_dict, __request__, common_extra_params)
+
+        parallel_system_content = user_valves.SYSTEM_PROMPT
+        if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
+            parallel_system_content += "\n\n" + skill_manifest
+
         if __event_emitter__:
             task_mapping = ", ".join(
                 f"[{i + 1}] {task['description']}" for i, task in enumerate(validated_tasks)
@@ -1200,7 +1341,7 @@ RESPONSE REQUIREMENTS:
                     user=user,
                     model_id=model_id,
                     messages=[
-                        {"role": "system", "content": user_valves.SYSTEM_PROMPT},
+                        {"role": "system", "content": parallel_system_content},
                         {"role": "user", "content": task_prompt},
                     ],
                     tools_dict=tools_dict,
