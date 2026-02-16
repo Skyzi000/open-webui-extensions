@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.4.0
+version: 0.4.1
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -33,6 +33,7 @@ import asyncio
 import ast
 import json
 import logging
+import re
 import uuid
 from typing import Any, Callable, List, Optional, Type
 
@@ -554,6 +555,10 @@ async def run_sub_agent_loop(
 _SKILLS_MANIFEST_START = "<available_skills>"
 _SKILLS_MANIFEST_END = "</available_skills>"
 
+_SKILL_TAG_PATTERN = re.compile(
+    r"<skill name=.*?>\n.*?\n</skill>", re.DOTALL
+)
+
 
 def _find_manifest_in_text(text: str) -> str:
     """Return the <available_skills>…</available_skills> substring, or ""."""
@@ -566,41 +571,79 @@ def _find_manifest_in_text(text: str) -> str:
     return text[start : end + len(_SKILLS_MANIFEST_END)]
 
 
-def extract_skill_manifest(messages: Optional[list]) -> str:
-    """Extract the <available_skills> manifest from the parent conversation's
-    system message.
+def _find_skill_tags_in_text(text: str) -> list[str]:
+    """Return all ``<skill name="...">…</skill>`` blocks found in *text*."""
+    return _SKILL_TAG_PATTERN.findall(text)
 
-    Open WebUI's middleware injects the manifest into the system message but
-    does NOT pass __skill_ids__ to regular tool extra_params.  By reading the
-    manifest from the parent messages (__messages__), we can propagate the
-    exact same skills to the sub-agent.
 
-    Handles both plain-string content and list-of-parts content
+def _extract_from_system_messages(
+    messages: Optional[list],
+    extractor,
+):
+    """Walk system messages and apply *extractor* to each text chunk.
+
+    ``extractor`` is called with a single ``str`` argument and should return a
+    list of results (or a single truthy result).  The function handles both
+    plain-string content and list-of-parts content
     (``[{"type": "text", "text": "..."}]``).
-
-    Args:
-        messages: The parent conversation messages (__messages__).
-
-    Returns:
-        The manifest XML string, or empty string if not found.
     """
+    results: list = []
     if not messages:
-        return ""
+        return results
     for msg in messages:
         if msg.get("role") != "system":
             continue
         content = msg.get("content")
         if isinstance(content, str):
-            result = _find_manifest_in_text(content)
-            if result:
-                return result
+            found = extractor(content)
+            if found:
+                results.append(found) if isinstance(found, str) else results.extend(
+                    found
+                )
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
-                    result = _find_manifest_in_text(part.get("text") or "")
-                    if result:
-                        return result
-    return ""
+                    found = extractor(part.get("text") or "")
+                    if found:
+                        results.append(found) if isinstance(
+                            found, str
+                        ) else results.extend(found)
+    return results
+
+
+def extract_skill_manifest(messages: Optional[list]) -> str:
+    """Extract the ``<available_skills>`` manifest from the parent
+    conversation's system messages.
+
+    Since v0.8.2, only **model-attached** skills appear in this manifest.
+    User-selected skills are injected as full ``<skill>`` tags instead
+    (see :func:`extract_user_skill_tags`).
+
+    Args:
+        messages: The parent conversation messages (``__messages__``).
+
+    Returns:
+        The manifest XML string, or empty string if not found.
+    """
+    results = _extract_from_system_messages(messages, _find_manifest_in_text)
+    return results[0] if results else ""
+
+
+def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
+    """Extract ``<skill name="...">content</skill>`` tags from the parent
+    conversation's system messages.
+
+    Since Open WebUI v0.8.2, user-selected skills are injected as individual
+    ``<skill>`` tags with full content (as opposed to the lazy-loading
+    manifest used for model-attached skills).
+
+    Args:
+        messages: The parent conversation messages (``__messages__``).
+
+    Returns:
+        A list of ``<skill …>…</skill>`` strings, possibly empty.
+    """
+    return _extract_from_system_messages(messages, _find_skill_tags_in_text)
 
 
 def register_view_skill(
@@ -610,8 +653,13 @@ def register_view_skill(
 ) -> None:
     """Manually register the view_skill builtin tool in tools_dict.
 
-    This is needed because get_builtin_tools only registers view_skill when
-    __skill_ids__ is non-empty, which is never the case for regular tools.
+    This is needed for **model-attached** skills whose content is not injected
+    inline.  The sub-agent can call ``view_skill`` to lazily load their content
+    from the ``<available_skills>`` manifest.
+
+    Since v0.8.2, user-selected skills are injected as full ``<skill>`` tags
+    and do NOT require ``view_skill``; they are passed directly in the system
+    message.
 
     Args:
         tools_dict: The tools dict to add view_skill to (modified in-place).
@@ -757,10 +805,9 @@ async def load_sub_agent_tools(
         # Get features from metadata (for memory, etc.)
         features = metadata.get("features", {})
 
-        # NOTE: view_skill is NOT registered here (requires __skill_ids__
-        # which middleware doesn't inject into tool extra_params).
-        # Instead, it's registered manually via register_view_skill() when
-        # the parent conversation's skill manifest is detected.
+        # NOTE: view_skill is NOT registered here; it's registered manually
+        # via register_view_skill() when the parent conversation's
+        # <available_skills> manifest is detected (model-attached skills).
         builtin_extra_params = {
             "__user__": extra_params.get("__user__"),
             "__event_emitter__": event_emitter,
@@ -976,11 +1023,12 @@ RESPONSE REQUIREMENTS:
         raw_user_valves = (__user__ or {}).get("valves", {})
         user_valves = coerce_user_valves(raw_user_valves, self.UserValves)
 
-        # Extract skill manifest from parent conversation messages.
-        # The middleware injects <available_skills> into the system message
-        # but does NOT pass __skill_ids__ to tool extra_params.
+        # Extract skills from parent conversation messages.
+        # Since v0.8.2, user-selected skills are injected as full <skill> tags,
+        # while model-attached skills appear in the <available_skills> manifest.
         # __messages__ is injected via get_tools/get_updated_tool_function.
         skill_manifest = extract_skill_manifest(__messages__)
+        user_skill_tags = extract_user_skill_tags(__messages__)
 
         if __event_emitter__:
             await __event_emitter__(
@@ -1044,14 +1092,19 @@ RESPONSE REQUIREMENTS:
             self_tool_id=__id__,
         )
 
-        # Register view_skill and inject manifest if skills are available
+        # Register view_skill if model-attached skills manifest is available
         if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
             register_view_skill(tools_dict, __request__, common_extra_params)
 
-        # Build initial messages
+        # Build initial messages with skills context
         system_content = user_valves.SYSTEM_PROMPT
-        if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
-            system_content += "\n\n" + skill_manifest
+        if self.valves.ENABLE_SKILLS_TOOLS:
+            # User-selected skills: inject full content (v0.8.2+)
+            if user_skill_tags:
+                system_content += "\n\n" + "\n".join(user_skill_tags)
+            # Model-attached skills: inject manifest for lazy loading via view_skill
+            if skill_manifest:
+                system_content += "\n\n" + skill_manifest
 
         messages = [
             {"role": "system", "content": system_content},
@@ -1225,8 +1278,9 @@ RESPONSE REQUIREMENTS:
         raw_user_valves = (__user__ or {}).get("valves", {})
         user_valves = coerce_user_valves(raw_user_valves, self.UserValves)
 
-        # Extract skill manifest from parent conversation (same as run_sub_agent)
+        # Extract skills from parent conversation (same as run_sub_agent)
         skill_manifest = extract_skill_manifest(__messages__)
+        user_skill_tags = extract_user_skill_tags(__messages__)
 
         # Determine model ID
         # Priority: DEFAULT_MODEL (valve) > chat model (metadata) > task model (__model__)
@@ -1289,13 +1343,17 @@ RESPONSE REQUIREMENTS:
             self_tool_id=__id__,
         )
 
-        # Register view_skill and build system content with manifest
+        # Register view_skill if model-attached skills manifest is available
         if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
             register_view_skill(tools_dict, __request__, common_extra_params)
 
+        # Build system content with skills context
         parallel_system_content = user_valves.SYSTEM_PROMPT
-        if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
-            parallel_system_content += "\n\n" + skill_manifest
+        if self.valves.ENABLE_SKILLS_TOOLS:
+            if user_skill_tags:
+                parallel_system_content += "\n\n" + "\n".join(user_skill_tags)
+            if skill_manifest:
+                parallel_system_content += "\n\n" + skill_manifest
 
         if __event_emitter__:
             task_mapping = ", ".join(
