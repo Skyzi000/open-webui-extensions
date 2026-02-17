@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.4.1
+version: 0.4.2
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -61,6 +61,7 @@ BUILTIN_TOOL_CATEGORIES = {
         "query_knowledge_bases",
         "search_knowledge_files",
         "query_knowledge_files",
+        "view_file",
         "view_knowledge_file",
     },
     "chat": {"search_chats", "view_chat"},
@@ -119,6 +120,26 @@ def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseMode
     if isinstance(raw_valves, dict):
         return valves_cls.model_validate(raw_valves)
     return valves_cls.model_validate({})
+
+
+def model_has_note_knowledge(model: Optional[dict]) -> bool:
+    """Return True if the current model has note-type attached knowledge."""
+    if not isinstance(model, dict):
+        return False
+    knowledge_items = (model.get("info", {}).get("meta", {}).get("knowledge") or [])
+    if not isinstance(knowledge_items, list):
+        return False
+    return any(item.get("type") == "note" for item in knowledge_items if isinstance(item, dict))
+
+
+def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
+    """Return True if model-level builtin knowledge tools are enabled."""
+    if not isinstance(model, dict):
+        return True
+    builtin_tools = model.get("info", {}).get("meta", {}).get("builtinTools", {})
+    if not isinstance(builtin_tools, dict):
+        return True
+    return bool(builtin_tools.get("knowledge", True))
 
 
 async def execute_tool_call(
@@ -831,20 +852,33 @@ async def load_sub_agent_tools(
             if not getattr(valves, valve_field):
                 disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES[category])
 
+        knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
+        notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
+        keep_view_note_for_knowledge = (
+            (not notes_tools_enabled)
+            and knowledge_tools_enabled
+            and model_knowledge_tools_enabled(model)
+            and model_has_note_knowledge(model)
+        )
+
         # Filter builtin tools based on Valves settings
         # NOTE: Regular tools take priority over builtin tools with the same name.
         # This allows users to override builtin behavior with custom tools.
         builtin_count = 0
         for name, tool_dict in all_builtin_tools.items():
-            if name not in disabled_builtin_tools:
-                if name not in tools_dict:
-                    tools_dict[name] = tool_dict
-                    builtin_count += 1
-                elif valves.DEBUG:
-                    log.warning(
-                        f"[SubAgent] Builtin tool '{name}' skipped: "
-                        "regular tool with same name takes priority"
-                    )
+            if name in disabled_builtin_tools and not (
+                name == "view_note" and keep_view_note_for_knowledge
+            ):
+                continue
+
+            if name not in tools_dict:
+                tools_dict[name] = tool_dict
+                builtin_count += 1
+            elif valves.DEBUG:
+                log.warning(
+                    f"[SubAgent] Builtin tool '{name}' skipped: "
+                    "regular tool with same name takes priority"
+                )
 
         if valves.DEBUG:
             log.info(

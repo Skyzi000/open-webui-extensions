@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.5
+version: 0.1.6
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -35,6 +35,7 @@ BUILTIN_TOOL_CATEGORIES = {
         "query_knowledge_bases",
         "search_knowledge_files",
         "query_knowledge_files",
+        "view_file",
         "view_knowledge_file",
     },
     "chat": {"search_chats", "view_chat"},
@@ -150,6 +151,26 @@ def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseMode
     else:
         data = {}
     return valves_cls.model_validate(data)
+
+
+def model_has_note_knowledge(model: Optional[dict]) -> bool:
+    """Return True if the current model has note-type attached knowledge."""
+    if not isinstance(model, dict):
+        return False
+    knowledge_items = (model.get("info", {}).get("meta", {}).get("knowledge") or [])
+    if not isinstance(knowledge_items, list):
+        return False
+    return any(item.get("type") == "note" for item in knowledge_items if isinstance(item, dict))
+
+
+def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
+    """Return True if model-level builtin knowledge tools are enabled."""
+    if not isinstance(model, dict):
+        return True
+    builtin_tools = model.get("info", {}).get("meta", {}).get("builtinTools", {})
+    if not isinstance(builtin_tools, dict):
+        return True
+    return bool(builtin_tools.get("knowledge", True))
 
 
 def parse_model_ids(value: Any) -> List[str]:
@@ -720,8 +741,19 @@ async def build_tools_dict(
         if not getattr(valves, valve_field, True):
             disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
 
+    knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
+    notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
+    keep_view_note_for_knowledge = (
+        (not notes_tools_enabled)
+        and knowledge_tools_enabled
+        and model_knowledge_tools_enabled(model)
+        and model_has_note_knowledge(model)
+    )
+
     for name, tool_dict in all_builtin_tools.items():
-        if name in disabled_builtin_tools:
+        if name in disabled_builtin_tools and not (
+            name == "view_note" and keep_view_note_for_knowledge
+        ):
             continue
         if name not in tools_dict:
             tools_dict[name] = tool_dict
