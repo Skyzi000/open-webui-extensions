@@ -10,15 +10,8 @@ Open WebUI executes tool calls sequentially, which can be slow when multiple
 independent tools need to run. This tool allows you to batch independent tool
 calls and execute them concurrently using asyncio.gather.
 
-Tip: Combine with the Sub Agent tool to run multiple sub-agents in parallel.
-https://github.com/Skyzi000/open-webui-extensions/blob/main/tools/sub_agent.py
-For example, you can spawn several research sub-agents simultaneously,
-each investigating a different topic, and get all results at once.
-
-Watch out for rate limits on web search APIs, LLM providers, etc.!
-
 Limitations:
-- Requires a high-capability model (e.g., GPT-5.2, Claude Opus 4.5) to correctly
+- Requires a high-capability model (e.g., GPT-5.2, Claude Opus 4.6) to correctly
   invoke this tool. Smaller/mid-tier models may fail to pass the tool_calls
   parameter in the expected format.
 """
