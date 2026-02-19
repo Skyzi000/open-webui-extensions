@@ -18,7 +18,7 @@ and efficient.
 
 Requirements:
 - Native Function Calling must be enabled for the model
-  (Model settings > Parameters > Function Calling: native)
+  (Model settings > Advanced Params> Function Calling: native)
 
 Inspired by VS Code's runSubagent functionality, this tool was developed from scratch specifically for Open WebUI to ensure seamless integration and optimal performance.
 
