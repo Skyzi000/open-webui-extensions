@@ -67,6 +67,4 @@ git clone --recurse-submodules https://github.com/Skyzi000/open-webui-extensions
 
 ## License
 
-*Applies only to code authored by Skyzi000.*
-
 MIT License
