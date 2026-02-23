@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.4
+version: 0.1.5
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 
 # Tools that generate citation sources
 # NOTE: Update this set when new citation-capable tools are added to Open WebUI.
-CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files"}
+CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files", "fetch_url"}
 
 
 # ============================================================================

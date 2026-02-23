@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.6
+version: 0.1.7
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -39,7 +39,7 @@ BUILTIN_TOOL_CATEGORIES = {
         "view_knowledge_file",
     },
     "chat": {"search_chats", "view_chat"},
-    "memory": {"search_memories", "add_memory", "replace_memory_content"},
+    "memory": {"search_memories", "add_memory", "replace_memory_content", "delete_memory", "list_memories"},
     "notes": {
         "search_notes",
         "view_note",
@@ -53,6 +53,7 @@ BUILTIN_TOOL_CATEGORIES = {
         "view_channel_message",
     },
     "code_interpreter": {"execute_code"},
+    "skills": {"view_skill"},
 }
 
 # Mapping from Valves field names to category names
@@ -71,7 +72,7 @@ VALVE_TO_CATEGORY = {
 # Tools that generate citation sources
 # NOTE: Update this set when new citation-capable tools are added to Open WebUI.
 # See open_webui/utils/middleware.py:get_citation_source_from_tool_result() for supported tools.
-CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files"}
+CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files", "fetch_url"}
 
 
 # ============================================================================

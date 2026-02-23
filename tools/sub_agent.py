@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.4.2
+version: 0.4.3
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -65,7 +65,7 @@ BUILTIN_TOOL_CATEGORIES = {
         "view_knowledge_file",
     },
     "chat": {"search_chats", "view_chat"},
-    "memory": {"search_memories", "add_memory", "replace_memory_content"},
+    "memory": {"search_memories", "add_memory", "replace_memory_content", "delete_memory", "list_memories"},
     "notes": {
         "search_notes",
         "view_note",
@@ -99,7 +99,7 @@ VALVE_TO_CATEGORY = {
 # Tools that generate citation sources
 # NOTE: Update this set when new citation-capable tools are added to Open WebUI.
 # See open_webui/utils/middleware.py:get_citation_source_from_tool_result() for supported tools.
-CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files"}
+CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files", "fetch_url"}
 
 
 # ============================================================================
