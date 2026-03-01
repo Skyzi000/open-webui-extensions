@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.4.3
+version: 0.4.4
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -752,6 +752,27 @@ async def load_sub_agent_tools(
         log.info(f"[SubAgent] Available tool_ids from metadata: {available_tool_ids}")
         log.info(f"[SubAgent] self_tool_id: {self_tool_id}")
 
+    # Apply exclusions first
+    excluded = set()
+    if valves.EXCLUDED_TOOL_IDS.strip():
+        excluded = {
+            tid.strip() for tid in valves.EXCLUDED_TOOL_IDS.split(",") if tid.strip()
+        }
+
+    # Always exclude this tool itself to prevent infinite recursion
+    if not self_tool_id:
+        log.warning(
+            "[SubAgent] self_tool_id is None, cannot exclude self from tool list. "
+            "Recursion prevention may not work."
+        )
+    else:
+        excluded.add(self_tool_id)
+
+    if valves.DEBUG:
+        log.info(f"[SubAgent] EXCLUDED_TOOL_IDS valve: '{valves.EXCLUDED_TOOL_IDS}'")
+        if excluded:
+            log.info(f"[SubAgent] Excluded tool IDs (including self): {sorted(excluded)}")
+
     # Determine which tools to use
     if valves.AVAILABLE_TOOL_IDS.strip():
         # Use Valves setting (admin-configured list)
@@ -767,22 +788,6 @@ async def load_sub_agent_tools(
             log.info(
                 f"[SubAgent] Using all available tool_ids from metadata: {tool_id_list}"
             )
-
-    # Apply exclusions
-    excluded = set()
-    if valves.EXCLUDED_TOOL_IDS.strip():
-        excluded = {
-            tid.strip() for tid in valves.EXCLUDED_TOOL_IDS.split(",") if tid.strip()
-        }
-
-    # Always exclude this tool itself to prevent infinite recursion
-    if not self_tool_id:
-        log.warning(
-            "[SubAgent] self_tool_id is None, cannot exclude self from tool list. "
-            "Recursion prevention may not work."
-        )
-    else:
-        excluded.add(self_tool_id)
 
     tool_id_list = [tid for tid in tool_id_list if tid not in excluded]
 
@@ -922,11 +927,26 @@ class Tools:
         )
         AVAILABLE_TOOL_IDS: str = Field(
             default="",
-            description="Comma-separated list of tool IDs available to sub-agents. Leave empty to use all tools.",
+            description=(
+                "[Advanced] Comma-separated list of tool IDs available to sub-agents. "
+                "Leave empty (recommended) to use only tools enabled in the chat UI. "
+                "When set, ONLY these tools are available (overrides chat UI tool selection). "
+                "This controls regular tools only; builtin tools (web search, memory, etc.) "
+                "are controlled separately by the ENABLE_*_TOOLS toggles below. "
+                "WARNING: Mismatched tool sets between main AI and sub-agent can cause failures - "
+                "the main AI may instruct the sub-agent to use tools it doesn't have. "
+                "Tool server IDs (e.g., MCPO/OpenAPI) require 'server:' prefix (e.g., 'server:context7'). "
+                "To find exact tool IDs, enable DEBUG, enable the desired tools in the chat UI, "
+                "invoke the sub-agent, and check server logs for '[SubAgent] Available tool_ids from metadata'."
+            ),
         )
         EXCLUDED_TOOL_IDS: str = Field(
             default="",
-            description="Comma-separated list of tool IDs to exclude from sub-agents (e.g., this tool itself to prevent recursion).",
+            description=(
+                "Comma-separated list of tool IDs to exclude from sub-agents (e.g., this tool itself to prevent recursion). "
+                "This controls regular tools only; to disable builtin tools, use the ENABLE_*_TOOLS toggles. "
+                "If unsure about tool IDs or exclusion behavior, enable DEBUG and check server logs."
+            ),
         )
         APPLY_INLET_FILTERS: bool = Field(
             default=True,
@@ -936,7 +956,12 @@ class Tools:
         # Builtin tool category toggles
         ENABLE_TIME_TOOLS: bool = Field(
             default=True,
-            description="Enable time utilities (get_current_timestamp, calculate_timestamp).",
+            description=(
+                "Enable time utilities (get_current_timestamp, calculate_timestamp). "
+                "NOTE for all ENABLE_*_TOOLS toggles: These can only disable builtin tools; "
+                "they cannot enable tools that are disabled by global admin settings, "
+                "model capabilities, or chat UI features (e.g., web search)."
+            ),
         )
         ENABLE_WEB_TOOLS: bool = Field(
             default=True,
