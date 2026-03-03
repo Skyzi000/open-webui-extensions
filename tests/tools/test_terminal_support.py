@@ -508,6 +508,94 @@ async def test_multi_model_council_resolves_terminal_from_request_body(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_multi_model_council_resolves_terminal_once_before_parallel_members(
+    monkeypatch, dummy_request, mock_user
+):
+    resolve_calls = []
+    build_tools_terminal_ids = []
+
+    async def fake_resolve_terminal_id_from_request_and_metadata(
+        *, request, metadata, debug=False
+    ):
+        resolve_calls.append(1)
+        return "term-shared"
+
+    async def fake_get_available_models(request, user):
+        return [{"id": "model-a"}, {"id": "model-b"}]
+
+    async def fake_build_tools_dict(
+        *,
+        request,
+        model,
+        metadata,
+        user,
+        valves,
+        extra_params,
+        tool_id_list,
+        excluded_tool_ids,
+        resolved_terminal_id=None,
+    ):
+        build_tools_terminal_ids.append(resolved_terminal_id)
+        return {}
+
+    async def fake_run_agent_loop(**kwargs):
+        return json.dumps({"vote": "A", "reasoning": "ok"})
+
+    async def fake_event_emitter(event: dict):
+        return None
+
+    monkeypatch.setattr(
+        multi_model_council,
+        "resolve_terminal_id_from_request_and_metadata",
+        fake_resolve_terminal_id_from_request_and_metadata,
+    )
+    monkeypatch.setattr(
+        multi_model_council,
+        "get_available_models",
+        fake_get_available_models,
+    )
+    monkeypatch.setattr(
+        multi_model_council,
+        "build_tools_dict",
+        fake_build_tools_dict,
+    )
+    monkeypatch.setattr(
+        multi_model_council,
+        "run_agent_loop",
+        fake_run_agent_loop,
+    )
+
+    setattr(dummy_request.app.state, "MODELS", {"model-a": {}, "model-b": {}})
+
+    user_payload = {
+        **mock_user,
+        "last_active_at": 0,
+        "updated_at": 0,
+        "created_at": 0,
+    }
+    metadata = {"tool_ids": [], "features": {}}
+
+    tool = multi_model_council.Tools()
+    result_json = await tool.council_decide(
+        proposition="pick one",
+        option_a="A",
+        option_b="B",
+        models="model-a,model-b",
+        __user__=user_payload,
+        __request__=dummy_request,
+        __metadata__=metadata,
+        __event_emitter__=fake_event_emitter,
+    )
+
+    payload = json.loads(result_json)
+    assert payload["decision"] == "A"
+    assert len(resolve_calls) == 1
+    assert len(build_tools_terminal_ids) == 2
+    assert all(tid == "term-shared" for tid in build_tools_terminal_ids)
+    assert metadata["terminal_id"] == "term-shared"
+
+
+@pytest.mark.asyncio
 async def test_multi_model_council_without_terminal_symbol_keeps_builtin(
     monkeypatch, dummy_request
 ):

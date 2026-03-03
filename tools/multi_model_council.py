@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.8
+version: 0.1.9
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -805,6 +805,7 @@ async def build_tools_dict(
     extra_params: dict,
     tool_id_list: List[str],
     excluded_tool_ids: Optional[set],
+    resolved_terminal_id: Optional[str] = None,
 ) -> dict:
     from open_webui.utils.tools import get_builtin_tools, get_tools
 
@@ -815,11 +816,14 @@ async def build_tools_dict(
 
     metadata = metadata or {}
     tools_dict: Dict[str, dict] = {}
-    terminal_id = await resolve_terminal_id_from_request_and_metadata(
-        request=request,
-        metadata=metadata,
-        debug=bool(getattr(valves, "DEBUG", False)),
-    )
+    if resolved_terminal_id is None:
+        terminal_id = await resolve_terminal_id_from_request_and_metadata(
+            request=request,
+            metadata=metadata,
+            debug=bool(getattr(valves, "DEBUG", False)),
+        )
+    else:
+        terminal_id = normalize_text(resolved_terminal_id)
     if terminal_id:
         metadata["terminal_id"] = terminal_id
         extra_metadata = extra_params.get("__metadata__")
@@ -1161,6 +1165,7 @@ CRITICAL RULES:
         metadata = __metadata__ or {}
         raw_user_valves = (__user__ or {}).get("valves", {})
         user_valves = coerce_user_valves(raw_user_valves, self.UserValves)
+        resolved_terminal_id = ""
 
         include_sources = bool(user_valves.INCLUDE_SOURCES)
 
@@ -1253,6 +1258,15 @@ CRITICAL RULES:
                 ensure_ascii=False,
             )
 
+        if bool(getattr(self.valves, "ENABLE_TERMINAL_TOOLS", True)):
+            resolved_terminal_id = await resolve_terminal_id_from_request_and_metadata(
+                request=request,
+                metadata=metadata,
+                debug=bool(getattr(self.valves, "DEBUG", False)),
+            )
+            if resolved_terminal_id:
+                metadata["terminal_id"] = resolved_terminal_id
+
         extra_params = {
             "__user__": __user__,
             "__event_emitter__": __event_emitter__,
@@ -1327,6 +1341,7 @@ CRITICAL RULES:
                     extra_params=member_extra_params,
                     tool_id_list=tool_id_list,
                     excluded_tool_ids=excluded_tool_ids,
+                    resolved_terminal_id=resolved_terminal_id,
                 )
                 tools_cache[member_model_id] = tools_dict
 
