@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.5
+version: 0.1.6
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -32,10 +32,63 @@ log = logging.getLogger(__name__)
 # NOTE: Update this set when new citation-capable tools are added to Open WebUI.
 CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files", "fetch_url"}
 
+# Tool types that may return (data, headers) tuples from execute_tool_server.
+EXTERNAL_TOOL_TYPES = {"external", "action", "terminal"}
+
+# Terminal tool names that should emit UI refresh/display events.
+TERMINAL_EVENT_TOOLS = {"display_file", "write_file"}
+
 
 # ============================================================================
 # Helper functions (outside class - AI cannot invoke these)
 # ============================================================================
+
+
+async def resolve_terminal_id_from_request_and_metadata(
+    *,
+    request: Optional[Request],
+    metadata: Optional[dict],
+    debug: bool = False,
+) -> str:
+    """Resolve terminal_id from request.body() first, then metadata."""
+
+    def normalize_terminal_id(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        return value.strip()
+
+    metadata_terminal_id = ""
+    if isinstance(metadata, dict):
+        metadata_terminal_id = normalize_terminal_id(metadata.get("terminal_id"))
+
+    request_terminal_id = ""
+    if request is not None:
+        request_body = getattr(request, "body", None)
+        if callable(request_body):
+            try:
+                raw_body = await request_body()
+                if raw_body:
+                    body = json.loads(raw_body)
+                    if isinstance(body, dict):
+                        request_terminal_id = normalize_terminal_id(body.get("terminal_id"))
+                        if not request_terminal_id:
+                            nested_metadata = body.get("metadata")
+                            if isinstance(nested_metadata, dict):
+                                request_terminal_id = normalize_terminal_id(
+                                    nested_metadata.get("terminal_id")
+                                )
+            except Exception:
+                request_terminal_id = ""
+
+    if request_terminal_id:
+        if debug and metadata_terminal_id and metadata_terminal_id != request_terminal_id:
+            log.warning(
+                "[ParallelTools] terminal_id mismatch between request body and metadata; "
+                "using request body terminal_id"
+            )
+        return request_terminal_id
+
+    return metadata_terminal_id
 
 
 async def execute_single_tool(
@@ -93,8 +146,16 @@ async def execute_single_tool(
         # Handle OpenAPI/external tool results that return (data, headers) tuple
         # Headers (CIMultiDictProxy) are not JSON-serializable, so extract just the data
         tool_type = tool.get("type", "")
-        if tool_type == "external" and isinstance(result, tuple) and len(result) == 2:
+        if tool_type in EXTERNAL_TOOL_TYPES and isinstance(result, tuple) and len(result) == 2:
             result = result[0]  # Extract data, discard headers
+
+        # Emit terminal:* events for display/refresh behavior in UI
+        await emit_terminal_tool_event(
+            tool_name=tool_name,
+            tool_args=filtered_args,
+            tool_result=result,
+            event_emitter=event_emitter,
+        )
 
         # Try to parse JSON string results to avoid double-encoding
         if isinstance(result, str):
@@ -141,6 +202,37 @@ async def execute_single_tool(
         }
 
 
+async def emit_terminal_tool_event(
+    *,
+    tool_name: str,
+    tool_args: dict,
+    tool_result: Any,
+    event_emitter: Optional[Callable],
+) -> None:
+    """Emit terminal:* UI events for Open Terminal tool results."""
+    if not event_emitter or tool_name not in TERMINAL_EVENT_TOOLS:
+        return
+
+    path = tool_args.get("path", "") if isinstance(tool_args, dict) else ""
+    if not isinstance(path, str) or not path:
+        return
+
+    if tool_name == "display_file":
+        parsed = tool_result
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except Exception:
+                parsed = tool_result
+        if isinstance(parsed, dict) and parsed.get("exists") is False:
+            return
+
+    try:
+        await event_emitter({"type": f"terminal:{tool_name}", "data": {"path": path}})
+    except Exception as e:
+        log.warning(f"Error emitting terminal event for {tool_name}: {e}")
+
+
 # ============================================================================
 # Tools class
 # ============================================================================
@@ -157,6 +249,13 @@ class Tools:
         EXCLUDED_TOOL_IDS: str = Field(
             default="",
             description="Comma-separated list of tool IDs to exclude from parallel execution.",
+        )
+        ENABLE_TERMINAL_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable Open Terminal tools when terminal_id is available in chat metadata "
+                "(e.g., run_command, list_files, read_file, write_file, display_file)."
+            ),
         )
         DEBUG: bool = Field(
             default=False,
@@ -275,6 +374,28 @@ class Tools:
         from open_webui.utils.tools import get_tools
 
         user = UserModel(**__user__)
+        __metadata__ = __metadata__ or {}
+
+        terminal_id = await resolve_terminal_id_from_request_and_metadata(
+            request=__request__,
+            metadata=__metadata__,
+            debug=self.valves.DEBUG,
+        )
+        if terminal_id:
+            __metadata__["terminal_id"] = terminal_id
+
+        extra_params = {
+            "__user__": __user__,
+            "__event_emitter__": __event_emitter__,
+            "__event_call__": __event_call__,
+            "__request__": __request__,
+            "__model__": __model__,
+            "__metadata__": __metadata__,
+            "__chat_id__": __chat_id__,
+            "__message_id__": __message_id__,
+            "__oauth_token__": __oauth_token__,
+            "__files__": __metadata__.get("files", []) if __metadata__ else [],
+        }
 
         # Determine which tools to use
         available_tool_ids = []
@@ -317,19 +438,6 @@ class Tools:
         tools_dict = {}
         if regular_tool_ids:
             try:
-                extra_params = {
-                    "__user__": __user__,
-                    "__event_emitter__": __event_emitter__,
-                    "__event_call__": __event_call__,
-                    "__request__": __request__,
-                    "__model__": __model__,
-                    "__metadata__": __metadata__,
-                    "__chat_id__": __chat_id__,
-                    "__message_id__": __message_id__,
-                    "__oauth_token__": __oauth_token__,
-                    "__files__": __metadata__.get("files", []) if __metadata__ else [],
-                }
-
                 tools_dict = await get_tools(
                     request=__request__,
                     tool_ids=regular_tool_ids,
@@ -343,6 +451,26 @@ class Tools:
             except Exception as e:
                 log.exception(f"Error loading tools: {e}")
                 return json.dumps({"error": f"Failed to load tools: {e}"})
+
+        # Load terminal tools
+        if terminal_id and self.valves.ENABLE_TERMINAL_TOOLS:
+            try:
+                from open_webui.utils.tools import get_terminal_tools
+
+                terminal_tools = await get_terminal_tools(
+                    request=__request__,
+                    terminal_id=terminal_id,
+                    user=user,
+                    extra_params=extra_params,
+                )
+                if terminal_tools:
+                    tools_dict = {**tools_dict, **terminal_tools}
+                    if self.valves.DEBUG:
+                        log.info(
+                            f"[ParallelTools] Loaded {len(terminal_tools)} terminal tools for terminal_id={terminal_id}"
+                        )
+            except Exception as e:
+                log.exception(f"Error loading terminal tools: {e}")
 
         # Load builtin tools
         try:

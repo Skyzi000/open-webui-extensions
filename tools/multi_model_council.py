@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.7
+version: 0.1.8
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -74,6 +74,12 @@ VALVE_TO_CATEGORY = {
 # See open_webui/utils/middleware.py:get_citation_source_from_tool_result() for supported tools.
 CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files", "fetch_url"}
 
+# Tool types that may return (data, headers) tuples from execute_tool_server.
+EXTERNAL_TOOL_TYPES = {"external", "action", "terminal"}
+
+# Terminal tool names that should emit UI refresh/display events.
+TERMINAL_EVENT_TOOLS = {"display_file", "write_file"}
+
 
 # ============================================================================
 # Event emitter
@@ -131,6 +137,53 @@ def normalize_text(value: Optional[str]) -> str:
     return str(value).strip()
 
 
+async def resolve_terminal_id_from_request_and_metadata(
+    *,
+    request: Optional[Request],
+    metadata: Optional[dict],
+    debug: bool = False,
+) -> str:
+    """Resolve terminal_id from request.body() first, then metadata."""
+
+    def normalize_terminal_id(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        return value.strip()
+
+    metadata_terminal_id = ""
+    if isinstance(metadata, dict):
+        metadata_terminal_id = normalize_terminal_id(metadata.get("terminal_id"))
+
+    request_terminal_id = ""
+    if request is not None:
+        request_body = getattr(request, "body", None)
+        if callable(request_body):
+            try:
+                raw_body = await request_body()
+                if raw_body:
+                    body = json.loads(raw_body)
+                    if isinstance(body, dict):
+                        request_terminal_id = normalize_terminal_id(body.get("terminal_id"))
+                        if not request_terminal_id:
+                            nested_metadata = body.get("metadata")
+                            if isinstance(nested_metadata, dict):
+                                request_terminal_id = normalize_terminal_id(
+                                    nested_metadata.get("terminal_id")
+                                )
+            except Exception:
+                request_terminal_id = ""
+
+    if request_terminal_id:
+        if debug and metadata_terminal_id and metadata_terminal_id != request_terminal_id:
+            log.warning(
+                "[MultiModelCouncil] terminal_id mismatch between request body and metadata; "
+                "using request body terminal_id"
+            )
+        return request_terminal_id
+
+    return metadata_terminal_id
+
+
 def truncate_text(value: str, limit: int = 200) -> str:
     if not value:
         return ""
@@ -172,6 +225,44 @@ def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
     if not isinstance(builtin_tools, dict):
         return True
     return bool(builtin_tools.get("knowledge", True))
+
+
+def extract_tool_result_payload(*, tool_type: str, tool_result: Any) -> Any:
+    """Extract serializable payload from tool result for external/terminal-style tools."""
+    if tool_type in EXTERNAL_TOOL_TYPES and isinstance(tool_result, tuple) and len(tool_result) == 2:
+        return tool_result[0]
+    return tool_result
+
+
+async def emit_terminal_tool_event(
+    *,
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool_result: Any,
+    event_emitter: Optional[Callable],
+) -> None:
+    """Emit terminal:* UI events for Open Terminal tool results."""
+    if not event_emitter or tool_function_name not in TERMINAL_EVENT_TOOLS:
+        return
+
+    path = tool_function_params.get("path", "") if isinstance(tool_function_params, dict) else ""
+    if not isinstance(path, str) or not path:
+        return
+
+    if tool_function_name == "display_file":
+        parsed = tool_result
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except Exception:
+                parsed = tool_result
+        if isinstance(parsed, dict) and parsed.get("exists") is False:
+            return
+
+    try:
+        await event_emitter({"type": f"terminal:{tool_function_name}", "data": {"path": path}})
+    except Exception as exc:
+        log.warning(f"Error emitting terminal event for {tool_function_name}: {exc}")
 
 
 def parse_model_ids(value: Any) -> List[str]:
@@ -332,7 +423,10 @@ async def execute_tool_call(
                 "tool_call_id": tool_call_id,
                 "content": f"Error parsing arguments: {exc}",
             }
+    if not isinstance(tool_function_params, dict):
+        tool_function_params = {}
 
+    emit_terminal_event = False
     if tool_function_name in tools_dict:
         tool = tools_dict[tool_function_name]
         spec = tool.get("spec", {})
@@ -363,11 +457,24 @@ async def execute_tool_call(
             )
 
             tool_result = await tool_function(**tool_function_params)
+            tool_result = extract_tool_result_payload(
+                tool_type=tool.get("type", ""),
+                tool_result=tool_result,
+            )
+            emit_terminal_event = True
         except Exception as exc:
             log.exception(f"Error executing tool {tool_function_name}: {exc}")
             tool_result = f"Error: {exc}"
     else:
         tool_result = f"Tool '{tool_function_name}' not found"
+
+    if emit_terminal_event:
+        await emit_terminal_tool_event(
+            tool_function_name=tool_function_name,
+            tool_function_params=tool_function_params,
+            tool_result=tool_result,
+            event_emitter=event_emitter,
+        )
 
     if tool_result is None:
         tool_result = ""
@@ -701,7 +808,25 @@ async def build_tools_dict(
 ) -> dict:
     from open_webui.utils.tools import get_builtin_tools, get_tools
 
+    try:
+        from open_webui.utils.tools import get_terminal_tools
+    except Exception:
+        get_terminal_tools = None
+
+    metadata = metadata or {}
     tools_dict: Dict[str, dict] = {}
+    terminal_id = await resolve_terminal_id_from_request_and_metadata(
+        request=request,
+        metadata=metadata,
+        debug=bool(getattr(valves, "DEBUG", False)),
+    )
+    if terminal_id:
+        metadata["terminal_id"] = terminal_id
+        extra_metadata = extra_params.get("__metadata__")
+        if isinstance(extra_metadata, dict):
+            extra_metadata["terminal_id"] = terminal_id
+        else:
+            extra_params["__metadata__"] = metadata
 
     # Load regular tools available to the main agent
     regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
@@ -719,8 +844,26 @@ async def build_tools_dict(
         except Exception as exc:
             log.exception(f"Error loading regular tools: {exc}")
 
+    # Load terminal tools (if available in chat metadata)
+    if terminal_id and bool(getattr(valves, "ENABLE_TERMINAL_TOOLS", True)):
+        if get_terminal_tools is None:
+            if getattr(valves, "DEBUG", False):
+                log.info("[MultiModelCouncil] get_terminal_tools is unavailable in this Open WebUI version")
+        else:
+            try:
+                terminal_tools = await get_terminal_tools(
+                    request=request,
+                    terminal_id=terminal_id,
+                    user=user,
+                    extra_params=extra_params,
+                )
+                if terminal_tools:
+                    tools_dict = {**tools_dict, **terminal_tools}
+            except Exception as exc:
+                log.exception(f"Error loading terminal tools: {exc}")
+
     # Load builtin tools
-    features = metadata.get("features", {}) if metadata else {}
+    features = metadata.get("features", {})
     all_builtin_tools = get_builtin_tools(
         request=request,
         extra_params={
@@ -852,6 +995,13 @@ class Tools:
         ENABLE_CHANNELS_TOOLS: bool = Field(
             default=True,
             description="Enable channels tools (search_channels, search_channel_messages, etc.).",
+        )
+        ENABLE_TERMINAL_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable Open Terminal tools when terminal_id is available in chat metadata "
+                "(e.g., run_command, list_files, read_file, write_file, display_file)."
+            ),
         )
         ENABLE_CODE_INTERPRETER_TOOLS: bool = Field(
             default=True,
