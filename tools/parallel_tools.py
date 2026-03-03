@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.6
+version: 0.1.7
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -91,6 +91,121 @@ async def resolve_terminal_id_from_request_and_metadata(
     return metadata_terminal_id
 
 
+def normalize_direct_tool_servers(value: Any) -> List[dict]:
+    """Normalize direct tool server payload into a list of dict copies."""
+    if not isinstance(value, list):
+        return []
+    normalized = []
+    for item in value:
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+    return normalized
+
+
+async def resolve_direct_tool_servers_from_request_and_metadata(
+    *,
+    request: Optional[Request],
+    metadata: Optional[dict],
+    debug: bool = False,
+) -> List[dict]:
+    """Resolve direct tool servers from request.body() first, then metadata."""
+    metadata_servers = normalize_direct_tool_servers(
+        (metadata or {}).get("tool_servers") if isinstance(metadata, dict) else None
+    )
+
+    request_servers: List[dict] = []
+    if request is not None:
+        request_body = getattr(request, "body", None)
+        if callable(request_body):
+            try:
+                raw_body = await request_body()
+                if raw_body:
+                    body = json.loads(raw_body)
+                    if isinstance(body, dict):
+                        request_servers = normalize_direct_tool_servers(body.get("tool_servers"))
+                        if not request_servers:
+                            nested_metadata = body.get("metadata")
+                            if isinstance(nested_metadata, dict):
+                                request_servers = normalize_direct_tool_servers(
+                                    nested_metadata.get("tool_servers")
+                                )
+            except Exception:
+                request_servers = []
+
+    if request_servers:
+        if debug and metadata_servers and len(metadata_servers) != len(request_servers):
+            log.warning(
+                "[ParallelTools] tool_servers mismatch between request body and metadata; "
+                "using request body tool_servers"
+            )
+        return request_servers
+
+    return metadata_servers
+
+
+def build_direct_tools_dict(*, tool_servers: List[dict]) -> dict:
+    """Build direct tool entries compatible with Open WebUI middleware."""
+    direct_tools = {}
+    for server in tool_servers:
+        if not isinstance(server, dict):
+            continue
+        specs = server.get("specs", [])
+        if not isinstance(specs, list) or not specs:
+            continue
+
+        server_payload = {k: v for k, v in server.items() if k != "specs"}
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            name = spec.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            direct_tools[name] = {
+                "spec": spec,
+                "direct": True,
+                "server": server_payload,
+                "type": "direct",
+            }
+    return direct_tools
+
+
+async def execute_direct_tool_call(
+    *,
+    tool_name: str,
+    tool_args: dict,
+    tool: dict,
+    extra_params: dict,
+) -> Any:
+    """Execute direct tools through __event_call__ like core middleware."""
+    event_call = extra_params.get("__event_call__")
+    if not callable(event_call):
+        raise RuntimeError("Direct tool execution requires __event_call__ context")
+
+    metadata = extra_params.get("__metadata__")
+    session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
+    return await event_call(
+        {
+            "type": "execute:tool",
+            "data": {
+                "id": str(uuid.uuid4()),
+                "name": tool_name,
+                "params": tool_args,
+                "server": tool.get("server", {}),
+                "session_id": session_id,
+            },
+        }
+    )
+
+
+def extract_tool_result_payload(*, tool_type: str, tool_result: Any, direct_tool: bool = False) -> Any:
+    """Extract serializable payload from tool result for external/terminal/direct tools."""
+    if tool_type in EXTERNAL_TOOL_TYPES and isinstance(tool_result, tuple) and len(tool_result) == 2:
+        return tool_result[0]
+    if direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
+        return tool_result[0]
+    return tool_result
+
+
 async def execute_single_tool(
     tool_name: str,
     tool_args: dict,
@@ -127,27 +242,38 @@ async def execute_single_tool(
         # Filter to allowed parameters
         allowed_params = spec.get("parameters", {}).get("properties", {}).keys()
         filtered_args = {k: v for k, v in tool_args.items() if k in allowed_params}
+        direct_tool = bool(tool.get("direct", False))
 
-        tool_function = tool["callable"]
+        if direct_tool:
+            result = await execute_direct_tool_call(
+                tool_name=tool_name,
+                tool_args=filtered_args,
+                tool=tool,
+                extra_params=extra_params,
+            )
+        else:
+            tool_function = tool["callable"]
 
-        # Update function with current messages/files context
-        from open_webui.utils.tools import get_updated_tool_function
+            # Update function with current messages/files context
+            from open_webui.utils.tools import get_updated_tool_function
 
-        tool_function = get_updated_tool_function(
-            function=tool_function,
-            extra_params={
-                "__messages__": extra_params.get("__messages__", []),
-                "__files__": extra_params.get("__files__", []),
-            },
-        )
+            tool_function = get_updated_tool_function(
+                function=tool_function,
+                extra_params={
+                    "__messages__": extra_params.get("__messages__", []),
+                    "__files__": extra_params.get("__files__", []),
+                },
+            )
 
-        result = await tool_function(**filtered_args)
+            result = await tool_function(**filtered_args)
 
-        # Handle OpenAPI/external tool results that return (data, headers) tuple
-        # Headers (CIMultiDictProxy) are not JSON-serializable, so extract just the data
+        # Handle OpenAPI/external/direct tool results that return (data, headers)
         tool_type = tool.get("type", "")
-        if tool_type in EXTERNAL_TOOL_TYPES and isinstance(result, tuple) and len(result) == 2:
-            result = result[0]  # Extract data, discard headers
+        result = extract_tool_result_payload(
+            tool_type=tool_type,
+            tool_result=result,
+            direct_tool=direct_tool,
+        )
 
         # Emit terminal:* events for display/refresh behavior in UI
         await emit_terminal_tool_event(
@@ -384,6 +510,14 @@ class Tools:
         if terminal_id:
             __metadata__["terminal_id"] = terminal_id
 
+        direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
+            request=__request__,
+            metadata=__metadata__,
+            debug=self.valves.DEBUG,
+        )
+        if direct_tool_servers:
+            __metadata__["tool_servers"] = direct_tool_servers
+
         extra_params = {
             "__user__": __user__,
             "__event_emitter__": __event_emitter__,
@@ -471,6 +605,17 @@ class Tools:
                         )
             except Exception as e:
                 log.exception(f"Error loading terminal tools: {e}")
+
+        # Load direct tools from metadata.tool_servers
+        if direct_tool_servers:
+            try:
+                direct_tools = build_direct_tools_dict(tool_servers=direct_tool_servers)
+                if direct_tools:
+                    tools_dict = {**tools_dict, **direct_tools}
+                    if self.valves.DEBUG:
+                        log.info(f"[ParallelTools] Loaded {len(direct_tools)} direct tools")
+            except Exception as e:
+                log.exception(f"Error loading direct tools: {e}")
 
         # Load builtin tools
         try:

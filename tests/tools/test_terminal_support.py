@@ -534,6 +534,7 @@ async def test_multi_model_council_resolves_terminal_once_before_parallel_member
         tool_id_list,
         excluded_tool_ids,
         resolved_terminal_id=None,
+        resolved_direct_tool_servers=None,
     ):
         build_tools_terminal_ids.append(resolved_terminal_id)
         return {}
@@ -989,3 +990,297 @@ async def test_magi_execute_tool_call_not_found_does_not_emit_terminal_event():
 
     assert "Tool 'display_file' not found" in result["content"]
     assert not any(event.get("type", "").startswith("terminal:") for event in events)
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_load_tools_includes_direct_tool_servers(monkeypatch, dummy_request):
+    import open_webui.utils.tools as ow_tools
+
+    async def fake_get_tools(request, tool_ids, user, extra_params):
+        return {}
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {}
+
+    async def fake_get_terminal_tools(request, terminal_id, user, extra_params):
+        return {}
+
+    monkeypatch.setattr(ow_tools, "get_tools", fake_get_tools)
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+    monkeypatch.setattr(ow_tools, "get_terminal_tools", fake_get_terminal_tools)
+
+    valves = sub_agent.Tools().valves
+    valves.ENABLE_TERMINAL_TOOLS = True
+
+    metadata = {
+        "tool_ids": [],
+        "features": {},
+        "tool_servers": [
+            {
+                "url": "https://direct.example.com",
+                "specs": [
+                    {
+                        "name": "direct_run",
+                        "parameters": {"properties": {"command": {"type": "string"}}},
+                    }
+                ],
+            }
+        ],
+    }
+    tools_dict = await sub_agent.load_sub_agent_tools(
+        request=dummy_request,
+        user=SimpleNamespace(id="u1"),
+        valves=valves,
+        metadata=metadata,
+        model={},
+        extra_params={"__metadata__": metadata},
+        self_tool_id=None,
+    )
+
+    assert "direct_run" in tools_dict
+    assert tools_dict["direct_run"]["direct"] is True
+    assert tools_dict["direct_run"]["server"]["url"] == "https://direct.example.com"
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_direct_tool_without_specs_is_not_loaded(monkeypatch, dummy_request):
+    import open_webui.utils.tools as ow_tools
+
+    async def fake_get_tools(request, tool_ids, user, extra_params):
+        return {}
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {}
+
+    async def fake_get_terminal_tools(request, terminal_id, user, extra_params):
+        return {}
+
+    monkeypatch.setattr(ow_tools, "get_tools", fake_get_tools)
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+    monkeypatch.setattr(ow_tools, "get_terminal_tools", fake_get_terminal_tools)
+
+    valves = sub_agent.Tools().valves
+    valves.ENABLE_TERMINAL_TOOLS = True
+
+    metadata = {
+        "tool_ids": [],
+        "features": {},
+        "tool_servers": [{"url": "https://direct-hydrate.example.com"}],
+    }
+    tools_dict = await sub_agent.load_sub_agent_tools(
+        request=dummy_request,
+        user=SimpleNamespace(id="u1"),
+        valves=valves,
+        metadata=metadata,
+        model={},
+        extra_params={"__metadata__": metadata},
+        self_tool_id=None,
+    )
+
+    assert "hydrated_run" not in tools_dict
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_execute_direct_tool_uses_event_call_and_session_id():
+    events = []
+    execute_calls = []
+
+    async def event_emitter(event: dict):
+        events.append(event)
+
+    async def event_call(payload: dict):
+        execute_calls.append(payload)
+        return [{"exists": True, "path": "/tmp/direct.txt"}, {"Content-Type": "application/json"}]
+
+    tool_call = {
+        "id": "tc-direct-sub-agent",
+        "function": {
+            "name": "display_file",
+            "arguments": json.dumps({"path": "/tmp/direct.txt"}),
+        },
+    }
+    tools_dict = {
+        "display_file": {
+            "spec": make_spec("path"),
+            "direct": True,
+            "server": {"url": "https://direct.example.com"},
+            "type": "direct",
+        }
+    }
+
+    result = await sub_agent.execute_tool_call(
+        tool_call=tool_call,
+        tools_dict=tools_dict,
+        extra_params={
+            "__event_call__": event_call,
+            "__metadata__": {"session_id": "sess-sub-agent"},
+        },
+        event_emitter=event_emitter,
+    )
+
+    payload = json.loads(result["content"])
+    assert payload["path"] == "/tmp/direct.txt"
+    assert len(execute_calls) == 1
+    assert execute_calls[0]["type"] == "execute:tool"
+    assert execute_calls[0]["data"]["session_id"] == "sess-sub-agent"
+    assert any(event.get("type") == "terminal:display_file" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_execute_direct_tool_without_event_call_fails_without_terminal_event():
+    events = []
+
+    async def event_emitter(event: dict):
+        events.append(event)
+
+    tool_call = {
+        "id": "tc-direct-no-event-call",
+        "function": {
+            "name": "display_file",
+            "arguments": json.dumps({"path": "/tmp/direct-no-call.txt"}),
+        },
+    }
+    tools_dict = {
+        "display_file": {
+            "spec": make_spec("path"),
+            "direct": True,
+            "server": {"url": "https://direct.example.com"},
+            "type": "direct",
+        }
+    }
+
+    result = await sub_agent.execute_tool_call(
+        tool_call=tool_call,
+        tools_dict=tools_dict,
+        extra_params={"__metadata__": {"session_id": "sess-sub-agent"}},
+        event_emitter=event_emitter,
+    )
+
+    assert result["content"].startswith("Error:")
+    assert not any(event.get("type", "").startswith("terminal:") for event in events)
+
+
+@pytest.mark.asyncio
+async def test_multi_model_council_build_tools_dict_includes_direct_tools(dummy_request):
+    valves = multi_model_council.Tools().valves
+    metadata = {
+        "tool_ids": [],
+        "features": {},
+        "tool_servers": [
+            {
+                "url": "https://direct-council.example.com",
+                "specs": [
+                    {
+                        "name": "direct_lookup",
+                        "parameters": {"properties": {"query": {"type": "string"}}},
+                    }
+                ],
+            }
+        ],
+    }
+    extra_params = {"__metadata__": metadata}
+    tools_dict = await multi_model_council.build_tools_dict(
+        request=dummy_request,
+        model={},
+        metadata=metadata,
+        user=SimpleNamespace(id="u1"),
+        valves=valves,
+        extra_params=extra_params,
+        tool_id_list=[],
+        excluded_tool_ids=None,
+    )
+
+    assert "direct_lookup" in tools_dict
+    assert tools_dict["direct_lookup"]["direct"] is True
+
+
+@pytest.mark.asyncio
+async def test_magi_build_tools_dict_includes_direct_tools(dummy_request):
+    metadata = {
+        "tool_ids": [],
+        "features": {},
+        "tool_servers": [
+            {
+                "url": "https://direct-magi.example.com",
+                "specs": [
+                    {
+                        "name": "direct_search",
+                        "parameters": {"properties": {"query": {"type": "string"}}},
+                    }
+                ],
+            }
+        ],
+    }
+    extra_params = {"__metadata__": metadata}
+    tools_dict = await magi_decision_support.build_tools_dict(
+        request=dummy_request,
+        model={},
+        metadata=metadata,
+        user=SimpleNamespace(id="u1"),
+        enable_web_tools=True,
+        enable_terminal_tools=True,
+        extra_params=extra_params,
+        tool_id_list=[],
+        excluded_tool_ids=None,
+    )
+
+    assert "direct_search" in tools_dict
+    assert tools_dict["direct_search"]["direct"] is True
+
+
+@pytest.mark.asyncio
+async def test_parallel_tools_executes_direct_tool_via_event_call(
+    monkeypatch, dummy_request, mock_user
+):
+    import open_webui.utils.tools as ow_tools
+
+    async def fake_get_tools(request, tool_ids, user, extra_params):
+        return {}
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {}
+
+    execute_calls = []
+
+    async def event_call(payload: dict):
+        execute_calls.append(payload)
+        return [{"ok": True, "command": payload["data"]["params"]["command"]}, {}]
+
+    monkeypatch.setattr(ow_tools, "get_tools", fake_get_tools)
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+
+    tool = parallel_tools.Tools()
+    user_payload = {
+        **mock_user,
+        "last_active_at": 0,
+        "updated_at": 0,
+        "created_at": 0,
+    }
+    result_json = await tool.run_tools_parallel(
+        tool_calls=[{"name": "direct_run", "args": {"command": "pwd"}}],
+        __user__=user_payload,
+        __request__=dummy_request,
+        __metadata__={
+            "tool_ids": [],
+            "features": {},
+            "session_id": "sess-parallel",
+            "tool_servers": [
+                {
+                    "url": "https://direct-parallel.example.com",
+                    "specs": [
+                        {
+                            "name": "direct_run",
+                            "parameters": {"properties": {"command": {"type": "string"}}},
+                        }
+                    ],
+                }
+            ],
+        },
+        __event_call__=event_call,
+    )
+
+    payload = json.loads(result_json)
+    assert payload["results"][0]["tool_name"] == "direct_run"
+    assert payload["results"][0]["result"]["ok"] is True
+    assert execute_calls[0]["type"] == "execute:tool"
+    assert execute_calls[0]["data"]["session_id"] == "sess-parallel"

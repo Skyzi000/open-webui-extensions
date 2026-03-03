@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.4.5
+version: 0.4.6
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -200,9 +200,122 @@ async def resolve_terminal_id_for_sub_agent(
     return ""
 
 
-def extract_tool_result_payload(*, tool_type: str, tool_result: Any) -> Any:
+def normalize_direct_tool_servers(value: Any) -> List[dict]:
+    """Normalize direct tool server payload into a list of dict copies."""
+    if not isinstance(value, list):
+        return []
+    normalized = []
+    for item in value:
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+    return normalized
+
+
+async def resolve_direct_tool_servers_for_sub_agent(
+    *,
+    metadata: Optional[dict],
+    request: Optional[Request],
+    debug: bool,
+) -> List[dict]:
+    """Resolve direct tool servers from request.body() first, then metadata."""
+    metadata_servers = normalize_direct_tool_servers(
+        (metadata or {}).get("tool_servers") if isinstance(metadata, dict) else None
+    )
+
+    request_servers: List[dict] = []
+    if request is not None:
+        request_body = getattr(request, "body", None)
+        if callable(request_body):
+            try:
+                raw_body = await request_body()
+                if raw_body:
+                    body = json.loads(raw_body)
+                    if isinstance(body, dict):
+                        request_servers = normalize_direct_tool_servers(body.get("tool_servers"))
+                        if not request_servers:
+                            nested_metadata = body.get("metadata")
+                            if isinstance(nested_metadata, dict):
+                                request_servers = normalize_direct_tool_servers(
+                                    nested_metadata.get("tool_servers")
+                                )
+            except Exception:
+                request_servers = []
+
+    if request_servers:
+        if debug and metadata_servers and len(metadata_servers) != len(request_servers):
+            log.warning(
+                "[SubAgent] tool_servers mismatch between request body and metadata; "
+                "using request body tool_servers"
+            )
+        return request_servers
+
+    return metadata_servers
+
+
+def build_direct_tools_dict(*, tool_servers: List[dict], debug: bool) -> dict:
+    """Build direct tool entries compatible with Open WebUI middleware."""
+    direct_tools = {}
+    for server in tool_servers:
+        if not isinstance(server, dict):
+            continue
+
+        specs = server.get("specs", [])
+        if not isinstance(specs, list) or not specs:
+            continue
+
+        server_payload = {k: v for k, v in server.items() if k != "specs"}
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            name = spec.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            direct_tools[name] = {
+                "spec": spec,
+                "direct": True,
+                "server": server_payload,
+                "type": "direct",
+            }
+
+    if debug and tool_servers and not direct_tools:
+        log.info("[SubAgent] No direct tools loaded from tool_servers")
+
+    return direct_tools
+
+
+async def execute_direct_tool_call(
+    *,
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool: dict,
+    extra_params: dict,
+) -> Any:
+    """Execute direct tools through __event_call__ like core middleware."""
+    event_call = extra_params.get("__event_call__")
+    if not callable(event_call):
+        raise RuntimeError("Direct tool execution requires __event_call__ context")
+
+    metadata = extra_params.get("__metadata__")
+    session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
+    return await event_call(
+        {
+            "type": "execute:tool",
+            "data": {
+                "id": str(uuid.uuid4()),
+                "name": tool_function_name,
+                "params": tool_function_params,
+                "server": tool.get("server", {}),
+                "session_id": session_id,
+            },
+        }
+    )
+
+
+def extract_tool_result_payload(*, tool_type: str, tool_result: Any, direct_tool: bool = False) -> Any:
     """Extract serializable payload from tool result for external/terminal-style tools."""
     if tool_type in EXTERNAL_TOOL_TYPES and isinstance(tool_result, tuple) and len(tool_result) == 2:
+        return tool_result[0]
+    if direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
         return tool_result[0]
     return tool_result
 
@@ -281,6 +394,7 @@ async def execute_tool_call(
     if tool_function_name in tools_dict:
         tool = tools_dict[tool_function_name]
         spec = tool.get("spec", {})
+        direct_tool = bool(tool.get("direct", False))
 
         try:
             allowed_params = spec.get("parameters", {}).get("properties", {}).keys()
@@ -288,24 +402,32 @@ async def execute_tool_call(
                 k: v for k, v in tool_function_params.items() if k in allowed_params
             }
 
-            tool_function = tool["callable"]
+            if direct_tool:
+                tool_result = await execute_direct_tool_call(
+                    tool_function_name=tool_function_name,
+                    tool_function_params=tool_function_params,
+                    tool=tool,
+                    extra_params=extra_params,
+                )
+            else:
+                tool_function = tool["callable"]
 
-            # Update function with current context
-            # __event_emitter__ is included so parallel sub-agents can
-            # override it with a task-specific indexed emitter.
-            from open_webui.utils.tools import get_updated_tool_function
+                # Update function with current context
+                # __event_emitter__ is included so parallel sub-agents can
+                # override it with a task-specific indexed emitter.
+                from open_webui.utils.tools import get_updated_tool_function
 
-            tool_function = get_updated_tool_function(
-                function=tool_function,
-                extra_params={
-                    "__messages__": extra_params.get("__messages__", []),
-                    "__files__": extra_params.get("__files__", []),
-                    "__event_emitter__": extra_params.get("__event_emitter__"),
-                    "__event_call__": extra_params.get("__event_call__"),
-                },
-            )
+                tool_function = get_updated_tool_function(
+                    function=tool_function,
+                    extra_params={
+                        "__messages__": extra_params.get("__messages__", []),
+                        "__files__": extra_params.get("__files__", []),
+                        "__event_emitter__": extra_params.get("__event_emitter__"),
+                        "__event_call__": extra_params.get("__event_call__"),
+                    },
+                )
 
-            tool_result = await tool_function(**tool_function_params)
+                tool_result = await tool_function(**tool_function_params)
 
             # Handle OpenAPI/external tool results that return (data, headers) tuple
             # Headers (CIMultiDictProxy) are not JSON-serializable
@@ -313,6 +435,7 @@ async def execute_tool_call(
             tool_result = extract_tool_result_payload(
                 tool_type=tool_type,
                 tool_result=tool_result,
+                direct_tool=direct_tool,
             )
             emit_terminal_event = True
 
@@ -855,16 +978,30 @@ async def load_sub_agent_tools(
     model = model or {}
     extra_params = extra_params or {}
     event_emitter = extra_params.get("__event_emitter__")
+    extra_metadata = extra_params.get("__metadata__")
     terminal_id = await resolve_terminal_id_for_sub_agent(
         metadata=metadata,
         request=request,
         debug=bool(getattr(valves, "DEBUG", False)),
     )
+    direct_tool_servers = await resolve_direct_tool_servers_for_sub_agent(
+        metadata=metadata,
+        request=request,
+        debug=bool(getattr(valves, "DEBUG", False)),
+    )
+
     if terminal_id:
         metadata["terminal_id"] = terminal_id
-        extra_metadata = extra_params.get("__metadata__")
         if isinstance(extra_metadata, dict):
             extra_metadata["terminal_id"] = terminal_id
+        else:
+            extra_params["__metadata__"] = metadata
+            extra_metadata = metadata
+
+    if direct_tool_servers:
+        metadata["tool_servers"] = direct_tool_servers
+        if isinstance(extra_metadata, dict):
+            extra_metadata["tool_servers"] = direct_tool_servers
         else:
             extra_params["__metadata__"] = metadata
 
@@ -879,6 +1016,9 @@ async def load_sub_agent_tools(
         log.info(f"[SubAgent] Available tool_ids from metadata: {available_tool_ids}")
         log.info(f"[SubAgent] self_tool_id: {self_tool_id}")
         log.info(f"[SubAgent] resolved terminal_id: {terminal_id}")
+        log.info(
+            f"[SubAgent] resolved direct tool servers: {len(direct_tool_servers)}"
+        )
 
     # Apply exclusions first
     excluded = set()
@@ -993,6 +1133,36 @@ async def load_sub_agent_tools(
                     )
     elif terminal_id and valves.DEBUG:
         log.info("[SubAgent] Terminal tools disabled by ENABLE_TERMINAL_TOOLS valve")
+
+    # Resolve direct tool servers
+    if direct_tool_servers:
+        try:
+            direct_tools = build_direct_tools_dict(
+                tool_servers=direct_tool_servers,
+                debug=bool(getattr(valves, "DEBUG", False)),
+            )
+            if direct_tools:
+                duplicate_names = set(tools_dict.keys()) & set(direct_tools.keys())
+                tools_dict = {**tools_dict, **direct_tools}
+                if valves.DEBUG:
+                    if duplicate_names:
+                        log.warning(
+                            "[SubAgent] Direct tools overrode existing tool names: "
+                            f"{sorted(duplicate_names)}"
+                        )
+                    log.info(f"[SubAgent] Loaded {len(direct_tools)} direct tools")
+        except Exception as e:
+            log.exception(f"Error loading direct tools: {e}")
+            if event_emitter:
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Warning: Could not load direct tools: {e}",
+                            "done": False,
+                        },
+                    }
+                )
 
     # Load builtin tools
     try:
