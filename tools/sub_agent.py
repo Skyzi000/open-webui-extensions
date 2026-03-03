@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.4.6
+version: 0.4.7
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -1565,7 +1565,7 @@ RESPONSE REQUIREMENTS:
 
     async def run_parallel_sub_agents(
         self,
-        tasks: list,
+        tasks: list[dict],
         __user__: dict = None,
         __request__: Request = None,
         __model__: dict = None,
@@ -1631,6 +1631,16 @@ RESPONSE REQUIREMENTS:
 
         validated_tasks = []
         for i, task in enumerate(tasks):
+            # Fallback: parse JSON strings (some LLMs pass stringified objects
+            # when the schema advertises items as strings).
+            if isinstance(task, str):
+                try:
+                    task = json.loads(task)
+                except (json.JSONDecodeError, TypeError):
+                    return json.dumps(
+                        {"error": f"tasks[{i}] must be an object, got unparseable string"},
+                        ensure_ascii=False,
+                    )
             if not isinstance(task, dict):
                 return json.dumps(
                     {"error": f"tasks[{i}] must be an object"},
