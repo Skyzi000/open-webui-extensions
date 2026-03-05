@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.4.7
+version: 0.4.8
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -281,6 +281,194 @@ def build_direct_tools_dict(*, tool_servers: List[dict], debug: bool) -> dict:
         log.info("[SubAgent] No direct tools loaded from tool_servers")
 
     return direct_tools
+
+
+# Sentinel to distinguish "not cached" from "cached as empty dict"
+_TERMINAL_TOOLS_NOT_CACHED = object()
+
+
+def diagnose_terminal_tools_failure(
+    *,
+    request: Request,
+    terminal_id: str,
+    user: Any,
+    extra_params: dict,
+) -> None:
+    """Log diagnostic info when get_terminal_tools returns empty.
+
+    Re-runs the same checks as get_terminal_tools (tools.py:954-1045) to
+    identify which step rejected the request.
+    """
+    try:
+        from open_webui.utils.access_control import has_connection_access
+        from open_webui.models.groups import Groups
+    except ImportError:
+        log.warning("[SubAgent] Terminal diagnosis: required imports unavailable")
+        return
+
+    config = getattr(getattr(getattr(request, "app", None), "state", None), "config", None)
+    connections = getattr(config, "TERMINAL_SERVER_CONNECTIONS", None) or []
+
+    connection = next((c for c in connections if c.get("id") == terminal_id), None)
+    if connection is None:
+        log.warning(
+            f"[SubAgent] Terminal diagnosis: terminal_id '{terminal_id}' not found "
+            f"in TERMINAL_SERVER_CONNECTIONS ({len(connections)} connections). "
+            f"Available IDs: {[c.get('id') for c in connections]}"
+        )
+        return
+
+    try:
+        user_group_ids = {group.id for group in Groups.get_groups_by_member_id(user.id)}
+        if not has_connection_access(user, connection, user_group_ids):
+            log.warning(
+                f"[SubAgent] Terminal diagnosis: access denied for user {user.id} "
+                f"(role={getattr(user, 'role', 'unknown')}) to terminal '{terminal_id}'"
+            )
+            return
+    except Exception as e:
+        log.warning(f"[SubAgent] Terminal diagnosis: access check error: {e}")
+
+    terminal_servers = getattr(request.app.state, "TERMINAL_SERVERS", [])
+    server_data = next(
+        (s for s in terminal_servers if s.get("id") == terminal_id), None
+    )
+    if server_data is None:
+        log.warning(
+            f"[SubAgent] Terminal diagnosis: terminal_id '{terminal_id}' not found "
+            f"in TERMINAL_SERVERS cache ({len(terminal_servers)} servers). "
+            f"Cached IDs: {[s.get('id') for s in terminal_servers]}"
+        )
+        return
+
+    specs = server_data.get("specs", [])
+    if not specs:
+        log.warning(
+            f"[SubAgent] Terminal diagnosis: no specs found for terminal '{terminal_id}' "
+            f"(server_data keys: {list(server_data.keys())})"
+        )
+        return
+
+    log.warning(
+        f"[SubAgent] Terminal diagnosis: all checks passed but tools still empty. "
+        f"terminal_id={terminal_id}, specs_count={len(specs)}, "
+        f"connection_url={connection.get('url', 'N/A')}"
+    )
+
+
+async def build_terminal_tools_from_cached_servers(
+    *,
+    request: Request,
+    terminal_id: str,
+    user: Any,
+    extra_params: dict,
+    cached_servers: list,
+) -> dict:
+    """Build terminal tools from a cached TERMINAL_SERVERS snapshot.
+
+    Replicates get_terminal_tools() logic (tools.py:954-1045) but reads
+    specs from the provided ``cached_servers`` list instead of calling
+    ``get_terminal_servers()`` (which may refetch via HTTP and fail).
+    """
+    try:
+        from open_webui.utils.tools import (
+            execute_tool_server,
+            get_async_tool_function_and_apply_extra_params,
+            clean_openai_tool_schema,
+            get_terminal_cwd,
+        )
+        from open_webui.utils.access_control import has_connection_access
+        from open_webui.models.groups import Groups
+    except ImportError:
+        return {}
+
+    # Find connection config
+    config = getattr(getattr(getattr(request, "app", None), "state", None), "config", None)
+    connections = getattr(config, "TERMINAL_SERVER_CONNECTIONS", None) or []
+    connection = next((c for c in connections if c.get("id") == terminal_id), None)
+    if connection is None:
+        return {}
+
+    # Access check
+    try:
+        user_group_ids = {group.id for group in Groups.get_groups_by_member_id(user.id)}
+        if not has_connection_access(user, connection, user_group_ids):
+            return {}
+    except Exception:
+        return {}
+
+    # Find server data from cached snapshot
+    server_data = next(
+        (s for s in cached_servers if s.get("id") == terminal_id), None
+    )
+    if server_data is None or not server_data.get("specs"):
+        return {}
+
+    # Build auth headers (mirrors get_terminal_tools logic)
+    auth_type = connection.get("auth_type", "bearer")
+    cookies: dict = {}
+    headers = {"Content-Type": "application/json", "X-User-Id": user.id}
+
+    if auth_type == "bearer":
+        headers["Authorization"] = f"Bearer {connection.get('key', '')}"
+    elif auth_type == "session":
+        cookies = dict(request.cookies) if hasattr(request, "cookies") else {}
+        token = getattr(getattr(request, "state", None), "token", None)
+        if token:
+            headers["Authorization"] = f"Bearer {token.credentials}"
+    elif auth_type == "system_oauth":
+        cookies = dict(request.cookies) if hasattr(request, "cookies") else {}
+        oauth_token = extra_params.get("__oauth_token__")
+        if isinstance(oauth_token, dict):
+            headers["Authorization"] = f"Bearer {oauth_token.get('access_token', '')}"
+
+    # CWD (optional, 5s timeout matches core)
+    terminal_cwd = None
+    try:
+        terminal_cwd = await asyncio.wait_for(
+            get_terminal_cwd(connection.get("url", ""), headers, cookies),
+            timeout=5.0,
+        )
+    except Exception:
+        pass
+
+    # Build tool functions
+    tools_dict = {}
+    for spec in server_data.get("specs", []):
+        function_name = spec.get("name")
+        if not function_name:
+            continue
+
+        tool_spec = clean_openai_tool_schema(spec)
+        if function_name == "run_command" and terminal_cwd:
+            tool_spec["description"] = (
+                tool_spec.get("description", "")
+                + f"\n\nThe current working directory is: {terminal_cwd}"
+            )
+
+        def make_tool_function(fn_name, srv_data, hdrs, cks):
+            async def tool_function(**kwargs):
+                return await execute_tool_server(
+                    url=srv_data["url"],
+                    headers=hdrs,
+                    cookies=cks,
+                    name=fn_name,
+                    params=kwargs,
+                    server_data=srv_data,
+                )
+            return tool_function
+
+        tool_function = make_tool_function(function_name, server_data, headers, cookies)
+        callable_fn = get_async_tool_function_and_apply_extra_params(tool_function, {})
+
+        tools_dict[function_name] = {
+            "tool_id": f"terminal:{terminal_id}",
+            "callable": callable_fn,
+            "spec": tool_spec,
+            "type": "terminal",
+        }
+
+    return tools_dict
 
 
 async def execute_direct_tool_call(
@@ -1100,16 +1288,18 @@ async def load_sub_agent_tools(
             if valves.DEBUG:
                 log.info("[SubAgent] get_terminal_tools is unavailable in this Open WebUI version")
         else:
-            try:
-                terminal_tools = await get_terminal_tools(
-                    request=request,
-                    terminal_id=terminal_id,
-                    user=user,
-                    extra_params=extra_params,
-                )
-                if terminal_tools:
-                    duplicate_names = set(tools_dict.keys()) & set(terminal_tools.keys())
-                    tools_dict = {**tools_dict, **terminal_tools}
+            # Check request.state cache first to avoid redundant get_terminal_tools
+            # calls within the same HTTP request (e.g. parallel sub-agents).
+            cache_attr = f"_sub_agent_terminal_tools_{terminal_id}"
+            cached_terminal_tools = getattr(
+                request.state, cache_attr, _TERMINAL_TOOLS_NOT_CACHED
+            )
+
+            if cached_terminal_tools is not _TERMINAL_TOOLS_NOT_CACHED:
+                # Cache hit — reuse previously loaded terminal tools
+                if cached_terminal_tools:
+                    duplicate_names = set(tools_dict.keys()) & set(cached_terminal_tools.keys())
+                    tools_dict = {**tools_dict, **cached_terminal_tools}
                     if valves.DEBUG:
                         if duplicate_names:
                             log.warning(
@@ -1117,20 +1307,90 @@ async def load_sub_agent_tools(
                                 f"{sorted(duplicate_names)}"
                             )
                         log.info(
-                            f"[SubAgent] Loaded {len(terminal_tools)} terminal tools for terminal_id={terminal_id}"
+                            f"[SubAgent] Reused {len(cached_terminal_tools)} cached "
+                            f"terminal tools (terminal_id={terminal_id})"
                         )
-            except Exception as e:
-                log.exception(f"Error loading terminal tools: {e}")
-                if event_emitter:
-                    await event_emitter(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"Warning: Could not load terminal tools: {e}",
-                                "done": False,
-                            },
-                        }
+            else:
+                # Cache miss — call get_terminal_tools and cache the result
+                terminal_tools: dict = {}
+                try:
+                    terminal_tools = await get_terminal_tools(
+                        request=request,
+                        terminal_id=terminal_id,
+                        user=user,
+                        extra_params=extra_params,
                     )
+                except Exception as e:
+                    log.warning(f"[SubAgent] get_terminal_tools raised: {e}")
+
+                if terminal_tools:
+                    duplicate_names = set(tools_dict.keys()) & set(terminal_tools.keys())
+                    tools_dict = {**tools_dict, **terminal_tools}
+                    setattr(request.state, cache_attr, terminal_tools)
+                    if valves.DEBUG:
+                        if duplicate_names:
+                            log.warning(
+                                "[SubAgent] Terminal tools overrode existing tool names: "
+                                f"{sorted(duplicate_names)}"
+                            )
+                        log.info(
+                            f"[SubAgent] Loaded {len(terminal_tools)} terminal tools "
+                            f"for terminal_id={terminal_id}"
+                        )
+                else:
+                    # get_terminal_tools returned empty — diagnose and try fallback
+                    diagnose_terminal_tools_failure(
+                        request=request,
+                        terminal_id=terminal_id,
+                        user=user,
+                        extra_params=extra_params,
+                    )
+
+                    # Fallback: build tools directly from app.state.TERMINAL_SERVERS
+                    # which was populated by the middleware's earlier set_terminal_servers
+                    # call. This avoids the HTTP refetch in get_terminal_servers().
+                    cached_servers = getattr(request.app.state, "TERMINAL_SERVERS", [])
+                    if cached_servers:
+                        fallback_tools = await build_terminal_tools_from_cached_servers(
+                            request=request,
+                            terminal_id=terminal_id,
+                            user=user,
+                            extra_params=extra_params,
+                            cached_servers=cached_servers,
+                        )
+                        if fallback_tools:
+                            tools_dict = {**tools_dict, **fallback_tools}
+                            setattr(request.state, cache_attr, fallback_tools)
+                            log.info(
+                                f"[SubAgent] Fallback: built {len(fallback_tools)} terminal "
+                                f"tools from TERMINAL_SERVERS cache "
+                                f"(terminal_id={terminal_id})"
+                            )
+                        else:
+                            setattr(request.state, cache_attr, {})
+                    else:
+                        setattr(request.state, cache_attr, {})
+
+                    # Emit user-visible warning if no terminal tools at all
+                    if not getattr(request.state, cache_attr, None):
+                        log.warning(
+                            f"[SubAgent] Terminal tools unavailable for sub-agent "
+                            f"(terminal_id={terminal_id}). "
+                            "Try toggling the terminal off/on or reloading the page."
+                        )
+                        if event_emitter:
+                            await event_emitter(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "description": (
+                                            "Terminal tools unavailable for sub-agent. "
+                                            "Try toggling the terminal off/on or reloading the page."
+                                        ),
+                                        "done": False,
+                                    },
+                                }
+                            )
     elif terminal_id and valves.DEBUG:
         log.info("[SubAgent] Terminal tools disabled by ENABLE_TERMINAL_TOOLS valve")
 

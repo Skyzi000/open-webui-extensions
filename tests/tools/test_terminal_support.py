@@ -1284,3 +1284,285 @@ async def test_parallel_tools_executes_direct_tool_via_event_call(
     assert payload["results"][0]["result"]["ok"] is True
     assert execute_calls[0]["type"] == "execute:tool"
     assert execute_calls[0]["data"]["session_id"] == "sess-parallel"
+
+
+# ============================================================================
+# Terminal tools caching + fallback tests
+# ============================================================================
+
+
+def _make_mock_ow_tools_module(get_terminal_tools_fn):
+    """Create a mock open_webui.utils.tools module with required functions."""
+    import types
+    mod = types.ModuleType("open_webui.utils.tools")
+
+    async def mock_get_tools(request, tool_ids, user, extra_params):
+        return {}
+
+    def mock_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {}
+
+    mod.get_tools = mock_get_tools
+    mod.get_builtin_tools = mock_get_builtin_tools
+    mod.get_terminal_tools = get_terminal_tools_fn
+    return mod
+
+
+def _install_mock_ow_modules(monkeypatch, mock_tools_module):
+    """Install mock open_webui modules in sys.modules to avoid import errors."""
+    import types
+    # Ensure parent packages exist so 'from open_webui.utils.tools import ...' works
+    for pkg_name in ("open_webui", "open_webui.utils"):
+        if pkg_name not in sys.modules:
+            pkg = types.ModuleType(pkg_name)
+            pkg.__path__ = []
+            monkeypatch.setitem(sys.modules, pkg_name, pkg)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.tools", mock_tools_module)
+
+
+@pytest.mark.asyncio
+async def test_terminal_tools_request_state_cache_avoids_second_call(
+    monkeypatch, dummy_request,
+):
+    """When terminal tools are cached on request.state, get_terminal_tools is not called again."""
+    call_count = 0
+
+    async def fake_get_terminal_tools(request, terminal_id, user, extra_params):
+        nonlocal call_count
+        call_count += 1
+        return {"run_command": {"callable": lambda: None, "spec": make_spec("cmd"), "type": "terminal", "tool_id": "terminal:t1"}}
+
+    mock_mod = _make_mock_ow_tools_module(fake_get_terminal_tools)
+    _install_mock_ow_modules(monkeypatch, mock_mod)
+
+    # Give dummy_request a state object
+    dummy_request.state = SimpleNamespace()
+    dummy_request.app.state.TERMINAL_SERVERS = []
+    dummy_request.app.state.MODELS = {}
+
+    valves = sub_agent.Tools().valves
+    metadata = {"terminal_id": "t1", "tool_ids": [], "features": {}}
+    extra_params = {"__metadata__": metadata, "__event_emitter__": None}
+
+    # First call — should invoke get_terminal_tools
+    tools1 = await sub_agent.load_sub_agent_tools(
+        request=dummy_request,
+        user=SimpleNamespace(id="u1", role="admin"),
+        valves=valves,
+        metadata=dict(metadata),
+        model={},
+        extra_params=dict(extra_params),
+        self_tool_id="test",
+    )
+    assert call_count == 1
+    assert "run_command" in tools1
+
+    # Second call — should use request.state cache
+    tools2 = await sub_agent.load_sub_agent_tools(
+        request=dummy_request,
+        user=SimpleNamespace(id="u1", role="admin"),
+        valves=valves,
+        metadata=dict(metadata),
+        model={},
+        extra_params=dict(extra_params),
+        self_tool_id="test",
+    )
+    assert call_count == 1  # Not called again
+    assert "run_command" in tools2
+
+
+@pytest.mark.asyncio
+async def test_terminal_tools_fallback_from_terminal_servers_cache(
+    monkeypatch, dummy_request,
+):
+    """When get_terminal_tools returns empty, fallback builds tools from TERMINAL_SERVERS."""
+
+    import types
+
+    async def empty_get_terminal_tools(request, terminal_id, user, extra_params):
+        return {}
+
+    async def mock_execute_tool_server(**kwargs):
+        return {"ok": True}
+
+    def mock_get_async_tool_function_and_apply_extra_params(fn, params):
+        return fn
+
+    def mock_clean_openai_tool_schema(spec):
+        return dict(spec)
+
+    async def mock_get_terminal_cwd(url, headers, cookies):
+        return "/tmp"
+
+    mock_tools_module = _make_mock_ow_tools_module(empty_get_terminal_tools)
+    mock_tools_module.execute_tool_server = mock_execute_tool_server
+    mock_tools_module.get_async_tool_function_and_apply_extra_params = (
+        mock_get_async_tool_function_and_apply_extra_params
+    )
+    mock_tools_module.clean_openai_tool_schema = mock_clean_openai_tool_schema
+    mock_tools_module.get_terminal_cwd = mock_get_terminal_cwd
+    _install_mock_ow_modules(monkeypatch, mock_tools_module)
+
+    # Set up TERMINAL_SERVERS as if middleware populated it
+    dummy_request.state = SimpleNamespace()
+    dummy_request.app.state.TERMINAL_SERVERS = [
+        {
+            "id": "t1",
+            "url": "http://terminal.local",
+            "specs": [
+                {"name": "run_command", "parameters": {"properties": {"cmd": {"type": "string"}}}},
+                {"name": "list_files", "parameters": {"properties": {"path": {"type": "string"}}}},
+            ],
+        }
+    ]
+    dummy_request.app.state.config.TERMINAL_SERVER_CONNECTIONS = [
+        {"id": "t1", "url": "http://terminal.local", "key": "test-key", "auth_type": "bearer"},
+    ]
+    dummy_request.app.state.MODELS = {}
+
+    mock_access_module = types.ModuleType("open_webui.utils.access_control")
+    mock_access_module.has_connection_access = lambda user, conn, groups=None: True
+    monkeypatch.setitem(sys.modules, "open_webui.utils.access_control", mock_access_module)
+
+    mock_groups_module = types.ModuleType("open_webui.models.groups")
+    mock_groups_module.Groups = SimpleNamespace(
+        get_groups_by_member_id=lambda uid: [],
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.models.groups", mock_groups_module)
+
+    valves = sub_agent.Tools().valves
+    metadata = {"terminal_id": "t1", "tool_ids": [], "features": {}}
+    extra_params = {"__metadata__": metadata, "__event_emitter__": None}
+
+    tools = await sub_agent.load_sub_agent_tools(
+        request=dummy_request,
+        user=SimpleNamespace(id="u1", role="admin"),
+        valves=valves,
+        metadata=dict(metadata),
+        model={},
+        extra_params=dict(extra_params),
+        self_tool_id="test",
+    )
+
+    assert "run_command" in tools
+    assert "list_files" in tools
+    assert tools["run_command"]["type"] == "terminal"
+
+
+@pytest.mark.asyncio
+async def test_terminal_tools_diagnose_logs_missing_connection(
+    monkeypatch, dummy_request, caplog,
+):
+    """diagnose_terminal_tools_failure logs when terminal_id not in connections."""
+    import logging
+
+    dummy_request.state = SimpleNamespace()
+    dummy_request.app.state.TERMINAL_SERVERS = []
+    dummy_request.app.state.config.TERMINAL_SERVER_CONNECTIONS = []
+
+    # Mock access control imports
+    import types
+    mock_access_module = types.ModuleType("open_webui.utils.access_control")
+    mock_access_module.has_connection_access = lambda user, conn, groups=None: True
+    monkeypatch.setitem(sys.modules, "open_webui.utils.access_control", mock_access_module)
+
+    mock_groups_module = types.ModuleType("open_webui.models.groups")
+    mock_groups_module.Groups = SimpleNamespace(
+        get_groups_by_member_id=lambda uid: [],
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.models.groups", mock_groups_module)
+
+    with caplog.at_level(logging.WARNING):
+        sub_agent.diagnose_terminal_tools_failure(
+            request=dummy_request,
+            terminal_id="nonexistent",
+            user=SimpleNamespace(id="u1", role="admin"),
+            extra_params={},
+        )
+
+    assert "not found in TERMINAL_SERVER_CONNECTIONS" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_terminal_tools_status_message_on_total_failure(
+    monkeypatch, dummy_request,
+):
+    """When all terminal tool loading fails, a user-visible status message is emitted."""
+    events = []
+
+    async def event_emitter(event: dict):
+        events.append(event)
+
+    async def empty_get_terminal_tools(request, terminal_id, user, extra_params):
+        return {}
+
+    mock_mod = _make_mock_ow_tools_module(empty_get_terminal_tools)
+    _install_mock_ow_modules(monkeypatch, mock_mod)
+
+    dummy_request.state = SimpleNamespace()
+    dummy_request.app.state.TERMINAL_SERVERS = []
+    dummy_request.app.state.config.TERMINAL_SERVER_CONNECTIONS = []
+    dummy_request.app.state.MODELS = {}
+
+    valves = sub_agent.Tools().valves
+    metadata = {"terminal_id": "t1", "tool_ids": [], "features": {}}
+    extra_params = {"__metadata__": metadata, "__event_emitter__": event_emitter}
+
+    await sub_agent.load_sub_agent_tools(
+        request=dummy_request,
+        user=SimpleNamespace(id="u1", role="admin"),
+        valves=valves,
+        metadata=dict(metadata),
+        model={},
+        extra_params=dict(extra_params),
+        self_tool_id="test",
+    )
+
+    status_events = [e for e in events if e.get("type") == "status"]
+    assert any(
+        "toggling the terminal" in e.get("data", {}).get("description", "")
+        for e in status_events
+    ), f"Expected toggle hint in status events: {status_events}"
+
+
+@pytest.mark.asyncio
+async def test_terminal_tools_no_fallback_when_primary_succeeds(
+    monkeypatch, dummy_request,
+):
+    """When get_terminal_tools succeeds, fallback is not used."""
+    fallback_called = False
+    original_fallback = sub_agent.build_terminal_tools_from_cached_servers
+
+    async def tracking_fallback(**kwargs):
+        nonlocal fallback_called
+        fallback_called = True
+        return await original_fallback(**kwargs)
+
+    monkeypatch.setattr(sub_agent, "build_terminal_tools_from_cached_servers", tracking_fallback)
+
+    async def ok_get_terminal_tools(request, terminal_id, user, extra_params):
+        return {"run_command": {"callable": lambda: None, "spec": make_spec("cmd"), "type": "terminal", "tool_id": "terminal:t1"}}
+
+    mock_mod = _make_mock_ow_tools_module(ok_get_terminal_tools)
+    _install_mock_ow_modules(monkeypatch, mock_mod)
+
+    dummy_request.state = SimpleNamespace()
+    dummy_request.app.state.TERMINAL_SERVERS = []
+    dummy_request.app.state.MODELS = {}
+
+    valves = sub_agent.Tools().valves
+    metadata = {"terminal_id": "t1", "tool_ids": [], "features": {}}
+    extra_params = {"__metadata__": metadata, "__event_emitter__": None}
+
+    tools = await sub_agent.load_sub_agent_tools(
+        request=dummy_request,
+        user=SimpleNamespace(id="u1", role="admin"),
+        valves=valves,
+        metadata=dict(metadata),
+        model={},
+        extra_params=dict(extra_params),
+        self_tool_id="test",
+    )
+
+    assert "run_command" in tools
+    assert not fallback_called
