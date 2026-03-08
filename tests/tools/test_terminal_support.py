@@ -27,6 +27,34 @@ def make_spec(*param_names: str) -> dict:
     }
 
 
+TERMINAL_EVENT_MODULE_CASES = [
+    (
+        "sub_agent",
+        sub_agent,
+        "tool_function_name",
+        "tool_function_params",
+    ),
+    (
+        "multi_model_council",
+        multi_model_council,
+        "tool_function_name",
+        "tool_function_params",
+    ),
+    (
+        "magi_decision_support",
+        magi_decision_support,
+        "tool_function_name",
+        "tool_function_params",
+    ),
+    (
+        "parallel_tools",
+        parallel_tools,
+        "tool_name",
+        "tool_args",
+    ),
+]
+
+
 @pytest.fixture
 def dummy_request():
     return SimpleNamespace(
@@ -1124,6 +1152,58 @@ async def test_sub_agent_execute_direct_tool_uses_event_call_and_session_id():
     assert execute_calls[0]["type"] == "execute:tool"
     assert execute_calls[0]["data"]["session_id"] == "sess-sub-agent"
     assert any(event.get("type") == "terminal:display_file" for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("_module_name", "module", "name_key", "params_key"),
+    TERMINAL_EVENT_MODULE_CASES,
+)
+async def test_emit_terminal_tool_event_supports_replace_file_content(
+    _module_name, module, name_key, params_key
+):
+    events = []
+
+    async def event_emitter(event: dict):
+        events.append(event)
+
+    kwargs = {
+        name_key: "replace_file_content",
+        params_key: {"path": "/tmp/replaced.txt"},
+        "tool_result": {"ok": True},
+        "event_emitter": event_emitter,
+    }
+
+    await module.emit_terminal_tool_event(**kwargs)
+
+    assert events == [
+        {"type": "terminal:replace_file_content", "data": {"path": "/tmp/replaced.txt"}}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("_module_name", "module", "name_key", "params_key"),
+    TERMINAL_EVENT_MODULE_CASES,
+)
+async def test_emit_terminal_tool_event_supports_run_command(
+    _module_name, module, name_key, params_key
+):
+    events = []
+
+    async def event_emitter(event: dict):
+        events.append(event)
+
+    kwargs = {
+        name_key: "run_command",
+        params_key: {"command": "pwd"},
+        "tool_result": {"ok": True},
+        "event_emitter": event_emitter,
+    }
+
+    await module.emit_terminal_tool_event(**kwargs)
+
+    assert events == [{"type": "terminal:run_command", "data": {}}]
 
 
 @pytest.mark.asyncio

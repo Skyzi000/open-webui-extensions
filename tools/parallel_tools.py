@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.7
+version: 0.1.8
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -36,7 +36,12 @@ CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files", 
 EXTERNAL_TOOL_TYPES = {"external", "action", "terminal"}
 
 # Terminal tool names that should emit UI refresh/display events.
-TERMINAL_EVENT_TOOLS = {"display_file", "write_file"}
+TERMINAL_EVENT_TOOLS = {
+    "display_file",
+    "write_file",
+    "replace_file_content",
+    "run_command",
+}
 
 
 # ============================================================================
@@ -339,11 +344,10 @@ async def emit_terminal_tool_event(
     if not event_emitter or tool_name not in TERMINAL_EVENT_TOOLS:
         return
 
-    path = tool_args.get("path", "") if isinstance(tool_args, dict) else ""
-    if not isinstance(path, str) or not path:
-        return
-
     if tool_name == "display_file":
+        path = tool_args.get("path", "") if isinstance(tool_args, dict) else ""
+        if not isinstance(path, str) or not path:
+            return
         parsed = tool_result
         if isinstance(parsed, str):
             try:
@@ -352,9 +356,19 @@ async def emit_terminal_tool_event(
                 parsed = tool_result
         if isinstance(parsed, dict) and parsed.get("exists") is False:
             return
+        event = {"type": "terminal:display_file", "data": {"path": path}}
+    elif tool_name in {"write_file", "replace_file_content"}:
+        path = tool_args.get("path", "") if isinstance(tool_args, dict) else ""
+        if not isinstance(path, str) or not path:
+            return
+        event = {"type": f"terminal:{tool_name}", "data": {"path": path}}
+    elif tool_name == "run_command":
+        event = {"type": "terminal:run_command", "data": {}}
+    else:
+        return
 
     try:
-        await event_emitter({"type": f"terminal:{tool_name}", "data": {"path": path}})
+        await event_emitter(event)
     except Exception as e:
         log.warning(f"Error emitting terminal event for {tool_name}: {e}")
 
