@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.4.7
+version: 0.4.8
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -35,6 +35,7 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Mapping, Sequence
 from typing import Any, Callable, List, Optional, Type
 
 from fastapi import Request
@@ -368,23 +369,37 @@ async def execute_tool_call(
     Returns:
         Dict with tool_call_id and content (result)
     """
+    if not isinstance(tool_call, dict):
+        return {
+            "tool_call_id": str(uuid.uuid4()),
+            "content": f"Malformed tool_call: expected dict, got {type(tool_call).__name__}",
+        }
     tool_call_id = tool_call.get("id", str(uuid.uuid4()))
-    tool_function_name = tool_call.get("function", {}).get("name", "")
-    tool_args_str = tool_call.get("function", {}).get("arguments", "{}")
+    func = tool_call.get("function")
+    if not isinstance(func, dict):
+        return {
+            "tool_call_id": tool_call_id,
+            "content": f"Malformed tool_call: 'function' is {type(func).__name__}, not dict",
+        }
+    tool_function_name = func.get("name", "")
+    tool_args_raw = func.get("arguments", "{}")
 
-    # Parse arguments
-    tool_function_params = {}
-    try:
-        tool_function_params = ast.literal_eval(tool_args_str)
-    except Exception:
+    # Parse arguments - handle both JSON string and pre-parsed dict/list
+    tool_function_params: dict = {}
+    if isinstance(tool_args_raw, dict):
+        tool_function_params = tool_args_raw
+    elif isinstance(tool_args_raw, str):
         try:
-            tool_function_params = json.loads(tool_args_str)
-        except Exception as e:
-            log.error(f"Error parsing tool call arguments: {tool_args_str} - {e}")
-            return {
-                "tool_call_id": tool_call_id,
-                "content": f"Error parsing arguments: {e}",
-            }
+            tool_function_params = ast.literal_eval(tool_args_raw)
+        except Exception:
+            try:
+                tool_function_params = json.loads(tool_args_raw)
+            except Exception as e:
+                log.error(f"Error parsing tool call arguments: {tool_args_raw} - {e}")
+                return {
+                    "tool_call_id": tool_call_id,
+                    "content": f"Error parsing arguments: {e}",
+                }
     if not isinstance(tool_function_params, dict):
         tool_function_params = {}
 
@@ -650,7 +665,13 @@ async def run_sub_agent_loop(
         if isinstance(response, JSONResponse):
             try:
                 error_data = json.loads(bytes(response.body).decode("utf-8"))
-                error_msg = error_data.get("error", {}).get("message", str(error_data))
+                error_field = error_data.get("error") if isinstance(error_data, dict) else None
+                if isinstance(error_field, dict):
+                    error_msg = error_field.get("message", str(error_data))
+                elif isinstance(error_field, str):
+                    error_msg = error_field
+                else:
+                    error_msg = error_data.get("message", str(error_data)) if isinstance(error_data, dict) else str(error_data)
                 return f"API error: {error_msg}"
             except Exception:
                 return f"API error (status {response.status_code}): Failed to parse response"
@@ -660,7 +681,14 @@ async def run_sub_agent_loop(
             if not choices:
                 return "No response from model"
 
-            message = choices[0].get("message", {})
+            choice = choices[0]
+            if not isinstance(choice, Mapping):
+                return f"API returned malformed response: choices[0] is {type(choice).__name__}, not a mapping"
+
+            message = choice.get("message", {})
+            if not isinstance(message, Mapping):
+                return f"API returned malformed response: message is {type(message).__name__}, not a mapping"
+
             content = message.get("content", "")
             tool_calls = message.get("tool_calls", [])
 
@@ -680,9 +708,30 @@ async def run_sub_agent_loop(
             if not tool_calls:
                 return content or ""
 
+            # Normalize: filter out non-mapping entries from tool_calls
+            if not isinstance(tool_calls, Sequence) or isinstance(tool_calls, (str, bytes)):
+                return (
+                    f"API returned malformed response: tool_calls is "
+                    f"{type(tool_calls).__name__}, not a sequence. "
+                    f"Content so far: {content or '(none)'}"
+                )
+            raw_count = len(tool_calls)
+            tool_calls = [tc for tc in tool_calls if isinstance(tc, Mapping)]
+            if not tool_calls:
+                if raw_count > 0:
+                    return (
+                        f"API returned malformed response: {raw_count} tool_calls "
+                        f"entries were all non-mapping. "
+                        f"Content so far: {content or '(none)'}"
+                    )
+                return content or ""
+
             # Emit status with tool calls summary
             if event_emitter:
-                tool_names = [tc.get("function", {}).get("name", "unknown") for tc in tool_calls]
+                tool_names = [
+                    tc["function"].get("name", "unknown") if isinstance(tc.get("function"), Mapping) else "malformed"
+                    for tc in tool_calls
+                ]
                 await event_emitter(
                     {
                         "type": "status",
@@ -693,25 +742,47 @@ async def run_sub_agent_loop(
                     }
                 )
 
-            # Add assistant message with tool calls to conversation
+            normalized_tool_calls = []
+            for tc in tool_calls:
+                tc_func = tc.get("function")
+                if not isinstance(tc_func, Mapping):
+                    continue
+                args = tc_func.get("arguments", "{}")
+                if not isinstance(args, str):
+                    try:
+                        args = json.dumps(args, ensure_ascii=False)
+                    except Exception:
+                        args = str(args)
+                normalized_tool_calls.append({
+                    **tc,
+                    "function": {**tc_func, "arguments": args},
+                })
+            if not normalized_tool_calls:
+                return (
+                    f"API returned malformed response: all tool_calls had invalid "
+                    f"'function' fields. Content so far: {content or '(none)'}"
+                )
+
             current_messages.append(
                 {
                     "role": "assistant",
                     "content": content or "",
-                    "tool_calls": tool_calls,
+                    "tool_calls": normalized_tool_calls,
                 }
             )
 
             # Execute each tool call
-            for tool_call in tool_calls:
-                tool_args = tool_call.get("function", {}).get("arguments", "{}")
+            for tool_call in normalized_tool_calls:
+                tc_func = tool_call.get("function")
+                tool_args_raw = tc_func.get("arguments", "{}") if isinstance(tc_func, dict) else "{}"
+                tool_args_display = str(tool_args_raw).replace(chr(10), " ") if tool_args_raw else "{}"
 
                 if event_emitter:
                     await event_emitter(
                         {
                             "type": "status",
                             "data": {
-                                "description": f"[Step {iteration}] Args: {tool_args.replace(chr(10), ' ')}",
+                                "description": f"[Step {iteration}] Args: {tool_args_display}",
                                 "done": False,
                             },
                         }
@@ -799,7 +870,11 @@ async def run_sub_agent_loop(
         if isinstance(response, dict):
             choices = response.get("choices", [])
             if choices:
-                return choices[0].get("message", {}).get("content", "")
+                choice = choices[0]
+                if isinstance(choice, Mapping):
+                    message = choice.get("message", {})
+                    if isinstance(message, Mapping):
+                        return message.get("content", "")
     except Exception as e:
         log.exception(f"Error getting final response: {e}")
 
@@ -1381,15 +1456,15 @@ RESPONSE REQUIREMENTS:
         self,
         description: str,
         prompt: str,
-        __user__: dict = None,
-        __request__: Request = None,
-        __model__: dict = None,
-        __metadata__: dict = None,
-        __id__: str = None,
-        __event_emitter__: Callable[[dict], Any] = None,
-        __event_call__: Callable[[dict], Any] = None,
-        __chat_id__: str = None,
-        __message_id__: str = None,
+        __user__: Optional[dict] = None,
+        __request__: Optional[Request] = None,
+        __model__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+        __event_call__: Optional[Callable[[dict], Any]] = None,
+        __chat_id__: Optional[str] = None,
+        __message_id__: Optional[str] = None,
         __oauth_token__: Optional[dict] = None,
         __messages__: Optional[list] = None,
     ) -> str:
@@ -1566,15 +1641,15 @@ RESPONSE REQUIREMENTS:
     async def run_parallel_sub_agents(
         self,
         tasks: list[dict],
-        __user__: dict = None,
-        __request__: Request = None,
-        __model__: dict = None,
-        __metadata__: dict = None,
-        __id__: str = None,
-        __event_emitter__: Callable[[dict], Any] = None,
-        __event_call__: Callable[[dict], Any] = None,
-        __chat_id__: str = None,
-        __message_id__: str = None,
+        __user__: Optional[dict] = None,
+        __request__: Optional[Request] = None,
+        __model__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+        __event_call__: Optional[Callable[[dict], Any]] = None,
+        __chat_id__: Optional[str] = None,
+        __message_id__: Optional[str] = None,
         __oauth_token__: Optional[dict] = None,
         __messages__: Optional[list] = None,
     ) -> str:
