@@ -21,11 +21,15 @@ os.environ.setdefault("ENABLE_OPENAI_API", "false")
 
 
 def pytest_configure(config):
-    """Add Open WebUI backend to Python path."""
+    """Add Open WebUI backend and tools directories to Python path."""
     repo_root = Path(__file__).parent.parent
     backend_path = repo_root / "references" / "open-webui" / "backend"
     if backend_path.exists() and str(backend_path) not in sys.path:
         sys.path.insert(0, str(backend_path))
+
+    tools_dir = repo_root / "tools"
+    if tools_dir.exists() and str(tools_dir) not in sys.path:
+        sys.path.insert(0, str(tools_dir))
 
 
 def pytest_unconfigure(config):

@@ -11,10 +11,10 @@ import pytest
 tools_dir = Path(__file__).parent.parent.parent / "tools"
 sys.path.insert(0, str(tools_dir))
 
-import magi_decision_support
-import multi_model_council
-import parallel_tools
-import sub_agent
+import magi_decision_support  # noqa: E402
+import multi_model_council  # noqa: E402
+import parallel_tools  # noqa: E402
+import sub_agent  # noqa: E402
 
 
 def make_spec(*param_names: str) -> dict:
@@ -52,6 +52,18 @@ TERMINAL_EVENT_MODULE_CASES = [
         "tool_name",
         "tool_args",
     ),
+]
+
+RESULT_HELPER_MODULES = [
+    ("sub_agent", sub_agent),
+    ("multi_model_council", multi_model_council),
+    ("magi_decision_support", magi_decision_support),
+    ("parallel_tools", parallel_tools),
+]
+
+BUILTIN_KNOWLEDGE_MODULES = [
+    ("sub_agent", sub_agent),
+    ("multi_model_council", multi_model_council),
 ]
 
 
@@ -624,6 +636,13 @@ async def test_multi_model_council_resolves_terminal_once_before_parallel_member
     assert metadata["terminal_id"] == "term-shared"
 
 
+def test_multi_model_council_parse_model_ids_deduplicates_values():
+    assert multi_model_council.parse_model_ids("model-a, model-a, model-b") == [
+        "model-a",
+        "model-b",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_multi_model_council_without_terminal_symbol_keeps_builtin(
     monkeypatch, dummy_request
@@ -1071,6 +1090,56 @@ async def test_sub_agent_load_tools_includes_direct_tool_servers(monkeypatch, du
 
 
 @pytest.mark.asyncio
+async def test_sub_agent_load_tools_collects_direct_tool_server_system_prompts(
+    monkeypatch, dummy_request
+):
+    import open_webui.utils.tools as ow_tools
+
+    async def fake_get_tools(request, tool_ids, user, extra_params):
+        return {}
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {}
+
+    async def fake_get_terminal_tools(request, terminal_id, user, extra_params):
+        return {}
+
+    monkeypatch.setattr(ow_tools, "get_tools", fake_get_tools)
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+    monkeypatch.setattr(ow_tools, "get_terminal_tools", fake_get_terminal_tools)
+
+    valves = sub_agent.Tools().valves
+    metadata = {
+        "tool_ids": [],
+        "features": {},
+        "tool_servers": [
+            {
+                "url": "https://direct.example.com",
+                "system_prompt": "Direct prompt A",
+                "specs": [
+                    {
+                        "name": "direct_run",
+                        "parameters": {"properties": {"command": {"type": "string"}}},
+                    }
+                ],
+            }
+        ],
+    }
+    extra_params = {"__metadata__": metadata}
+    await sub_agent.load_sub_agent_tools(
+        request=dummy_request,
+        user=SimpleNamespace(id="u1"),
+        valves=valves,
+        metadata=metadata,
+        model={},
+        extra_params=extra_params,
+        self_tool_id=None,
+    )
+
+    assert extra_params["__direct_tool_server_system_prompts__"] == ["Direct prompt A"]
+
+
+@pytest.mark.asyncio
 async def test_sub_agent_direct_tool_without_specs_is_not_loaded(monkeypatch, dummy_request):
     import open_webui.utils.tools as ow_tools
 
@@ -1095,17 +1164,19 @@ async def test_sub_agent_direct_tool_without_specs_is_not_loaded(monkeypatch, du
         "features": {},
         "tool_servers": [{"url": "https://direct-hydrate.example.com"}],
     }
+    extra_params = {"__metadata__": metadata}
     tools_dict = await sub_agent.load_sub_agent_tools(
         request=dummy_request,
         user=SimpleNamespace(id="u1"),
         valves=valves,
         metadata=metadata,
         model={},
-        extra_params={"__metadata__": metadata},
+        extra_params=extra_params,
         self_tool_id=None,
     )
 
     assert "hydrated_run" not in tools_dict
+    assert "__direct_tool_server_system_prompts__" not in extra_params
 
 
 @pytest.mark.asyncio
@@ -1275,6 +1346,73 @@ async def test_multi_model_council_build_tools_dict_includes_direct_tools(dummy_
 
 
 @pytest.mark.asyncio
+async def test_multi_model_council_build_tools_dict_collects_direct_tool_server_system_prompts(
+    dummy_request,
+):
+    valves = multi_model_council.Tools().valves
+    metadata = {
+        "tool_ids": [],
+        "features": {},
+        "tool_servers": [
+            {
+                "url": "https://direct-council.example.com",
+                "system_prompt": "Direct prompt Council",
+                "specs": [
+                    {
+                        "name": "direct_lookup",
+                        "parameters": {"properties": {"query": {"type": "string"}}},
+                    }
+                ],
+            }
+        ],
+    }
+    extra_params = {"__metadata__": metadata}
+    await multi_model_council.build_tools_dict(
+        request=dummy_request,
+        model={},
+        metadata=metadata,
+        user=SimpleNamespace(id="u1"),
+        valves=valves,
+        extra_params=extra_params,
+        tool_id_list=[],
+        excluded_tool_ids=None,
+    )
+
+    assert extra_params["__direct_tool_server_system_prompts__"] == ["Direct prompt Council"]
+
+
+@pytest.mark.asyncio
+async def test_multi_model_council_build_tools_dict_ignores_unloaded_direct_tool_prompts(
+    dummy_request,
+):
+    valves = multi_model_council.Tools().valves
+    metadata = {
+        "tool_ids": [],
+        "features": {},
+        "tool_servers": [
+            {
+                "url": "https://direct-council.example.com",
+                "system_prompt": "Ghost prompt Council",
+            }
+        ],
+    }
+    extra_params = {"__metadata__": metadata}
+    tools_dict = await multi_model_council.build_tools_dict(
+        request=dummy_request,
+        model={},
+        metadata=metadata,
+        user=SimpleNamespace(id="u1"),
+        valves=valves,
+        extra_params=extra_params,
+        tool_id_list=[],
+        excluded_tool_ids=None,
+    )
+
+    assert "direct_lookup" not in tools_dict
+    assert "__direct_tool_server_system_prompts__" not in extra_params
+
+
+@pytest.mark.asyncio
 async def test_magi_build_tools_dict_includes_direct_tools(dummy_request):
     metadata = {
         "tool_ids": [],
@@ -1306,6 +1444,69 @@ async def test_magi_build_tools_dict_includes_direct_tools(dummy_request):
 
     assert "direct_search" in tools_dict
     assert tools_dict["direct_search"]["direct"] is True
+
+
+@pytest.mark.asyncio
+async def test_magi_build_tools_dict_collects_direct_tool_server_system_prompts(dummy_request):
+    metadata = {
+        "tool_ids": [],
+        "features": {},
+        "tool_servers": [
+            {
+                "url": "https://direct-magi.example.com",
+                "system_prompt": "Direct prompt MAGI",
+                "specs": [
+                    {
+                        "name": "direct_search",
+                        "parameters": {"properties": {"query": {"type": "string"}}},
+                    }
+                ],
+            }
+        ],
+    }
+    extra_params = {"__metadata__": metadata}
+    await magi_decision_support.build_tools_dict(
+        request=dummy_request,
+        model={},
+        metadata=metadata,
+        user=SimpleNamespace(id="u1"),
+        enable_web_tools=True,
+        enable_terminal_tools=True,
+        extra_params=extra_params,
+        tool_id_list=[],
+        excluded_tool_ids=None,
+    )
+
+    assert extra_params["__direct_tool_server_system_prompts__"] == ["Direct prompt MAGI"]
+
+
+@pytest.mark.asyncio
+async def test_magi_build_tools_dict_ignores_unloaded_direct_tool_prompts(dummy_request):
+    metadata = {
+        "tool_ids": [],
+        "features": {},
+        "tool_servers": [
+            {
+                "url": "https://direct-magi.example.com",
+                "system_prompt": "Ghost prompt MAGI",
+            }
+        ],
+    }
+    extra_params = {"__metadata__": metadata}
+    tools_dict = await magi_decision_support.build_tools_dict(
+        request=dummy_request,
+        model={},
+        metadata=metadata,
+        user=SimpleNamespace(id="u1"),
+        enable_web_tools=True,
+        enable_terminal_tools=True,
+        extra_params=extra_params,
+        tool_id_list=[],
+        excluded_tool_ids=None,
+    )
+
+    assert "direct_search" not in tools_dict
+    assert "__direct_tool_server_system_prompts__" not in extra_params
 
 
 @pytest.mark.asyncio
@@ -1364,3 +1565,34 @@ async def test_parallel_tools_executes_direct_tool_via_event_call(
     assert payload["results"][0]["result"]["ok"] is True
     assert execute_calls[0]["type"] == "execute:tool"
     assert execute_calls[0]["data"]["session_id"] == "sess-parallel"
+
+
+@pytest.mark.parametrize(("module_name", "module"), RESULT_HELPER_MODULES)
+def test_normalize_terminal_tools_result_supports_tuple_return(module_name, module):
+    extra_params = {}
+    terminal_tools = {
+        "run_command": {
+            "callable": lambda **kwargs: None,
+            "spec": make_spec("command"),
+            "type": "terminal",
+            "tool_id": "terminal:test",
+        }
+    }
+
+    normalized = module.normalize_terminal_tools_result(
+        terminal_tools_result=(terminal_tools, "Use the terminal working directory."),
+        extra_params=extra_params,
+    )
+
+    assert normalized == terminal_tools, module_name
+    assert extra_params["__terminal_system_prompt__"] == "Use the terminal working directory."
+
+
+@pytest.mark.parametrize(("module_name", "module"), RESULT_HELPER_MODULES)
+def test_citation_tools_include_view_file(module_name, module):
+    assert "view_file" in module.CITATION_TOOLS, module_name
+
+
+@pytest.mark.parametrize(("module_name", "module"), BUILTIN_KNOWLEDGE_MODULES)
+def test_builtin_knowledge_category_includes_list_knowledge(module_name, module):
+    assert "list_knowledge" in module.BUILTIN_TOOL_CATEGORIES["knowledge"], module_name

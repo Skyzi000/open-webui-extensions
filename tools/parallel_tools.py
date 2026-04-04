@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.8
+version: 0.1.9
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -28,12 +28,17 @@ from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
 
+_core_process_tool_result = None
+
 # Tools that generate citation sources
 # NOTE: Update this set when new citation-capable tools are added to Open WebUI.
-CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files", "fetch_url"}
-
-# Tool types that may return (data, headers) tuples from execute_tool_server.
-EXTERNAL_TOOL_TYPES = {"external", "action", "terminal"}
+CITATION_TOOLS = {
+    "search_web",
+    "view_file",
+    "view_knowledge_file",
+    "query_knowledge_files",
+    "fetch_url",
+}
 
 # Terminal tool names that should emit UI refresh/display events.
 TERMINAL_EVENT_TOOLS = {
@@ -202,13 +207,89 @@ async def execute_direct_tool_call(
     )
 
 
-def extract_tool_result_payload(*, tool_type: str, tool_result: Any, direct_tool: bool = False) -> Any:
-    """Extract serializable payload from tool result for external/terminal/direct tools."""
-    if tool_type in EXTERNAL_TOOL_TYPES and isinstance(tool_result, tuple) and len(tool_result) == 2:
-        return tool_result[0]
-    if direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
-        return tool_result[0]
-    return tool_result
+def normalize_terminal_tools_result(*, terminal_tools_result: Any, extra_params: Optional[dict]) -> dict:
+    """Normalize get_terminal_tools() return value across Open WebUI versions."""
+    terminal_system_prompt = None
+    terminal_tools = terminal_tools_result
+
+    if (
+        isinstance(terminal_tools_result, tuple)
+        and len(terminal_tools_result) == 2
+        and isinstance(terminal_tools_result[0], dict)
+    ):
+        terminal_tools = terminal_tools_result[0]
+        if isinstance(terminal_tools_result[1], str):
+            stripped_prompt = terminal_tools_result[1].strip()
+            if stripped_prompt:
+                terminal_system_prompt = stripped_prompt
+
+    if isinstance(extra_params, dict):
+        if terminal_system_prompt:
+            extra_params["__terminal_system_prompt__"] = terminal_system_prompt
+        else:
+            extra_params.pop("__terminal_system_prompt__", None)
+
+    if isinstance(terminal_tools, dict):
+        return terminal_tools
+    return {}
+
+
+def _normalize_user(user: Any) -> Any:
+    """Convert raw __user__ dict payloads into UserModel when needed."""
+    if user is None or hasattr(user, "id"):
+        return user
+    if isinstance(user, dict):
+        try:
+            from open_webui.models.users import UserModel
+
+            return UserModel(**user)
+        except Exception:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(**user)
+    return user
+
+
+def process_tool_result(
+    *,
+    tool_function_name: str = "tool",
+    tool_type: str,
+    tool_result: Any,
+    direct_tool: bool = False,
+    request: Optional[Request] = None,
+    metadata: Optional[dict] = None,
+    user: Any = None,
+) -> tuple[Any, list, list]:
+    """Process tool result into (payload, files, embeds) using core when available."""
+    global _core_process_tool_result
+    if _core_process_tool_result is None:
+        try:
+            from open_webui.utils.middleware import process_tool_result as fn
+
+            if fn is not None:
+                _core_process_tool_result = fn
+        except ImportError:
+            pass
+    if _core_process_tool_result is not None:
+        return _core_process_tool_result(
+            request,
+            tool_function_name,
+            tool_result,
+            tool_type,
+            direct_tool=direct_tool,
+            metadata=metadata if isinstance(metadata, dict) else {},
+            user=_normalize_user(user),
+        )
+    # Fallback for Open WebUI < 0.8.x
+    if isinstance(tool_result, tuple):
+        tool_result = tool_result[0] if tool_result else ""
+    elif direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
+        tool_result = tool_result[0]
+    if isinstance(tool_result, (dict, list)):
+        tool_result = json.dumps(tool_result, indent=2, ensure_ascii=False)
+    elif tool_result is not None and not isinstance(tool_result, str):
+        tool_result = str(tool_result)
+    return tool_result, [], []
 
 
 async def execute_single_tool(
@@ -248,6 +329,8 @@ async def execute_single_tool(
         allowed_params = spec.get("parameters", {}).get("properties", {}).keys()
         filtered_args = {k: v for k, v in tool_args.items() if k in allowed_params}
         direct_tool = bool(tool.get("direct", False))
+        tool_result_files: list[dict] = []
+        tool_result_embeds: list[Any] = []
 
         if direct_tool:
             result = await execute_direct_tool_call(
@@ -274,10 +357,14 @@ async def execute_single_tool(
 
         # Handle OpenAPI/external/direct tool results that return (data, headers)
         tool_type = tool.get("type", "")
-        result = extract_tool_result_payload(
+        result, tool_result_files, tool_result_embeds = process_tool_result(
+            tool_function_name=tool_name,
             tool_type=tool_type,
             tool_result=result,
             direct_tool=direct_tool,
+            request=extra_params.get("__request__"),
+            metadata=extra_params.get("__metadata__"),
+            user=extra_params.get("__user__"),
         )
 
         # Emit terminal:* events for display/refresh behavior in UI
@@ -287,6 +374,11 @@ async def execute_single_tool(
             tool_result=result,
             event_emitter=event_emitter,
         )
+        defer_artifact_events = bool(extra_params.get("__defer_artifact_events__", False))
+        if event_emitter and tool_result_files and not defer_artifact_events:
+            await event_emitter({"type": "files", "data": {"files": tool_result_files}})
+        if event_emitter and tool_result_embeds and not defer_artifact_events:
+            await event_emitter({"type": "embeds", "data": {"embeds": tool_result_embeds}})
 
         # Try to parse JSON string results to avoid double-encoding
         if isinstance(result, str):
@@ -323,6 +415,14 @@ async def execute_single_tool(
         return {
             "tool_name": tool_name,
             "result": result,
+            **({"files": tool_result_files} if tool_result_files else {}),
+            **(
+                {
+                    "embeds": tool_result_embeds
+                }
+                if tool_result_embeds and (not event_emitter or defer_artifact_events)
+                else {}
+            ),
         }
 
     except Exception as e:
@@ -605,10 +705,14 @@ class Tools:
             try:
                 from open_webui.utils.tools import get_terminal_tools
 
-                terminal_tools = await get_terminal_tools(
+                terminal_tools_result = await get_terminal_tools(
                     request=__request__,
                     terminal_id=terminal_id,
                     user=user,
+                    extra_params=extra_params,
+                )
+                terminal_tools = normalize_terminal_tools_result(
+                    terminal_tools_result=terminal_tools_result,
                     extra_params=extra_params,
                 )
                 if terminal_tools:
@@ -679,6 +783,7 @@ class Tools:
             "__oauth_token__": __oauth_token__,
             "__messages__": __messages__ or [],
             "__files__": __metadata__.get("files", []) if __metadata__ else [],
+            "__defer_artifact_events__": True,
         }
 
         # Execute all tools in parallel
@@ -697,6 +802,8 @@ class Tools:
 
         # Process results
         processed_results = []
+        aggregated_files = []
+        aggregated_embeds = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 processed_results.append(
@@ -706,7 +813,23 @@ class Tools:
                     }
                 )
             else:
+                if isinstance(result, dict):
+                    files = result.get("files", [])
+                    embeds = result.get("embeds", [])
+                    if isinstance(files, list):
+                        aggregated_files.extend(files)
+                        if __event_emitter__:
+                            result = {k: v for k, v in result.items() if k != "files"}
+                    if isinstance(embeds, list):
+                        aggregated_embeds.extend(embeds)
+                        if __event_emitter__:
+                            result = {k: v for k, v in result.items() if k != "embeds"}
                 processed_results.append(result)
+
+        if __event_emitter__ and aggregated_files:
+            await __event_emitter__({"type": "files", "data": {"files": aggregated_files}})
+        if __event_emitter__ and aggregated_embeds:
+            await __event_emitter__({"type": "embeds", "data": {"embeds": aggregated_embeds}})
 
         return json.dumps(
             {"results": processed_results},

@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.11
+version: 0.1.12
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
 
+_core_process_tool_result = None
+
 
 # ============================================================================
 # Builtin tool categories (copied from tools/sub_agent.py)
@@ -31,6 +33,7 @@ BUILTIN_TOOL_CATEGORIES = {
     "web": {"search_web", "fetch_url"},
     "image": {"generate_image", "edit_image"},
     "knowledge": {
+        "list_knowledge",
         "list_knowledge_bases",
         "search_knowledge_bases",
         "query_knowledge_bases",
@@ -73,10 +76,15 @@ VALVE_TO_CATEGORY = {
 # Tools that generate citation sources
 # NOTE: Update this set when new citation-capable tools are added to Open WebUI.
 # See open_webui/utils/middleware.py:get_citation_source_from_tool_result() for supported tools.
-CITATION_TOOLS = {"search_web", "view_knowledge_file", "query_knowledge_files", "fetch_url"}
+CITATION_TOOLS = {
+    "search_web",
+    "view_file",
+    "view_knowledge_file",
+    "query_knowledge_files",
+    "fetch_url",
+}
 
-# Tool types that may return (data, headers) tuples from execute_tool_server.
-EXTERNAL_TOOL_TYPES = {"external", "action", "terminal"}
+
 
 # Terminal tool names that should emit UI refresh/display events.
 TERMINAL_EVENT_TOOLS = {
@@ -199,6 +207,25 @@ def normalize_direct_tool_servers(value: Any) -> List[dict]:
         if isinstance(item, dict):
             normalized.append(dict(item))
     return normalized
+
+
+def extract_direct_tool_server_prompts(direct_tools: Dict[str, dict]) -> List[str]:
+    """Collect unique non-empty system prompts from loaded direct tools only."""
+    prompts: List[str] = []
+    seen_prompts = set()
+    for tool in direct_tools.values():
+        if not isinstance(tool, dict):
+            continue
+        server = tool.get("server")
+        if not isinstance(server, dict):
+            continue
+        system_prompt = server.get("system_prompt")
+        if isinstance(system_prompt, str):
+            stripped_prompt = system_prompt.strip()
+            if stripped_prompt and stripped_prompt not in seen_prompts:
+                prompts.append(stripped_prompt)
+                seen_prompts.add(stripped_prompt)
+    return prompts
 
 
 async def resolve_direct_tool_servers_from_request_and_metadata(
@@ -340,13 +367,62 @@ async def execute_direct_tool_call(
     )
 
 
-def extract_tool_result_payload(*, tool_type: str, tool_result: Any, direct_tool: bool = False) -> Any:
-    """Extract serializable payload from tool result for external/terminal-style tools."""
-    if tool_type in EXTERNAL_TOOL_TYPES and isinstance(tool_result, tuple) and len(tool_result) == 2:
-        return tool_result[0]
-    if direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
-        return tool_result[0]
-    return tool_result
+def _normalize_user(user: Any) -> Any:
+    """Convert raw __user__ dict payloads into UserModel when needed."""
+    if user is None or hasattr(user, "id"):
+        return user
+    if isinstance(user, dict):
+        try:
+            from open_webui.models.users import UserModel
+
+            return UserModel(**user)
+        except Exception:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(**user)
+    return user
+
+
+def process_tool_result(
+    *,
+    tool_function_name: str = "tool",
+    tool_type: str,
+    tool_result: Any,
+    direct_tool: bool = False,
+    request: Optional[Request] = None,
+    metadata: Optional[dict] = None,
+    user: Any = None,
+) -> tuple[Any, list, list]:
+    """Process tool result into (payload, files, embeds) using core when available."""
+    global _core_process_tool_result
+    if _core_process_tool_result is None:
+        try:
+            from open_webui.utils.middleware import process_tool_result as fn
+
+            if fn is not None:
+                _core_process_tool_result = fn
+        except ImportError:
+            pass
+    if _core_process_tool_result is not None:
+        return _core_process_tool_result(
+            request,
+            tool_function_name,
+            tool_result,
+            tool_type,
+            direct_tool=direct_tool,
+            metadata=metadata if isinstance(metadata, dict) else {},
+            user=_normalize_user(user),
+        )
+    # Fallback for Open WebUI < 0.8.x
+    if isinstance(tool_result, tuple):
+        tool_result = tool_result[0] if tool_result else ""
+    elif direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
+        tool_result = tool_result[0]
+    if isinstance(tool_result, (dict, list)):
+        tool_result = json.dumps(tool_result, indent=2, ensure_ascii=False)
+    elif tool_result is not None and not isinstance(tool_result, str):
+        tool_result = str(tool_result)
+    return tool_result, [], []
 
 
 async def emit_terminal_tool_event(
@@ -440,6 +516,45 @@ def build_council_system_prompt(base_prompt: str, include_sources: bool) -> str:
     if base_prompt:
         return f"{base_prompt}\n\n{council_prompt}"
     return council_prompt
+
+
+def merge_prompt_sections(*sections: Optional[str]) -> str:
+    """Join non-empty prompt sections with blank lines."""
+    merged_sections = []
+    for section in sections:
+        if not isinstance(section, str):
+            continue
+        stripped = section.strip()
+        if stripped:
+            merged_sections.append(stripped)
+    return "\n\n".join(merged_sections)
+
+
+def normalize_terminal_tools_result(*, terminal_tools_result: Any, extra_params: Optional[dict]) -> dict:
+    """Normalize get_terminal_tools() return value across Open WebUI versions."""
+    terminal_system_prompt = None
+    terminal_tools = terminal_tools_result
+
+    if (
+        isinstance(terminal_tools_result, tuple)
+        and len(terminal_tools_result) == 2
+        and isinstance(terminal_tools_result[0], dict)
+    ):
+        terminal_tools = terminal_tools_result[0]
+        if isinstance(terminal_tools_result[1], str):
+            stripped_prompt = terminal_tools_result[1].strip()
+            if stripped_prompt:
+                terminal_system_prompt = stripped_prompt
+
+    if isinstance(extra_params, dict):
+        if terminal_system_prompt:
+            extra_params["__terminal_system_prompt__"] = terminal_system_prompt
+        else:
+            extra_params.pop("__terminal_system_prompt__", None)
+
+    if isinstance(terminal_tools, dict):
+        return terminal_tools
+    return {}
 
 
 def build_council_user_prompt(
@@ -550,6 +665,8 @@ async def execute_tool_call(
     if not isinstance(tool_function_params, dict):
         tool_function_params = {}
 
+    tool_result_files: list[dict] = []
+    tool_result_embeds: list[Any] = []
     emit_terminal_event = False
     if tool_function_name in tools_dict:
         tool = tools_dict[tool_function_name]
@@ -590,10 +707,14 @@ async def execute_tool_call(
                 )
 
                 tool_result = await tool_function(**tool_function_params)
-            tool_result = extract_tool_result_payload(
+            tool_result, tool_result_files, tool_result_embeds = process_tool_result(
+                tool_function_name=tool_function_name,
                 tool_type=tool.get("type", ""),
                 tool_result=tool_result,
                 direct_tool=direct_tool,
+                request=extra_params.get("__request__"),
+                metadata=extra_params.get("__metadata__"),
+                user=extra_params.get("__user__"),
             )
             emit_terminal_event = True
         except Exception as exc:
@@ -609,6 +730,10 @@ async def execute_tool_call(
             tool_result=tool_result,
             event_emitter=event_emitter,
         )
+        if event_emitter and tool_result_files:
+            await event_emitter({"type": "files", "data": {"files": tool_result_files}})
+        if event_emitter and tool_result_embeds:
+            await event_emitter({"type": "embeds", "data": {"embeds": tool_result_embeds}})
 
     if tool_result is None:
         tool_result = ""
@@ -673,6 +798,50 @@ async def apply_inlet_filters_if_enabled(
     except Exception as exc:
         log.warning(f"Error applying inlet filters: {exc}")
 
+    return form_data
+
+
+def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
+    """Append terminal/direct-tool-server system prompts to messages.
+
+    Open WebUI core injects these prompts AFTER inlet filters so they survive
+    filters that rewrite the system message.  We replicate the same ordering by
+    calling this helper after ``apply_inlet_filters_if_enabled``.
+    """
+    prompts: list[str] = []
+    terminal_prompt = (extra_params or {}).get("__terminal_system_prompt__")
+    if isinstance(terminal_prompt, str) and terminal_prompt.strip():
+        prompts.append(terminal_prompt)
+    direct_prompts = (extra_params or {}).get(
+        "__direct_tool_server_system_prompts__", []
+    )
+    if isinstance(direct_prompts, list):
+        prompts.extend(p for p in direct_prompts if isinstance(p, str) and p.strip())
+
+    if not prompts:
+        return form_data
+
+    messages = list(form_data.get("messages", []))
+    combined = "\n\n".join(prompts)
+    if messages and messages[0].get("role") == "system":
+        # Copy the dict so we don't mutate current_messages across iterations
+        msg = {**messages[0]}
+        content = msg.get("content", "")
+        # Handle structured content (list of {"type": "text", "text": ...})
+        # the same way core's update_message_content does.
+        if isinstance(content, list):
+            msg["content"] = [
+                {**item, "text": f'{item["text"]}\n{combined}'}
+                if item.get("type") == "text"
+                else item
+                for item in content
+            ]
+        else:
+            msg["content"] = f"{content}\n\n{combined}" if content else combined
+        messages[0] = msg
+    else:
+        messages.insert(0, {"role": "system", "content": combined})
+    form_data["messages"] = messages
     return form_data
 
 
@@ -751,6 +920,7 @@ async def run_agent_loop(
         form_data = await apply_inlet_filters_if_enabled(
             apply_inlet_filters, request, model, form_data, extra_params
         )
+        form_data = _append_tool_server_prompts(form_data, extra_params)
 
         try:
             response = await generate_chat_completion(
@@ -908,6 +1078,7 @@ async def run_agent_loop(
     form_data = await apply_inlet_filters_if_enabled(
         apply_inlet_filters, request, model, form_data, extra_params
     )
+    form_data = _append_tool_server_prompts(form_data, extra_params)
 
     try:
         response = await generate_chat_completion(
@@ -984,6 +1155,7 @@ async def build_tools_dict(
             extra_metadata["tool_servers"] = direct_tool_servers
         else:
             extra_params["__metadata__"] = metadata
+            extra_metadata = metadata
 
     # Load regular tools available to the main agent
     regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
@@ -1008,10 +1180,14 @@ async def build_tools_dict(
                 log.info("[MultiModelCouncil] get_terminal_tools is unavailable in this Open WebUI version")
         else:
             try:
-                terminal_tools = await get_terminal_tools(
+                terminal_tools_result = await get_terminal_tools(
                     request=request,
                     terminal_id=terminal_id,
                     user=user,
+                    extra_params=extra_params,
+                )
+                terminal_tools = normalize_terminal_tools_result(
+                    terminal_tools_result=terminal_tools_result,
                     extra_params=extra_params,
                 )
                 if terminal_tools:
@@ -1025,8 +1201,18 @@ async def build_tools_dict(
             direct_tools = build_direct_tools_dict(tool_servers=direct_tool_servers)
             if direct_tools:
                 tools_dict = {**tools_dict, **direct_tools}
+                direct_tool_server_prompts = extract_direct_tool_server_prompts(direct_tools)
+                if direct_tool_server_prompts:
+                    extra_params["__direct_tool_server_system_prompts__"] = direct_tool_server_prompts
+                else:
+                    extra_params.pop("__direct_tool_server_system_prompts__", None)
+            else:
+                extra_params.pop("__direct_tool_server_system_prompts__", None)
         except Exception as exc:
             log.exception(f"Error loading direct tools: {exc}")
+            extra_params.pop("__direct_tool_server_system_prompts__", None)
+    else:
+        extra_params.pop("__direct_tool_server_system_prompts__", None)
 
     # Load builtin tools
     features = metadata.get("features", {})
