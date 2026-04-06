@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.9
+version: 0.1.10
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -508,7 +508,7 @@ class Tools:
 
     async def run_tools_parallel(
         self,
-        tool_calls: list,
+        tool_calls: list[dict],
         __user__: dict = None,
         __request__: Request = None,
         __model__: dict = None,
@@ -585,6 +585,17 @@ class Tools:
 
         # Validate each call
         for i, call in enumerate(calls):
+            # Fallback: parse JSON strings (some LLMs pass stringified objects
+            # when the schema advertises items as strings).
+            if isinstance(call, str):
+                try:
+                    call = json.loads(call)
+                    calls[i] = call
+                except (json.JSONDecodeError, TypeError):
+                    return json.dumps(
+                        {"error": f"tool_calls[{i}] must be an object, got unparseable string"},
+                        ensure_ascii=False,
+                    )
             if not isinstance(call, dict):
                 return json.dumps({"error": f"tool_calls[{i}] must be an object"})
             if "name" not in call:
