@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.12
+version: 0.1.13
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -1395,10 +1395,7 @@ CRITICAL RULES:
         """
         List model IDs available to the current user.
 
-        Args:
-            query: Optional search string to filter models by ID or name.
-                - Example: "gpt", "claude", "gemini", "ollama"
-                - Empty string returns all available models.
+        :param query: Optional search string to filter models by ID or name; examples include "gpt", "claude", "gemini", and "ollama", and an empty string returns all available models.
 
         Returns a JSON string:
         {"models": ["id1", "id2", ...]}
@@ -1473,14 +1470,11 @@ CRITICAL RULES:
         """
         Run a multi-model council decision with majority vote.
 
-        Args:
-            proposition: The decision question to analyze (required).
-            option_a: First option to evaluate (required).
-            option_b: Second option to evaluate (required).
-            prerequisites: Optional constraints and assumptions.
-            models: Optional model ID list as a comma-separated string.
-                - Example: "gpt-5.2, claude-4-5-sonnet, gemini-2.5-pro"
-                - If omitted or empty, DEFAULT_MODELS (Valves) is used.
+        :param proposition: The decision question to analyze (required).
+        :param option_a: First option to evaluate (required).
+        :param option_b: Second option to evaluate (required).
+        :param prerequisites: Optional constraints and assumptions.
+        :param models: Optional model ID list as a comma-separated string; example: "gpt-5.2, claude-4-5-sonnet, gemini-2.5-pro", and if omitted or empty, DEFAULT_MODELS (Valves) is used.
 
         Returns a JSON string with:
         - decision: "A" | "B" | "tie" | "no_decision"

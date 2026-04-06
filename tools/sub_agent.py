@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.4.10
+version: 0.4.11
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -45,6 +45,17 @@ from pydantic import BaseModel, Field
 log = logging.getLogger(__name__)
 
 _core_process_tool_result = None
+
+
+class SubAgentTaskItem(BaseModel):
+    """A single sub-agent task specification."""
+
+    description: str = Field(
+        description="Brief task summary shown to the user as status text, and it should be written in the user's language."
+    )
+    prompt: str = Field(
+        description="Detailed instructions for the sub-agent; this can be written in any language that best suits the task."
+    )
 
 
 # ============================================================================
@@ -138,6 +149,96 @@ def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseMode
     if isinstance(raw_valves, dict):
         return valves_cls.model_validate(raw_valves)
     return valves_cls.model_validate({})
+
+
+def normalize_parallel_sub_agent_tasks(tasks: Any) -> tuple[Optional[list[dict[str, str]]], Optional[str]]:
+    """Normalize raw parallel task payloads into validated dicts."""
+    if not isinstance(tasks, list):
+        return (
+            None,
+            json.dumps(
+                {
+                    "error": f"tasks must be a list, got {type(tasks).__name__}",
+                    "expected_format": '[{"description": "Task summary", "prompt": "Detailed instructions"}]',
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+    validated_tasks: list[dict[str, str]] = []
+    for i, task in enumerate(tasks):
+        if isinstance(task, SubAgentTaskItem):
+            task_item = task
+        else:
+            if isinstance(task, str):
+                try:
+                    task = json.loads(task)
+                except (json.JSONDecodeError, TypeError):
+                    return (
+                        None,
+                        json.dumps(
+                            {"error": f"tasks[{i}] must be an object, got unparseable string"},
+                            ensure_ascii=False,
+                        ),
+                    )
+
+            if not isinstance(task, dict):
+                return (
+                    None,
+                    json.dumps(
+                        {"error": f"tasks[{i}] must be an object"},
+                        ensure_ascii=False,
+                    ),
+                )
+
+            try:
+                task_item = SubAgentTaskItem.model_validate(task)
+            except Exception as exc:
+                if hasattr(exc, "errors"):
+                    errors = exc.errors()
+                    if errors:
+                        first_error = errors[0]
+                        loc = ".".join(str(part) for part in first_error.get("loc", ()))
+                        message = first_error.get("msg", "is invalid")
+                        if loc:
+                            return (
+                                None,
+                                json.dumps(
+                                    {"error": f"tasks[{i}].{loc} {message}"},
+                                    ensure_ascii=False,
+                                ),
+                            )
+                return (
+                    None,
+                    json.dumps(
+                        {"error": f"tasks[{i}] is invalid"},
+                        ensure_ascii=False,
+                    ),
+                )
+
+        description = task_item.description.strip()
+        prompt = task_item.prompt.strip()
+
+        if not description:
+            return (
+                None,
+                json.dumps(
+                    {"error": f"tasks[{i}].description cannot be empty"},
+                    ensure_ascii=False,
+                ),
+            )
+        if not prompt:
+            return (
+                None,
+                json.dumps(
+                    {"error": f"tasks[{i}].prompt cannot be empty"},
+                    ensure_ascii=False,
+                ),
+            )
+
+        validated_tasks.append({"description": description, "prompt": prompt})
+
+    return validated_tasks, None
 
 
 def model_has_note_knowledge(model: Optional[dict]) -> bool:
@@ -1678,8 +1779,8 @@ RESPONSE REQUIREMENTS:
         It executes tools in a loop until completion, returning only the final result
         to keep the main conversation context clean.
 
-        :param description: Brief task summary (shown to user as status)
-        :param prompt: Detailed instructions for the sub-agent
+        :param description: Brief task summary shown to the user as status text, and it should be written in the user's language.
+        :param prompt: Detailed instructions for the sub-agent; this can be written in any language that best suits the task.
         :return: Sub-agent's final response after task completion
         """
         if __request__ is None:
@@ -1840,7 +1941,7 @@ RESPONSE REQUIREMENTS:
 
     async def run_parallel_sub_agents(
         self,
-        tasks: list[dict],
+        tasks: list[SubAgentTaskItem],
         __user__: Optional[dict] = None,
         __request__: Optional[Request] = None,
         __model__: Optional[dict] = None,
@@ -1860,14 +1961,15 @@ RESPONSE REQUIREMENTS:
         2 or more tasks that do NOT depend on each other's results.
         All tasks share the same model and tools but run in isolated contexts,
         so they execute simultaneously and finish much faster than sequential calls.
+        Craft each prompt as you would for run_sub_agent (role, context,
+        specific instructions, expected output format, etc.).
 
-        :param tasks: List of task objects. Each must have "description" and "prompt".
-                      Craft each prompt as you would for run_sub_agent (role, context,
-                      specific instructions, expected output format, etc.).
-                      Example: [
-                          {"description": "Research topic A", "prompt": "You are a research specialist. ..."},
-                          {"description": "Analyze data B", "prompt": "You are a data analyst. ..."}
-                      ]
+        Example: [
+            {"description": "Research topic A", "prompt": "You are a research specialist. ..."},
+            {"description": "Analyze data B", "prompt": "You are a data analyst. ..."}
+        ]
+
+        :param tasks: List of task objects using the SubAgentTaskItem schema.
         :return: JSON with "results" array in the same order as tasks.
                  Each element has "description" and either "result" or "error".
         """
@@ -1883,19 +1985,7 @@ RESPONSE REQUIREMENTS:
                 ensure_ascii=False,
             )
 
-        if not isinstance(tasks, list):
-            return json.dumps(
-                {
-                    "error": f"tasks must be a list, got {type(tasks).__name__}",
-                    "expected_format": '[{"description": "Task summary", "prompt": "Detailed instructions"}]',
-                },
-                ensure_ascii=False,
-            )
-
-        if not tasks:
-            return json.dumps({"error": "tasks array is empty"}, ensure_ascii=False)
-
-        if len(tasks) > self.valves.MAX_PARALLEL_AGENTS:
+        if isinstance(tasks, list) and len(tasks) > self.valves.MAX_PARALLEL_AGENTS:
             return json.dumps(
                 {
                     "error": f"tasks count ({len(tasks)}) exceeds MAX_PARALLEL_AGENTS ({self.valves.MAX_PARALLEL_AGENTS})",
@@ -1904,59 +1994,12 @@ RESPONSE REQUIREMENTS:
                 ensure_ascii=False,
             )
 
-        validated_tasks = []
-        for i, task in enumerate(tasks):
-            # Fallback: parse JSON strings (some LLMs pass stringified objects
-            # when the schema advertises items as strings).
-            if isinstance(task, str):
-                try:
-                    task = json.loads(task)
-                except (json.JSONDecodeError, TypeError):
-                    return json.dumps(
-                        {"error": f"tasks[{i}] must be an object, got unparseable string"},
-                        ensure_ascii=False,
-                    )
-            if not isinstance(task, dict):
-                return json.dumps(
-                    {"error": f"tasks[{i}] must be an object"},
-                    ensure_ascii=False,
-                )
-            if "description" not in task:
-                return json.dumps(
-                    {"error": f"tasks[{i}] missing 'description' field"},
-                    ensure_ascii=False,
-                )
-            if "prompt" not in task:
-                return json.dumps(
-                    {"error": f"tasks[{i}] missing 'prompt' field"},
-                    ensure_ascii=False,
-                )
-            if not isinstance(task.get("description"), str):
-                return json.dumps(
-                    {"error": f"tasks[{i}].description must be a string"},
-                    ensure_ascii=False,
-                )
-            if not isinstance(task.get("prompt"), str):
-                return json.dumps(
-                    {"error": f"tasks[{i}].prompt must be a string"},
-                    ensure_ascii=False,
-                )
+        validated_tasks, tasks_error = normalize_parallel_sub_agent_tasks(tasks)
+        if tasks_error is not None:
+            return tasks_error
 
-            description = task.get("description", "").strip()
-            prompt = task.get("prompt", "").strip()
-
-            if not description:
-                return json.dumps(
-                    {"error": f"tasks[{i}].description cannot be empty"},
-                    ensure_ascii=False,
-                )
-            if not prompt:
-                return json.dumps(
-                    {"error": f"tasks[{i}].prompt cannot be empty"},
-                    ensure_ascii=False,
-                )
-
-            validated_tasks.append({"description": description, "prompt": prompt})
+        if not validated_tasks:
+            return json.dumps({"error": "tasks array is empty"}, ensure_ascii=False)
 
         # Import here to avoid issues when not running in Open WebUI
         from open_webui.models.users import UserModel

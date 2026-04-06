@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.5
+version: 0.2.6
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -1236,11 +1236,10 @@ class Tools:
         """
         Run MAGI decision support with three independent perspectives and majority vote.
 
-        Args:
-            proposition: The decision question to analyze
-            option_a: First option to evaluate
-            option_b: Second option to evaluate
-            prerequisites: Optional constraints and assumptions for the decision
+        :param proposition: The decision question to analyze.
+        :param option_a: First option to evaluate.
+        :param option_b: Second option to evaluate.
+        :param prerequisites: Optional constraints and assumptions for the decision.
 
         Returns a JSON string with:
         - decision: Majority vote result ("A", "B", "tie", or "no_decision")

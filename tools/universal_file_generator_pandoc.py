@@ -1,7 +1,7 @@
 """
 title: Universal File Generator (Pandoc Edition)
 author: Skyzi000 & Claude
-version: 0.20.4-pandoc
+version: 0.20.5-pandoc
 requirements: fastapi, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool using Pandoc for superior document conversion.
@@ -1015,23 +1015,25 @@ class Tools:
         """
         Generate a file of specified type from provided data using Pandoc for superior document conversion
         Uploads all files to a cloud service and returns download link
+
+        Expected data formats by file type:
+        **IMPORTANT: For DOCX and PDF, data should be STRING format (HTML/Markdown/text), NOT JSON/Dict objects**
+        - Any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, ini, conf, log, etc.): str (pre-formatted text content)
+        - DOCX: str (HTML, Markdown, or plain text - auto-detected) - Pandoc powered with native SVG support
+        - PDF: str (HTML, Markdown, or plain text - auto-detected) - Pandoc powered with XeLaTeX and Japanese fonts
+        - XLSX: Flexible format support:
+            * List[Dict] - list of dictionaries (most common)
+            * List[Dict] with sheet_name/values - multiple sheets: [{"sheet_name": "Sheet1", "values": [[...]]}, ...]
+            * Dict - multiple sheets (keys as sheet names) or single sheet key-value pairs
+            * List[List] - 2D array with first row as headers
+            * Supports nested structures with automatic table extraction
+        - SVG: str (SVG XML content)
+        - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {path, content/url} objects) - Call `list_zip_formats()` for detailed ZIP creation examples.
         
         :param file_type: File extension (e.g., 'csv', 'pdf', 'zip' or '.csv', '.pdf', '.zip') - Must be exact match
-        :param data: Data to convert - expected formats by file type:
-                    **IMPORTANT: For DOCX and PDF, data should be STRING format (HTML/Markdown/text), NOT JSON/Dict objects**
-                    - Any text format (csv, json, xml, txt, html, md, yaml, toml, js, py, sql, ini, conf, log, etc.): str (pre-formatted text content)
-                    - DOCX: str (HTML, Markdown, or plain text - auto-detected) - Pandoc powered with native SVG support
-                    - PDF: str (HTML, Markdown, or plain text - auto-detected) - Pandoc powered with XeLaTeX and Japanese fonts
-                    - XLSX: Flexible format support:
-                        * List[Dict] - list of dictionaries (most common)
-                        * List[Dict] with sheet_name/values - multiple sheets: [{"sheet_name": "Sheet1", "values": [[...]]}, ...]
-                        * Dict - multiple sheets (keys as sheet names) or single sheet key-value pairs
-                        * List[List] - 2D array with first row as headers
-                        * Supports nested structures with automatic table extraction
-                    - SVG: str (SVG XML content)
-                    - ZIP: Dict[str, Any] (filename -> content mapping) OR List[Dict] (list of {path, content/url} objects) - Call `list_zip_formats()` for detailed ZIP creation examples.
-        :param filename: Optional custom filename
-        :param password: Optional password for ZIP encryption (AES encryption via pyzipper)
+        :param data: Data to convert; expected formats by file type are listed above.
+        :param filename: Optional custom filename.
+        :param password: Optional password for ZIP encryption (AES encryption via pyzipper).
         :return: Markdown with download information
         """
         
