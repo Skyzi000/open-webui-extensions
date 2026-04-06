@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.10
+version: 0.1.11
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -27,6 +27,14 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
+
+
+class ToolCallItem(BaseModel):
+    """A single tool call specification."""
+
+    name: str = Field(description="Tool function name to call")
+    args: dict = Field(default_factory=dict, description="Arguments to pass to the tool")
+
 
 _core_process_tool_result = None
 
@@ -508,7 +516,7 @@ class Tools:
 
     async def run_tools_parallel(
         self,
-        tool_calls: list[dict],
+        tool_calls: list[ToolCallItem],
         __user__: dict = None,
         __request__: Request = None,
         __model__: dict = None,
@@ -539,9 +547,7 @@ class Tools:
         - BAD: Use multi_tool_use.parallel → still sequential in Open WebUI
         - GOOD: Call run_tools_parallel with both searches → true parallel execution
 
-        :param tool_calls: MUST be a raw JSON array, NOT a stringified/escaped JSON string.
-                          Each item must have "name" (tool name) and "args" (dict of arguments).
-                          Example: [{"name": "search_web", "args": {"query": "Python"}}, {"name": "search_web", "args": {"query": "FastAPI"}}]
+        :param tool_calls: List of tool calls. Each item has "name" (tool name) and "args" (arguments dict). Example: [{"name": "search_web", "args": {"query": "Python"}}]
         :return: JSON object with results for each tool call
         """
         if __request__ is None:
@@ -550,8 +556,12 @@ class Tools:
         if __user__ is None:
             return json.dumps({"error": "User context not available."})
 
+        # Convert ToolCallItem instances to dicts for uniform processing
         if isinstance(tool_calls, list):
-            calls = tool_calls
+            calls = [
+                c.model_dump() if isinstance(c, ToolCallItem) else c
+                for c in tool_calls
+            ]
         elif isinstance(tool_calls, str):
             try:
                 calls = ast.literal_eval(tool_calls)
