@@ -183,6 +183,24 @@ class Tools:
 - Do NOT document system-injected parameters (`__user__`, `__event_emitter__`,
   etc.) in docstrings—AI cannot pass them, will be confused, and wastes context
 
+#### Docstring and Schema Constraints
+
+Open WebUI's `parse_docstring()` uses a single-line regex
+(`re.compile(r':param (\w+):\s*(.+)')`) to extract `:param` descriptions.
+**Only the first line of each `:param` is captured**; continuation lines are
+silently discarded. This means critical information (field names, format
+examples, usage warnings) on subsequent lines will never reach the LLM.
+
+- **Always write `:param` descriptions as a single line.** If the description
+  is too long, move the details into the method-level docstring (before the
+  first `:param`) which is captured in full.
+- **For `list[dict]` parameters where items have expected keys**, define a
+  Pydantic `BaseModel` subclass outside the `Tools` class and use it as the
+  item type (e.g., `list[MyItem]`). `list[dict]` generates
+  `items: {"type": "object", "additionalProperties": true}` with no
+  `properties`, so the LLM must guess field names from the description alone —
+  which may itself be truncated by the single-line parser above.
+
 #### Input Validation
 
 - Validate inputs defensively. On invalid arguments, never raise exceptions;
