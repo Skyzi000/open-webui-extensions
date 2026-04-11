@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.4.12
+version: 0.5.0
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -496,6 +496,256 @@ def _normalize_user(user: Any) -> Any:
 
             return SimpleNamespace(**user)
     return user
+
+
+async def emit_notification(
+    event_emitter: Optional[Callable],
+    *,
+    level: str,
+    content: str,
+) -> None:
+    """Emit a frontend notification toast when the current chat supports it."""
+    if not callable(event_emitter):
+        return
+    if not isinstance(content, str) or not content.strip():
+        return
+
+    try:
+        await event_emitter(
+            {
+                "type": "notification",
+                "data": {
+                    "type": level,
+                    "content": content.strip(),
+                },
+            }
+        )
+    except Exception as e:
+        log.debug(f"[SubAgent] Error emitting notification ({level}): {e}")
+
+
+async def resolve_mcp_tools(
+    request: Request,
+    user: Any,
+    mcp_tool_ids: list[str],
+    extra_params: dict,
+    metadata: dict,
+    debug: bool = False,
+) -> tuple[dict, dict]:
+    """Resolve MCP ``server:mcp:`` tool IDs into tool callables and live clients."""
+    try:
+        from open_webui.utils.mcp.client import MCPClient
+    except ImportError:
+        if debug and mcp_tool_ids:
+            log.info("[SubAgent] MCPClient unavailable; skipping MCP tool resolution")
+        return {}, {}
+
+    from open_webui.utils.misc import is_string_allowed
+    from open_webui.utils.headers import include_user_info_headers
+    from open_webui.env import ENABLE_FORWARD_USER_INFO_HEADERS
+
+    try:
+        from open_webui.utils.access_control import has_connection_access
+    except ImportError:
+        from open_webui.utils.tools import (
+            has_tool_server_access as has_connection_access,
+        )
+
+    try:
+        from open_webui.env import (
+            FORWARD_SESSION_INFO_HEADER_CHAT_ID,
+            FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
+        )
+    except ImportError:
+        FORWARD_SESSION_INFO_HEADER_CHAT_ID = None
+        FORWARD_SESSION_INFO_HEADER_MESSAGE_ID = None
+
+    async def emit_warning(description: str) -> None:
+        await emit_notification(
+            extra_params.get("__event_emitter__"),
+            level="warning",
+            content=description,
+        )
+
+    metadata = metadata or {}
+    extra_params = extra_params or {}
+    mcp_tools_dict: dict[str, dict] = {}
+    mcp_clients: dict[str, Any] = {}
+    server_connections = (
+        getattr(getattr(request.app.state, "config", None), "TOOL_SERVER_CONNECTIONS", [])
+        or []
+    )
+
+    ordered_server_ids: list[str] = []
+    seen_server_ids: set[str] = set()
+    for tool_id in mcp_tool_ids:
+        if not isinstance(tool_id, str) or not tool_id.startswith("server:mcp:"):
+            continue
+        server_id = tool_id[len("server:mcp:") :].strip()
+        if not server_id:
+            continue
+        if server_id not in seen_server_ids:
+            seen_server_ids.add(server_id)
+            ordered_server_ids.append(server_id)
+
+    for server_id in ordered_server_ids:
+        client = None
+        try:
+            mcp_server_connection = next(
+                (
+                    server_connection
+                    for server_connection in server_connections
+                    if server_connection.get("type", "") == "mcp"
+                    and server_connection.get("info", {}).get("id") == server_id
+                ),
+                None,
+            )
+
+            if not mcp_server_connection:
+                log.warning(f"[SubAgent] MCP server with id {server_id} not found")
+                await emit_warning(f"MCP server '{server_id}' was not found")
+                continue
+
+            if not mcp_server_connection.get("config", {}).get("enable", True):
+                if debug:
+                    log.info(f"[SubAgent] MCP server {server_id} is disabled; skipping")
+                await emit_warning(f"MCP server '{server_id}' is disabled")
+                continue
+
+            try:
+                has_access = has_connection_access(user, mcp_server_connection)
+            except TypeError:
+                has_access = has_connection_access(user, mcp_server_connection, None)
+
+            if not has_access:
+                log.warning(f"[SubAgent] Access denied to MCP server {server_id} for user {user.id}")
+                await emit_warning(f"Access denied to MCP server '{server_id}'")
+                continue
+
+            auth_type = mcp_server_connection.get("auth_type", "")
+            headers: dict[str, Any] = {}
+            if auth_type == "bearer":
+                headers["Authorization"] = f'Bearer {mcp_server_connection.get("key", "")}'
+            elif auth_type == "none":
+                pass
+            elif auth_type == "session":
+                token = getattr(getattr(request.state, "token", None), "credentials", "")
+                headers["Authorization"] = f"Bearer {token}"
+            elif auth_type == "system_oauth":
+                oauth_token = extra_params.get("__oauth_token__", None)
+                if oauth_token:
+                    headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
+            elif auth_type in ("oauth_2.1", "oauth_2.1_static"):
+                try:
+                    oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
+                        user.id, f"mcp:{server_id}"
+                    )
+
+                    if oauth_token:
+                        headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
+                except Exception as e:
+                    log.error(
+                        f"[SubAgent] Error getting OAuth token for MCP server {server_id}: {e}"
+                    )
+
+            connection_headers = mcp_server_connection.get("headers", None)
+            if connection_headers and isinstance(connection_headers, dict):
+                headers.update(connection_headers)
+
+            if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+                headers = include_user_info_headers(headers, user)
+                if FORWARD_SESSION_INFO_HEADER_CHAT_ID and metadata.get("chat_id"):
+                    headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata["chat_id"]
+                if FORWARD_SESSION_INFO_HEADER_MESSAGE_ID and metadata.get("message_id"):
+                    headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID] = metadata["message_id"]
+
+            function_name_filter_list = mcp_server_connection.get("config", {}).get(
+                "function_name_filter_list", ""
+            )
+            if isinstance(function_name_filter_list, str):
+                function_name_filter_list = [
+                    item.strip()
+                    for item in function_name_filter_list.split(",")
+                    if item.strip()
+                ]
+
+            client = MCPClient()
+            client_lock = asyncio.Lock()
+            setattr(client, "_sub_agent_lock", client_lock)
+
+            await client.connect(
+                url=mcp_server_connection.get("url", ""),
+                headers=headers if headers else None,
+            )
+
+            tool_specs = await client.list_tool_specs() or []
+
+            def make_tool_function(
+                mcp_client: Any,
+                function_name: str,
+                lock: asyncio.Lock,
+            ) -> Callable[..., Any]:
+                async def tool_function(**kwargs):
+                    async with lock:
+                        return await mcp_client.call_tool(
+                            function_name,
+                            function_args=kwargs,
+                        )
+
+                return tool_function
+
+            loaded_tool_count = 0
+            for tool_spec in tool_specs:
+                if not isinstance(tool_spec, dict):
+                    continue
+
+                tool_name = tool_spec.get("name")
+                if not isinstance(tool_name, str) or not tool_name:
+                    continue
+
+                if function_name_filter_list and not is_string_allowed(
+                    tool_name, function_name_filter_list
+                ):
+                    continue
+
+                safe_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", server_id)
+                prefixed_name = f"{safe_prefix}_{tool_name}"
+                mcp_tools_dict[prefixed_name] = {
+                    "spec": {
+                        **tool_spec,
+                        "name": prefixed_name,
+                    },
+                    "callable": make_tool_function(client, tool_name, client_lock),
+                    "type": "mcp",
+                    "direct": False,
+                }
+                loaded_tool_count += 1
+
+            mcp_clients[server_id] = client
+
+            if debug:
+                log.info(
+                    f"[SubAgent] Loaded {loaded_tool_count} MCP tools from server {server_id}"
+                )
+        except Exception as e:
+            log.warning(f"[SubAgent] Failed to load MCP tools from {server_id}: {e}")
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            await emit_warning(f"Could not load MCP tools from '{server_id}': {e}")
+
+    return mcp_tools_dict, mcp_clients
+
+
+async def cleanup_mcp_clients(mcp_clients: dict) -> None:
+    """Disconnect all MCP clients, mirroring Open WebUI task cleanup."""
+    for client in reversed(list((mcp_clients or {}).values())):
+        try:
+            await client.disconnect()
+        except Exception as e:
+            log.debug(f"[SubAgent] Error cleaning up MCP client: {e}")
 
 
 def process_tool_result(
@@ -1325,8 +1575,8 @@ async def load_sub_agent_tools(
     model: dict,
     extra_params: dict,
     self_tool_id: Optional[str],
-) -> dict:
-    """Load regular + builtin tools for sub-agent, returns tools_dict."""
+) -> tuple[dict, dict]:
+    """Load regular, MCP, terminal, direct, and builtin tools for sub-agent."""
     from open_webui.utils.tools import get_builtin_tools, get_tools
 
     try:
@@ -1424,17 +1674,26 @@ async def load_sub_agent_tools(
     # They are loaded separately via get_builtin_tools() and controlled by Valves.
     # Regular tools only (filter out any builtin: prefixed IDs just in case)
     regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
+    mcp_tool_ids = [tid for tid in regular_tool_ids if tid.startswith("server:mcp:")]
+    non_mcp_tool_ids = [
+        tid for tid in regular_tool_ids if not tid.startswith("server:mcp:")
+    ]
 
     if valves.DEBUG:
         log.info(f"[SubAgent] Regular tool IDs: {regular_tool_ids}")
+        if mcp_tool_ids:
+            log.info(f"[SubAgent] MCP tool IDs: {mcp_tool_ids}")
+        if non_mcp_tool_ids != regular_tool_ids:
+            log.info(f"[SubAgent] Non-MCP regular tool IDs: {non_mcp_tool_ids}")
 
     # Load regular tools
     tools_dict = {}
-    if regular_tool_ids:
+    mcp_clients: dict[str, Any] = {}
+    if non_mcp_tool_ids:
         try:
             tools_dict = await get_tools(
                 request=request,
-                tool_ids=regular_tool_ids,
+                tool_ids=non_mcp_tool_ids,
                 user=user,
                 extra_params=extra_params,
             )
@@ -1444,16 +1703,40 @@ async def load_sub_agent_tools(
 
         except Exception as e:
             log.exception(f"Error loading tools: {e}")
-            if event_emitter:
-                await event_emitter(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Warning: Could not load tools: {e}",
-                            "done": False,
-                        },
-                    }
-                )
+            await emit_notification(
+                event_emitter,
+                level="warning",
+                content=f"Could not load tools: {e}",
+            )
+
+    if mcp_tool_ids:
+        try:
+            mcp_tools, mcp_clients = await resolve_mcp_tools(
+                request=request,
+                user=user,
+                mcp_tool_ids=mcp_tool_ids,
+                extra_params=extra_params,
+                metadata=metadata,
+                debug=bool(getattr(valves, "DEBUG", False)),
+            )
+
+            if mcp_tools:
+                duplicate_names = set(tools_dict.keys()) & set(mcp_tools.keys())
+                tools_dict.update(mcp_tools)
+                if valves.DEBUG:
+                    if duplicate_names:
+                        log.warning(
+                            "[SubAgent] MCP tools overrode existing tool names: "
+                            f"{sorted(duplicate_names)}"
+                        )
+                    log.info(f"[SubAgent] Loaded {len(mcp_tools)} MCP tools")
+        except Exception as e:
+            log.exception(f"Error loading MCP tools: {e}")
+            await emit_notification(
+                event_emitter,
+                level="warning",
+                content=f"Could not load MCP tools: {e}",
+            )
 
     # Resolve terminal tools (if available in chat metadata)
     if terminal_id and bool(getattr(valves, "ENABLE_TERMINAL_TOOLS", True)):
@@ -1486,16 +1769,11 @@ async def load_sub_agent_tools(
                         )
             except Exception as e:
                 log.exception(f"Error loading terminal tools: {e}")
-                if event_emitter:
-                    await event_emitter(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"Warning: Could not load terminal tools: {e}",
-                                "done": False,
-                            },
-                        }
-                    )
+                await emit_notification(
+                    event_emitter,
+                    level="warning",
+                    content=f"Could not load terminal tools: {e}",
+                )
     elif terminal_id and valves.DEBUG:
         log.info("[SubAgent] Terminal tools disabled by ENABLE_TERMINAL_TOOLS valve")
 
@@ -1526,16 +1804,11 @@ async def load_sub_agent_tools(
         except Exception as e:
             log.exception(f"Error loading direct tools: {e}")
             extra_params.pop("__direct_tool_server_system_prompts__", None)
-            if event_emitter:
-                await event_emitter(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Warning: Could not load direct tools: {e}",
-                            "done": False,
-                        },
-                    }
-                )
+            await emit_notification(
+                event_emitter,
+                level="warning",
+                content=f"Could not load direct tools: {e}",
+            )
     else:
         extra_params.pop("__direct_tool_server_system_prompts__", None)
 
@@ -1607,18 +1880,13 @@ async def load_sub_agent_tools(
 
     except Exception as e:
         log.exception(f"Error loading builtin tools: {e}")
-        if event_emitter:
-            await event_emitter(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Warning: Could not load builtin tools: {e}",
-                        "done": False,
-                    },
-                }
-            )
+        await emit_notification(
+            event_emitter,
+            level="warning",
+            content=f"Could not load builtin tools: {e}",
+        )
 
-    return tools_dict
+    return tools_dict, mcp_clients
 
 
 # ============================================================================
@@ -1862,7 +2130,7 @@ RESPONSE REQUIREMENTS:
             "__files__": __metadata__.get("files", []) if __metadata__ else [],
         }
 
-        tools_dict = await load_sub_agent_tools(
+        tools_dict, mcp_clients = await load_sub_agent_tools(
             request=__request__,
             user=user,
             valves=self.valves,
@@ -1872,73 +2140,76 @@ RESPONSE REQUIREMENTS:
             self_tool_id=__id__,
         )
 
-        # Register view_skill if model-attached skills manifest is available
-        if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
-            register_view_skill(tools_dict, __request__, common_extra_params)
-
-        # Build initial messages with skills context
-        prompt_sections: list[str] = [user_valves.SYSTEM_PROMPT]
-        if self.valves.ENABLE_SKILLS_TOOLS:
-            # User-selected skills: inject full content (v0.8.2+)
-            if user_skill_tags:
-                prompt_sections.extend(user_skill_tags)
-            # Model-attached skills: inject manifest for lazy loading via view_skill
-            if skill_manifest:
-                prompt_sections.append(skill_manifest)
-        system_content = merge_prompt_sections(*prompt_sections)
-
-        messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": prompt},
-        ]
-
-        if __event_emitter__:
-            tool_count = len(tools_dict)
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Sub-agent started with {tool_count} tools available",
-                        "done": False,
-                    },
-                }
-            )
-
-        # Run the sub-agent loop
         try:
-            result = await run_sub_agent_loop(
-                request=__request__,
-                user=user,
-                model_id=model_id,
-                messages=messages,
-                tools_dict=tools_dict,
-                max_iterations=self.valves.MAX_ITERATIONS,
-                event_emitter=__event_emitter__,
-                extra_params=common_extra_params,
-                apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
-            )
-        except Exception as e:
-            log.exception(f"Error in sub-agent execution: {e}")
-            result = f"Sub-agent error: {e}"
+            # Register view_skill if model-attached skills manifest is available
+            if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
+                register_view_skill(tools_dict, __request__, common_extra_params)
 
-        if __event_emitter__:
-            await __event_emitter__(
+            # Build initial messages with skills context
+            prompt_sections: list[str] = [user_valves.SYSTEM_PROMPT]
+            if self.valves.ENABLE_SKILLS_TOOLS:
+                # User-selected skills: inject full content (v0.8.2+)
+                if user_skill_tags:
+                    prompt_sections.extend(user_skill_tags)
+                # Model-attached skills: inject manifest for lazy loading via view_skill
+                if skill_manifest:
+                    prompt_sections.append(skill_manifest)
+            system_content = merge_prompt_sections(*prompt_sections)
+
+            messages = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": prompt},
+            ]
+
+            if __event_emitter__:
+                tool_count = len(tools_dict)
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Sub-agent started with {tool_count} tools available",
+                            "done": False,
+                        },
+                    }
+                )
+
+            # Run the sub-agent loop
+            try:
+                result = await run_sub_agent_loop(
+                    request=__request__,
+                    user=user,
+                    model_id=model_id,
+                    messages=messages,
+                    tools_dict=tools_dict,
+                    max_iterations=self.valves.MAX_ITERATIONS,
+                    event_emitter=__event_emitter__,
+                    extra_params=common_extra_params,
+                    apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                )
+            except Exception as e:
+                log.exception(f"Error in sub-agent execution: {e}")
+                result = f"Sub-agent error: {e}"
+
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Sub-agent completed: {description}",
+                            "done": True,
+                        },
+                    }
+                )
+
+            return json.dumps(
                 {
-                    "type": "status",
-                    "data": {
-                        "description": f"Sub-agent completed: {description}",
-                        "done": True,
-                    },
-                }
+                    "note": "The user does NOT see this result directly - only you (the main agent) can see it.",
+                    "result": result,
+                },
+                ensure_ascii=False,
             )
-
-        return json.dumps(
-            {
-                "note": "The user does NOT see this result directly - only you (the main agent) can see it.",
-                "result": result,
-            },
-            ensure_ascii=False,
-        )
+        finally:
+            await cleanup_mcp_clients(mcp_clients)
 
     async def run_parallel_sub_agents(
         self,
@@ -2068,7 +2339,7 @@ RESPONSE REQUIREMENTS:
         # __event_emitter__ per invocation via get_updated_tool_function.
         # Caveat: tools that store __event_emitter__ on `self` (non-standard
         # pattern) could see cross-task interference.
-        tools_dict = await load_sub_agent_tools(
+        tools_dict, mcp_clients = await load_sub_agent_tools(
             request=__request__,
             user=user,
             valves=self.valves,
@@ -2078,117 +2349,122 @@ RESPONSE REQUIREMENTS:
             self_tool_id=__id__,
         )
 
-        # Register view_skill if model-attached skills manifest is available
-        if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
-            register_view_skill(tools_dict, __request__, common_extra_params)
+        try:
+            # Register view_skill if model-attached skills manifest is available
+            if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
+                register_view_skill(tools_dict, __request__, common_extra_params)
 
-        # Build system content with skills context
-        parallel_prompt_sections: list[str] = [user_valves.SYSTEM_PROMPT]
-        if self.valves.ENABLE_SKILLS_TOOLS:
-            if user_skill_tags:
-                parallel_prompt_sections.extend(user_skill_tags)
-            if skill_manifest:
-                parallel_prompt_sections.append(skill_manifest)
-        parallel_system_content = merge_prompt_sections(*parallel_prompt_sections)
-
-        if __event_emitter__:
+            # Build system content with skills context
+            parallel_prompt_sections: list[str] = [user_valves.SYSTEM_PROMPT]
+            if self.valves.ENABLE_SKILLS_TOOLS:
+                if user_skill_tags:
+                    parallel_prompt_sections.extend(user_skill_tags)
+                if skill_manifest:
+                    parallel_prompt_sections.append(skill_manifest)
+            parallel_system_content = merge_prompt_sections(*parallel_prompt_sections)
             task_mapping = ", ".join(
                 f"[{i + 1}] {task['description']}" for i, task in enumerate(validated_tasks)
             )
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Running {len(validated_tasks)} sub-agents: {task_mapping}",
-                        "done": False,
-                    },
-                }
-            )
 
-        async def run_single_task(task_index: int, task: dict) -> dict:
-            task_description = task["description"]
-            task_prompt = task["prompt"]
-
-            async def indexed_event_emitter(event: dict):
-                if not __event_emitter__:
-                    return
-
-                if (
-                    isinstance(event, dict)
-                    and event.get("type") == "status"
-                    and isinstance(event.get("data"), dict)
-                ):
-                    prefixed_data = dict(event["data"])
-                    original_description = prefixed_data.get("description", "")
-                    if original_description:
-                        prefixed_data["description"] = (
-                            f"[{task_index}] {original_description}"
-                        )
-                    await __event_emitter__({"type": "status", "data": prefixed_data})
-                    return
-
-                await __event_emitter__(event)
-
-            try:
-                result = await run_sub_agent_loop(
-                    request=__request__,
-                    user=user,
-                    model_id=model_id,
-                    messages=[
-                        {"role": "system", "content": parallel_system_content},
-                        {"role": "user", "content": task_prompt},
-                    ],
-                    tools_dict=tools_dict,
-                    max_iterations=self.valves.MAX_ITERATIONS,
-                    event_emitter=indexed_event_emitter if __event_emitter__ else None,
-                    extra_params={
-                        **common_extra_params,
-                        "__event_emitter__": indexed_event_emitter
-                        if __event_emitter__
-                        else None,
-                    },
-                    apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
-                )
-                return {"description": task_description, "result": result}
-            except Exception as e:
-                log.exception(
-                    f"Error in parallel sub-agent [{task_index}] {task_description}: {e}"
-                )
-                error_msg = str(e) or type(e).__name__
-                return {"description": task_description, "error": error_msg}
-
-        task_coroutines = [
-            run_single_task(i + 1, task) for i, task in enumerate(validated_tasks)
-        ]
-        gathered_results = await asyncio.gather(*task_coroutines, return_exceptions=True)
-
-        processed_results = []
-        for i, result in enumerate(gathered_results):
-            if isinstance(result, BaseException):
-                processed_results.append(
+            if __event_emitter__:
+                await __event_emitter__(
                     {
-                        "description": validated_tasks[i]["description"],
-                        "error": str(result) or type(result).__name__,
+                        "type": "status",
+                        "data": {
+                            "description": f"Running {len(validated_tasks)} sub-agents: {task_mapping}",
+                            "done": False,
+                        },
                     }
                 )
-            else:
-                processed_results.append(result)
 
-        if __event_emitter__:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Sub-agents completed: {task_mapping}",
-                        "done": True,
-                    },
-                }
+            async def run_single_task(task_index: int, task: dict) -> dict:
+                task_description = task["description"]
+                task_prompt = task["prompt"]
+
+                async def indexed_event_emitter(event: dict):
+                    if not __event_emitter__:
+                        return
+
+                    if (
+                        isinstance(event, dict)
+                        and event.get("type") == "status"
+                        and isinstance(event.get("data"), dict)
+                    ):
+                        prefixed_data = dict(event["data"])
+                        original_description = prefixed_data.get("description", "")
+                        if original_description:
+                            prefixed_data["description"] = (
+                                f"[{task_index}] {original_description}"
+                            )
+                        await __event_emitter__({"type": "status", "data": prefixed_data})
+                        return
+
+                    await __event_emitter__(event)
+
+                try:
+                    result = await run_sub_agent_loop(
+                        request=__request__,
+                        user=user,
+                        model_id=model_id,
+                        messages=[
+                            {"role": "system", "content": parallel_system_content},
+                            {"role": "user", "content": task_prompt},
+                        ],
+                        tools_dict=tools_dict,
+                        max_iterations=self.valves.MAX_ITERATIONS,
+                        event_emitter=indexed_event_emitter if __event_emitter__ else None,
+                        extra_params={
+                            **common_extra_params,
+                            "__event_emitter__": indexed_event_emitter
+                            if __event_emitter__
+                            else None,
+                        },
+                        apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                    )
+                    return {"description": task_description, "result": result}
+                except Exception as e:
+                    log.exception(
+                        f"Error in parallel sub-agent [{task_index}] {task_description}: {e}"
+                    )
+                    error_msg = str(e) or type(e).__name__
+                    return {"description": task_description, "error": error_msg}
+
+            task_coroutines = [
+                run_single_task(i + 1, task) for i, task in enumerate(validated_tasks)
+            ]
+            gathered_results = await asyncio.gather(
+                *task_coroutines, return_exceptions=True
             )
 
-        return json.dumps(
-            {
-                "note": "The user does NOT see this result directly - only you (the main agent) can see it.",
-                "results": processed_results,
-            },
-            ensure_ascii=False,
-        )
+            processed_results = []
+            for i, result in enumerate(gathered_results):
+                if isinstance(result, BaseException):
+                    processed_results.append(
+                        {
+                            "description": validated_tasks[i]["description"],
+                            "error": str(result) or type(result).__name__,
+                        }
+                    )
+                else:
+                    processed_results.append(result)
+
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Sub-agents completed: {task_mapping}",
+                            "done": True,
+                        },
+                    }
+                )
+
+            return json.dumps(
+                {
+                    "note": "The user does NOT see this result directly - only you (the main agent) can see it.",
+                    "results": processed_results,
+                },
+                ensure_ascii=False,
+            )
+        finally:
+            await cleanup_mcp_clients(mcp_clients)

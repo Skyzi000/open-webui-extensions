@@ -149,7 +149,7 @@ async def test_sub_agent_load_tools_includes_terminal_tools(monkeypatch, dummy_r
     valves.ENABLE_TERMINAL_TOOLS = True
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-1"}
-    tools_dict = await sub_agent.load_sub_agent_tools(
+    tools_dict, _ = await sub_agent.load_sub_agent_tools(
         request=dummy_request,
         user=SimpleNamespace(id="u1"),
         valves=valves,
@@ -190,7 +190,7 @@ async def test_sub_agent_load_tools_without_terminal_symbol_keeps_builtin(
     valves.ENABLE_TERMINAL_TOOLS = True
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-compat"}
-    tools_dict = await sub_agent.load_sub_agent_tools(
+    tools_dict, _ = await sub_agent.load_sub_agent_tools(
         request=dummy_request,
         user=SimpleNamespace(id="u1"),
         valves=valves,
@@ -202,6 +202,147 @@ async def test_sub_agent_load_tools_without_terminal_symbol_keeps_builtin(
 
     assert "search_web" in tools_dict
     assert tools_dict["search_web"]["type"] == "builtin"
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_load_tools_returns_tools_and_mcp_clients(monkeypatch, dummy_request):
+    import open_webui.utils.tools as ow_tools
+
+    async def fake_get_tools(request, tool_ids, user, extra_params):
+        return {}
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {}
+
+    async def fake_get_terminal_tools(request, terminal_id, user, extra_params):
+        return {}
+
+    monkeypatch.setattr(ow_tools, "get_tools", fake_get_tools)
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+    monkeypatch.setattr(ow_tools, "get_terminal_tools", fake_get_terminal_tools)
+
+    valves = sub_agent.Tools().valves
+    metadata = {"tool_ids": [], "features": {}}
+    tools_dict, mcp_clients = await sub_agent.load_sub_agent_tools(
+        request=dummy_request,
+        user=SimpleNamespace(id="u1"),
+        valves=valves,
+        metadata=metadata,
+        model={},
+        extra_params={"__metadata__": metadata},
+        self_tool_id=None,
+    )
+
+    assert isinstance(tools_dict, dict)
+    assert mcp_clients == {}
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_resolve_mcp_tools_supports_oauth_2_1_static(monkeypatch):
+    from types import ModuleType
+
+    import open_webui
+    import open_webui.env as ow_env
+    import open_webui.utils.tools as ow_tools
+
+    oauth_calls = []
+    connected_headers = []
+
+    class FakeOAuthClientManager:
+        async def get_oauth_token(self, user_id, client_id):
+            oauth_calls.append((user_id, client_id))
+            return {"access_token": "static-token"}
+
+    class FakeMCPClient:
+        async def connect(self, url: str, headers=None):
+            connected_headers.append({"url": url, "headers": headers})
+
+        async def list_tool_specs(self):
+            return [
+                {
+                    "name": "lookup_docs",
+                    "description": "Lookup docs",
+                    "parameters": {"properties": {}},
+                }
+            ]
+
+        async def disconnect(self):
+            return None
+
+    _always_allow = lambda user, connection, user_group_ids=None: True
+    monkeypatch.setattr(
+        ow_tools,
+        "has_tool_server_access",
+        _always_allow,
+        raising=False,
+    )
+    try:
+        import open_webui.utils.access_control as ow_ac
+        monkeypatch.setattr(ow_ac, "has_connection_access", _always_allow, raising=False)
+    except ImportError:
+        pass
+    monkeypatch.setattr(ow_env, "ENABLE_FORWARD_USER_INFO_HEADERS", False, raising=False)
+
+    utils_package = open_webui.utils
+    fake_misc_module = ModuleType("open_webui.utils.misc")
+    fake_misc_module.is_string_allowed = lambda value, allowlist: True
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", fake_misc_module)
+    monkeypatch.setattr(utils_package, "misc", fake_misc_module, raising=False)
+
+    fake_headers_module = ModuleType("open_webui.utils.headers")
+    fake_headers_module.include_user_info_headers = lambda headers, user: headers
+    monkeypatch.setitem(sys.modules, "open_webui.utils.headers", fake_headers_module)
+    monkeypatch.setattr(utils_package, "headers", fake_headers_module, raising=False)
+
+    fake_mcp_package = ModuleType("open_webui.utils.mcp")
+    fake_mcp_client_module = ModuleType("open_webui.utils.mcp.client")
+    fake_mcp_client_module.MCPClient = FakeMCPClient
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp", fake_mcp_package)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp.client", fake_mcp_client_module)
+    monkeypatch.setattr(utils_package, "mcp", fake_mcp_package, raising=False)
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                config=SimpleNamespace(
+                    TOOL_SERVER_CONNECTIONS=[
+                        {
+                            "type": "mcp",
+                            "url": "https://mcp.example.com",
+                            "auth_type": "oauth_2.1_static",
+                            "headers": {"X-Test": "1"},
+                            "config": {"enable": True},
+                            "info": {"id": "suite:ctx7"},
+                        }
+                    ],
+                ),
+                oauth_client_manager=FakeOAuthClientManager(),
+            )
+        )
+    )
+
+    tools_dict, mcp_clients = await sub_agent.resolve_mcp_tools(
+        request=request,
+        user=SimpleNamespace(id="u1", role="user"),
+        mcp_tool_ids=["server:mcp:suite:ctx7"],
+        extra_params={},
+        metadata={},
+        debug=False,
+    )
+
+    assert oauth_calls == [("u1", "mcp:suite:ctx7")]
+    assert connected_headers == [
+        {
+            "url": "https://mcp.example.com",
+            "headers": {
+                "Authorization": "Bearer static-token",
+                "X-Test": "1",
+            },
+        }
+    ]
+    assert "suite_ctx7_lookup_docs" in tools_dict
+    assert isinstance(mcp_clients, dict)
+    assert "suite:ctx7" in mcp_clients
 
 
 @pytest.mark.asyncio
@@ -232,7 +373,7 @@ async def test_sub_agent_terminal_error_does_not_skip_builtin(monkeypatch, dummy
     valves.ENABLE_TERMINAL_TOOLS = True
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-fail"}
-    tools_dict = await sub_agent.load_sub_agent_tools(
+    tools_dict, _ = await sub_agent.load_sub_agent_tools(
         request=dummy_request,
         user=SimpleNamespace(id="u1"),
         valves=valves,
@@ -283,7 +424,7 @@ async def test_sub_agent_uses_request_body_terminal_id_when_metadata_missing(
     valves.ENABLE_TERMINAL_TOOLS = True
 
     metadata = {"tool_ids": [], "features": {}}
-    tools_dict = await sub_agent.load_sub_agent_tools(
+    tools_dict, _ = await sub_agent.load_sub_agent_tools(
         request=dummy_request,
         user=SimpleNamespace(id="u1"),
         valves=valves,
@@ -334,7 +475,7 @@ async def test_sub_agent_prefers_request_terminal_id_over_metadata(
     valves.ENABLE_TERMINAL_TOOLS = True
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-metadata"}
-    tools_dict = await sub_agent.load_sub_agent_tools(
+    tools_dict, _ = await sub_agent.load_sub_agent_tools(
         request=dummy_request,
         user=SimpleNamespace(id="u1"),
         valves=valves,
@@ -389,7 +530,7 @@ async def test_sub_agent_uses_request_body_terminal_id_before_json(
     valves.ENABLE_TERMINAL_TOOLS = True
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-metadata"}
-    tools_dict = await sub_agent.load_sub_agent_tools(
+    tools_dict, _ = await sub_agent.load_sub_agent_tools(
         request=dummy_request,
         user=SimpleNamespace(id="u1"),
         valves=valves,
@@ -438,7 +579,7 @@ async def test_sub_agent_propagates_resolved_terminal_id_to_extra_metadata(
 
     metadata = {"tool_ids": [], "features": {}}
     extra_params = {"__metadata__": metadata}
-    await sub_agent.load_sub_agent_tools(
+    _, _ = await sub_agent.load_sub_agent_tools(
         request=dummy_request,
         user=SimpleNamespace(id="u1"),
         valves=valves,
@@ -1074,7 +1215,7 @@ async def test_sub_agent_load_tools_includes_direct_tool_servers(monkeypatch, du
             }
         ],
     }
-    tools_dict = await sub_agent.load_sub_agent_tools(
+    tools_dict, _ = await sub_agent.load_sub_agent_tools(
         request=dummy_request,
         user=SimpleNamespace(id="u1"),
         valves=valves,
@@ -1126,7 +1267,7 @@ async def test_sub_agent_load_tools_collects_direct_tool_server_system_prompts(
         ],
     }
     extra_params = {"__metadata__": metadata}
-    await sub_agent.load_sub_agent_tools(
+    _, _ = await sub_agent.load_sub_agent_tools(
         request=dummy_request,
         user=SimpleNamespace(id="u1"),
         valves=valves,
@@ -1165,7 +1306,7 @@ async def test_sub_agent_direct_tool_without_specs_is_not_loaded(monkeypatch, du
         "tool_servers": [{"url": "https://direct-hydrate.example.com"}],
     }
     extra_params = {"__metadata__": metadata}
-    tools_dict = await sub_agent.load_sub_agent_tools(
+    tools_dict, _ = await sub_agent.load_sub_agent_tools(
         request=dummy_request,
         user=SimpleNamespace(id="u1"),
         valves=valves,
