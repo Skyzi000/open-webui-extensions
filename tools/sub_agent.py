@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.4.11
+version: 0.4.12
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -1775,9 +1775,10 @@ RESPONSE REQUIREMENTS:
         you MUST NOT perform it yourself. Delegate to this tool immediately.
         Only handle simple 1-2 tool call tasks yourself. When in doubt, delegate.
 
-        The sub-agent runs in an isolated context with access to the same tools.
-        It executes tools in a loop until completion, returning only the final result
-        to keep the main conversation context clean.
+        The sub-agent runs in a fresh context with NO access to the current
+        conversation history — include all necessary context in the prompt.
+        It has the same tools and executes them in a loop until completion,
+        returning only the final result to keep the main conversation clean.
 
         :param description: Brief task summary shown to the user as status text, and it should be written in the user's language.
         :param prompt: Detailed instructions for the sub-agent; this can be written in any language that best suits the task.
@@ -1959,8 +1960,10 @@ RESPONSE REQUIREMENTS:
 
         Use this instead of calling run_sub_agent multiple times when you have
         2 or more tasks that do NOT depend on each other's results.
-        All tasks share the same model and tools but run in isolated contexts,
-        so they execute simultaneously and finish much faster than sequential calls.
+        All tasks share the same model and tools but each runs in a fresh
+        context with NO access to the conversation history, so include all
+        necessary context in each prompt. They execute simultaneously and
+        finish much faster than sequential calls.
         Craft each prompt as you would for run_sub_agent (role, context,
         specific instructions, expected output format, etc.).
 
