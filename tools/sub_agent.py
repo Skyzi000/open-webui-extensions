@@ -21,12 +21,6 @@ Requirements:
   (Model settings > Advanced Params> Function Calling: native)
 
 Inspired by VS Code's runSubagent functionality, this tool was developed from scratch specifically for Open WebUI to ensure seamless integration and optimal performance.
-
-💡 Since v0.3, this tool natively supports parallel sub-agent execution via
-   run_parallel_sub_agents — no need for "Parallel Tools" anymore!
-   If parallel execution causes issues (e.g., search API rate limits),
-   reduce MAX_PARALLEL_AGENTS in Valves, or comment out the
-   run_parallel_sub_agents method to disable it entirely.
 """
 
 import asyncio
