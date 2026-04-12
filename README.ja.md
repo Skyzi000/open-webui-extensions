@@ -4,7 +4,7 @@
 
 ## 🌟 ハイライト
 
-**[Sub Agent Tool](tools/sub_agent.py)** ([openwebui.com](https://openwebui.com/posts/sub_agent_7bfeb0b7)) - openwebui.com で **Upvote数1位**、ダウンロード数 **1,400+** を達成!（2026/02/08時点）
+**[Sub Agent Tool](tools/sub_agent.py)** ([openwebui.com](https://openwebui.com/posts/sub_agent_7bfeb0b7)) - openwebui.com で **Upvote数1位**、ダウンロード数 **7,500+** を達成！ Open WebUI 公式の [Community Newsletter, January 28th 2026](https://openwebui.com/blog/newsletter-january-28-2026) で "This Week's Most Useful" ツールの1つとして紹介されました。
 
 ツール呼び出しが多いタスクをサブエージェントに委譲し、メインの会話コンテキストをクリーンに保つツールです。Open WebUI v0.7 以降のビルトインツール（Web検索、メモリ、ナレッジベース等）を最大限に活用できます。
 
@@ -14,8 +14,22 @@
 
 <!-- markdownlint-disable-next-line MD028 -->
 
-> [!NOTE]
-> MCPサーバーの直接接続には未対応ですが（[#6](https://github.com/Skyzi000/open-webui-extensions/issues/6)）、[mcpo](https://github.com/open-webui/mcpo)経由（MCPをOpenAPIに変換）であれば問題なく使用できます。
+> [!TIP]
+> v0.4以降、Open WebUI v0.8 で導入されたスキルが自動的にサブエージェントへ伝播されます（実験的機能）。
+
+<!-- markdownlint-disable-next-line MD028 -->
+
+> [!TIP]
+> v0.4.5以降、Open Terminal のツール（Open WebUI v0.8.6+）が自動的にサブエージェントに転送されます。
+
+<!-- markdownlint-disable-next-line MD028 -->
+
+> [!TIP]
+> v0.5以降、Open WebUI に設定済みの MCP サーバーがサブエージェントでも直接利用可能になりました（mcpo 経由不要）（[#6](https://github.com/Skyzi000/open-webui-extensions/issues/6)）。
+
+**[Parallel Tools](tools/parallel_tools.py)** ([openwebui.com](https://openwebui.com/posts/parallel_tools_1d44cfce)) - Open WebUI 公式の [Community Newsletter, March 17th 2026](https://openwebui.com/blog/community-newsletter-march-17th-2026) で "Editor's Picks" ツールの1つとして紹介されました。
+
+複数の独立したツール呼び出しを並列実行して処理を高速化します。
 
 ## Tools
 

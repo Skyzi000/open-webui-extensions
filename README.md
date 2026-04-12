@@ -6,7 +6,7 @@ A collection of tools and filters for Open WebUI.
 
 ## 🌟 Highlights
 
-**[Sub Agent Tool](tools/sub_agent.py)** ([openwebui.com](https://openwebui.com/posts/sub_agent_7bfeb0b7)) - **#1 most upvoted** on openwebui.com with **1,400+ downloads**! (as of 2026/02/08)
+**[Sub Agent Tool](tools/sub_agent.py)** ([openwebui.com](https://openwebui.com/posts/sub_agent_7bfeb0b7)) - **#1 most upvoted** on openwebui.com with **7,500+ downloads**! Featured in Open WebUI's official [Community Newsletter, January 28th 2026](https://openwebui.com/blog/newsletter-january-28-2026) as one of "This Week's Most Useful".
 
 Delegate tool-heavy tasks to sub-agents running in isolated contexts, keeping your main conversation clean and efficient. Fully leverages Open WebUI v0.7+ built-in tools (web search, memory, knowledge bases, etc.).
 
@@ -16,8 +16,22 @@ Delegate tool-heavy tasks to sub-agents running in isolated contexts, keeping yo
 
 <!-- markdownlint-disable-next-line MD028 -->
 
-> [!NOTE]
-> Direct MCP server connections are not supported ([#6](https://github.com/Skyzi000/open-webui-extensions/issues/6)), but MCP tools work fine via [mcpo](https://github.com/open-webui/mcpo) (converts MCP to OpenAPI).
+> [!TIP]
+> Since v0.4, skills introduced in Open WebUI v0.8 are automatically propagated to sub-agents (experimental).
+
+<!-- markdownlint-disable-next-line MD028 -->
+
+> [!TIP]
+> Since v0.4.5, Open Terminal tools (Open WebUI v0.8.6+) are automatically forwarded to sub-agents.
+
+<!-- markdownlint-disable-next-line MD028 -->
+
+> [!TIP]
+> Since v0.5, MCP servers configured in Open WebUI are directly available to sub-agents — no mcpo proxy needed ([#6](https://github.com/Skyzi000/open-webui-extensions/issues/6)).
+
+**[Parallel Tools](tools/parallel_tools.py)** ([openwebui.com](https://openwebui.com/posts/parallel_tools_1d44cfce)) - Featured in Open WebUI's official [Community Newsletter, March 17th 2026](https://openwebui.com/blog/community-newsletter-march-17th-2026) as one of the "Editor's Picks".
+
+Execute multiple independent tool calls in parallel for faster execution.
 
 ## Tools
 
