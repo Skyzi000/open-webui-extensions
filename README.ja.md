@@ -8,24 +8,17 @@
 
 ツール呼び出しが多いタスクをサブエージェントに委譲し、メインの会話コンテキストをクリーンに保つツールです。Open WebUI v0.7 以降のビルトインツール（Web検索、メモリ、ナレッジベース等）を最大限に活用できます。
 
+### What's New
+
+- **v0.5** — Open WebUI に設定済みの MCP サーバーがサブエージェントでも直接利用可能になりました（mcpo 経由不要）（[#6](https://github.com/Skyzi000/open-webui-extensions/issues/6)）
+- **v0.4.5** — Open Terminal のツール（Open WebUI v0.8.6+）が自動的にサブエージェントに転送されます
+- **v0.4** — Open WebUI v0.8 で導入されたスキルが自動的にサブエージェントへ伝播されます（実験的機能）
+- **v0.3** — `run_parallel_sub_agents` によるサブエージェントの並列実行をネイティブサポート
+
+フルチェンジログ: [sub_agent.py のコミット履歴](https://github.com/Skyzi000/open-webui-extensions/commits/main/tools/sub_agent.py)
+
 > [!TIP]
-> v0.3以降、`run_parallel_sub_agents` によるサブエージェントの並列実行をネイティブサポートしています。サブエージェントの並列実行のために「Parallel Tools」を併用する必要はなくなりました。
 > 並列実行で問題が発生する場合（検索APIのレートリミット等）は、Valvesの `MAX_PARALLEL_AGENTS` を下げるか、`run_parallel_sub_agents` メソッドをコメントアウトして無効化してください。
-
-<!-- markdownlint-disable-next-line MD028 -->
-
-> [!TIP]
-> v0.4以降、Open WebUI v0.8 で導入されたスキルが自動的にサブエージェントへ伝播されます（実験的機能）。
-
-<!-- markdownlint-disable-next-line MD028 -->
-
-> [!TIP]
-> v0.4.5以降、Open Terminal のツール（Open WebUI v0.8.6+）が自動的にサブエージェントに転送されます。
-
-<!-- markdownlint-disable-next-line MD028 -->
-
-> [!TIP]
-> v0.5以降、Open WebUI に設定済みの MCP サーバーがサブエージェントでも直接利用可能になりました（mcpo 経由不要）（[#6](https://github.com/Skyzi000/open-webui-extensions/issues/6)）。
 
 **[Parallel Tools](tools/parallel_tools.py)** ([openwebui.com](https://openwebui.com/posts/parallel_tools_1d44cfce)) - Open WebUI 公式の [Community Newsletter, March 17th 2026](https://openwebui.com/blog/community-newsletter-march-17th-2026) で "Editor's Picks" ツールの1つとして紹介されました。
 

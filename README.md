@@ -10,24 +10,17 @@ A collection of tools and filters for Open WebUI.
 
 Delegate tool-heavy tasks to sub-agents running in isolated contexts, keeping your main conversation clean and efficient. Fully leverages Open WebUI v0.7+ built-in tools (web search, memory, knowledge bases, etc.).
 
+### What's New
+
+- **v0.5** — MCP servers configured in Open WebUI are directly available to sub-agents — no mcpo proxy needed ([#6](https://github.com/Skyzi000/open-webui-extensions/issues/6))
+- **v0.4.5** — Open Terminal tools (Open WebUI v0.8.6+) are automatically forwarded to sub-agents
+- **v0.4** — Skills introduced in Open WebUI v0.8 are automatically propagated to sub-agents (experimental)
+- **v0.3** — Native parallel sub-agent execution via `run_parallel_sub_agents`
+
+Full changelog: [commits on sub_agent.py](https://github.com/Skyzi000/open-webui-extensions/commits/main/tools/sub_agent.py)
+
 > [!TIP]
-> Since v0.3, this tool natively supports parallel sub-agent execution via `run_parallel_sub_agents` — no need to use "Parallel Tools" just for running sub-agents in parallel.
 > If parallel execution causes issues (e.g., search API rate limits), reduce `MAX_PARALLEL_AGENTS` in Valves, or comment out the `run_parallel_sub_agents` method to disable it entirely.
-
-<!-- markdownlint-disable-next-line MD028 -->
-
-> [!TIP]
-> Since v0.4, skills introduced in Open WebUI v0.8 are automatically propagated to sub-agents (experimental).
-
-<!-- markdownlint-disable-next-line MD028 -->
-
-> [!TIP]
-> Since v0.4.5, Open Terminal tools (Open WebUI v0.8.6+) are automatically forwarded to sub-agents.
-
-<!-- markdownlint-disable-next-line MD028 -->
-
-> [!TIP]
-> Since v0.5, MCP servers configured in Open WebUI are directly available to sub-agents — no mcpo proxy needed ([#6](https://github.com/Skyzi000/open-webui-extensions/issues/6)).
 
 **[Parallel Tools](tools/parallel_tools.py)** ([openwebui.com](https://openwebui.com/posts/parallel_tools_1d44cfce)) - Featured in Open WebUI's official [Community Newsletter, March 17th 2026](https://openwebui.com/blog/community-newsletter-march-17th-2026) as one of the "Editor's Picks".
 
