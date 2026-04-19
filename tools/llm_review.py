@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation based on arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.2.1
+version: 0.3.0
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -3944,6 +3944,48 @@ def extract_model_ids(models: list[dict]) -> list[str]:
     return ids
 
 
+def resolve_chat_model_id(
+    metadata: Optional[dict], model_dict: Optional[dict]
+) -> str:
+    # Open WebUI injects the lightweight task model into __model__, NOT the
+    # user's chat model. The real chat model lives in __metadata__["model"]["id"].
+    # See sub_agent.py for the same pattern.
+    chat_model_id = ""
+    if metadata:
+        chat_model_id = (metadata.get("model") or {}).get("id", "") or ""
+    if not chat_model_id and model_dict:
+        chat_model_id = model_dict.get("id", "") or ""
+    return chat_model_id
+
+
+def resolve_review_model_ids(
+    valves: Any,
+    models_arg: Optional[str],
+    chat_model_id: str,
+) -> list[str]:
+    default_models = parse_model_ids(getattr(valves, "DEFAULT_MODELS", ""))
+
+    if getattr(valves, "ALLOW_AI_MODEL_SELECTION", False):
+        provided_models = parse_model_ids(models_arg)
+    else:
+        provided_models = []
+
+    if provided_models:
+        model_ids = list(provided_models)
+    elif default_models:
+        model_ids = list(default_models)
+    elif chat_model_id:
+        model_ids = [chat_model_id, chat_model_id, chat_model_id]
+    else:
+        model_ids = []
+
+    if 0 < len(model_ids) < 3 and chat_model_id:
+        while len(model_ids) < 3:
+            model_ids.append(chat_model_id)
+
+    return model_ids[:3]
+
+
 # ============================================================================
 # Tools class
 # ============================================================================
@@ -3953,9 +3995,25 @@ class Tools:
     """LLM Review collaborative writing tool."""
 
     class Valves(BaseModel):
+        ALLOW_AI_MODEL_SELECTION: bool = Field(
+            default=False,
+            description=(
+                "If True, the AI may dynamically choose models via the `models` "
+                "parameter of llm_review. If False (default, safer), the AI's "
+                "`models` argument is silently ignored and the lineup falls back "
+                "to DEFAULT_MODELS or the current chat model."
+            ),
+        )
         DEFAULT_MODELS: str = Field(
             default="",
-            description="Comma-separated default model IDs (3 expected for LLM Review). If empty, models must be provided in the call.",
+            description=(
+                "Comma-separated default model IDs (1-3 entries). If fewer than 3 "
+                "are provided, the remaining slots are padded with the current "
+                "chat model. If empty, the current chat model is used for all 3 "
+                "slots. Always honored regardless of ALLOW_AI_MODEL_SELECTION; "
+                "only consulted when the AI did not (or was not allowed to) "
+                "specify models."
+            ),
         )
         MAX_ITERATIONS: int = Field(
             default=10,
@@ -4213,14 +4271,17 @@ CRITICAL RULES:
         query: str = "",
         __user__: Optional[dict] = None,
         __request__: Optional[Request] = None,
+        __metadata__: Optional[dict] = None,
+        __model__: Optional[dict] = None,
     ) -> str:
         """
-        List model IDs available to the current user.
+        List model IDs available to the current user. Call this only when you need to know which model IDs can be specified.
 
-        :param query: Optional search string to filter models by ID or name; examples include "gpt", "claude", "gemini", and "ollama", and an empty string returns all available models.
+        :param query: Optional case-insensitive substring to filter model IDs/names; pass an empty string for all.
 
-        Returns a JSON string:
-        {"models": ["id1", "id2", ...]}
+        Returns a JSON string. The shape varies with operator configuration:
+        - {"models": ["id1", "id2", ...]} when free model selection is enabled
+        - {"message": "...", "models_that_will_be_used": [...]} when the operator has locked the model lineup
         """
         if __request__ is None:
             return json.dumps(
@@ -4243,6 +4304,28 @@ CRITICAL RULES:
         from open_webui.models.users import UserModel
 
         user = UserModel(**__user__)
+
+        if not getattr(self.valves, "ALLOW_AI_MODEL_SELECTION", False):
+            chat_model_id = resolve_chat_model_id(__metadata__, __model__)
+            locked_ids = resolve_review_model_ids(
+                self.valves, models_arg=None, chat_model_id=chat_model_id
+            )
+            payload: dict[str, Any] = {
+                "message": (
+                    "Model selection is locked by the operator. llm_review will "
+                    "run with the models below regardless of any `models` "
+                    "argument."
+                ),
+                "models_that_will_be_used": locked_ids,
+            }
+            if not locked_ids:
+                payload["message"] = (
+                    "Model selection is locked by the operator and no fallback "
+                    "model is available (DEFAULT_MODELS is empty and the chat "
+                    "model could not be detected). llm_review will fail until "
+                    "the operator sets DEFAULT_MODELS."
+                )
+            return json.dumps(payload, ensure_ascii=False)
 
         try:
             models = await get_available_models(__request__, user)
@@ -4300,7 +4383,7 @@ CRITICAL RULES:
 
         :param topic: The writing topic or prompt (required).
         :param requirements: Optional specific requirements, constraints, length targets, or style notes.
-        :param models: Optional comma-separated model ID list; exactly 3 IDs are required (use list_models() to discover). If omitted or empty, DEFAULT_MODELS (Valves) is used; example "gpt-5.2, claude-4-5-sonnet, gemini-2.5-pro".
+        :param models: Optional comma-separated 3 model IDs; honored only when the operator enabled AI model selection in Valves, otherwise silently ignored — DEFAULT_MODELS or the current chat model is used instead.
         :param personas: Optional list of exactly 3 persona objects, each with `name` and `description` fields; if omitted or fewer than 3 valid entries are provided, default personas (Analytical Thinker, Creative Visionary, Practical Strategist) are used.
 
         Returns a JSON string with:
@@ -4426,11 +4509,15 @@ CRITICAL RULES:
                     valve_defaults.append(dict(fallback))
             agent_personas = valve_defaults
 
-        # Resolve model IDs
-        provided_models = parse_model_ids(models)
-        default_models = parse_model_ids(self.valves.DEFAULT_MODELS)
+        # Resolve model IDs.
+        # Priority: AI-provided `models` (only if ALLOW_AI_MODEL_SELECTION) >
+        # DEFAULT_MODELS valve > current chat model × 3. Sub-3 lists are padded
+        # with the chat model. See resolve_review_model_ids() for the helper.
+        chat_model_id = resolve_chat_model_id(__metadata__, __model__)
+        model_ids = resolve_review_model_ids(
+            self.valves, models_arg=models, chat_model_id=chat_model_id
+        )
 
-        model_ids = provided_models or default_models
         if len(model_ids) < 3:
             try:
                 available_models = await get_available_models(__request__, user)
@@ -4440,16 +4527,17 @@ CRITICAL RULES:
 
             return json.dumps(
                 {
-                    "error": "Exactly 3 model IDs are required for LLM Review.",
+                    "error": "Cannot determine 3 models for LLM Review.",
                     "provided_models": model_ids,
                     "available_models": available_ids,
-                    "action": "Provide exactly 3 model IDs in the models parameter (or DEFAULT_MODELS valve).",
+                    "action": (
+                        "Set DEFAULT_MODELS in Valves (1-3 IDs; <3 will be "
+                        "padded with the current chat model), or enable "
+                        "ALLOW_AI_MODEL_SELECTION and pass `models` explicitly."
+                    ),
                 },
                 ensure_ascii=False,
             )
-
-        # Use exactly 3 model slots.
-        model_ids = model_ids[:3]
 
         # Validate model IDs
         try:
@@ -4468,12 +4556,20 @@ CRITICAL RULES:
 
         unknown_ids = [mid for mid in model_ids if mid not in available_ids]
         if unknown_ids:
+            if getattr(self.valves, "ALLOW_AI_MODEL_SELECTION", False):
+                action = "Pick model IDs from available_models or call list_models()."
+            else:
+                action = (
+                    "Operator-configured DEFAULT_MODELS contains unknown IDs (or "
+                    "the current chat model is unavailable). Ask the user to fix "
+                    "DEFAULT_MODELS in the Valves UI."
+                )
             return json.dumps(
                 {
                     "error": "Unknown model IDs.",
                     "unknown_models": unknown_ids,
                     "available_models": sorted(list(available_ids)),
-                    "action": "Pick model IDs from available_models or call list_models().",
+                    "action": action,
                 },
                 ensure_ascii=False,
             )
