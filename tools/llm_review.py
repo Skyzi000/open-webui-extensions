@@ -1,8 +1,8 @@
 """
 title: LLM Review
-description: Run an LLM Review collaborative writing process where multiple agents with distinct personas independently draft, cross-review, and revise their work over multiple rounds. Inspired by arXiv:2601.08003 "LLM Review".
+description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation based on arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.2.0
+version: 0.2.1
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -220,6 +220,31 @@ def _safe_script_json(obj: Any) -> str:
         .replace("\u2028", "\\u2028")
         .replace("\u2029", "\\u2029")
     )
+
+
+def _is_rich_shell_embed(embed: Any, marker: str) -> bool:
+    """True when ``embed`` is the rich progress shell identified by ``marker``.
+
+    The shell is always a string containing the run-scoped HTML comment
+    marker; anything else (other tool-produced embeds, dict-shaped
+    payloads, etc.) is treated as non-shell and eligible for preservation.
+    """
+    return isinstance(embed, str) and marker in embed
+
+
+def _embed_dedupe_key(embed: Any) -> str:
+    """Stable string key for deduping ``embed`` across wrapper observations.
+
+    Strings key off their content. Dict/list-shaped embeds go through
+    ``json.dumps(sort_keys=True)``; if that fails we fall back to
+    ``repr`` so dedup never blows up on an exotic payload.
+    """
+    if isinstance(embed, str):
+        return "s:" + embed
+    try:
+        return "j:" + json.dumps(embed, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        return "r:" + repr(embed)
 
 
 def _render_shell_html(
@@ -1342,6 +1367,7 @@ class EventEmitter:
         *,
         enabled: bool = False,
         message_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
         render_markdown: bool = True,
         force_theme: str = "auto",
     ) -> None:
@@ -1361,11 +1387,20 @@ class EventEmitter:
         ft = str(force_theme or "auto").strip().lower()
         self._force_theme = ft if ft in ("auto", "light", "dark") else "auto"
         self._message_id = message_id
+        self._chat_id = chat_id
         self.tag = f"owui-{uuid.uuid4().hex[:8]}"
         self._shell_marker = f"<!--llm-review-shell:{self.tag}-->"
         self._shell_html: Optional[str] = None
         self._rich_initialized = False
         self._finalized = False
+        # Downstream tools (web search previews, citations, etc.) may emit
+        # their own `embeds` events while we're running. The frontend replaces
+        # message.embeds on every embed event, so after we emit our final
+        # summary those peer embeds would vanish from the live view even
+        # though they're safe in DB. Track the non-shell ones here so
+        # finalize() can re-append them via a live-only correction event.
+        self._preserved_embeds: list = []
+        self._preserved_embed_keys: set = set()
         self._total_steps = 1
         self._state: dict = {
             "phase": "",
@@ -1390,24 +1425,50 @@ class EventEmitter:
         self, raw: Callable[[dict], Any]
     ) -> Callable[[dict], Any]:
         async def wrapped(event: dict) -> None:
+            event_type = event.get("type") if isinstance(event, dict) else None
             if (
-                isinstance(event, dict)
-                and event.get("type") == "embeds"
+                event_type in ("embeds", "chat:message:embeds")
                 and self._rich_initialized
                 and not self._finalized
                 and self._shell_html is not None
             ):
                 data = event.get("data") or {}
                 embeds = list(data.get("embeds") or [])
-                # Only prepend shell if some downstream producer emitted an
-                # embeds event that doesn't already contain our shell. Our
-                # own emissions from init_rich/finalize bypass this wrapper
-                # (they go through _raw_emitter directly).
+                # Preservation: only track embeds carried by persisted
+                # ``type: "embeds"`` events. The tracker exists solely
+                # to compensate for a side-effect of the DB persist
+                # path — every ``type: "embeds"`` event both writes to
+                # DB (via backend ``extend``) and replaces ``message
+                # .embeds`` in the live view; our finalize live-fix
+                # re-issues those so the live view matches DB again.
+                # ``chat:message:embeds`` doesn't touch DB, so we have
+                # no DB/live mismatch to correct for there. Whatever a
+                # downstream tool chose to render via that channel is
+                # its own live-only lifecycle decision — re-issuing
+                # such embeds in our finalize payload would override
+                # that decision and could show content that the tool
+                # never intended to persist past its own next update.
+                if event_type == "embeds":
+                    for e in embeds:
+                        if _is_rich_shell_embed(e, self._shell_marker):
+                            continue
+                        key = _embed_dedupe_key(e)
+                        if key in self._preserved_embed_keys:
+                            continue
+                        self._preserved_embed_keys.add(key)
+                        self._preserved_embeds.append(e)
+                # Prepend shell to any embed-carrying event (persisted or
+                # live-only) that doesn't already include it — otherwise
+                # the frontend's ``message.embeds = data.embeds`` replace
+                # would kick our progress shell out of the live view
+                # whenever a downstream tool refreshes its own embeds.
+                # Our own init_rich/finalize emissions bypass this
+                # wrapper (via _raw_emitter) so they aren't affected.
                 if not any(
-                    isinstance(e, str) and self._shell_marker in e for e in embeds
+                    _is_rich_shell_embed(e, self._shell_marker) for e in embeds
                 ):
                     event = {
-                        "type": "embeds",
+                        "type": event_type,
                         "data": {"embeds": [self._shell_html] + embeds},
                     }
             await raw(event)
@@ -1453,12 +1514,66 @@ class EventEmitter:
             force_theme=self._force_theme,
         )
         assert self._raw_emitter is not None
+        # Before we fire the shell, snapshot any embeds that earlier
+        # tools in this same assistant turn already persisted. The
+        # incoming `type:"embeds"` shell event will replace
+        # message.embeds in the live view (backend still keeps them via
+        # extend, so reload is fine), and since those embeds were
+        # emitted before our wrapper existed we wouldn't otherwise know
+        # they're there. Seeding them into _preserved_embeds lets
+        # finalize() rebuild a correct live view, and the follow-up
+        # live-fix below keeps them visible during the whole run.
+        pre_existing: list = []
+        if self._chat_id and self._message_id:
+            try:
+                from open_webui.models.chats import Chats
+
+                msg = Chats.get_message_by_id_and_message_id(
+                    self._chat_id, self._message_id
+                )
+                existing = list((msg or {}).get("embeds") or [])
+                for e in existing:
+                    # Skip BOTH the current run's shell (defensive; shouldn't
+                    # appear yet) and any stale shells from prior runs on the
+                    # same message (those are height:0 invisible anyway and
+                    # re-emitting them would just bloat events).
+                    if isinstance(e, str) and "<!--llm-review-shell:" in e:
+                        continue
+                    key = _embed_dedupe_key(e)
+                    if key in self._preserved_embed_keys:
+                        continue
+                    self._preserved_embed_keys.add(key)
+                    self._preserved_embeds.append(e)
+                    pre_existing.append(e)
+            except Exception as e:
+                log.debug(
+                    f"[LLMReview] Pre-existing embeds read failed: {e}"
+                )
         try:
             # Emit via _raw_emitter so the wrapper doesn't try to re-prepend
             # the shell to this first shell-only embed event.
             await self._raw_emitter(
                 {"type": "embeds", "data": {"embeds": [self._shell_html]}}
             )
+            if pre_existing:
+                # Live-only correction so the user keeps seeing the
+                # embeds that were on-screen before we started. The
+                # backend doesn't persist chat:message:embeds, so DB is
+                # not duplicated — those entries are already in DB from
+                # their original producers' persist events.
+                try:
+                    await self._raw_emitter(
+                        {
+                            "type": "chat:message:embeds",
+                            "data": {
+                                "embeds": [self._shell_html] + pre_existing
+                            },
+                        }
+                    )
+                except Exception as e:
+                    log.debug(
+                        f"[LLMReview] Pre-existing live-fix failed: {e}"
+                    )
             # Give the iframe srcdoc a moment to load before the first execute.
             await asyncio.sleep(0.05)
             self._rich_initialized = True
@@ -1752,15 +1867,42 @@ class EventEmitter:
         # Flip the flag BEFORE emitting so any late downstream embeds event
         # races don't re-prepend the shell to the final payload.
         self._finalized = True
+        final_html = _render_final_html(summary)
         try:
+            # 1) Persisted final: a single [final_html] via type "embeds".
+            #    The backend extends this with existing DB embeds (prior
+            #    shell snapshots + any downstream tool embeds we wrapped),
+            #    so DB ends up with final + everything already stored.
+            #    Don't include preserved embeds here — they're already in
+            #    DB and would be duplicated.
             await self._raw_emitter(
-                {
-                    "type": "embeds",
-                    "data": {"embeds": [_render_final_html(summary)]},
-                }
+                {"type": "embeds", "data": {"embeds": [final_html]}}
             )
         except Exception as e:
             log.warning(f"[LLMReview] Rich progress finalize failed: {e}")
+            return
+        if not self._preserved_embeds:
+            return
+        try:
+            # 2) Live-only correction: the frontend replaces message.embeds
+            #    on every embed event, so step (1) just wiped the live view
+            #    of any tool-generated embeds. Emit a "chat:message:embeds"
+            #    event that the backend doesn't persist (only "embeds"
+            #    triggers the DB upsert) to restore them in the live UI.
+            #    Shell is intentionally excluded — final view shouldn't
+            #    contain the progress skeleton anymore.
+            await self._raw_emitter(
+                {
+                    "type": "chat:message:embeds",
+                    "data": {
+                        "embeds": [final_html] + list(self._preserved_embeds)
+                    },
+                }
+            )
+        except Exception as e:
+            log.warning(
+                f"[LLMReview] Rich progress live correction failed: {e}"
+            )
 
 
 # ============================================================================
@@ -4218,6 +4360,7 @@ CRITICAL RULES:
             __event_emitter__,
             enabled=bool(user_valves.RICH_PROGRESS),
             message_id=__message_id__,
+            chat_id=__chat_id__,
             render_markdown=bool(getattr(user_valves, "RENDER_DRAFTS_AS_MARKDOWN", True)),
             force_theme=str(getattr(user_valves, "RICH_PROGRESS_THEME", "auto") or "auto"),
         )
