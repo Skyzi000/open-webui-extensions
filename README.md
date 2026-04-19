@@ -33,6 +33,7 @@ Execute multiple independent tool calls in parallel for faster execution.
 | [**Sub Agent**](tools/sub_agent.py) | Delegate tasks to autonomous sub-agents to keep context consumption low |
 | [**Parallel Tools**](tools/parallel_tools.py) | Execute multiple independent tool calls in parallel for faster results (note: often requires a strong flagship model to invoke correctly) |
 | [**Multi Model Council**](tools/multi_model_council.py) | Run a multi-model council decision with majority vote |
+| [**LLM Review**](tools/llm_review.py) | Multi-persona creative writing that preserves divergent voices — each persona produces a distinctive draft through independent revision and peer feedback, rather than merging into one (inspired by arXiv:2601.08003) |
 | [**User Location**](tools/user_location.py) | Get user's current location via the browser's Geolocation API |
 | [**Universal File Generator (Pandoc)**](tools/universal_file_generator_pandoc.py) | Generate files in various formats using Pandoc. *Not intended for use by others at this time* |
 

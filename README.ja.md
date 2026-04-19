@@ -31,6 +31,7 @@
 | [**Sub Agent**](tools/sub_agent.py) | 自律的なサブエージェントにタスクを委譲し、コンテキスト消費を抑制 |
 | [**Parallel Tools**](tools/parallel_tools.py) | 複数のツール呼び出しを並列実行して高速化（※強力なフラッグシップモデルでないと正常に呼び出せないことが多いので注意） |
 | [**Multi Model Council**](tools/multi_model_council.py) | 複数のモデルによる評議会で多数決を実施 |
+| [**LLM Review**](tools/llm_review.py) | 創造性の発散を保つ多ペルソナ創作ライティング — ペルソナごとに独立起草・相互レビュー・改訂を行い、マージせず個性の異なるドラフトを複数返す（arXiv:2601.08003 を参考に独自実装） |
 | [**User Location**](tools/user_location.py) | ブラウザのGeolocation APIでユーザーの位置情報を取得 |
 | [**Universal File Generator (Pandoc)**](tools/universal_file_generator_pandoc.py) | Pandocを利用して様々な形式のファイルを生成 ※現在のところ、自分以外が使用することを想定していません |
 
