@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation based on arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.3.1
+version: 0.4.0
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -294,7 +294,13 @@ def _render_shell_html(
         ".phase{font-weight:600;font-size:14px;margin-bottom:8px;display:flex;justify-content:space-between;gap:8px}"
         ".phase .pct{font-variant-numeric:tabular-nums;opacity:0.75}"
         ".bar{position:relative;height:8px;background:rgba(127,127,127,0.2);border-radius:4px;overflow:hidden;margin-bottom:10px}"
-        ".bar>i{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6);border-radius:4px;transition:width 0.3s ease}"
+        # Filled bar: width transitions smoothly between sub-step ticks,
+        # and the gradient itself flows leftward via background-position
+        # animation so the bar feels alive even between updates. Wider
+        # background-size (300%) keeps the flow visible at small widths
+        # where the bar is still narrow.
+        ".bar>i{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6,#6366f1,#3b82f6);background-size:300% 100%;border-radius:4px;transition:width 0.3s ease;animation:barFlow 3s linear infinite}"
+        "@keyframes barFlow{0%{background-position:300% 0}100%{background-position:0% 0}}"
         # Match Open WebUI's multi-model response layout (see core
         # MultiResponseMessages.svelte): flex row with horizontal snap scroll
         # and a per-card min-width that switches to full-width on narrow
@@ -308,12 +314,14 @@ def _render_shell_html(
         "@media (max-width:720px){.ag{flex:0 0 100%;min-width:100%}}"
         ".ag.active{border-color:#3b82f6;background:rgba(59,130,246,0.07)}"
         ".ag.done{border-color:#10b981;background:rgba(16,185,129,0.07)}"
+        ".ag.error{border-color:#ef4444;background:rgba(239,68,68,0.07)}"
         ".ag .hdr{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:4px}"
         ".ag .name{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
         ".ag .state{font-size:11px;padding:2px 7px;border-radius:999px;background:rgba(127,127,127,0.15);white-space:nowrap}"
         ".ag .model{font-size:10.5px;opacity:0.6;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,monospace}"
         ".ag.active .state{background:rgba(59,130,246,0.2);color:#3b82f6}"
         ".ag.done .state{background:rgba(16,185,129,0.2);color:#10b981}"
+        ".ag.error .state{background:rgba(239,68,68,0.2);color:#ef4444}"
         ".log{display:flex;flex-direction:column;gap:3px;font-size:11.5px;margin-top:4px}"
         ".log .li{display:flex;gap:6px;opacity:0.88;overflow-wrap:anywhere;word-break:break-word}"
         ".log .li .k{flex:0 0 auto;opacity:0.6;font-variant-numeric:tabular-nums;min-width:1em}"
@@ -428,6 +436,12 @@ def _render_shell_html(
         "<script>(function(){"
         f"const TAG={_safe_script_json(tag)};"
         f"let state={_safe_script_json(initial_state)};"
+        # Track the bar's last rendered width so each rerender can mount
+        # the <i> at the previous width and transition to the new one.
+        # Without this, innerHTML rebuilds the element with width:${v}%
+        # baked in and CSS transitions never fire (transitions need an
+        # existing property to CHANGE, not a fresh element).
+        "let lastBarV=0;"
         "const root=document.getElementById('root');"
         # Full HTML escape including " and ' so the same function is safe
         # in both text content AND attribute-value contexts. Model IDs,
@@ -586,6 +600,9 @@ def _render_shell_html(
         # blank) stays neutral grey.
         "const statusClass=(raw)=>{"
         "const s=String(raw||'').trim().toLowerCase();"
+        # Check 'failed' first so review states like "reviewed 1/2 (1 failed)"
+        # classify as error even though they contain the 'reviewed' token.
+        "if(s.indexOf('failed')>=0)return 'error';"
         "if(s==='done'||s==='ready'||s==='drafted'||s==='revised')return 'done';"
         "const rm=/^reviewed\\s+(\\d+)\\s*\\/\\s*(\\d+)$/.exec(s);"
         "if(rm){return rm[1]===rm[2]?'done':'active';}"
@@ -621,7 +638,7 @@ def _render_shell_html(
         "root.innerHTML=`<div class=\"card\">`+"
         "(state.topic?`<div class=\"topic\">${esc(state.topic)}</div>`:'')+"
         "`<div class=\"phase\"><span>${esc(state.phase||'')}</span><span class=\"pct\">${v.toFixed(0)}%</span></div>"
-        "<div class=\"bar\"><i style=\"width:${v}%\"></i></div>"
+        "<div class=\"bar\"><i style=\"width:${lastBarV}%\"></i></div>"
         "<div class=\"agents\">${cards}</div>"
         "<div class=\"detail\">${esc(state.detail||'')}</div></div>`;"
         # Restore open state: if user had it open, keep open; on first appearance
@@ -632,6 +649,12 @@ def _render_shell_html(
         "else if(!seen.has(oid)){seen.add(oid);if(d.dataset.defaultOpen==='1')d.open=true;}"
         "});"
         "restoreScroll(savedScroll);"
+        # Trigger the bar's width transition by mounting at lastBarV (set
+        # in the innerHTML above) and then updating to v on the next frame
+        # — the browser sees a real property change and runs the ease.
+        "const barFill=root.querySelector('.bar>i');"
+        "if(barFill){requestAnimationFrame(()=>{barFill.style.width=v+'%';});}"
+        "lastBarV=v;"
         "document.body.classList.add('ready');"
         "postHeight();"
         "};"
@@ -978,6 +1001,10 @@ def _render_final_html(summary: dict) -> str:
     rounds = summary.get("rounds") or []
     render_md = bool(summary.get("render_markdown", True))
     force_theme = str(summary.get("force_theme") or "auto")
+    is_cancelled = bool(summary.get("cancelled"))
+    header_mark = "\u23F9" if is_cancelled else "\u2713"
+    header_text = "LLM Review cancelled" if is_cancelled else "LLM Review complete"
+    cancel_cls = " cancelled" if is_cancelled else ""
 
     def _draft_body_html(draft_text: str) -> str:
         """Render draft text as either markdown-sanitized HTML (md class) or
@@ -1176,8 +1203,10 @@ def _render_final_html(summary: dict) -> str:
         "body.dark{color:#e6edf3}"
         "a{color:inherit;text-decoration:underline;text-underline-offset:2px}"
         ".wrap{padding:14px 16px;border:1px solid rgba(16,185,129,0.4);border-radius:10px;background:rgba(16,185,129,0.06)}"
+        ".wrap.cancelled{border-color:rgba(148,163,184,0.4);background:rgba(148,163,184,0.06)}"
         ".head{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-weight:600;font-size:14px}"
         ".head .mark{color:#10b981;font-size:16px}"
+        ".head.cancelled .mark{color:#94a3b8}"
         ".topic{font-size:13px;margin-bottom:8px;overflow-wrap:anywhere;word-break:break-word}"
         ".meta{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;opacity:0.75;margin-bottom:10px}"
         ".pills{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}"
@@ -1254,8 +1283,9 @@ def _render_final_html(summary: dict) -> str:
         # RICH_PROGRESS_THEME valve ('light'/'dark' force), or tries to
         # detect OWUI's theme in 'auto'. See _theme_detect_js().
         f"<script>{_theme_detect_js(force_theme)}</script>"
-        '<div class="wrap">'
-        '<div class="head"><span class="mark">\u2713</span><span>LLM Review complete</span></div>'
+        f'<div class="wrap{cancel_cls}">'
+        f'<div class="head{cancel_cls}"><span class="mark">{header_mark}</span>'
+        f'<span>{header_text}</span></div>'
         f'<div class="topic">{_html_escape(topic)}</div>'
         f'<div class="meta"><span>Rounds: {num_rounds}</span>{elapsed_str}</div>'
         f'<div class="pills">{pills_html}</div>'
@@ -1402,6 +1432,13 @@ class EventEmitter:
         self._preserved_embeds: list = []
         self._preserved_embed_keys: set = set()
         self._total_steps = 1
+        # Sub-step tracking lets the bar advance per agent task within a
+        # phase instead of jumping only at phase boundaries. _current_step
+        # mirrors the integer step set by push(); _sub_total / _sub_done
+        # count atomic tasks (compose, review, revise) inside that step.
+        self._current_step: int = 0
+        self._sub_total: int = 0
+        self._sub_done: int = 0
         self._state: dict = {
             "phase": "",
             "value": 0,
@@ -1495,6 +1532,9 @@ class EventEmitter:
         if not self._rich_enabled or self._rich_initialized:
             return
         self._total_steps = max(1, int(total_steps))
+        self._current_step = 0
+        self._sub_total = 0
+        self._sub_done = 0
         self._agents_by_id = {a["id"]: dict(a) for a in agents}
         self._activities_by_id = {a["id"]: [] for a in agents}
         self._state.update(
@@ -1692,18 +1732,63 @@ class EventEmitter:
         phase: Optional[str] = None,
         detail: Optional[str] = None,
         agent_state: Optional[dict[str, str]] = None,
+        total_substeps: Optional[int] = None,
     ) -> None:
         if not self._rich_enabled or not self._rich_initialized:
             return
         assert self._lock is not None
         async with self._lock:
             if step is not None:
+                # Switching phase: snap value to the new step boundary and
+                # reset sub-step tracking so a stale fraction can't carry
+                # into the next phase.
+                self._current_step = int(step)
+                self._sub_total = 0
+                self._sub_done = 0
                 self._state["value"] = max(
                     0.0,
                     min(100.0, (float(step) / float(self._total_steps)) * 100.0),
                 )
+            if total_substeps is not None:
+                self._sub_total = max(0, int(total_substeps))
+                self._sub_done = 0
             if phase is not None:
                 self._state["phase"] = phase
+            if detail is not None:
+                self._state["detail"] = detail
+            if agent_state:
+                for aid, s in agent_state.items():
+                    if aid in self._agents_by_id:
+                        self._agents_by_id[aid]["state"] = s
+            await self._flush()
+
+    async def tick_substep(
+        self,
+        *,
+        detail: Optional[str] = None,
+        agent_state: Optional[dict[str, str]] = None,
+    ) -> None:
+        """Advance the bar by ``1 / _sub_total`` within the current phase.
+
+        Used at compose/review/revise task completion so the percentage
+        moves smoothly inside a phase. No-op when sub_total is 0 (i.e.
+        the caller never declared a sub-step budget for this phase) or
+        when rich progress is disabled."""
+        if not self._rich_enabled or not self._rich_initialized:
+            return
+        assert self._lock is not None
+        async with self._lock:
+            if self._sub_total > 0:
+                self._sub_done += 1
+                fraction = min(1.0, self._sub_done / self._sub_total)
+                self._state["value"] = max(
+                    0.0,
+                    min(
+                        100.0,
+                        ((float(self._current_step) + fraction)
+                         / float(self._total_steps)) * 100.0,
+                    ),
+                )
             if detail is not None:
                 self._state["detail"] = detail
             if agent_state:
@@ -4793,69 +4878,84 @@ CRITICAL RULES:
                 step=0,
                 phase="Phase 1: Initial Composition",
                 agent_state={aid: "composing" for aid in agent_ids},
+                total_substeps=len(agent_ids),
             )
 
             async def compose_draft(agent_id: str) -> tuple[str, str, dict]:
                 persona = agents[agent_id]
-                tools_dict, terminal_prompt, direct_prompts = await ensure_tools(
-                    agent_id
-                )
-                member_extra_params = make_member_extra_params(
-                    agent_id, terminal_prompt, direct_prompts
-                )
+                # ``state`` stays "failed" unless we actually produce a usable
+                # draft. run_agent_loop returns API/auth/parse errors as
+                # string content (e.g. "API error: ..."), so a successful
+                # ``await`` is NOT enough — we must see a non-empty string
+                # ``draft`` field in parsed JSON to call the task a success.
+                # The try/finally also guarantees tick_substep fires on
+                # exception paths so the progress bar isn't frozen at the
+                # failed agent's sub-step.
+                state = "failed"
+                content: str = ""
+                parsed: Any = {}
+                try:
+                    tools_dict, terminal_prompt, direct_prompts = await ensure_tools(
+                        agent_id
+                    )
+                    member_extra_params = make_member_extra_params(
+                        agent_id, terminal_prompt, direct_prompts
+                    )
 
-                system_prompt = build_compose_system_prompt(
-                    base_system_prompt, persona, include_sources
-                )
-                user_prompt = build_compose_user_prompt(topic_text, requirements_text)
+                    system_prompt = build_compose_system_prompt(
+                        base_system_prompt, persona, include_sources
+                    )
+                    user_prompt = build_compose_user_prompt(topic_text, requirements_text)
 
-                content = await run_agent_loop(
-                    request=request,
-                    user=user,
-                    model_id=agent_model[agent_id],
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    tools_dict=tools_dict,
-                    max_iterations=self.valves.MAX_ITERATIONS,
-                    extra_params=member_extra_params,
-                    apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
-                    agent_name=f"{persona['name']}",
-                    event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
-                )
+                    content = await run_agent_loop(
+                        request=request,
+                        user=user,
+                        model_id=agent_model[agent_id],
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        tools_dict=tools_dict,
+                        max_iterations=self.valves.MAX_ITERATIONS,
+                        extra_params=member_extra_params,
+                        apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                        agent_name=f"{persona['name']}",
+                        event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
+                    )
 
-                # compose wants the draft payload — require ``draft`` to
-                # be a non-empty string so a scratchpad {"approach": "..."}
-                # emitted before the real object is skipped over.
-                parsed = safe_json_loads(content, expect_keys=("draft",))
-                # Guard every rich-UI call so malformed LLM JSON (list/scalar
-                # instead of object, or any other shape) can NEVER crash the
-                # agent task — downstream normalize_draft_result already
-                # handles non-dict parsed results with a content fallback.
-                # Also require that the draft/approach fields are actually
-                # strings; stringifying a list/dict into the UI as if it were
-                # a real draft is worse than showing nothing for this round.
-                if isinstance(parsed, dict):
-                    draft_val = parsed.get("draft")
-                    if isinstance(draft_val, str) and draft_val.strip():
-                        approach_val = parsed.get("approach")
-                        approach_clean = (
-                            approach_val.strip()
-                            if isinstance(approach_val, str) and approach_val.strip()
-                            else None
-                        )
-                        try:
-                            await emitter.set_draft(
-                                agent_id,
-                                draft=draft_val,
-                                phase_label="Initial composition",
-                                approach=approach_clean,
+                    parsed = safe_json_loads(content, expect_keys=("draft",))
+                    if isinstance(parsed, dict):
+                        draft_val = parsed.get("draft")
+                        if isinstance(draft_val, str) and draft_val.strip():
+                            state = "drafted"
+                            approach_val = parsed.get("approach")
+                            approach_clean = (
+                                approach_val.strip()
+                                if isinstance(approach_val, str) and approach_val.strip()
+                                else None
                             )
-                        except Exception as e:
-                            log.warning(f"[LLMReview] set_draft failed: {e}")
-                await emitter.push(agent_state={agent_id: "drafted"})
-                return agent_id, content, parsed or {}
+                            try:
+                                await emitter.set_draft(
+                                    agent_id,
+                                    draft=draft_val,
+                                    phase_label="Initial composition",
+                                    approach=approach_clean,
+                                )
+                            except Exception as e:
+                                log.warning(f"[LLMReview] set_draft failed: {e}")
+                            # Commit now so a mid-gather cancel preserves
+                            # what the iframe just displayed. The outer
+                            # aggregation loop below also assigns this
+                            # key, which is idempotent because it uses
+                            # the same normalize_draft_result(parsed,...)
+                            # output.
+                            current_drafts[agent_id] = normalize_draft_result(
+                                parsed,
+                                f"Non-JSON response: {truncate_text(content, 180)}",
+                            )
+                    return agent_id, content, parsed or {}
+                finally:
+                    await emitter.tick_substep(agent_state={agent_id: state})
 
             compose_results = await asyncio.gather(
                 *[compose_draft(aid) for aid in agent_ids], return_exceptions=True
@@ -4907,6 +5007,9 @@ CRITICAL RULES:
                     step=1 + 2 * (round_num - 1),
                     phase=f"Round {round_num}/{num_rounds}: Cross-Review",
                     agent_state={aid: "reviewing 0/2" for aid in agent_ids},
+                    # N reviewers each review (N-1) peers — total reviews
+                    # this round drives the per-completion sub-step grain.
+                    total_substeps=len(agent_ids) * (len(agent_ids) - 1),
                 )
                 # Drop stale reviews from the previous round so the iframe
                 # shows only the current round's feedback while it lands.
@@ -4914,6 +5017,7 @@ CRITICAL RULES:
 
                 all_reviews: dict[str, dict[str, dict]] = {aid: {} for aid in agent_ids}
                 review_counts: dict[str, int] = {aid: 0 for aid in agent_ids}
+                review_fails: dict[str, int] = {aid: 0 for aid in agent_ids}
                 review_counts_lock = asyncio.Lock()
 
                 async def review_draft(
@@ -4922,71 +5026,84 @@ CRITICAL RULES:
                     reviewer_persona = agents[reviewer_id]
                     author_persona = agents[author_id]
                     author_draft = current_drafts[author_id]["draft"]
+                    # ``review_ok`` flips only after we see a usable
+                    # ``key_feedback`` string — run_agent_loop returning an
+                    # "API error: ..." content, malformed JSON, or a parsed
+                    # dict missing ``key_feedback`` all stay as failure so
+                    # the reviewer card shows red instead of done-green.
+                    review_ok = False
+                    content: str = ""
+                    parsed: Any = {}
+                    try:
+                        _, terminal_prompt, direct_prompts = await ensure_tools(
+                            reviewer_id
+                        )
+                        member_extra_params = make_member_extra_params(
+                            reviewer_id, terminal_prompt, direct_prompts
+                        )
 
-                    # Reviews don't use tools, but reuse the cached prompts so
-                    # any inlet filter referencing them sees consistent context.
-                    _, terminal_prompt, direct_prompts = await ensure_tools(
-                        reviewer_id
-                    )
-                    member_extra_params = make_member_extra_params(
-                        reviewer_id, terminal_prompt, direct_prompts
-                    )
+                        system_prompt = build_review_system_prompt(
+                            base_system_prompt,
+                            reviewer_persona,
+                            criteria=review_criteria,
+                        )
+                        user_prompt = build_review_user_prompt(
+                            topic_text, author_persona["name"], author_draft
+                        )
 
-                    system_prompt = build_review_system_prompt(
-                        base_system_prompt,
-                        reviewer_persona,
-                        criteria=review_criteria,
-                    )
-                    user_prompt = build_review_user_prompt(
-                        topic_text, author_persona["name"], author_draft
-                    )
+                        content = await run_agent_loop(
+                            request=request,
+                            user=user,
+                            model_id=agent_model[reviewer_id],
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            tools_dict={},  # No tools for review
+                            max_iterations=int(self.valves.REVIEW_MAX_ITERATIONS),
+                            extra_params=member_extra_params,
+                            apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                            agent_name=f"{reviewer_persona['name']}\u2192{author_persona['name']}",
+                            event_emitter=emitter.wrap_agent(
+                                reviewer_id,
+                                f"{reviewer_persona['name']}\u2192{author_persona['name']}",
+                            ),
+                        )
 
-                    content = await run_agent_loop(
-                        request=request,
-                        user=user,
-                        model_id=agent_model[reviewer_id],
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        tools_dict={},  # No tools for review
-                        max_iterations=int(self.valves.REVIEW_MAX_ITERATIONS),
-                        extra_params=member_extra_params,
-                        apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
-                        agent_name=f"{reviewer_persona['name']}\u2192{author_persona['name']}",
-                        event_emitter=emitter.wrap_agent(
-                            reviewer_id,
-                            f"{reviewer_persona['name']}\u2192{author_persona['name']}",
-                        ),
-                    )
-
-                    # review wants the feedback payload — require
-                    # ``key_feedback`` to be a non-empty string so a
-                    # scratchpad {"strengths": [...]} without the
-                    # load-bearing summary is skipped over.
-                    parsed = safe_json_loads(
-                        content, expect_keys=("key_feedback",)
-                    )
-                    # Only feed the iframe when parsed is actually a dict —
-                    # a list / scalar from a malformed LLM response must not
-                    # abort this review_draft task via AttributeError.
-                    if isinstance(parsed, dict):
-                        try:
-                            await emitter.set_review(
-                                author_id=author_id,
-                                reviewer_id=reviewer_id,
-                                reviewer_name=reviewer_persona["name"],
-                                review=parsed,
-                            )
-                        except Exception as e:
-                            log.warning(f"[LLMReview] set_review failed: {e}")
-                    async with review_counts_lock:
-                        review_counts[reviewer_id] += 1
-                        done_count = review_counts[reviewer_id]
-                    await emitter.push(
-                        agent_state={reviewer_id: f"reviewed {done_count}/2"}
-                    )
-                    return reviewer_id, author_id, content, parsed or {}
+                        parsed = safe_json_loads(
+                            content, expect_keys=("key_feedback",)
+                        )
+                        if isinstance(parsed, dict):
+                            kf = parsed.get("key_feedback")
+                            if isinstance(kf, str) and kf.strip():
+                                review_ok = True
+                                try:
+                                    await emitter.set_review(
+                                        author_id=author_id,
+                                        reviewer_id=reviewer_id,
+                                        reviewer_name=reviewer_persona["name"],
+                                        review=parsed,
+                                    )
+                                except Exception as e:
+                                    log.warning(f"[LLMReview] set_review failed: {e}")
+                        return reviewer_id, author_id, content, parsed or {}
+                    finally:
+                        async with review_counts_lock:
+                            review_counts[reviewer_id] += 1
+                            if not review_ok:
+                                review_fails[reviewer_id] += 1
+                            attempted = review_counts[reviewer_id]
+                            failed = review_fails[reviewer_id]
+                            succeeded = attempted - failed
+                        if failed:
+                            # N/2 tracks successes; the paren tail lets the
+                            # JS statusClass pick this up as an error card.
+                            state_text = f"reviewed {succeeded}/2 ({failed} failed)"
+                        else:
+                            state_text = f"reviewed {succeeded}/2"
+                        await emitter.tick_substep(
+                            agent_state={reviewer_id: state_text}
+                        )
 
                 review_tasks = [
                     review_draft(reviewer_id, author_id)
@@ -5016,76 +5133,113 @@ CRITICAL RULES:
                     step=2 + 2 * (round_num - 1),
                     phase=f"Round {round_num}/{num_rounds}: Revision",
                     agent_state={aid: "revising" for aid in agent_ids},
+                    total_substeps=len(agent_ids),
                 )
 
                 async def revise_draft(agent_id: str) -> tuple[str, str, dict]:
                     persona = agents[agent_id]
                     original_draft = current_drafts[agent_id]["draft"]
                     feedbacks = list(all_reviews[agent_id].values())
+                    # Same contract as compose_draft: only flip ``state``
+                    # to "revised" after we observe a real non-empty
+                    # ``draft`` string in the parsed payload. API-error
+                    # strings and malformed JSON leave it as "failed".
+                    state = "failed"
+                    content: str = ""
+                    parsed: Any = {}
+                    try:
+                        tools_dict, terminal_prompt, direct_prompts = await ensure_tools(
+                            agent_id
+                        )
+                        member_extra_params = make_member_extra_params(
+                            agent_id, terminal_prompt, direct_prompts
+                        )
 
-                    tools_dict, terminal_prompt, direct_prompts = await ensure_tools(
-                        agent_id
-                    )
-                    member_extra_params = make_member_extra_params(
-                        agent_id, terminal_prompt, direct_prompts
-                    )
+                        system_prompt = build_revise_system_prompt(
+                            base_system_prompt, persona, include_sources
+                        )
+                        user_prompt = build_revise_user_prompt(
+                            topic_text,
+                            original_draft,
+                            feedbacks,
+                            anonymize=anonymize_reviewers,
+                        )
 
-                    system_prompt = build_revise_system_prompt(
-                        base_system_prompt, persona, include_sources
-                    )
-                    user_prompt = build_revise_user_prompt(
-                        topic_text,
-                        original_draft,
-                        feedbacks,
-                        anonymize=anonymize_reviewers,
-                    )
+                        content = await run_agent_loop(
+                            request=request,
+                            user=user,
+                            model_id=agent_model[agent_id],
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            tools_dict=tools_dict,
+                            max_iterations=self.valves.MAX_ITERATIONS,
+                            extra_params=member_extra_params,
+                            apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                            agent_name=f"{persona['name']}",
+                            event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
+                        )
 
-                    content = await run_agent_loop(
-                        request=request,
-                        user=user,
-                        model_id=agent_model[agent_id],
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        tools_dict=tools_dict,
-                        max_iterations=self.valves.MAX_ITERATIONS,
-                        extra_params=member_extra_params,
-                        apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
-                        agent_name=f"{persona['name']}",
-                        event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
-                    )
-
-                    # revise wants the revised draft payload — require
-                    # ``draft`` to be a non-empty string so a scratchpad
-                    # {"changes_made": ["..."]} before the real object
-                    # is skipped.
-                    parsed = safe_json_loads(content, expect_keys=("draft",))
-                    if isinstance(parsed, dict):
-                        draft_val = parsed.get("draft")
-                        if isinstance(draft_val, str) and draft_val.strip():
-                            raw_changes = parsed.get("changes_made")
-                            raw_declined = parsed.get("feedback_declined")
-                            try:
-                                await emitter.set_draft(
-                                    agent_id,
-                                    draft=draft_val,
-                                    phase_label=f"Round {round_num}/{num_rounds} revision",
-                                    changes_made=[
-                                        s for s in raw_changes if isinstance(s, str) and s.strip()
-                                    ]
-                                    if isinstance(raw_changes, list)
-                                    else None,
-                                    feedback_declined=[
-                                        s for s in raw_declined if isinstance(s, str) and s.strip()
-                                    ]
-                                    if isinstance(raw_declined, list)
-                                    else None,
+                        parsed = safe_json_loads(content, expect_keys=("draft",))
+                        if isinstance(parsed, dict):
+                            draft_val = parsed.get("draft")
+                            if isinstance(draft_val, str) and draft_val.strip():
+                                state = "revised"
+                                raw_changes = parsed.get("changes_made")
+                                raw_declined = parsed.get("feedback_declined")
+                                try:
+                                    await emitter.set_draft(
+                                        agent_id,
+                                        draft=draft_val,
+                                        phase_label=f"Round {round_num}/{num_rounds} revision",
+                                        changes_made=[
+                                            s for s in raw_changes if isinstance(s, str) and s.strip()
+                                        ]
+                                        if isinstance(raw_changes, list)
+                                        else None,
+                                        feedback_declined=[
+                                            s for s in raw_declined if isinstance(s, str) and s.strip()
+                                        ]
+                                        if isinstance(raw_declined, list)
+                                        else None,
+                                    )
+                                except Exception as e:
+                                    log.warning(f"[LLMReview] set_draft failed: {e}")
+                                # Commit now so a mid-gather cancel keeps
+                                # the revision the iframe just displayed.
+                                # Mirrors the post-gather merge below:
+                                # prior sources + new sources, deduped by
+                                # (title, url). Approach is preserved from
+                                # the compose phase.
+                                revise_out = normalize_revise_result(
+                                    parsed, original_draft
                                 )
-                            except Exception as e:
-                                log.warning(f"[LLMReview] set_draft failed: {e}")
-                    await emitter.push(agent_state={agent_id: "revised"})
-                    return agent_id, content, parsed or {}
+                                prior = current_drafts.get(agent_id) or {}
+                                prior_sources = list(prior.get("sources") or [])
+                                new_sources = list(revise_out.get("sources") or [])
+                                seen: set = set()
+                                merged_sources: list[dict] = []
+                                for src in prior_sources + new_sources:
+                                    if not isinstance(src, dict):
+                                        continue
+                                    title = normalize_text(src.get("title"))
+                                    url = normalize_text(src.get("url"))
+                                    if not (title or url):
+                                        continue
+                                    key = (title, url)
+                                    if key in seen:
+                                        continue
+                                    seen.add(key)
+                                    merged_sources.append({"title": title, "url": url})
+                                current_drafts[agent_id] = {
+                                    "draft": revise_out["draft"],
+                                    "approach": prior.get("approach", ""),
+                                    "sources": merged_sources,
+                                }
+                        return agent_id, content, parsed or {}
+                    finally:
+                        await emitter.tick_substep(agent_state={agent_id: state})
 
                 revise_results = await asyncio.gather(
                     *[revise_draft(aid) for aid in agent_ids], return_exceptions=True
@@ -5287,6 +5441,62 @@ CRITICAL RULES:
             }
 
             return json.dumps(response_payload, ensure_ascii=False)
+        except asyncio.CancelledError:
+            # User pressed the chat's stop button (or the request was
+            # otherwise aborted). Finalize with whatever partial state
+            # we have so the iframe flips to a "Cancelled" view instead
+            # of leaving a frozen progress bar behind; also close out
+            # the status line so the global spinner stops. Wrapped in a
+            # broad try/except because any failure here must not prevent
+            # the CancelledError from propagating — MCP cleanup still
+            # has to run in the outer finally.
+            try:
+                partial_final_drafts = {
+                    aid: {
+                        "persona": agents[aid]["name"],
+                        "model": agent_model[aid],
+                        "draft": current_drafts[aid].get("draft", ""),
+                        "sources": current_drafts[aid].get("sources", []),
+                    }
+                    for aid in agent_ids
+                    if isinstance(current_drafts.get(aid), dict)
+                    and current_drafts[aid].get("draft")
+                }
+                cancel_summary = {
+                    "topic": topic_text,
+                    "num_rounds": num_rounds,
+                    "agents": [
+                        {
+                            "id": aid,
+                            "model": agent_model[aid],
+                            "persona": agents[aid]["name"],
+                        }
+                        for aid in agent_ids
+                    ],
+                    "model_ids": list(agent_ids),
+                    "final_drafts": partial_final_drafts,
+                    "rounds": rounds_data,
+                    "render_markdown": bool(
+                        getattr(user_valves, "RENDER_DRAFTS_AS_MARKDOWN", True)
+                    ),
+                    "force_theme": getattr(
+                        user_valves, "RICH_PROGRESS_THEME", "auto"
+                    ) or "auto",
+                    "elapsed_seconds": (
+                        asyncio.get_event_loop().time() - started_at
+                    ),
+                    "cancelled": True,
+                }
+                await emitter.finalize(summary=cancel_summary)
+                await emitter.emit(
+                    description="LLM Review cancelled",
+                    done=True,
+                )
+            except BaseException as cleanup_exc:
+                log.warning(
+                    f"[LLMReview] Cancel finalize failed: {cleanup_exc}"
+                )
+            raise
         finally:
             for mcp_clients in all_mcp_clients:
                 await cleanup_mcp_clients(mcp_clients)
