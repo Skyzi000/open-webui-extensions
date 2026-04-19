@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation based on arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.3.0
+version: 0.3.1
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -4375,31 +4375,23 @@ CRITICAL RULES:
         """
         Run an LLM Review collaborative writing workflow with cross-feedback.
 
-        Exactly 3 agents with distinct personas independently draft the topic,
-        exchange peer feedback, and revise over UserValves.ROUNDS rounds (1-5).
-        Each agent's voice is preserved across rounds. If `personas` is omitted
-        or fewer than 3 entries are provided, built-in default personas are used
-        (Analytical Thinker, Creative Visionary, Practical Strategist).
+        Three persona agents independently draft the topic, exchange peer
+        feedback, and revise over UserValves.ROUNDS rounds. Each agent's voice
+        is preserved across rounds. Returns one draft per persona — never a
+        single merged output — so use this for tasks where divergent angles
+        matter (essays, design analyses, brainstorming, creative writing), not
+        for queries needing one authoritative answer.
+
+        Independence: drafts are composed in parallel (no agent sees others');
+        reviewers see only the single assigned draft; revising agents see only
+        their own prior draft plus feedback summaries on it — never other
+        agents' raw drafts. UserValves.ANONYMIZE_REVIEWERS additionally hides
+        reviewer identities for fully blind review.
 
         :param topic: The writing topic or prompt (required).
         :param requirements: Optional specific requirements, constraints, length targets, or style notes.
         :param models: Optional comma-separated 3 model IDs; honored only when the operator enabled AI model selection in Valves, otherwise silently ignored — DEFAULT_MODELS or the current chat model is used instead.
-        :param personas: Optional list of exactly 3 persona objects, each with `name` and `description` fields; if omitted or fewer than 3 valid entries are provided, default personas (Analytical Thinker, Creative Visionary, Practical Strategist) are used.
-
-        Returns a JSON string with:
-        - topic: the review topic (echoed for reference)
-        - num_rounds: how many review-revise rounds were executed
-        - final_drafts: {agent_id: {persona, model, draft, sources}} — the
-          final per-agent outputs (full draft bodies and merged citations)
-        - rounds: list of per-round objects. Round 0 always carries
-          per-agent composition approaches; each subsequent round always
-          carries reviews (key_feedback/strengths/improvements per
-          reviewer) and revisions (changes_made/feedback_declined per
-          agent). When UserValves.INCLUDE_FULL_HISTORY is enabled the
-          intermediate draft bodies (round 0 full drafts and per-round
-          revised draft + sources) are included as well; otherwise they
-          are omitted to keep the tool-call context small (the Rich
-          iframe still keeps them in the UI regardless).
+        :param personas: Optional list of exactly 3 persona objects with `name` and `description`; choose markedly contrasting profiles to maximize divergence — similar personas defeat the tool's purpose. If fewer than 3 are provided, defaults are used (Analytical Thinker, Creative Visionary, Practical Strategist).
         """
         if __request__ is None:
             return json.dumps(
@@ -5277,6 +5269,16 @@ CRITICAL RULES:
                         }
                     return_rounds.append(stripped)
 
+            # Return-shape notes (kept out of the docstring to avoid bloating
+            # the LLM tool spec — the calling LLM can read the JSON directly):
+            # - final_drafts: canonical "latest per-persona output". Read this
+            #   for the answer; in strip mode it is the ONLY place the final
+            #   draft body lives (the last round's revisions drop ``draft``).
+            # - rounds: heterogeneous audit trail. Round 0 carries composition
+            #   data — full ``drafts`` in full-history mode, only
+            #   ``approaches`` when stripped. Rounds 1+ carry ``reviews`` plus
+            #   ``revisions`` (which lose the ``draft`` body when
+            #   INCLUDE_FULL_HISTORY is off — see strip block above).
             response_payload = {
                 "topic": topic_text,
                 "num_rounds": num_rounds,
