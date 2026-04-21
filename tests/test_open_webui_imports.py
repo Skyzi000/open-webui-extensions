@@ -19,6 +19,7 @@ Usage by extensions:
 
 import ast
 import inspect
+import importlib
 from typing import get_origin, get_args
 
 import pytest
@@ -583,6 +584,7 @@ class TestBodyStructure:
     Filters receive 'body' parameter which should contain:
     - messages: list - required
     - model: str - required
+    - files: runtime top-level payload used for attached files
 
     This test searches multiple possible locations for the schema to avoid
     false positives when Open WebUI refactors schema locations.
@@ -628,6 +630,20 @@ class TestBodyStructure:
         assert annotation is str, \
             field_type_message("GenerateChatCompletionForm", "model", "str", str(annotation))
 
+    def test_main_uses_form_data_files(self):
+        """Verify chat request handling reads top-level form_data['files']."""
+        try:
+            main_module = importlib.import_module("open_webui.main")
+            source = inspect.getsource(main_module)
+
+            assert (
+                "'files': form_data.get('files', None)" in source
+                or '"files": form_data.get("files", None)' in source
+            ), \
+                "main.py doesn't read form_data['files']. File-aware filters may break."
+        except ImportError as e:
+            pytest.fail(import_error_message("open_webui.main") + f"\n{e}")
+
 
 class TestMetadataStructure:
     """Test __metadata__ structure passed to filters/tools.
@@ -635,7 +651,7 @@ class TestMetadataStructure:
     __metadata__ contains runtime context:
     - chat_id: str - Used by Graphiti for conversation tracking
     - message_id: str - Used by Graphiti for message tracking
-    - files: list - Used by full_context_mode_toggle
+    - files: list - Legacy attached-file payload location used by full_context_mode_toggle
 
     Uses AST analysis to verify these keys are actually used in metadata dict
     construction, avoiding false negatives from simple string matching.
@@ -679,7 +695,7 @@ class TestMetadataStructure:
     def test_metadata_has_files_key(self):
         """Verify middleware uses files key in metadata construction.
 
-        full_context_mode_toggle uses body.get("metadata", {}).get("files", [])
+        full_context_mode_toggle reads body["metadata"]["files"] as a legacy payload location.
         """
         try:
             from open_webui.utils import middleware
