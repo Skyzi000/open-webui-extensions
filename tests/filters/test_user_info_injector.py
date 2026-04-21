@@ -55,16 +55,16 @@ class TestUserInfoInjectorInstantiation:
 class TestUserInfoInjectorBehavior:
     """Test User Info Injector filter behavior."""
 
-    def test_inlet_empty_messages(self):
+    async def test_inlet_empty_messages(self):
         """Verify inlet handles empty messages."""
         from user_info_injector import Filter
 
         f = Filter()
         body = {"messages": []}
-        result = f.inlet(body)
+        result = await f.inlet(body)
         assert result == body
 
-    def test_inlet_no_user(self):
+    async def test_inlet_no_user(self):
         """Verify inlet handles missing user."""
         from user_info_injector import Filter
 
@@ -74,11 +74,11 @@ class TestUserInfoInjectorBehavior:
                 {"role": "user", "content": "Hello"},
             ]
         }
-        result = f.inlet(body, __user__=None)
+        result = await f.inlet(body, __user__=None)
         # Should return unchanged
         assert len(result["messages"]) == 1
 
-    def test_inlet_injects_user_info(self):
+    async def test_inlet_injects_user_info(self):
         """Verify inlet injects user info system message."""
         from user_info_injector import Filter
 
@@ -94,7 +94,7 @@ class TestUserInfoInjectorBehavior:
             "role": "user",
             "valves": {},
         }
-        result = f.inlet(body, __user__=user)
+        result = await f.inlet(body, __user__=user)
         messages = result.get("messages", [])
 
         # Should have 2 messages now (system + user)
@@ -130,7 +130,7 @@ class TestGroupsInjection:
             ]
         }
 
-    def test_groups_injection_with_monkeypatch(self, monkeypatch, base_user, base_body):
+    async def test_groups_injection_with_monkeypatch(self, monkeypatch, base_user, base_body):
         """Verify groups are injected when include_groups=True."""
         from user_info_injector import Filter
 
@@ -145,7 +145,7 @@ class TestGroupsInjection:
 
         f = Filter()
         f.valves.include_groups = True
-        result = f.inlet(base_body, __user__=base_user)
+        result = await f.inlet(base_body, __user__=base_user)
         messages = result.get("messages", [])
 
         # Should have 2 messages (system + user)
@@ -160,7 +160,7 @@ class TestGroupsInjection:
         assert "Groups:" in system_content, \
             "Groups label should be present"
 
-    def test_groups_exclusion_single(self, monkeypatch, base_user, base_body):
+    async def test_groups_exclusion_single(self, monkeypatch, base_user, base_body):
         """Verify excluded_groups UserValve filters out a single group."""
         from user_info_injector import Filter
 
@@ -176,7 +176,7 @@ class TestGroupsInjection:
         f = Filter()
         f.valves.include_groups = True
         user = {**base_user, "valves": {"excluded_groups": "Internal"}}
-        result = f.inlet(base_body, __user__=user)
+        result = await f.inlet(base_body, __user__=user)
         messages = result.get("messages", [])
 
         system_content = messages[0]["content"]
@@ -188,7 +188,7 @@ class TestGroupsInjection:
         assert "Engineering" in system_content
         assert "Admins" in system_content
 
-    def test_groups_exclusion_multiple_comma_separated(self, monkeypatch, base_user, base_body):
+    async def test_groups_exclusion_multiple_comma_separated(self, monkeypatch, base_user, base_body):
         """Verify excluded_groups handles comma-separated list of groups.
 
         AGENTS.md specifies: 'accept comma-separated strings (e.g., "choiceA,choiceB")'
@@ -213,7 +213,7 @@ class TestGroupsInjection:
         f.valves.include_groups = True
         # Test comma-separated exclusion with spaces
         user = {**base_user, "valves": {"excluded_groups": "Internal, QA"}}
-        result = f.inlet(base_body, __user__=user)
+        result = await f.inlet(base_body, __user__=user)
         messages = result.get("messages", [])
 
         system_content = messages[0]["content"]
@@ -227,7 +227,7 @@ class TestGroupsInjection:
         assert "Engineering" in system_content
         assert "Admins" in system_content
 
-    def test_groups_disabled_does_not_call_api(self, monkeypatch, base_user, base_body):
+    async def test_groups_disabled_does_not_call_api(self, monkeypatch, base_user, base_body):
         """Verify Groups API is not called when include_groups=False."""
         from user_info_injector import Filter
 
@@ -246,12 +246,12 @@ class TestGroupsInjection:
 
         f = Filter()
         f.valves.include_groups = False
-        f.inlet(base_body, __user__=base_user)
+        await f.inlet(base_body, __user__=base_user)
 
         assert api_called["count"] == 0, \
             "Groups API should not be called when include_groups=False"
 
-    def test_groups_empty_shows_none(self, monkeypatch, base_user, base_body):
+    async def test_groups_empty_shows_none(self, monkeypatch, base_user, base_body):
         """Verify 'Groups: None' is shown when user has no groups."""
         from user_info_injector import Filter
 
@@ -264,14 +264,14 @@ class TestGroupsInjection:
 
         f = Filter()
         f.valves.include_groups = True
-        result = f.inlet(base_body, __user__=base_user)
+        result = await f.inlet(base_body, __user__=base_user)
         messages = result.get("messages", [])
 
         system_content = messages[0]["content"]
         assert "Groups: None" in system_content, \
             "Should show 'Groups: None' when user has no groups"
 
-    def test_groups_all_excluded_shows_none(self, monkeypatch, base_user, base_body):
+    async def test_groups_all_excluded_shows_none(self, monkeypatch, base_user, base_body):
         """Verify 'Groups: None' is shown when all groups are excluded."""
         from user_info_injector import Filter
 
@@ -287,7 +287,7 @@ class TestGroupsInjection:
         f = Filter()
         f.valves.include_groups = True
         user = {**base_user, "valves": {"excluded_groups": "Internal,QA"}}
-        result = f.inlet(base_body, __user__=user)
+        result = await f.inlet(base_body, __user__=user)
         messages = result.get("messages", [])
 
         system_content = messages[0]["content"]

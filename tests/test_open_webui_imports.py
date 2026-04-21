@@ -651,6 +651,8 @@ class TestMetadataStructure:
     __metadata__ contains runtime context:
     - chat_id: str - Used by Graphiti for conversation tracking
     - message_id: str - Used by Graphiti for message tracking
+    - user_message: dict - Current user message payload (Open WebUI 0.9.x)
+    - user_message_id: str - Current user message ID (Open WebUI 0.9.x)
     - files: list - Legacy attached-file payload location used by full_context_mode_toggle
 
     Uses AST analysis to verify these keys are actually used in metadata dict
@@ -711,6 +713,44 @@ class TestMetadataStructure:
         except ImportError as e:
             pytest.fail(import_error_message("open_webui.utils.middleware") + f"\n{e}")
 
+    def test_main_metadata_has_user_message_keys(self):
+        """Verify main.py builds Open WebUI 0.9.x user_message metadata keys."""
+        try:
+            main_module = importlib.import_module("open_webui.main")
+            source = inspect.getsource(main_module)
+            tree = ast.parse(source)
+
+            visitor = MetadataDictVisitor(["user_message", "user_message_id"])
+            visitor.visit(tree)
+
+            assert "user_message" in visitor.found_keys, \
+                "main.py doesn't build metadata['user_message']. " \
+                "Extensions reading the current user message may break."
+            assert "user_message_id" in visitor.found_keys, \
+                "main.py doesn't build metadata['user_message_id']. " \
+                "Extensions reading the current user message ID may break."
+        except ImportError as e:
+            pytest.fail(import_error_message("open_webui.main") + f"\n{e}")
+
+    def test_main_metadata_does_not_emit_legacy_parent_message_keys(self):
+        """Verify main.py no longer emits legacy parent_message metadata keys."""
+        try:
+            main_module = importlib.import_module("open_webui.main")
+            source = inspect.getsource(main_module)
+            tree = ast.parse(source)
+
+            visitor = MetadataDictVisitor(["parent_message", "parent_message_id"])
+            visitor.visit(tree)
+
+            assert "parent_message" not in visitor.found_keys, \
+                "main.py still builds legacy metadata['parent_message']; " \
+                "tests should track the active Open WebUI metadata shape."
+            assert "parent_message_id" not in visitor.found_keys, \
+                "main.py still builds legacy metadata['parent_message_id']; " \
+                "tests should track the active Open WebUI metadata shape."
+        except ImportError as e:
+            pytest.fail(import_error_message("open_webui.main") + f"\n{e}")
+
     def test_extra_params_has_metadata_key(self):
         """Verify extra_params dict includes __metadata__ key.
 
@@ -764,11 +804,11 @@ class TestMemoriesModule:
         assert "user_id" in params, \
             signature_changed_message("Memories", "get_memories_by_user_id", "user_id", str(params))
 
-    def test_get_memories_by_user_id_is_sync(self, memories_class):
-        """Verify get_memories_by_user_id is synchronous."""
+    def test_get_memories_by_user_id_is_async(self, memories_class):
+        """Verify get_memories_by_user_id is asynchronous in Open WebUI 0.9.x."""
         method = getattr(memories_class, "get_memories_by_user_id")
-        assert not inspect.iscoroutinefunction(method), \
-            "Memories.get_memories_by_user_id should be synchronous, but it's async"
+        assert inspect.iscoroutinefunction(method), \
+            "Memories.get_memories_by_user_id should be async in Open WebUI 0.9.x"
 
     def test_insert_new_memory_exists(self, memories_class):
         """Verify insert_new_memory method exists."""

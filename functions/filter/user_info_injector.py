@@ -3,13 +3,19 @@ title: User Info Injector
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Injects user name and group information as a system message just before the user's latest prompt.
-version: 1.0.0
+version: 1.0.1
 license: MIT
 """
 
 from pydantic import BaseModel, Field
 
 from open_webui.models.groups import Groups
+
+
+async def maybe_await(value):
+    if hasattr(value, "__await__"):
+        return await value
+    return value
 
 
 class Filter:
@@ -38,7 +44,7 @@ class Filter:
     def __init__(self):
         self.valves = self.Valves()
 
-    def inlet(self, body: dict, __user__: dict | None = None) -> dict:
+    async def inlet(self, body: dict, __user__: dict | None = None) -> dict:
         """Inject user name and group information as a system message before the user's latest prompt."""
         messages = body.get("messages", [])
         if not messages:
@@ -85,7 +91,7 @@ class Filter:
                         g.strip() for g in user_valves.excluded_groups.split(",") if g.strip()
                     }
 
-                user_groups = Groups.get_groups_by_member_id(user_id)
+                user_groups = await maybe_await(Groups.get_groups_by_member_id(user_id))
                 if user_groups:
                     # Filter out excluded groups
                     group_names = [

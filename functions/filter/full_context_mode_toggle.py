@@ -3,11 +3,17 @@ title: Full Context Mode
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Toggle full context mode for user-attached files at once. Sets the "context": "full" flag to leverage Open WebUI's native full context processing (RAG template with citations, etc.). Auto-injected model/folder knowledge entries are left untouched so large knowledge bases keep their normal chunk-based retrieval. Note: if the global RAG_FULL_CONTEXT setting is already enabled, this filter has no additional effect.
-version: 1.1.0
+version: 1.1.1
 license: MIT
 """
 
 from pydantic import BaseModel, Field
+
+
+async def maybe_await(value):
+    if hasattr(value, "__await__"):
+        return await value
+    return value
 
 
 def file_id(file: dict) -> str | None:
@@ -39,7 +45,7 @@ def model_knowledge_file_ids(metadata: dict) -> set[str]:
     return ids
 
 
-def folder_knowledge_file_ids(metadata: dict, __user__: dict | None) -> set[str]:
+async def folder_knowledge_file_ids(metadata: dict, __user__: dict | None) -> set[str]:
     user_id = (__user__ or {}).get("id")
     if not user_id:
         return set()
@@ -51,12 +57,12 @@ def folder_knowledge_file_ids(metadata: dict, __user__: dict | None) -> set[str]
         if not folder_id and chat_id and not chat_id.startswith("local:"):
             from open_webui.models.chats import Chats
 
-            folder_id = Chats.get_chat_folder_id(chat_id, user_id)
+            folder_id = await maybe_await(Chats.get_chat_folder_id(chat_id, user_id))
 
         if folder_id:
             from open_webui.models.folders import Folders
 
-            folder = Folders.get_folder_by_id_and_user_id(folder_id, user_id)
+            folder = await maybe_await(Folders.get_folder_by_id_and_user_id(folder_id, user_id))
             return file_ids((folder.data or {}).get("files", []) if folder else [])
     except Exception:
         return set()
@@ -64,12 +70,12 @@ def folder_knowledge_file_ids(metadata: dict, __user__: dict | None) -> set[str]
     return set()
 
 
-def auto_injected_file_ids(body: dict, __user__: dict | None) -> set[str]:
+async def auto_injected_file_ids(body: dict, __user__: dict | None) -> set[str]:
     metadata = body.get("metadata", {})
     if not isinstance(metadata, dict):
         return set()
 
-    return model_knowledge_file_ids(metadata) | folder_knowledge_file_ids(
+    return model_knowledge_file_ids(metadata) | await folder_knowledge_file_ids(
         metadata, __user__
     )
 
@@ -79,13 +85,19 @@ def current_message_file_ids(body: dict) -> set[str] | None:
     if not isinstance(metadata, dict):
         return None
 
-    parent_message = metadata.get("parent_message") or {}
-    if not isinstance(parent_message, dict):
+    if "user_message" in metadata:
+        user_message = metadata.get("user_message")
+    elif "parent_message" in metadata:
+        user_message = metadata.get("parent_message")
+    else:
         return None
 
-    files = parent_message.get("files")
-    if not isinstance(files, list):
+    if not isinstance(user_message, dict):
         return None
+
+    files = user_message.get("files")
+    if not isinstance(files, list):
+        return set()
 
     return file_ids(files)
 
@@ -102,14 +114,14 @@ class Filter:
         self.valves = self.Valves()
         self.toggle = True
 
-    def inlet(self, body: dict, __user__: dict | None = None) -> dict:
+    async def inlet(self, body: dict, __user__: dict | None = None) -> dict:
         """Set the "context": "full" flag for user-attached files in both body["files"] and body["metadata"]["files"] payload shapes. Auto-injected model/folder knowledge entries are skipped to avoid forcing full-context retrieval on large knowledge bases."""
         if not isinstance(body, dict):
             return body
 
         top_level_files = body.get("files")
         metadata_files = body.get("metadata", {}).get("files")
-        auto_file_ids = auto_injected_file_ids(body, __user__)
+        auto_file_ids = await auto_injected_file_ids(body, __user__)
         explicit_file_ids = current_message_file_ids(body)
 
         for files in (top_level_files, metadata_files):

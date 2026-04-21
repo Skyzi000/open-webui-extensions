@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.11
+version: 0.1.12
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -60,6 +60,12 @@ TERMINAL_EVENT_TOOLS = {
 # ============================================================================
 # Helper functions (outside class - AI cannot invoke these)
 # ============================================================================
+
+
+async def maybe_await(value):
+    if hasattr(value, "__await__"):
+        return await value
+    return value
 
 
 async def resolve_terminal_id_from_request_and_metadata(
@@ -258,7 +264,7 @@ def _normalize_user(user: Any) -> Any:
     return user
 
 
-def process_tool_result(
+async def process_tool_result(
     *,
     tool_function_name: str = "tool",
     tool_type: str,
@@ -279,7 +285,7 @@ def process_tool_result(
         except ImportError:
             pass
     if _core_process_tool_result is not None:
-        return _core_process_tool_result(
+        return await maybe_await(_core_process_tool_result(
             request,
             tool_function_name,
             tool_result,
@@ -287,7 +293,7 @@ def process_tool_result(
             direct_tool=direct_tool,
             metadata=metadata if isinstance(metadata, dict) else {},
             user=_normalize_user(user),
-        )
+        ))
     # Fallback for Open WebUI < 0.8.x
     if isinstance(tool_result, tuple):
         tool_result = tool_result[0] if tool_result else ""
@@ -353,19 +359,19 @@ async def execute_single_tool(
             # Update function with current messages/files context
             from open_webui.utils.tools import get_updated_tool_function
 
-            tool_function = get_updated_tool_function(
+            tool_function = await maybe_await(get_updated_tool_function(
                 function=tool_function,
                 extra_params={
                     "__messages__": extra_params.get("__messages__", []),
                     "__files__": extra_params.get("__files__", []),
                 },
-            )
+            ))
 
             result = await tool_function(**filtered_args)
 
         # Handle OpenAPI/external/direct tool results that return (data, headers)
         tool_type = tool.get("type", "")
-        result, tool_result_files, tool_result_embeds = process_tool_result(
+        result, tool_result_files, tool_result_embeds = await process_tool_result(
             tool_function_name=tool_name,
             tool_type=tool_type,
             tool_result=result,
@@ -773,12 +779,12 @@ class Tools:
                 "__oauth_token__": __oauth_token__,
             }
 
-            all_builtin_tools = get_builtin_tools(
+            all_builtin_tools = await maybe_await(get_builtin_tools(
                 request=__request__,
                 extra_params=builtin_extra_params,
                 features=features,
                 model=model,
-            )
+            ))
 
             # Add builtin tools (regular tools take priority)
             for name, tool_dict in all_builtin_tools.items():

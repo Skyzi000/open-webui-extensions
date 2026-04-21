@@ -3,7 +3,7 @@
 from functions.filter.full_context_mode_toggle import Filter
 
 
-def test_inlet_marks_both_payload_shapes_when_they_are_distinct():
+async def test_inlet_marks_both_payload_shapes_when_they_are_distinct():
     f = Filter()
     body = {
         "files": [
@@ -16,14 +16,14 @@ def test_inlet_marks_both_payload_shapes_when_they_are_distinct():
         },
     }
 
-    result = f.inlet(body)
+    result = await f.inlet(body)
 
     assert result["files"][0]["context"] == "full"
     assert result["metadata"]["files"][0]["context"] == "full"
     assert result["metadata"]["files"][0]["id"] == "meta-file"
 
 
-def test_inlet_skips_auto_injected_knowledge_entries():
+async def test_inlet_skips_auto_injected_knowledge_entries():
     f = Filter()
     body = {
         "files": [
@@ -38,7 +38,7 @@ def test_inlet_skips_auto_injected_knowledge_entries():
             },
         ],
         "metadata": {
-            "parent_message": {
+            "user_message": {
                 "files": [
                     {"id": "attached", "type": "file", "name": "user.txt"},
                 ],
@@ -62,7 +62,7 @@ def test_inlet_skips_auto_injected_knowledge_entries():
         },
     }
 
-    result = f.inlet(body)
+    result = await f.inlet(body)
 
     assert result["files"][0]["context"] == "full"
     assert "context" not in result["files"][1]
@@ -70,14 +70,14 @@ def test_inlet_skips_auto_injected_knowledge_entries():
     assert "context" not in result["files"][3]
 
 
-def test_inlet_allows_explicit_attachment_even_when_same_file_is_model_knowledge():
+async def test_inlet_allows_explicit_attachment_even_when_same_file_is_model_knowledge():
     f = Filter()
     body = {
         "files": [
             {"id": "shared-file", "type": "file", "name": "shared.txt"},
         ],
         "metadata": {
-            "parent_message": {
+            "user_message": {
                 "files": [
                     {"id": "shared-file", "type": "file", "name": "shared.txt"},
                 ],
@@ -94,12 +94,12 @@ def test_inlet_allows_explicit_attachment_even_when_same_file_is_model_knowledge
         },
     }
 
-    result = f.inlet(body)
+    result = await f.inlet(body)
 
     assert result["files"][0]["context"] == "full"
 
 
-def test_inlet_marks_explicit_legacy_and_collection_knowledge_items():
+async def test_inlet_marks_explicit_legacy_and_collection_knowledge_items():
     f = Filter()
     body = {
         "files": [
@@ -112,7 +112,7 @@ def test_inlet_marks_explicit_legacy_and_collection_knowledge_items():
             },
         ],
         "metadata": {
-            "parent_message": {
+            "user_message": {
                 "files": [
                     {"id": "legacy-kb", "name": "Legacy KB", "legacy": True},
                     {
@@ -141,13 +141,13 @@ def test_inlet_marks_explicit_legacy_and_collection_knowledge_items():
         },
     }
 
-    result = f.inlet(body)
+    result = await f.inlet(body)
 
     assert result["files"][0]["context"] == "full"
     assert result["files"][1]["context"] == "full"
 
 
-def test_inlet_treats_files_as_explicit_when_parent_message_is_missing():
+async def test_inlet_treats_files_as_explicit_when_user_message_is_missing():
     f = Filter()
     body = {
         "files": [
@@ -166,6 +166,67 @@ def test_inlet_treats_files_as_explicit_when_parent_message_is_missing():
         },
     }
 
-    result = f.inlet(body)
+    result = await f.inlet(body)
+
+    assert result["files"][0]["context"] == "full"
+
+
+async def test_inlet_treats_missing_user_message_files_as_empty_attachments():
+    f = Filter()
+    body = {
+        "files": [
+            {"id": "model-file", "type": "file", "name": "model.txt"},
+            {"id": "collection-1", "name": "kb", "legacy": True},
+        ],
+        "metadata": {
+            "user_message": {
+                "id": "user-message-id",
+                "role": "user",
+                "content": "Hello",
+            },
+            "model": {
+                "info": {
+                    "meta": {
+                        "knowledge": [
+                            {"id": "model-file", "type": "file", "name": "model.txt"},
+                            {"id": "collection-1", "name": "kb", "legacy": True},
+                        ]
+                    }
+                }
+            },
+        },
+    }
+
+    result = await f.inlet(body)
+
+    assert "context" not in result["files"][0]
+    assert "context" not in result["files"][1]
+
+
+async def test_inlet_supports_legacy_parent_message_key():
+    f = Filter()
+    body = {
+        "files": [
+            {"id": "shared-file", "type": "file", "name": "shared.txt"},
+        ],
+        "metadata": {
+            "parent_message": {
+                "files": [
+                    {"id": "shared-file", "type": "file", "name": "shared.txt"},
+                ],
+            },
+            "model": {
+                "info": {
+                    "meta": {
+                        "knowledge": [
+                            {"id": "shared-file", "type": "file", "name": "shared.txt"}
+                        ]
+                    }
+                }
+            },
+        },
+    }
+
+    result = await f.inlet(body)
 
     assert result["files"][0]["context"] == "full"

@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.4.0
+version: 0.4.1
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -29,6 +29,12 @@ from pydantic import BaseModel, Field
 log = logging.getLogger(__name__)
 
 _core_process_tool_result = None
+
+
+async def maybe_await(value):
+    if hasattr(value, "__await__"):
+        return await value
+    return value
 
 
 # ============================================================================
@@ -68,6 +74,20 @@ BUILTIN_TOOL_CATEGORIES = {
     },
     "code_interpreter": {"execute_code"},
     "skills": {"view_skill"},
+    "tasks": {"create_tasks", "update_task"},
+    "automations": {
+        "create_automation",
+        "update_automation",
+        "list_automations",
+        "toggle_automation",
+        "delete_automation",
+    },
+    "calendar": {
+        "search_calendar_events",
+        "create_calendar_event",
+        "update_calendar_event",
+        "delete_calendar_event",
+    },
 }
 
 # Mapping from Valves field names to category names
@@ -82,6 +102,9 @@ VALVE_TO_CATEGORY = {
     "ENABLE_CHANNELS_TOOLS": "channels",
     "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
     "ENABLE_SKILLS_TOOLS": "skills",
+    "ENABLE_TASK_TOOLS": "tasks",
+    "ENABLE_AUTOMATION_TOOLS": "automations",
+    "ENABLE_CALENDAR_TOOLS": "calendar",
 }
 
 # Tools that generate citation sources
@@ -1568,9 +1591,9 @@ class EventEmitter:
             try:
                 from open_webui.models.chats import Chats
 
-                msg = Chats.get_message_by_id_and_message_id(
+                msg = await maybe_await(Chats.get_message_by_id_and_message_id(
                     self._chat_id, self._message_id
-                )
+                ))
                 existing = list((msg or {}).get("embeds") or [])
                 for e in existing:
                     # Skip BOTH the current run's shell (defensive; shouldn't
@@ -2486,9 +2509,9 @@ async def resolve_mcp_tools(
                 continue
 
             try:
-                has_access = has_connection_access(user, mcp_server_connection)
+                has_access = await maybe_await(has_connection_access(user, mcp_server_connection))
             except TypeError:
-                has_access = has_connection_access(user, mcp_server_connection, None)
+                has_access = await maybe_await(has_connection_access(user, mcp_server_connection, None))
 
             if not has_access:
                 log.warning(f"[LLMReview] Access denied to MCP server {server_id} for user {user.id}")
@@ -2620,7 +2643,7 @@ async def cleanup_mcp_clients(mcp_clients: dict) -> None:
             log.debug(f"[LLMReview] Error cleaning up MCP client: {e}")
 
 
-def process_tool_result(
+async def process_tool_result(
     *,
     tool_function_name: str = "tool",
     tool_type: str,
@@ -2641,7 +2664,7 @@ def process_tool_result(
         except ImportError:
             pass
     if _core_process_tool_result is not None:
-        return _core_process_tool_result(
+        return await maybe_await(_core_process_tool_result(
             request,
             tool_function_name,
             tool_result,
@@ -2649,7 +2672,7 @@ def process_tool_result(
             direct_tool=direct_tool,
             metadata=metadata if isinstance(metadata, dict) else {},
             user=_normalize_user(user),
-        )
+        ))
     # Fallback for Open WebUI < 0.8.x
     if isinstance(tool_result, tuple):
         tool_result = tool_result[0] if tool_result else ""
@@ -3124,7 +3147,7 @@ async def execute_tool_call(
                 # into __user__["valves"] and we must preserve that.
                 from open_webui.utils.tools import get_updated_tool_function
 
-                tool_function = get_updated_tool_function(
+                tool_function = await maybe_await(get_updated_tool_function(
                     function=tool_function,
                     extra_params={
                         "__messages__": extra_params.get("__messages__", []),
@@ -3132,14 +3155,14 @@ async def execute_tool_call(
                         "__event_emitter__": extra_params.get("__event_emitter__"),
                         "__event_call__": extra_params.get("__event_call__"),
                     },
-                )
+                ))
 
                 tool_result = await tool_function(**tool_function_params)
 
             # Handle OpenAPI/external tool results that return (data, headers) tuple
             # Headers (CIMultiDictProxy) are not JSON-serializable
             tool_type = tool.get("type", "")
-            tool_result, tool_result_files, tool_result_embeds = process_tool_result(
+            tool_result, tool_result_files, tool_result_embeds = await process_tool_result(
                 tool_function_name=tool_function_name,
                 tool_type=tool_type,
                 tool_result=tool_result,
@@ -3221,12 +3244,14 @@ async def apply_inlet_filters_if_enabled(
         if isinstance(local_extra_params.get("__user__"), dict):
             local_extra_params["__user__"] = dict(local_extra_params["__user__"])
 
-        filter_ids = get_sorted_filter_ids(
+        filter_ids = await maybe_await(get_sorted_filter_ids(
             request, model, form_data.get("metadata", {}).get("filter_ids", [])
-        )
-        filter_functions = [
-            Functions.get_function_by_id(filter_id) for filter_id in filter_ids
-        ]
+        ))
+        filter_functions = []
+        for filter_id in filter_ids:
+            function = await maybe_await(Functions.get_function_by_id(filter_id))
+            if function:
+                filter_functions.append(function)
         form_data, _ = await process_filter_functions(
             request=request,
             filter_functions=filter_functions,
@@ -3815,12 +3840,12 @@ async def build_tools_dict(
             "__oauth_token__": extra_params.get("__oauth_token__"),
         }
 
-        all_builtin_tools = get_builtin_tools(
+        all_builtin_tools = await maybe_await(get_builtin_tools(
             request=request,
             extra_params=builtin_extra_params,
             features=features,
             model=model,
-        )
+        ))
 
         # Build set of disabled tools based on Valves categories
         disabled_builtin_tools = set()
@@ -3941,16 +3966,25 @@ def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
     return _extract_from_system_messages(messages, _find_skill_tags_in_text)
 
 
-def register_view_skill(
+async def register_view_skill(
     tools_dict: dict,
     request: Request,
     extra_params: dict,
 ) -> None:
     """Manually register the view_skill builtin tool in tools_dict.
 
-    Needed for **model-attached** skills whose content is not injected
-    inline. The agent can call ``view_skill`` to lazily load their content
+    This is needed for **model-attached** skills whose content is not injected
+    inline.  The review agent can call ``view_skill`` to lazily load their content
     from the ``<available_skills>`` manifest.
+
+    Since v0.8.2, user-selected skills are injected as full ``<skill>`` tags
+    and do NOT require ``view_skill``; they are passed directly in the system
+    message.
+
+    Args:
+        tools_dict: The tools dict to add view_skill to (modified in-place).
+        request: FastAPI request object.
+        extra_params: Extra parameters for tool binding.
     """
     if "view_skill" in tools_dict:
         return
@@ -3963,7 +3997,7 @@ def register_view_skill(
             convert_pydantic_model_to_openai_function_spec,
         )
 
-        callable_fn = get_async_tool_function_and_apply_extra_params(
+        callable_fn = await maybe_await(get_async_tool_function_and_apply_extra_params(
             view_skill,
             {
                 "__request__": request,
@@ -3974,7 +4008,7 @@ def register_view_skill(
                 "__chat_id__": extra_params.get("__chat_id__"),
                 "__message_id__": extra_params.get("__message_id__"),
             },
-        )
+        ))
 
         pydantic_model = convert_function_to_pydantic_model(view_skill)
         spec = convert_pydantic_model_to_openai_function_spec(pydantic_model)
@@ -4015,7 +4049,7 @@ async def get_available_models(
             continue
         filtered.append(model)
 
-    return get_filtered_models(filtered, user)
+    return await maybe_await(get_filtered_models(filtered, user))
 
 
 def extract_model_ids(models: list[dict]) -> list[str]:
@@ -4205,6 +4239,18 @@ class Tools:
         ENABLE_SKILLS_TOOLS: bool = Field(
             default=True,
             description="Enable skills tools (view_skill). When enabled and the parent conversation has skills, review agents can view skill contents.",
+        )
+        ENABLE_TASK_TOOLS: bool = Field(
+            default=False,
+            description="Enable task management tools (create_tasks, update_task).",
+        )
+        ENABLE_AUTOMATION_TOOLS: bool = Field(
+            default=False,
+            description="Enable automation tools (create/update/list/toggle/delete automations). Off by default for LLM Review to avoid scheduling side effects.",
+        )
+        ENABLE_CALENDAR_TOOLS: bool = Field(
+            default=False,
+            description="Enable calendar tools (search/create/update/delete calendar events).",
         )
         DEBUG: bool = Field(
             default=False,
@@ -4840,7 +4886,7 @@ CRITICAL RULES:
                 skill_manifest
                 and bool(getattr(self.valves, "ENABLE_SKILLS_TOOLS", True))
             ):
-                register_view_skill(tools_dict, request, scratch_extra_params)
+                await register_view_skill(tools_dict, request, scratch_extra_params)
 
             terminal_prompt = scratch_extra_params.get("__terminal_system_prompt__")
             direct_prompts = scratch_extra_params.get(

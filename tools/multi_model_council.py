@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.13
+version: 0.1.14
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -19,6 +19,12 @@ from pydantic import BaseModel, Field
 log = logging.getLogger(__name__)
 
 _core_process_tool_result = None
+
+
+async def maybe_await(value):
+    if hasattr(value, "__await__"):
+        return await value
+    return value
 
 
 # ============================================================================
@@ -58,6 +64,20 @@ BUILTIN_TOOL_CATEGORIES = {
     },
     "code_interpreter": {"execute_code"},
     "skills": {"view_skill"},
+    "tasks": {"create_tasks", "update_task"},
+    "automations": {
+        "create_automation",
+        "update_automation",
+        "list_automations",
+        "toggle_automation",
+        "delete_automation",
+    },
+    "calendar": {
+        "search_calendar_events",
+        "create_calendar_event",
+        "update_calendar_event",
+        "delete_calendar_event",
+    },
 }
 
 # Mapping from Valves field names to category names
@@ -71,6 +91,9 @@ VALVE_TO_CATEGORY = {
     "ENABLE_NOTES_TOOLS": "notes",
     "ENABLE_CHANNELS_TOOLS": "channels",
     "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
+    "ENABLE_TASK_TOOLS": "tasks",
+    "ENABLE_AUTOMATION_TOOLS": "automations",
+    "ENABLE_CALENDAR_TOOLS": "calendar",
 }
 
 # Tools that generate citation sources
@@ -383,7 +406,7 @@ def _normalize_user(user: Any) -> Any:
     return user
 
 
-def process_tool_result(
+async def process_tool_result(
     *,
     tool_function_name: str = "tool",
     tool_type: str,
@@ -404,7 +427,7 @@ def process_tool_result(
         except ImportError:
             pass
     if _core_process_tool_result is not None:
-        return _core_process_tool_result(
+        return await maybe_await(_core_process_tool_result(
             request,
             tool_function_name,
             tool_result,
@@ -412,7 +435,7 @@ def process_tool_result(
             direct_tool=direct_tool,
             metadata=metadata if isinstance(metadata, dict) else {},
             user=_normalize_user(user),
-        )
+        ))
     # Fallback for Open WebUI < 0.8.x
     if isinstance(tool_result, tuple):
         tool_result = tool_result[0] if tool_result else ""
@@ -690,7 +713,7 @@ async def execute_tool_call(
 
                 from open_webui.utils.tools import get_updated_tool_function
 
-                tool_function = get_updated_tool_function(
+                tool_function = await maybe_await(get_updated_tool_function(
                     function=tool_function,
                     extra_params={
                         "__messages__": extra_params.get("__messages__", []),
@@ -704,10 +727,10 @@ async def execute_tool_call(
                         "__chat_id__": extra_params.get("__chat_id__"),
                         "__message_id__": extra_params.get("__message_id__"),
                     },
-                )
+                ))
 
                 tool_result = await tool_function(**tool_function_params)
-            tool_result, tool_result_files, tool_result_embeds = process_tool_result(
+            tool_result, tool_result_files, tool_result_embeds = await process_tool_result(
                 tool_function_name=tool_function_name,
                 tool_type=tool.get("type", ""),
                 tool_result=tool_result,
@@ -782,12 +805,14 @@ async def apply_inlet_filters_if_enabled(
         from open_webui.models.functions import Functions
         from open_webui.utils.filter import get_sorted_filter_ids, process_filter_functions
 
-        filter_ids = get_sorted_filter_ids(
+        filter_ids = await maybe_await(get_sorted_filter_ids(
             request, model, form_data.get("metadata", {}).get("filter_ids", [])
-        )
-        filter_functions = [
-            Functions.get_function_by_id(filter_id) for filter_id in filter_ids
-        ]
+        ))
+        filter_functions = []
+        for filter_id in filter_ids:
+            function = await maybe_await(Functions.get_function_by_id(filter_id))
+            if function:
+                filter_functions.append(function)
         form_data, _ = await process_filter_functions(
             request=request,
             filter_functions=filter_functions,
@@ -1216,7 +1241,7 @@ async def build_tools_dict(
 
     # Load builtin tools
     features = metadata.get("features", {})
-    all_builtin_tools = get_builtin_tools(
+    all_builtin_tools = await maybe_await(get_builtin_tools(
         request=request,
         extra_params={
             "__user__": extra_params.get("__user__"),
@@ -1229,7 +1254,7 @@ async def build_tools_dict(
         },
         features=features,
         model=model,
-    )
+    ))
 
     # Build set of disabled tools based on Valves categories
     disabled_builtin_tools = set()
@@ -1271,7 +1296,7 @@ async def get_available_models(
             continue
         filtered.append(model)
 
-    return get_filtered_models(filtered, user)
+    return await maybe_await(get_filtered_models(filtered, user))
 
 
 def extract_model_ids(models: List[dict]) -> List[str]:
@@ -1358,6 +1383,18 @@ class Tools:
         ENABLE_CODE_INTERPRETER_TOOLS: bool = Field(
             default=True,
             description="Enable code interpreter tools (execute_code).",
+        )
+        ENABLE_TASK_TOOLS: bool = Field(
+            default=True,
+            description="Enable task management tools (create_tasks, update_task).",
+        )
+        ENABLE_AUTOMATION_TOOLS: bool = Field(
+            default=True,
+            description="Enable automation tools (create/update/list/toggle/delete automations).",
+        )
+        ENABLE_CALENDAR_TOOLS: bool = Field(
+            default=True,
+            description="Enable calendar tools (search/create/update/delete calendar events).",
         )
         DEBUG: bool = Field(
             default=False,
