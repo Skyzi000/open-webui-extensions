@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.5.1
+version: 0.5.2
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -30,7 +30,7 @@ import logging
 import re
 import uuid
 from collections.abc import Mapping, Sequence
-from typing import Any, Callable, List, Optional, Type
+from typing import Any, Callable, List, Literal, Optional, Type
 
 from fastapi import Request
 from starlette.responses import JSONResponse
@@ -1112,6 +1112,7 @@ async def run_sub_agent_loop(
     event_emitter: Optional[Callable] = None,
     extra_params: Optional[dict] = None,
     apply_inlet_filters: bool = True,
+    iteration_note_role: Literal["user", "system"] = "user",
 ) -> str:
     """Run the sub-agent tool loop until completion.
 
@@ -1125,6 +1126,8 @@ async def run_sub_agent_loop(
         event_emitter: Optional event emitter for status updates
         extra_params: Extra parameters for tool execution
         apply_inlet_filters: Whether to apply inlet filters (outlet filters are never applied)
+        iteration_note_role: Role for the per-iteration meta note ("user" keeps the
+            leading system message intact; "system" appends an extra system message)
 
     Returns:
         Final text response from the sub-agent
@@ -1175,10 +1178,36 @@ async def run_sub_agent_loop(
         if iteration == max_iterations:
             iteration_info += " This is your FINAL tool call opportunity."
 
-        # Add iteration info as a system message for context
-        messages_with_context = current_messages + [
-            {"role": "system", "content": iteration_info}
-        ]
+        # Append iteration info as a meta note. Default role is "user" so the
+        # leading system message stays at the beginning of the conversation —
+        # some chat templates and inference APIs reject requests where a
+        # system message appears after the first turn.
+        #
+        # When the last message is already ``user`` (the initial request on
+        # iteration 1), merging the note into that user message avoids two
+        # consecutive user turns, which strict role-alternation validators
+        # also reject. Subsequent iterations always end with a ``tool``
+        # result (an assistant turn without tool calls exits the loop), so
+        # appending a fresh user message there is safe.
+        messages_with_context = list(current_messages)
+        last = messages_with_context[-1] if messages_with_context else None
+        last_role = last.get("role") if isinstance(last, dict) else None
+        if iteration_note_role == "user" and last_role == "user":
+            merged = dict(last)
+            content = merged.get("content", "")
+            if isinstance(content, list):
+                merged["content"] = content + [
+                    {"type": "text", "text": f"\n\n{iteration_info}"}
+                ]
+            else:
+                merged["content"] = (
+                    f"{content}\n\n{iteration_info}" if content else iteration_info
+                )
+            messages_with_context[-1] = merged
+        else:
+            messages_with_context.append(
+                {"role": iteration_note_role, "content": iteration_info}
+            )
 
         # Prepare request
         form_data = {
@@ -2022,6 +2051,18 @@ class Tools:
             default=5,
             description="Maximum number of sub-agents to run in parallel via run_parallel_sub_agents. To fully disable parallel execution, comment out the run_parallel_sub_agents method.",
         )
+        ITERATION_NOTE_ROLE: Literal["user", "system"] = Field(
+            default="user",
+            description=(
+                "Role used for the per-iteration meta note appended to each sub-agent request "
+                "(e.g. '[Iteration 2/5]'). Default 'user' keeps the system message at the beginning "
+                "of the conversation, preserving prompt caching and avoiding 'System message must be at "
+                "the beginning' errors reported by some chat templates or inference APIs. "
+                "Set to 'system' to restore the pre-0.5.2 behaviour (the meta note is appended as a "
+                "standalone system message at the end of each request) — use this if the new default "
+                "causes any regression with your model; note that it may re-trigger the system-position error."
+            ),
+        )
         DEBUG: bool = Field(
             default=False,
             description="Enable debug logging.",
@@ -2216,6 +2257,7 @@ RESPONSE REQUIREMENTS:
                     event_emitter=__event_emitter__,
                     extra_params=common_extra_params,
                     apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                    iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                 )
             except Exception as e:
                 log.exception(f"Error in sub-agent execution: {e}")
@@ -2451,6 +2493,7 @@ RESPONSE REQUIREMENTS:
                             else None,
                         },
                         apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                        iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                     )
                     return {"description": task_description, "result": result}
                 except Exception as e:

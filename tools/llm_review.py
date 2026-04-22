@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.4.1
+version: 0.4.2
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -3317,6 +3317,7 @@ async def run_agent_loop(
     extra_params: Optional[dict] = None,
     apply_inlet_filters: bool = True,
     agent_name: str = "Agent",
+    iteration_note_role: Literal["user", "system"] = "user",
 ) -> str:
     """Run the LLM Review agent tool loop until completion.
 
@@ -3367,9 +3368,36 @@ async def run_agent_loop(
         if iteration == max_iterations:
             iteration_info += " This is your FINAL tool call opportunity. Provide your final JSON response now."
 
-        messages_with_context = current_messages + [
-            {"role": "system", "content": iteration_info}
-        ]
+        # Default role is "user" so the leading system message stays at the
+        # beginning of the conversation — some chat templates and inference
+        # APIs reject requests where a system message appears after the
+        # first turn.
+        #
+        # When the last message is already ``user`` (the initial request on
+        # iteration 1), merging the note into that user message avoids two
+        # consecutive user turns, which strict role-alternation validators
+        # also reject. Subsequent iterations always end with a ``tool``
+        # result (an assistant turn without tool calls exits the loop), so
+        # appending a fresh user message there is safe.
+        messages_with_context = list(current_messages)
+        last = messages_with_context[-1] if messages_with_context else None
+        last_role = last.get("role") if isinstance(last, dict) else None
+        if iteration_note_role == "user" and last_role == "user":
+            merged = dict(last)
+            content = merged.get("content", "")
+            if isinstance(content, list):
+                merged["content"] = content + [
+                    {"type": "text", "text": f"\n\n{iteration_info}"}
+                ]
+            else:
+                merged["content"] = (
+                    f"{content}\n\n{iteration_info}" if content else iteration_info
+                )
+            messages_with_context[-1] = merged
+        else:
+            messages_with_context.append(
+                {"role": iteration_note_role, "content": iteration_info}
+            )
 
         form_data = {
             "model": model_id,
@@ -4252,6 +4280,19 @@ class Tools:
             default=False,
             description="Enable calendar tools (search/create/update/delete calendar events).",
         )
+        ITERATION_NOTE_ROLE: Literal["user", "system"] = Field(
+            default="user",
+            description=(
+                "Role used for the per-iteration meta note appended to each review-agent "
+                "request (e.g. '[Iteration 2/5]'). Default 'user' keeps the system message "
+                "at the beginning of the conversation, preserving prompt caching and avoiding "
+                "'System message must be at the beginning' errors reported by some chat "
+                "templates or inference APIs. Set to 'system' to restore the pre-0.4.2 "
+                "behaviour (the meta note is appended as a standalone system message at the "
+                "end of each request) — use this if the new default causes any regression "
+                "with your model; note that it may re-trigger the system-position error."
+            ),
+        )
         DEBUG: bool = Field(
             default=False,
             description="Enable debug logging.",
@@ -4967,6 +5008,7 @@ CRITICAL RULES:
                         apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
                         agent_name=f"{persona['name']}",
                         event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
+                        iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                     )
 
                     parsed = safe_json_loads(content, expect_keys=("draft",))
@@ -5114,6 +5156,7 @@ CRITICAL RULES:
                                 reviewer_id,
                                 f"{reviewer_persona['name']}\u2192{author_persona['name']}",
                             ),
+                            iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                         )
 
                         parsed = safe_json_loads(
@@ -5225,6 +5268,7 @@ CRITICAL RULES:
                             apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
                             agent_name=f"{persona['name']}",
                             event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
+                            iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                         )
 
                         parsed = safe_json_loads(content, expect_keys=("draft",))
