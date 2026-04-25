@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.4.2
+version: 0.5.0
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -1067,6 +1067,12 @@ def _render_final_html(summary: dict) -> str:
     )
 
     # ---- Final drafts section (one card per agent, side-by-side) ----
+    num_rounds_raw = summary.get("num_rounds")
+    total_rounds = num_rounds_raw if isinstance(num_rounds_raw, int) else 0
+    # (persona, last_successful_round, sub_kind) per incomplete agent.
+    # sub_kind distinguishes pre-cancel failures from in-flight cancels
+    # within the same run.
+    incomplete_entries: list[tuple[str, int, str]] = []
     final_cards = []
     for aid in agent_ids:
         aid_s = str(aid or "")
@@ -1075,7 +1081,122 @@ def _render_final_html(summary: dict) -> str:
             continue
         draft_text = str(fd.get("draft") or "")
         sources_html = _render_sources_block(fd.get("sources"))
-        body = f"{_draft_body_html(draft_text)}{sources_html}"
+        lsr_raw = fd.get("last_successful_round")
+        lsr = lsr_raw if isinstance(lsr_raw, int) else None
+        outcome_raw = fd.get("last_phase_outcome")
+        outcome = (
+            outcome_raw
+            if outcome_raw in ("success", "failed", "unknown")
+            else "unknown"
+        )
+        # Legacy payloads (no submitted_rounds key) fall back to a
+        # contiguous-chain assumption so existing callers see the
+        # original wording instead of garbage.
+        submitted_raw = fd.get("submitted_rounds")
+        if isinstance(submitted_raw, list) and all(
+            isinstance(x, int) for x in submitted_raw
+        ):
+            submitted_rounds_set = set(submitted_raw)
+        elif lsr is not None and lsr >= 0:
+            submitted_rounds_set = set(range(0, lsr + 1))
+        else:
+            submitted_rounds_set = set()
+        chain_end_for_audit = lsr if (lsr is not None and lsr >= 0) else -1
+        unchained_submitted = sorted(
+            r for r in submitted_rounds_set if r > chain_end_for_audit
+        )
+        has_unchained = bool(unchained_submitted)
+        incomplete_badge = ""
+        if (
+            total_rounds > 0
+            and lsr is not None
+            and lsr < total_rounds
+        ):
+            # During cancel, "failed" outcome wins over the run-level
+            # flag so a pre-cancel bug stays labelled as a failure.
+            if not is_cancelled or outcome == "failed":
+                sub_kind = "failed"
+            else:
+                sub_kind = "cancelled"
+            incomplete_entries.append(
+                (persona_by_agent.get(aid_s, aid_s), lsr, sub_kind)
+            )
+            if has_unchained:
+                rounds_str = ", ".join(str(r) for r in unchained_submitted)
+                noun = "round" if len(unchained_submitted) == 1 else "rounds"
+                unchained_suffix = (
+                    f" (revise {noun} {rounds_str} submitted but could "
+                    "not extend the chain)"
+                )
+            else:
+                unchained_suffix = ""
+            if sub_kind == "cancelled":
+                if lsr < 0:
+                    base_label = "composition cancelled before completion"
+                elif lsr == 0:
+                    if has_unchained:
+                        base_label = (
+                            "showing compose draft — round 1 revision "
+                            "failed; run cancelled mid-pipeline"
+                        )
+                    else:
+                        base_label = (
+                            f"showing compose draft — cancelled before any of the "
+                            f"{total_rounds} revision rounds could complete"
+                        )
+                else:
+                    base_label = (
+                        f"showing round {lsr} revision — cancelled before "
+                        "later rounds"
+                    )
+            else:
+                if lsr < 0:
+                    base_label = "composition failed"
+                elif lsr == 0:
+                    if is_cancelled and has_unchained:
+                        base_label = (
+                            "showing compose draft — round 1 revision "
+                            "failed; run cancelled mid-pipeline"
+                        )
+                    elif is_cancelled:
+                        base_label = (
+                            "showing compose draft — round 1 revision "
+                            "failed; run cancelled before retry"
+                        )
+                    elif has_unchained:
+                        base_label = (
+                            "showing compose draft — round 1 revision failed"
+                        )
+                    else:
+                        base_label = (
+                            f"showing compose draft — all {total_rounds} "
+                            "revision rounds failed"
+                        )
+                else:
+                    if is_cancelled and has_unchained:
+                        base_label = (
+                            f"showing round {lsr} revision — round "
+                            f"{lsr + 1} failed; run cancelled mid-pipeline"
+                        )
+                    elif is_cancelled:
+                        base_label = (
+                            f"showing round {lsr} revision — round "
+                            f"{lsr + 1} failed; run cancelled before retry"
+                        )
+                    elif has_unchained:
+                        base_label = (
+                            f"showing round {lsr} revision — round "
+                            f"{lsr + 1} failed"
+                        )
+                    else:
+                        base_label = (
+                            f"showing round {lsr} revision — later rounds failed"
+                        )
+            badge_label = base_label + unchained_suffix
+            incomplete_badge = (
+                f'<div class="revision-warning">\u26a0\ufe0f {_html_escape(badge_label)}</div>'
+            )
+        body = f"{incomplete_badge}{_draft_body_html(draft_text)}{sources_html}"
         final_cards.append(
             _render_agent_card(
                 model_by_agent.get(aid_s, aid_s),
@@ -1083,9 +1204,39 @@ def _render_final_html(summary: dict) -> str:
                 body,
             )
         )
+    section_banner = ""
+    if incomplete_entries:
+        has_failed = any(kind == "failed" for _, _, kind in incomplete_entries)
+        has_cancelled = any(
+            kind == "cancelled" for _, _, kind in incomplete_entries
+        )
+        details = ", ".join(
+            f"{_html_escape(persona)} ({kind}, last successful round: {rn})"
+            for persona, rn, kind in incomplete_entries
+        )
+        if has_failed and has_cancelled:
+            banner_prefix = (
+                "Revision pipeline incomplete (mixed failure and "
+                "cancellation outcomes)"
+            )
+        elif has_cancelled:
+            banner_prefix = (
+                "Run cancelled before the revision pipeline finished for "
+                "all agents"
+            )
+        else:
+            banner_prefix = (
+                "Revision pipeline did not complete for all agents"
+            )
+        section_banner = (
+            f'<div class="revision-warning revision-warning-banner">'
+            f"\u26a0\ufe0f {banner_prefix}: {details}."
+            f"</div>"
+        )
     final_section = (
         f'<section class="final-section">'
         f'<h3>Final drafts</h3>'
+        f"{section_banner}"
         f'<div class="agents">{"".join(final_cards)}</div>'
         f"</section>"
         if final_cards
@@ -1301,6 +1452,14 @@ def _render_final_html(summary: dict) -> str:
         ".round>summary:hover{background:rgba(127,127,127,0.12)}"
         ".round>.agents{padding:10px 10px 12px}"
         ".final-section h3,.history-section h3{margin-bottom:6px}"
+        # Incomplete-revision indicator — used both as a per-card badge
+        # inside a final draft card (small inline warning) and as a
+        # full-width banner at the top of the Final drafts section
+        # (aggregate overview). Amber palette matches the conventional
+        # "warning but not fatal" signal.
+        ".revision-warning{background:rgba(245,158,11,0.15);border:1px solid rgba(245,158,11,0.35);color:#92400e;padding:5px 8px;border-radius:5px;font-size:11.5px;font-weight:500;margin:4px 0;display:flex;align-items:center;gap:6px;overflow-wrap:anywhere}"
+        "body.dark .revision-warning{background:rgba(245,158,11,0.18);color:#fbbf24;border-color:rgba(245,158,11,0.45)}"
+        ".revision-warning-banner{font-size:12px;margin:0 0 8px}"
         "</style></head><body>"
         # Apply the theme BEFORE paint — honours the user's
         # RICH_PROGRESS_THEME valve ('light'/'dark' force), or tries to
@@ -1380,36 +1539,57 @@ def _parse_agent_status(agent_name: str, description: str) -> Optional[dict]:
     exec_match = re.match(r"Executing\s+([^(]+)\((.*)\)\s*$", rest, re.DOTALL)
     if exec_match:
         name = exec_match.group(1).strip()
+        raw_args = exec_match.group(2)
+        # Submission pseudo-tools carry the full draft / review payload in
+        # their arguments, which the Draft / Review side-panels already
+        # render. Dumping the same bytes into the activity feed here would
+        # both spam the feed and race with live truncation — collapse them
+        # to a one-line info card instead. Peek at args to distinguish the
+        # initial vs revised label without waiting for the ``returned:``
+        # status (which is filtered out below).
+        if name == "submit_draft":
+            parsed_args: Any = {}
+            try:
+                parsed_args = json.loads(raw_args)
+            except Exception:
+                parsed_args = {}
+            if isinstance(parsed_args, dict) and (
+                parsed_args.get("changes_made")
+                or parsed_args.get("feedback_declined")
+            ):
+                return {"kind": "info", "text": "Revised draft submitted"}
+            return {"kind": "info", "text": "Draft submitted"}
+        if name == "submit_review":
+            return {"kind": "info", "text": "Review submitted"}
         # Keep args readable but cap so huge payloads don't blow up
         # postMessage traffic on every push.
-        args = _truncate(exec_match.group(2), 1500)
+        args = _truncate(raw_args, 1500)
         return {"kind": "executing", "name": name, "args": args}
     returned_match = re.match(r"([^\s]+)\s+returned:\s*(.*)$", rest, re.DOTALL)
     if returned_match:
         name = returned_match.group(1).strip()
+        # Drop the submission-tool acknowledgement — the matching
+        # ``Executing`` line was already rendered as a "submitted" info
+        # card above, so the "tool_name received..." echo would just be
+        # redundant noise right under it.
+        if name in ("submit_draft", "submit_review"):
+            return None
         result = _truncate(returned_match.group(2), 2000)
         return {"kind": "result", "name": name, "result": result}
     if "Max iterations" in rest and "reached" in rest:
         return {"kind": "info", "text": rest}
-    # Short-circuit the agent's final JSON response so a full
-    # {"draft": "..."} / {"key_feedback": "..."} payload doesn't get
-    # dumped verbatim into the activity feed — the Draft / Review cards
-    # already render the parsed bodies. expect_keys is the PRIMARY
-    # payload identifier only (``draft`` or ``key_feedback``). Using the
-    # primary key with non-empty-string validation skips scratchpad
-    # objects that share auxiliary keys (e.g. {"changes_made": [...]})
-    # so we don't both miss the real draft AND spam prose into the feed.
     parsed_final = safe_json_loads(rest, expect_keys=("draft", "key_feedback"))
-    if isinstance(parsed_final, dict):
-        if isinstance(parsed_final.get("draft"), str):
-            if parsed_final.get("changes_made") or parsed_final.get(
-                "feedback_declined"
-            ):
-                return {"kind": "info", "text": "Revised draft submitted"}
-            return {"kind": "info", "text": "Draft submitted"}
-        if isinstance(parsed_final.get("key_feedback"), str):
-            return {"kind": "info", "text": "Review submitted"}
-    # Anything else is the agent's own speech/response content.
+    if isinstance(parsed_final, dict) and (
+        isinstance(parsed_final.get("draft"), str)
+        or isinstance(parsed_final.get("key_feedback"), str)
+    ):
+        return {
+            "kind": "info",
+            "text": (
+                "Submission rejected: payload emitted as content JSON instead of "
+                "calling submit_draft / submit_review"
+            ),
+        }
     return {"kind": "speech", "text": _truncate(rest, 400)}
 
 
@@ -2148,6 +2328,281 @@ def safe_json_loads(
     return first_dict
 
 
+# ============================================================================
+# Submission pseudo-tools
+# ----------------------------------------------------------------------------
+# The compose / review / revise phases historically required the LLM to emit a
+# JSON object as its final content (``{"draft": "...", ...}``). That contract
+# breaks whenever the model forgets to escape an inner ``"`` — a single
+# unescaped quote in prose dumps the whole run into the "failed" branch and
+# ``safe_json_loads`` cannot recover the draft.
+#
+# Native function-calling sidesteps the escaping problem entirely: tool-call
+# arguments arrive already structured on the API side. We expose per-phase
+# ``submit_draft`` / ``submit_review`` pseudo-tools whose sole purpose is to
+# hand the final payload back to the orchestrator through the tool channel
+# instead of the content channel. ``run_agent_loop`` treats them as
+# loop terminators (executes the call, then exits without another LLM
+# round) so the agent cannot drift past submission, and the content-JSON
+# fallback is preserved downstream for models that ignore the tool and
+# emit JSON anyway.
+# ============================================================================
+
+
+# Pseudo-tool names that should terminate the agent loop after they're called.
+# Centralised so run_agent_loop's early-break, _parse_agent_status's activity
+# classifier, and the per-phase factories all agree on the same set.
+SUBMISSION_TOOL_NAMES = frozenset({"submit_draft", "submit_review"})
+
+
+def _sources_schema() -> dict:
+    """OpenAI function-spec fragment for the ``sources`` array."""
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Title of the source."},
+                "url": {"type": "string", "description": "URL of the source."},
+            },
+            "required": ["title", "url"],
+        },
+        "description": (
+            "Sources you used during research. Leave empty if none. "
+            "Each entry is an object with title and url."
+        ),
+    }
+
+
+def build_submit_draft_spec(
+    *, phase: Literal["compose", "revise"], include_sources: bool
+) -> dict:
+    """Build the OpenAI function spec for ``submit_draft``.
+
+    Compose vs revise get different schemas — compose expects ``approach``
+    while revise expects ``changes_made`` / ``feedback_declined`` — but
+    the tool *name* stays stable so downstream status parsing and
+    loop-termination handling only need to recognise one label."""
+    properties: dict[str, dict] = {
+        "draft": {
+            "type": "string",
+            "description": (
+                "Your complete draft as a single string. Write naturally — "
+                "newlines, quotes, and any other characters are handled for "
+                "you by the tool channel, so do not attempt manual escaping."
+            ),
+        }
+    }
+    required = ["draft"]
+
+    if phase == "compose":
+        properties["approach"] = {
+            "type": "string",
+            "description": (
+                "Brief explanation (2-3 sentences) of your writing approach."
+            ),
+        }
+        description = (
+            "Submit your final initial draft. Call this EXACTLY ONCE as your "
+            "very last action — do not emit any further text or tool calls "
+            "after invoking it."
+        )
+    else:  # revise
+        properties["changes_made"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Specific changes you made based on peer feedback, as short "
+                "bullet strings."
+            ),
+        }
+        properties["feedback_declined"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Feedback items you chose not to incorporate (include reasons), "
+                "as short bullet strings."
+            ),
+        }
+        description = (
+            "Submit your revised draft. Call this EXACTLY ONCE as your very "
+            "last action — do not emit any further text or tool calls after "
+            "invoking it."
+        )
+    if include_sources:
+        properties["sources"] = _sources_schema()
+
+    return {
+        "name": "submit_draft",
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        },
+    }
+
+
+def build_submit_review_spec() -> dict:
+    """Build the OpenAI function spec for ``submit_review``."""
+    return {
+        "name": "submit_review",
+        "description": (
+            "Submit your peer review. Call this EXACTLY ONCE as your very "
+            "last action — do not emit any further text or tool calls after "
+            "invoking it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "strengths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Specific strengths of the draft, as short bullet strings."
+                    ),
+                },
+                "improvements": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Specific, actionable improvements, as short bullet strings."
+                    ),
+                },
+                "key_feedback": {
+                    "type": "string",
+                    "description": (
+                        "One paragraph summarising your most important feedback."
+                    ),
+                },
+            },
+            "required": ["key_feedback"],
+        },
+    }
+
+
+def make_submission_tool(*, spec: dict, capture: dict) -> dict:
+    """Build a ``tools_dict`` entry that captures the agent's final payload.
+
+    When the agent invokes the tool, the arguments (already parsed and
+    escaped by the LLM API's tool-call channel) are stored in the caller-
+    owned ``capture`` dict under the ``payload`` key. The tool returns a
+    short confirmation string so the agent receives a clear signal that
+    submission succeeded and it should end its turn.
+
+    ``execute_tool_call`` filters kwargs against the spec's declared
+    properties before invoking the callable, so ``**kwargs`` is safe —
+    only schema-declared fields reach the closure."""
+
+    tool_name = spec.get("name", "submit")
+
+    async def _submit(**kwargs: Any) -> str:
+        capture["payload"] = dict(kwargs)
+        return (
+            f"{tool_name} received. End your turn now — do not emit any further "
+            "text and do not call any more tools."
+        )
+
+    return {
+        "callable": _submit,
+        "spec": spec,
+    }
+
+
+def advance_last_successful_round_if_chained(
+    last_successful_round: dict[str, int],
+    aid: str,
+    round_num: int,
+) -> bool:
+    """Advance ``last_successful_round[aid]`` to ``round_num`` iff the
+    prior phase succeeded. Returns whether the chain advanced."""
+    if last_successful_round.get(aid) == round_num - 1:
+        last_successful_round[aid] = round_num
+        return True
+    return False
+
+
+def build_tool_call_status_description(
+    agent_name: str, tool_name: str, tool_args_raw: Any
+) -> str:
+    """Format the ``Executing tool(args)`` status line for the activity feed.
+
+    Submission pseudo-tools (``submit_draft`` / ``submit_review``) carry the
+    full draft / review text in their arguments. Streaming megabyte-scale
+    payloads through every status emit chokes the WebSocket on long outputs
+    while adding nothing to the UI — the side panel already renders the
+    body. Strip the payload here, preserving only the discriminator fields
+    ``_parse_agent_status`` consults to label the activity card.
+    """
+    if tool_name == "submit_draft":
+        try:
+            parsed = (
+                json.loads(tool_args_raw)
+                if isinstance(tool_args_raw, str)
+                else (tool_args_raw if isinstance(tool_args_raw, dict) else {})
+            )
+        except Exception:
+            parsed = {}
+        is_revise = isinstance(parsed, dict) and bool(
+            parsed.get("changes_made") or parsed.get("feedback_declined")
+        )
+        stub_args = '{"changes_made": [1]}' if is_revise else "{}"
+        return f"[{agent_name}] Executing {tool_name}({stub_args})"
+    if tool_name == "submit_review":
+        return f"[{agent_name}] Executing {tool_name}({{}})"
+    args_display = (
+        str(tool_args_raw).replace(chr(10), " ") if tool_args_raw else "{}"
+    )
+    return f"[{agent_name}] Executing {tool_name}({args_display})"
+
+
+def reset_succeeded_outcomes(
+    outcome_map: dict[str, str], agent_ids: Sequence[str]
+) -> None:
+    """Reset per-agent phase outcomes at a phase boundary.
+
+    Applied at the start of each new compose / revise phase so the
+    OLD phase's status doesn't leak into the NEW phase's cancel-time
+    labelling. The reset is asymmetric:
+
+    - ``"success"`` → ``"unknown"``: the new phase might legitimately
+      succeed, fail, or be cancelled; carrying the previous success
+      forward would be a lie about the new phase.
+    - ``"failed"`` → retained: a previously-failed agent keeps the
+      ``"failed"`` marker so a subsequent cancellation cannot
+      mislabel the real pre-existing failure as a cancellation. If
+      the new phase happens to succeed, the inline setter in
+      compose_draft / revise_draft will overwrite ``"failed"`` with
+      ``"success"`` anyway.
+    - ``"unknown"`` → retained: nothing to reset.
+
+    Extracted as a module-level helper so the invariants can be
+    regression-tested directly; the Tools-method closure calls into
+    this function with its local outcome map and agent id list."""
+    for aid in agent_ids:
+        if outcome_map.get(aid) == "success":
+            outcome_map[aid] = "unknown"
+
+
+def extract_submission_payload(
+    capture: dict, primary_key: str
+) -> Optional[dict]:
+    """Return the captured submission payload iff it carries a usable value.
+
+    ``primary_key`` is the load-bearing field (``draft`` for writers,
+    ``key_feedback`` for reviewers). A payload missing a non-empty string
+    at that key is treated as not-captured, so the caller falls through
+    to the content-JSON fallback rather than latching onto a tool call
+    that arrived with all-empty args."""
+    payload = capture.get("payload") if isinstance(capture, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    primary = payload.get(primary_key)
+    if not isinstance(primary, str) or not primary.strip():
+        return None
+    return payload
+
+
 def normalize_text(value: Any) -> str:
     # Only accept real strings. str(non_string) would coerce lists/dicts/ints
     # into plausible-looking prose (e.g. "[1, 2, 3]") and let a malformed LLM
@@ -2792,9 +3247,9 @@ def build_compose_system_prompt(
     include_sources: bool,
 ) -> str:
     sources_note = (
-        "Include all sources from your research in the sources array."
+        "If you used any external sources, pass them as the ``sources`` array."
         if include_sources
-        else "If you did not use external sources, leave sources as an empty array."
+        else "Leave ``sources`` as an empty array if the tool schema includes it."
     )
 
     persona_name = persona.get("name", "Writer")
@@ -2807,13 +3262,19 @@ def build_compose_system_prompt(
         "1. Write independently according to your unique perspective and persona.\n"
         "2. Use available tools proactively if they help your research and writing.\n"
         "3. Maintain your distinct voice throughout all revisions.\n"
-        "4. Return ONLY a JSON object as your final response.\n"
-        "5. You have limited tool call iterations. Use them wisely.\n\n"
-        "FINAL RESPONSE FORMAT (JSON only):\n"
-        "- draft: your complete written response to the topic\n"
+        "4. You have limited tool-call iterations. Use them wisely.\n\n"
+        "FINAL SUBMISSION (tool call):\n"
+        "When your draft is ready, call the ``submit_draft`` tool EXACTLY ONCE "
+        "as your last action. Put the full draft text in the ``draft`` argument "
+        "— newlines, quotation marks, and symbols are passed verbatim through "
+        "the tool channel, so write naturally and do not hand-escape anything. "
+        "After calling ``submit_draft`` end your turn immediately; do not emit "
+        "any further text or tool calls.\n\n"
+        "submit_draft arguments:\n"
+        "- draft: your complete written response to the topic (required)\n"
         "- approach: brief explanation of your writing approach (2-3 sentences)\n"
-        "- sources: array of {title, url} objects\n\n"
-        f"{sources_note}"
+        + ("- sources: array of {title, url} objects\n\n" if include_sources else "\n")
+        + sources_note
     )
 
     base_prompt = normalize_text(base_prompt)
@@ -2833,7 +3294,8 @@ def build_compose_user_prompt(
         "Instructions:\n"
         "1. Research the topic using available tools if needed.\n"
         "2. Write a comprehensive draft that reflects your unique perspective.\n"
-        "3. Provide your final JSON response with draft, approach, and sources."
+        "3. Finish by calling ``submit_draft`` with your full draft, approach, "
+        "and any sources."
     )
 
 
@@ -2881,12 +3343,17 @@ def build_review_system_prompt(
         "CRITICAL RULES:\n"
         "1. Provide constructive, specific feedback from your unique perspective.\n"
         "2. Focus on helping the author improve while respecting their voice.\n"
-        "3. Be direct but supportive in your critique.\n"
-        "4. Return ONLY a JSON object as your final response.\n\n"
-        "FINAL RESPONSE FORMAT (JSON only):\n"
+        "3. Be direct but supportive in your critique.\n\n"
+        "FINAL SUBMISSION (tool call):\n"
+        "When your review is ready, call the ``submit_review`` tool EXACTLY ONCE "
+        "as your last action. The tool channel passes strings verbatim, so write "
+        "naturally — do not hand-escape quotes or newlines. After calling "
+        "``submit_review`` end your turn immediately; do not emit any further "
+        "text or tool calls.\n\n"
+        "submit_review arguments:\n"
         "- strengths: array of specific strengths in the draft\n"
         "- improvements: array of specific, actionable suggestions\n"
-        "- key_feedback: one paragraph summarizing your most important feedback"
+        "- key_feedback: one paragraph summarising your most important feedback (required)"
     )
 
     base_prompt = normalize_text(base_prompt)
@@ -2904,7 +3371,8 @@ def build_review_user_prompt(
         f"Review the following draft written by '{author_persona_name}':\n\n"
         f"TOPIC: {topic}\n\n"
         f"DRAFT:\n{draft}\n\n"
-        "Provide your feedback in the required JSON format."
+        "Finish by calling ``submit_review`` with your strengths, improvements, "
+        "and key feedback."
     )
 
 
@@ -2914,9 +3382,9 @@ def build_revise_system_prompt(
     include_sources: bool,
 ) -> str:
     sources_note = (
-        "Update sources if you conducted additional research."
+        "Update the ``sources`` array if you conducted additional research."
         if include_sources
-        else "If you did not use external sources, leave sources as an empty array."
+        else "Leave ``sources`` as an empty array if the tool schema includes it."
     )
 
     persona_name = persona.get("name", "Writer")
@@ -2928,14 +3396,20 @@ def build_revise_system_prompt(
         "CRITICAL RULES:\n"
         "1. Consider the feedback carefully but maintain your unique voice.\n"
         "2. You may use tools to gather additional information if needed.\n"
-        "3. Accept suggestions that improve your work; respectfully decline others.\n"
-        "4. Return ONLY a JSON object as your final response.\n\n"
-        "FINAL RESPONSE FORMAT (JSON only):\n"
-        "- draft: your revised draft\n"
+        "3. Accept suggestions that improve your work; respectfully decline others.\n\n"
+        "FINAL SUBMISSION (tool call):\n"
+        "When your revision is ready, call the ``submit_draft`` tool EXACTLY ONCE "
+        "as your last action. Put the full revised text in the ``draft`` argument "
+        "— newlines, quotation marks, and symbols are passed verbatim through "
+        "the tool channel, so write naturally and do not hand-escape anything. "
+        "After calling ``submit_draft`` end your turn immediately; do not emit "
+        "any further text or tool calls.\n\n"
+        "submit_draft arguments:\n"
+        "- draft: your revised draft (required)\n"
         "- changes_made: array of specific changes you made based on feedback\n"
         "- feedback_declined: array of suggestions you chose not to incorporate (with reasons)\n"
-        "- sources: array of {title, url} objects\n\n"
-        f"{sources_note}"
+        + ("- sources: array of {title, url} objects\n\n" if include_sources else "\n")
+        + sources_note
     )
 
     base_prompt = normalize_text(base_prompt)
@@ -2986,7 +3460,8 @@ def build_revise_user_prompt(
         f"PEER FEEDBACK:{feedback_text}\n\n"
         "Revise your draft based on this feedback. "
         "Maintain your unique perspective while incorporating valuable suggestions. "
-        "Provide your response in the required JSON format."
+        "Finish by calling ``submit_draft`` with your revised draft, changes_made, "
+        "feedback_declined, and any sources."
     )
 
 
@@ -3318,10 +3793,19 @@ async def run_agent_loop(
     apply_inlet_filters: bool = True,
     agent_name: str = "Agent",
     iteration_note_role: Literal["user", "system"] = "user",
+    submission_tool_names: Optional[set[str]] = None,
 ) -> str:
     """Run the LLM Review agent tool loop until completion.
 
     Adapted from sub_agent.run_sub_agent_loop with branded status messages.
+
+    ``submission_tool_names`` is an optional set of tool names that signal
+    task completion when called. Once the agent invokes any tool in this
+    set during an iteration, the loop executes the call(s) for the side
+    effect (e.g. capturing the submission payload into a caller-owned
+    closure) and then exits without running another LLM round. This both
+    saves an iteration and prevents the agent from drifting past the
+    submission with additional text or tool calls.
     """
     from open_webui.models.users import UserModel
     from open_webui.utils.chat import generate_chat_completion
@@ -3366,7 +3850,25 @@ async def run_agent_loop(
 
         iteration_info = f"[Iteration {iteration}/{max_iterations}]"
         if iteration == max_iterations:
-            iteration_info += " This is your FINAL tool call opportunity. Provide your final JSON response now."
+            # The old wording told the agent to "provide your final JSON
+            # response now" — that directive conflicts with the submission
+            # pseudo-tool contract (the new compose/review/revise prompts
+            # require a ``submit_draft`` / ``submit_review`` tool call and
+            # explicitly forbid content-JSON). When a submission tool is
+            # registered, name it so the agent has a clear, unambiguous
+            # final action; otherwise fall back to a tool-agnostic nudge.
+            if submission_tool_names:
+                names = ", ".join(sorted(f"``{n}``" for n in submission_tool_names))
+                iteration_info += (
+                    f" This is your FINAL opportunity. Call {names} now with "
+                    "your complete payload and end your turn — do not emit "
+                    "any further text."
+                )
+            else:
+                iteration_info += (
+                    " This is your FINAL tool call opportunity. Complete "
+                    "your task now and end your turn."
+                )
 
         # Default role is "user" so the leading system message stays at the
         # beginning of the conversation — some chat templates and inference
@@ -3474,8 +3976,60 @@ async def run_agent_loop(
                     }
                 )
 
-            # If no tool calls, we're done
+            # If no tool calls, we're done — except under the strict
+            # tool-call contract, where the caller is relying on a
+            # submission tool to deposit the final payload via a
+            # capture closure. Returning a content-only response there
+            # would short-circuit the submission contract entirely:
+            # the caller checks the capture box, sees nothing, and
+            # marks the phase as failed even when the agent produced
+            # perfectly fine prose. Models that prefer free-form
+            # answers would fail every single time.
+            #
+            # Instead, push the assistant turn into history, inject
+            # a re-prompt explaining that submission requires the
+            # submission tool, and continue. If the model keeps
+            # refusing through ``max_iterations``, the loop exits
+            # naturally and the max-iterations fallback below
+            # (which exposes ONLY the submission tools and tells the
+            # agent to submit) gets one more shot at the capture.
             if not tool_calls:
+                if submission_tool_names:
+                    current_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": content or "",
+                        }
+                    )
+                    names = ", ".join(
+                        sorted(f"``{n}``" for n in submission_tool_names)
+                    )
+                    current_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"You did not call {names}. Your turn is "
+                                "not complete until you submit your final "
+                                f"payload via {names}. Call the tool now "
+                                "with the complete payload — do not emit "
+                                "the answer as plain text."
+                            ),
+                        }
+                    )
+                    if event_emitter:
+                        await event_emitter(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": (
+                                        f"[{agent_name}] Step {iteration}: "
+                                        "no submission tool called — re-prompting"
+                                    ),
+                                    "done": False,
+                                },
+                            }
+                        )
+                    continue
                 return content or ""
 
             # Normalize: filter out non-mapping entries from tool_calls
@@ -3541,19 +4095,28 @@ async def run_agent_loop(
                 }
             )
 
-            # Execute each tool call
+            # Execute each tool call in source order. If any of them lands
+            # in ``submission_tool_names`` we stop immediately AFTER that
+            # call — both to skip the remaining (now-pointless) tools in
+            # the same iteration and to exit the outer while-loop without
+            # requesting another LLM round. Running tools after submission
+            # would waste compute and, if the agent erroneously called
+            # submit_* twice in the same batch, would overwrite the
+            # capture payload with whatever came second.
+            submission_tool_fired = False
             for tool_call in normalized_tool_calls:
                 tc_func = tool_call.get("function")
                 tool_name = tc_func.get("name", "unknown") if isinstance(tc_func, dict) else "unknown"
                 tool_args_raw = tc_func.get("arguments", "{}") if isinstance(tc_func, dict) else "{}"
-                tool_args_display = str(tool_args_raw).replace(chr(10), " ") if tool_args_raw else "{}"
 
                 if event_emitter:
                     await event_emitter(
                         {
                             "type": "status",
                             "data": {
-                                "description": f"[{agent_name}] Executing {tool_name}({tool_args_display})",
+                                "description": build_tool_call_status_description(
+                                    agent_name, tool_name, tool_args_raw
+                                ),
                                 "done": False,
                             },
                         }
@@ -3591,6 +4154,16 @@ async def run_agent_loop(
                     }
                 )
 
+                if submission_tool_names and tool_name in submission_tool_names:
+                    submission_tool_fired = True
+                    break
+
+            if submission_tool_fired:
+                # Submission payload is already in the caller-owned capture
+                # closure; any further LLM round or tool execution here
+                # would be drift past the agent's own completion signal.
+                return content or ""
+
         else:
             # Unexpected response type
             return f"Unexpected response type: {type(response)}"
@@ -3607,16 +4180,67 @@ async def run_agent_loop(
             }
         )
 
-    # Try to get final response without tools
+    # Build the final-chance follow-up. Two contract differences from a
+    # normal iteration:
+    #
+    # 1. Non-submission tools are pruned. The agent has already burned
+    #    its exploration budget, so we don't want it digging further
+    #    into web-search / Open-Terminal / memory tools. Only the
+    #    submission tools (``submit_draft`` / ``submit_review``) remain
+    #    exposed.
+    # 2. Submission tools MUST stay reachable. Previously this block
+    #    ran with no ``tools`` at all and relied on the caller to
+    #    parse a JSON object out of ``content``. With the strict
+    #    tool-call contract that fallback is gone, so if we don't
+    #    expose the submission tools here the agent physically CANNOT
+    #    submit — every tool-heavy run that spent its iterations on
+    #    research would end in a guaranteed failure even when the
+    #    agent actually produced a usable final answer.
+    final_tools_param = None
+    final_tools_dict = {}
+    if submission_tool_names and tools_dict:
+        final_tools_dict = {
+            name: tool
+            for name, tool in tools_dict.items()
+            if name in submission_tool_names
+        }
+        if final_tools_dict:
+            final_tools_param = [
+                {"type": "function", "function": tool.get("spec", {})}
+                for tool in final_tools_dict.values()
+            ]
+
+    # Follow-up instruction. When submission tools are exposed, be
+    # explicit about what the agent must do next — otherwise models
+    # that ignored the submission tool on earlier iterations may
+    # default to free-form content again.
+    if final_tools_param:
+        names = ", ".join(sorted(f"``{n}``" for n in submission_tool_names or ()))
+        final_user_content = (
+            "Maximum tool iterations reached. Call "
+            f"{names} NOW with your complete payload to submit your final "
+            "response. No other tools are available — submission is your "
+            "only remaining action. Do not emit any additional text."
+        )
+    else:
+        final_user_content = (
+            "Maximum tool iterations reached. Please provide your final "
+            "answer based on the information gathered so far."
+        )
+
+    final_messages = list(current_messages)
+    if final_messages and final_messages[-1].get("role") == "user":
+        existing = final_messages[-1].get("content", "") or ""
+        merged = (
+            f"{existing}\n\n{final_user_content}" if existing else final_user_content
+        )
+        final_messages[-1] = {**final_messages[-1], "content": merged}
+    else:
+        final_messages.append({"role": "user", "content": final_user_content})
+
     form_data = {
         "model": model_id,
-        "messages": current_messages
-        + [
-            {
-                "role": "user",
-                "content": "Maximum tool iterations reached. Please provide your final answer based on the information gathered so far.",
-            }
-        ],
+        "messages": final_messages,
         "stream": False,
         "metadata": {
             "task": "llm_review",
@@ -3624,6 +4248,8 @@ async def run_agent_loop(
             "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
         },
     }
+    if final_tools_param:
+        form_data["tools"] = final_tools_param
 
     form_data = await apply_inlet_filters_if_enabled(
         apply_inlet_filters, request, model, form_data, extra_params
@@ -3644,7 +4270,82 @@ async def run_agent_loop(
                 if isinstance(choice, Mapping):
                     message = choice.get("message", {})
                     if isinstance(message, Mapping):
-                        return message.get("content", "")
+                        final_content = message.get("content", "") or ""
+                        final_tool_calls = message.get("tool_calls", []) or []
+                        # Process a submission if the agent took the hint
+                        # and called submit_*. This is the whole point of
+                        # exposing the submission tools here — without
+                        # executing the call the capture box stays empty
+                        # and the strict-contract caller would still mark
+                        # the phase as failed.
+                        if (
+                            final_tools_dict
+                            and isinstance(final_tool_calls, Sequence)
+                            and not isinstance(final_tool_calls, (str, bytes))
+                        ):
+                            for tc in final_tool_calls:
+                                if not isinstance(tc, Mapping):
+                                    continue
+                                tc_func = tc.get("function")
+                                if not isinstance(tc_func, Mapping):
+                                    continue
+                                tool_name = tc_func.get("name", "")
+                                if tool_name not in submission_tool_names:
+                                    # Non-submission tools were pruned
+                                    # from tools_param, so the API
+                                    # shouldn't return them — but
+                                    # defensive skip keeps us robust
+                                    # against misbehaving providers.
+                                    continue
+                                # Normalize args to a JSON string so
+                                # execute_tool_call's parser path
+                                # matches the regular iteration loop.
+                                args = tc_func.get("arguments", "{}")
+                                if not isinstance(args, str):
+                                    try:
+                                        args = json.dumps(
+                                            args, ensure_ascii=False
+                                        )
+                                    except Exception:
+                                        args = str(args)
+                                normalized_tc = {
+                                    **tc,
+                                    "function": {**tc_func, "arguments": args},
+                                }
+                                if event_emitter:
+                                    await event_emitter(
+                                        {
+                                            "type": "status",
+                                            "data": {
+                                                "description": build_tool_call_status_description(
+                                                    agent_name, tool_name, args
+                                                ),
+                                                "done": False,
+                                            },
+                                        }
+                                    )
+                                try:
+                                    await execute_tool_call(
+                                        normalized_tc,
+                                        final_tools_dict,
+                                        {
+                                            **extra_params,
+                                            "__messages__": current_messages,
+                                        },
+                                        event_emitter=event_emitter,
+                                    )
+                                except Exception as exec_exc:
+                                    log.warning(
+                                        f"[LLMReview] final-iteration submission "
+                                        f"tool exec failed: {exec_exc}"
+                                    )
+                                # One submission is enough — the capture
+                                # box is now populated (or the call
+                                # genuinely failed). Stop here so a
+                                # duplicate submission cannot overwrite
+                                # it.
+                                break
+                        return final_content
     except Exception as e:
         log.exception(f"Error getting final review agent response: {e}")
 
@@ -4230,8 +4931,9 @@ class Tools:
                 "Enable memory tools (search_memories, add_memory, "
                 "replace_memory_content). Off by default for LLM Review: review "
                 "agents occasionally dump their drafts into long-term memory "
-                "instead of returning them as JSON, polluting it. Turn on only "
-                "if review agents genuinely need to consult user memories."
+                "instead of submitting them via submit_draft/submit_review, "
+                "polluting it. Turn on only if review agents genuinely need to "
+                "consult user memories."
             ),
         )
         ENABLE_NOTES_TOOLS: bool = Field(
@@ -4240,8 +4942,8 @@ class Tools:
                 "Enable notes tools (search_notes, view_note, write_note, "
                 "replace_note_content). Off by default for LLM Review: review "
                 "agents will otherwise persist drafts as notes instead of "
-                "returning them as JSON. Turn on only if review agents should "
-                "read/modify the user's notes."
+                "submitting them via submit_draft/submit_review. Turn on only "
+                "if review agents should read/modify the user's notes."
             ),
         )
         ENABLE_CHANNELS_TOOLS: bool = Field(
@@ -4255,9 +4957,9 @@ class Tools:
                 "metadata (e.g., run_command, list_files, read_file, write_file, "
                 "display_file). Off by default for LLM Review: review agents "
                 "occasionally write drafts directly to disk via write_file "
-                "instead of returning them as JSON, which is unwanted side "
-                "effects for a drafting workflow. Turn on only if review agents "
-                "genuinely need terminal access."
+                "instead of submitting them via submit_draft/submit_review, "
+                "which is an unwanted side effect for a drafting workflow. "
+                "Turn on only if review agents genuinely need terminal access."
             ),
         )
         ENABLE_CODE_INTERPRETER_TOOLS: bool = Field(
@@ -4307,7 +5009,7 @@ You are a collaborative writing agent participating in a multi-agent review proc
 CRITICAL RULES:
 1. Maintain your unique perspective and writing voice throughout.
 2. Use tools when they help research and improve your writing.
-3. Respond ONLY with the required JSON format.
+3. Submit your final output ONLY via the ``submit_draft`` / ``submit_review`` tool call specified in the phase-specific instructions below — never dump JSON into your content.
 4. Be open to feedback but don't lose your distinctive style.""",
             description="Base system prompt prepended to every LLM Review agent prompt.",
         )
@@ -4892,7 +5594,41 @@ CRITICAL RULES:
         tools_cache: dict[str, tuple[dict, Optional[str], list[str]]] = {}
         all_mcp_clients: list[dict[str, Any]] = []
         rounds_data: list[dict] = []
+        # current_drafts: latest body for each agent, updated on every
+        # successful submission so cross-review during the run sees real
+        # prose. chained_drafts: only mirrored when the success chain
+        # actually advances; consumed by final_drafts so the displayed
+        # body matches last_successful_round.
         current_drafts: dict[str, dict] = {}
+        chained_drafts: dict[str, dict] = {}
+        # -1 = compose did not submit; 0 = compose only; N = revise N.
+        last_successful_round: dict[str, int] = {aid: -1 for aid in agent_ids}
+        # Rounds where the agent called submit_draft regardless of chain
+        # state. Lets the renderer differentiate "submitted on top of
+        # broken chain" from "did not submit at all".
+        submitted_rounds: dict[str, set[int]] = {aid: set() for aid in agent_ids}
+        # Per-agent outcome of the most recently ATTEMPTED phase. Reset
+        # to "unknown" at the start of each phase and set to "success"
+        # or "failed" inline inside compose_draft / revise_draft just
+        # before the task returns — so if cancellation interrupts a
+        # phase mid-flight the entry stays at "unknown". This lets the
+        # cancel-time renderer tell a mixed run apart: an agent whose
+        # latest attempted phase cleanly failed before cancellation
+        # shows "round N failed", while an agent that was actively
+        # running when the stop button was pressed shows "cancelled
+        # before round N could complete". Without this distinction,
+        # a single ``is_cancelled`` flag mislabels all incomplete
+        # agents as cancellation victims.
+        per_agent_last_phase_outcome: dict[str, str] = {
+            aid: "unknown" for aid in agent_ids
+        }
+
+        def reset_phase_outcomes() -> None:
+            """Thin wrapper over the module-level ``reset_succeeded_outcomes``
+            so this closure can be called at phase boundaries without
+            re-stating the semantic every time. See that helper's
+            docstring for why "failed" is preserved across resets."""
+            reset_succeeded_outcomes(per_agent_last_phase_outcome, agent_ids)
 
         async def ensure_tools(
             agent_id: str,
@@ -4967,6 +5703,7 @@ CRITICAL RULES:
                 agent_state={aid: "composing" for aid in agent_ids},
                 total_substeps=len(agent_ids),
             )
+            reset_phase_outcomes()
 
             async def compose_draft(agent_id: str) -> tuple[str, str, dict]:
                 persona = agents[agent_id]
@@ -4994,6 +5731,26 @@ CRITICAL RULES:
                     )
                     user_prompt = build_compose_user_prompt(topic_text, requirements_text)
 
+                    # Capture box + submission pseudo-tool. The agent calls
+                    # ``submit_draft`` with its final payload and the tool
+                    # channel deposits already-escaped args here — no more
+                    # content-JSON parsing hazard. A per-agent capture box
+                    # keeps compose_draft tasks that gather in parallel
+                    # from overwriting each other's payloads.
+                    submit_capture: dict = {"payload": None}
+                    submit_spec = build_submit_draft_spec(
+                        phase="compose", include_sources=include_sources
+                    )
+                    # Build a fresh dict so the cached ``tools_dict`` from
+                    # ``ensure_tools`` is not mutated (multiple agents may
+                    # share the same cache entry).
+                    combined_tools = {
+                        **tools_dict,
+                        "submit_draft": make_submission_tool(
+                            spec=submit_spec, capture=submit_capture
+                        ),
+                    }
+
                     content = await run_agent_loop(
                         request=request,
                         user=user,
@@ -5002,16 +5759,25 @@ CRITICAL RULES:
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},
                         ],
-                        tools_dict=tools_dict,
+                        tools_dict=combined_tools,
                         max_iterations=self.valves.MAX_ITERATIONS,
                         extra_params=member_extra_params,
                         apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
                         agent_name=f"{persona['name']}",
                         event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
                         iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
+                        submission_tool_names={"submit_draft"},
                     )
 
-                    parsed = safe_json_loads(content, expect_keys=("draft",))
+                    # Strict tool-call contract: the only authoritative
+                    # source of the draft payload is the submit_draft
+                    # capture box. The prompt explicitly forbids content
+                    # JSON, so we do NOT silently resurrect a content-JSON
+                    # fallback here — that would both contradict the
+                    # prompt and re-open the unescaped-quote parse bug
+                    # this whole migration set out to fix. Missing
+                    # capture → state stays "failed" with a clear label.
+                    parsed = extract_submission_payload(submit_capture, "draft")
                     if isinstance(parsed, dict):
                         draft_val = parsed.get("draft")
                         if isinstance(draft_val, str) and draft_val.strip():
@@ -5039,9 +5805,45 @@ CRITICAL RULES:
                             # output.
                             current_drafts[agent_id] = normalize_draft_result(
                                 parsed,
-                                f"Non-JSON response: {truncate_text(content, 180)}",
+                                f"Agent did not submit via submit_draft. Response: {truncate_text(content, 180)}",
                             )
+                            chained_drafts[agent_id] = current_drafts[agent_id]
+                            # Inline so a mid-gather cancel still sees
+                            # this agent as having finished compose;
+                            # outer aggregation re-assigns the same
+                            # value, idempotent.
+                            last_successful_round[agent_id] = 0
+                            submitted_rounds[agent_id].add(0)
+                            per_agent_last_phase_outcome[agent_id] = "success"
+                    # If we reach here with parsed still None or missing
+                    # a usable draft, the compose phase completed normally
+                    # but produced no submission — that's a clean failure,
+                    # not a cancellation. Tag it so the cancel-time
+                    # renderer can distinguish this from agents that were
+                    # interrupted mid-phase (outcome stays "unknown" for
+                    # those because CancelledError bypasses this block).
+                    if per_agent_last_phase_outcome[agent_id] == "unknown":
+                        per_agent_last_phase_outcome[agent_id] = "failed"
                     return agent_id, content, parsed or {}
+                except asyncio.CancelledError:
+                    # Genuine in-flight cancellation: leave outcome at
+                    # "unknown" so the renderer picks the "cancelled"
+                    # label branch. Re-raise so gather sees the cancel
+                    # and the outer try/except:CancelledError path in
+                    # the main body can run the cancel finalize.
+                    raise
+                except BaseException:
+                    # Non-cancel exception (e.g. ensure_tools crash, OOM,
+                    # transport blowup, etc.) before the success/failure
+                    # inline setters fired. Without this branch the
+                    # outcome stays "unknown" which the cancel-time
+                    # renderer would mislabel as cancellation. Treating
+                    # it as a clean failure keeps "failed" badges on
+                    # real tool failures even when the user happens to
+                    # press stop shortly after.
+                    if per_agent_last_phase_outcome[agent_id] == "unknown":
+                        per_agent_last_phase_outcome[agent_id] = "failed"
+                    raise
                 finally:
                     await emitter.tick_substep(agent_state={agent_id: state})
 
@@ -5056,12 +5858,22 @@ CRITICAL RULES:
                     current_drafts[agent_id] = normalize_draft_result(
                         None, f"Composition failed: {truncate_text(str(result), 180)}"
                     )
+                    chained_drafts[agent_id] = current_drafts[agent_id]
                     continue
 
                 aid, content, parsed = result
                 current_drafts[aid] = normalize_draft_result(
-                    parsed, f"Non-JSON response: {truncate_text(content, 180)}"
+                    parsed,
+                    f"Agent did not submit via submit_draft. Response: {truncate_text(content, 180)}",
                 )
+                chained_drafts[aid] = current_drafts[aid]
+                if (
+                    isinstance(parsed, dict)
+                    and isinstance(parsed.get("draft"), str)
+                    and parsed["draft"].strip()
+                ):
+                    last_successful_round[aid] = 0
+                    submitted_rounds[aid].add(0)
 
             # rounds_data always carries the FULL per-round data (drafts,
             # reviews, revisions with bodies) so the Rich iframe's final
@@ -5139,6 +5951,18 @@ CRITICAL RULES:
                             topic_text, author_persona["name"], author_draft
                         )
 
+                        # Reviewers use only the submit_review pseudo-tool —
+                        # they do not need research tools, and locking them
+                        # to the submission channel matches compose/revise's
+                        # escape-free tool-call contract.
+                        review_capture: dict = {"payload": None}
+                        review_tools = {
+                            "submit_review": make_submission_tool(
+                                spec=build_submit_review_spec(),
+                                capture=review_capture,
+                            )
+                        }
+
                         content = await run_agent_loop(
                             request=request,
                             user=user,
@@ -5147,7 +5971,7 @@ CRITICAL RULES:
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": user_prompt},
                             ],
-                            tools_dict={},  # No tools for review
+                            tools_dict=review_tools,
                             max_iterations=int(self.valves.REVIEW_MAX_ITERATIONS),
                             extra_params=member_extra_params,
                             apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
@@ -5157,10 +5981,18 @@ CRITICAL RULES:
                                 f"{reviewer_persona['name']}\u2192{author_persona['name']}",
                             ),
                             iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
+                            submission_tool_names={"submit_review"},
                         )
 
-                        parsed = safe_json_loads(
-                            content, expect_keys=("key_feedback",)
+                        # Strict tool-call contract: only the capture from
+                        # submit_review is authoritative. The prompt
+                        # forbids content-JSON, so we intentionally do
+                        # NOT fall back to parsing it here — doing so
+                        # would contradict the prompt and re-introduce
+                        # the unescaped-quote fragility this migration
+                        # eliminated.
+                        parsed = extract_submission_payload(
+                            review_capture, "key_feedback"
                         )
                         if isinstance(parsed, dict):
                             kf = parsed.get("key_feedback")
@@ -5209,7 +6041,8 @@ CRITICAL RULES:
 
                     reviewer_id, author_id, content, parsed = result
                     normalized = normalize_review_result(
-                        parsed, f"Review parsing failed: {truncate_text(content, 100)}"
+                        parsed,
+                        f"Reviewer did not submit via submit_review. Response: {truncate_text(content, 100)}",
                     )
                     normalized["reviewer"] = agents[reviewer_id]["name"]
                     all_reviews[author_id][reviewer_id] = normalized
@@ -5224,6 +6057,9 @@ CRITICAL RULES:
                     agent_state={aid: "revising" for aid in agent_ids},
                     total_substeps=len(agent_ids),
                 )
+                # Reset outcome markers so a previous round's success
+                # doesn't leak into THIS round's cancellation labelling.
+                reset_phase_outcomes()
 
                 async def revise_draft(agent_id: str) -> tuple[str, str, dict]:
                     persona = agents[agent_id]
@@ -5254,6 +6090,20 @@ CRITICAL RULES:
                             anonymize=anonymize_reviewers,
                         )
 
+                        # Same escape-free submission pattern as compose —
+                        # but the spec exposes changes_made / feedback_declined
+                        # instead of approach, matching the revise schema.
+                        submit_capture: dict = {"payload": None}
+                        submit_spec = build_submit_draft_spec(
+                            phase="revise", include_sources=include_sources
+                        )
+                        combined_tools = {
+                            **tools_dict,
+                            "submit_draft": make_submission_tool(
+                                spec=submit_spec, capture=submit_capture
+                            ),
+                        }
+
                         content = await run_agent_loop(
                             request=request,
                             user=user,
@@ -5262,16 +6112,22 @@ CRITICAL RULES:
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": user_prompt},
                             ],
-                            tools_dict=tools_dict,
+                            tools_dict=combined_tools,
                             max_iterations=self.valves.MAX_ITERATIONS,
                             extra_params=member_extra_params,
                             apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
                             agent_name=f"{persona['name']}",
                             event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
                             iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
+                            submission_tool_names={"submit_draft"},
                         )
 
-                        parsed = safe_json_loads(content, expect_keys=("draft",))
+                        # Strict tool-call contract — same rationale as
+                        # compose_draft above: the submission capture is
+                        # the single source of truth, no content-JSON
+                        # fallback. See the compose_draft comment for
+                        # the full reasoning.
+                        parsed = extract_submission_payload(submit_capture, "draft")
                         if isinstance(parsed, dict):
                             draft_val = parsed.get("draft")
                             if isinstance(draft_val, str) and draft_val.strip():
@@ -5327,7 +6183,44 @@ CRITICAL RULES:
                                     "approach": prior.get("approach", ""),
                                     "sources": merged_sources,
                                 }
+                                # Inline so a mid-gather cancel still
+                                # sees this agent as having finished
+                                # round N; outer aggregation re-assigns,
+                                # idempotent.
+                                submitted_rounds[agent_id].add(round_num)
+                                if advance_last_successful_round_if_chained(
+                                    last_successful_round, agent_id, round_num
+                                ):
+                                    chained_drafts[agent_id] = current_drafts[
+                                        agent_id
+                                    ]
+                                per_agent_last_phase_outcome[agent_id] = "success"
+                        # Reached here without a valid submission (and
+                        # without being cancelled — CancelledError would
+                        # skip this block). Mark a clean failure so the
+                        # cancel-time renderer can distinguish "this
+                        # agent's round actually failed" from "this agent
+                        # was cut off mid-round".
+                        if per_agent_last_phase_outcome[agent_id] == "unknown":
+                            per_agent_last_phase_outcome[agent_id] = "failed"
                         return agent_id, content, parsed or {}
+                    except asyncio.CancelledError:
+                        # Genuine in-flight cancellation: leave outcome
+                        # at "unknown" so the renderer uses the
+                        # "cancelled" label branch. Re-raise so the
+                        # outer cancel finalize path runs.
+                        raise
+                    except BaseException:
+                        # Non-cancel exception (e.g. ensure_tools crash,
+                        # transport blowup) before the success/failure
+                        # inline setters fired. Mark the outcome as
+                        # "failed" so the cancel-time renderer doesn't
+                        # mislabel a real tool failure as cancellation
+                        # just because the user pressed stop shortly
+                        # after the exception propagated.
+                        if per_agent_last_phase_outcome[agent_id] == "unknown":
+                            per_agent_last_phase_outcome[agent_id] = "failed"
+                        raise
                     finally:
                         await emitter.tick_substep(agent_state={agent_id: state})
 
@@ -5336,25 +6229,46 @@ CRITICAL RULES:
                 )
 
                 revised_drafts: dict[str, dict] = {}
+                revision_succeeded: dict[str, bool] = {}
                 for idx, result in enumerate(revise_results):
                     agent_id = agent_ids[idx]
                     if isinstance(result, BaseException):
                         log.exception(f"Revision failed ({agent_id}): {result}")
                         revised_drafts[agent_id] = normalize_revise_result(
-                            None, current_drafts[agent_id]["draft"]
+                            None,
+                            f"Revision failed ({agents[agent_id]['name']}): "
+                            f"{truncate_text(str(result), 120)}",
                         )
+                        revision_succeeded[agent_id] = False
                         continue
 
                     aid, content, parsed = result
-                    revised_drafts[aid] = normalize_revise_result(
-                        parsed, current_drafts[aid]["draft"]
-                    )
+                    if (
+                        isinstance(parsed, dict)
+                        and isinstance(parsed.get("draft"), str)
+                        and parsed["draft"].strip()
+                    ):
+                        revised_drafts[aid] = normalize_revise_result(parsed, "")
+                        revision_succeeded[aid] = True
+                    else:
+                        revised_drafts[aid] = normalize_revise_result(
+                            None,
+                            f"Agent did not submit via submit_draft. "
+                            f"Response: {truncate_text(content, 180)}",
+                        )
+                        revision_succeeded[aid] = False
 
-                # Update current drafts with revisions. Merge prior + new sources
-                # by (title, url) to preserve citations across rounds even when
-                # the revision agent only reports newly gathered sources or omits
-                # the array entirely. Order: prior sources first, then new ones.
+                # Failed revisions keep the previous current_drafts so the
+                # next round's cross-review has real prose to evaluate
+                # instead of cascading the error string. Sources are
+                # merged across rounds by (title, url).
                 for aid in agent_ids:
+                    if not revision_succeeded.get(aid, False):
+                        continue
+                    submitted_rounds[aid].add(round_num)
+                    chain_advanced = advance_last_successful_round_if_chained(
+                        last_successful_round, aid, round_num
+                    )
                     prior_sources = current_drafts[aid].get("sources", []) or []
                     new_sources = revised_drafts[aid].get("sources") or []
                     seen: set = set()
@@ -5376,6 +6290,8 @@ CRITICAL RULES:
                         "approach": current_drafts[aid].get("approach", ""),
                         "sources": merged_sources,
                     }
+                    if chain_advanced:
+                        chained_drafts[aid] = current_drafts[aid]
 
                 rounds_data.append(
                     {
@@ -5430,16 +6346,25 @@ CRITICAL RULES:
                 description="LLM Review Complete",
                 done=True,
             )
-            # final_drafts is keyed by agent_id for uniqueness; include the
-            # real underlying model id as a sibling field so the AI (and the
-            # final embed pills) can still tell which model produced each
-            # slot when two agents share one model.
+            # Body comes from chained_drafts so it matches
+            # last_successful_round (current_drafts may carry a
+            # post-break "success" body that contradicts the badge).
             final_drafts = {
                 aid: {
                     "persona": agents[aid]["name"],
                     "model": agent_model[aid],
-                    "draft": current_drafts[aid]["draft"],
-                    "sources": current_drafts[aid].get("sources", []),
+                    "draft": chained_drafts.get(aid, current_drafts[aid])[
+                        "draft"
+                    ],
+                    "sources": chained_drafts.get(
+                        aid, current_drafts[aid]
+                    ).get("sources", []),
+                    "last_successful_round": last_successful_round[aid],
+                    "final_round_completed": (
+                        last_successful_round[aid] == num_rounds
+                    ),
+                    "submitted_rounds": sorted(submitted_rounds[aid]),
+                    "last_phase_outcome": per_agent_last_phase_outcome[aid],
                 }
                 for aid in agent_ids
             }
@@ -5518,16 +6443,28 @@ CRITICAL RULES:
             # - final_drafts: canonical "latest per-persona output". Read this
             #   for the answer; in strip mode it is the ONLY place the final
             #   draft body lives (the last round's revisions drop ``draft``).
+            #   Each entry carries ``last_successful_round`` (0 = compose,
+            #   N = round N revision) and ``final_round_completed`` so the
+            #   caller can tell whether the draft actually made it through
+            #   the full revision pipeline.
             # - rounds: heterogeneous audit trail. Round 0 carries composition
             #   data — full ``drafts`` in full-history mode, only
             #   ``approaches`` when stripped. Rounds 1+ carry ``reviews`` plus
             #   ``revisions`` (which lose the ``draft`` body when
             #   INCLUDE_FULL_HISTORY is off — see strip block above).
+            # - revisions_complete: top-level boolean, ``True`` iff every
+            #   agent's last-successful-round equals ``num_rounds``. A
+            #   single-field short-circuit for LLM callers that only need
+            #   "did everything land?" without iterating final_drafts.
             response_payload = {
                 "topic": topic_text,
                 "num_rounds": num_rounds,
                 "final_drafts": final_drafts,
                 "rounds": return_rounds,
+                "revisions_complete": all(
+                    last_successful_round[aid] == num_rounds
+                    for aid in agent_ids
+                ),
             }
 
             return json.dumps(response_payload, ensure_ascii=False)
@@ -5541,16 +6478,45 @@ CRITICAL RULES:
             # the CancelledError from propagating — MCP cleanup still
             # has to run in the outer finally.
             try:
+                # Mirror the successful-path final_drafts shape down to the
+                # ``last_successful_round`` / ``final_round_completed``
+                # status fields. Without these the cancellation finalize
+                # would render the partial drafts with NO indication that
+                # the revision pipeline was interrupted mid-flight — the
+                # user presses stop partway through round 2, and the
+                # iframe happily shows the round-1 draft as if it were
+                # the intended final output. ``last_successful_round``
+                # naturally captures "how far we got before cancellation"
+                # because it is only advanced on phase success.
+                # Mid-cancel both maps may be partial; chained_drafts
+                # is preferred but current_drafts catches in-flight
+                # bodies the cancel cut short of mirroring.
                 partial_final_drafts = {
                     aid: {
                         "persona": agents[aid]["name"],
                         "model": agent_model[aid],
-                        "draft": current_drafts[aid].get("draft", ""),
-                        "sources": current_drafts[aid].get("sources", []),
+                        "draft": chained_drafts.get(
+                            aid, current_drafts.get(aid, {})
+                        ).get("draft", ""),
+                        "sources": chained_drafts.get(
+                            aid, current_drafts.get(aid, {})
+                        ).get("sources", []),
+                        "last_successful_round": last_successful_round[aid],
+                        "final_round_completed": (
+                            last_successful_round[aid] == num_rounds
+                        ),
+                        "submitted_rounds": sorted(submitted_rounds[aid]),
+                        "last_phase_outcome": per_agent_last_phase_outcome[aid],
                     }
                     for aid in agent_ids
-                    if isinstance(current_drafts.get(aid), dict)
-                    and current_drafts[aid].get("draft")
+                    if (
+                        isinstance(chained_drafts.get(aid), dict)
+                        and chained_drafts[aid].get("draft")
+                    )
+                    or (
+                        isinstance(current_drafts.get(aid), dict)
+                        and current_drafts[aid].get("draft")
+                    )
                 }
                 cancel_summary = {
                     "topic": topic_text,
