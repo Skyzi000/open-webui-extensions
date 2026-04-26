@@ -110,6 +110,7 @@ def build_target(
     target_doc_range = _module_docstring_range(target_module.tree)
     target_future = _collect_future_imports(target_module.tree)
     _verify_no_relative_imports(target_module)
+    _verify_no_star_imports(target_module)
     target_external, target_local = _classify_top_level_imports(
         target_module, local_import_roots
     )
@@ -458,6 +459,31 @@ def _verify_no_relative_imports(parsed: _ParsedModule) -> None:
             )
 
 
+def _verify_no_star_imports(parsed: _ParsedModule) -> None:
+    """Refuse ``from X import *`` anywhere in the module.
+
+    Star imports bind names that the inliner cannot statically enumerate, so
+    its name-collision detection silently skips them. In the merged single-file
+    output, names brought in by a star import can be shadowed by a later
+    inlined dep definition (or vice versa), changing which implementation the
+    target body actually calls without any build-time warning. Refuse rather
+    than ship a release whose behavior diverges from the source.
+    """
+
+    for node in ast.walk(parsed.tree):
+        if isinstance(node, ast.ImportFrom) and any(
+            alias.name == "*" for alias in node.names
+        ):
+            module = node.module or ""
+            prefix = "." * node.level
+            raise BuildError(
+                f"{parsed.path}:{node.lineno}: `from {prefix}{module} import *` "
+                f"is not allowed. The single-file output cannot statically "
+                f"track the bound names, so they may silently collide with "
+                f"inlined dep definitions. List the names explicitly."
+            )
+
+
 def _verify_externals_precede_locals(
     parsed: _ParsedModule, local_roots: tuple[str, ...]
 ) -> None:
@@ -605,6 +631,7 @@ def _resolve_dependency_graph(
             ) from exc
         parsed = _parse_module(path, source)
         _verify_no_relative_imports(parsed)
+        _verify_no_star_imports(parsed)
         _verify_no_nested_local_imports(parsed, local_import_roots)
         _verify_externals_precede_locals(parsed, local_import_roots)
         externals, locals_ = _classify_top_level_imports(parsed, local_import_roots)

@@ -338,7 +338,7 @@ def test_star_local_import_errors(tmp_path: Path) -> None:
         helper()
         ''',
     )
-    with pytest.raises(BuildError, match="not allowed for local shared modules"):
+    with pytest.raises(BuildError, match="import \\*"):
         _build(tmp_path, "src/owui_ext/tools/demo.py")
 
 
@@ -1187,6 +1187,84 @@ def test_rejects_relative_import_in_shared_dep(tmp_path: Path) -> None:
         ''',
     )
     with pytest.raises(BuildError, match="package-relative imports"):
+        _build(tmp_path, "src/owui_ext/tools/demo.py")
+
+
+def test_rejects_external_star_import_at_top_level(tmp_path: Path) -> None:
+    """`from X import *` at the top of the target is refused.
+
+    Star imports bind names that the inliner cannot enumerate, so the
+    name-collision detector silently skips them. A later inlined dep
+    definition could shadow a star-bound name (or be shadowed by it),
+    silently changing which implementation the target body calls. Refuse
+    rather than emit a release that diverges from source semantics.
+    """
+
+    _write(
+        tmp_path / "src/owui_ext/tools/demo.py",
+        '''
+        """version: 0.1"""
+
+        from math import *
+
+        sin(0)
+        ''',
+    )
+    with pytest.raises(BuildError, match="import \\*"):
+        _build(tmp_path, "src/owui_ext/tools/demo.py")
+
+
+def test_rejects_star_import_in_shared_dep(tmp_path: Path) -> None:
+    """Star imports inside a shared dependency are also refused."""
+
+    _write(
+        tmp_path / "src/owui_ext/shared/util.py",
+        textwrap.dedent(
+            """
+            from math import *
+
+
+            def helper() -> float:
+                return sin(0)
+            """
+        ).lstrip(),
+    )
+    _write(
+        tmp_path / "src/owui_ext/tools/demo.py",
+        '''
+        """version: 0.1"""
+
+        from owui_ext.shared.util import helper
+
+        helper()
+        ''',
+    )
+    with pytest.raises(BuildError, match="import \\*"):
+        _build(tmp_path, "src/owui_ext/tools/demo.py")
+
+
+def test_rejects_star_import_inside_top_level_conditional(tmp_path: Path) -> None:
+    """Star imports inside ``try``/``if`` blocks at module level are refused too.
+
+    Python only permits ``from X import *`` at module-level scope, but that
+    includes top-level conditional blocks. Names brought in there still leak
+    into module globals and can collide with inlined deps.
+    """
+
+    _write(
+        tmp_path / "src/owui_ext/tools/demo.py",
+        '''
+        """version: 0.1"""
+
+        try:
+            from math import *
+        except ImportError:
+            pass
+
+        sin(0)
+        ''',
+    )
+    with pytest.raises(BuildError, match="import \\*"):
         _build(tmp_path, "src/owui_ext/tools/demo.py")
 
 
