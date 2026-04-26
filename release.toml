@@ -1,0 +1,10 @@
+[meta]
+schema_version = 1
+
+[settings]
+local_import_roots = ["owui_ext.shared"]
+
+[[targets]]
+name = "parallel_tools"
+source = "src/owui_ext/tools/parallel_tools.py"
+output = "tools/parallel_tools.py"
