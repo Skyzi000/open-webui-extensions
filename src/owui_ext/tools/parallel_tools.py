@@ -16,6 +16,8 @@ Limitations:
   parameter in the expected format.
 """
 
+from __future__ import annotations
+
 import asyncio
 import ast
 import json

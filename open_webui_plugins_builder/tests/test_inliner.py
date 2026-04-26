@@ -11,7 +11,9 @@ These tests construct fake source trees on disk under ``tmp_path`` and exercise
   attached to its block so per-dep ``externals -> body`` order is preserved;
 * conflicting top-level import bindings (e.g., two sources binding the same
   name to different modules) raise ``BuildError``;
-* ``from __future__ import`` lines from target + deps union into one line;
+* every dep's ``from __future__`` set must match the target's exactly
+  (otherwise the merged compilation unit would silently change parse
+  semantics for one side or the other);
 * top-level conditional ``try/except ImportError`` blocks remain in place;
 * alias / star / module-style local shared imports raise ``BuildError``;
 * nested local shared imports (inside functions) raise ``BuildError``;
@@ -84,6 +86,8 @@ def test_inlines_shared_module_body(tmp_path: Path) -> None:
         version: 0.1.0
         """
 
+        from __future__ import annotations
+
         from owui_ext.shared.util import jload
 
 
@@ -102,11 +106,13 @@ def test_inlines_shared_module_body(tmp_path: Path) -> None:
     assert "import json" in output
 
 
-def test_unions_future_imports(tmp_path: Path) -> None:
+def test_emits_matching_future_imports_once(tmp_path: Path) -> None:
+    """When target and deps declare the same ``__future__`` set, emit one line."""
+
     _write(
         tmp_path / "src/owui_ext/shared/util.py",
         '''
-        from __future__ import annotations, division
+        from __future__ import annotations
 
 
         def helper() -> int:
@@ -118,7 +124,7 @@ def test_unions_future_imports(tmp_path: Path) -> None:
         '''
         """version: 0.1"""
 
-        from __future__ import annotations, generator_stop
+        from __future__ import annotations
 
         from owui_ext.shared.util import helper
 
@@ -131,10 +137,67 @@ def test_unions_future_imports(tmp_path: Path) -> None:
         line for line in output.splitlines() if line.startswith("from __future__ import")
     ]
     assert len(future_lines) == 1
-    line = future_lines[0]
-    assert "annotations" in line
-    assert "division" in line
-    assert "generator_stop" in line
+    assert "annotations" in future_lines[0]
+
+
+def test_rejects_dep_with_extra_future_import(tmp_path: Path) -> None:
+    """A dep cannot introduce a ``__future__`` flag the target lacks.
+
+    Inlining shares one compilation unit, so the union would silently
+    apply the dep's flag to the target's body. Refuse rather than emit
+    a release whose semantics differ from the source.
+    """
+
+    _write(
+        tmp_path / "src/owui_ext/shared/util.py",
+        '''
+        from __future__ import annotations
+
+
+        def helper() -> int:
+            return 1
+        ''',
+    )
+    _write(
+        tmp_path / "src/owui_ext/tools/demo.py",
+        '''
+        """version: 0.1"""
+
+        from owui_ext.shared.util import helper
+
+        helper()
+        ''',
+    )
+    with pytest.raises(BuildError, match="from __future__"):
+        _build(tmp_path, "src/owui_ext/tools/demo.py")
+
+
+def test_rejects_target_with_extra_future_import(tmp_path: Path) -> None:
+    """The target cannot declare a ``__future__`` flag a dep lacks.
+
+    The dep's body would run under the target's flag in the merged
+    file, which silently changes the dep's semantics relative to the
+    source. Refuse the build instead.
+    """
+
+    _write(
+        tmp_path / "src/owui_ext/shared/util.py",
+        "def helper() -> int:\n    return 1\n",
+    )
+    _write(
+        tmp_path / "src/owui_ext/tools/demo.py",
+        '''
+        """version: 0.1"""
+
+        from __future__ import annotations
+
+        from owui_ext.shared.util import helper
+
+        helper()
+        ''',
+    )
+    with pytest.raises(BuildError, match="from __future__"):
+        _build(tmp_path, "src/owui_ext/tools/demo.py")
 
 
 def test_target_and_dep_externals_are_emitted_in_order(tmp_path: Path) -> None:
@@ -489,8 +552,8 @@ def test_marker_falls_back_to_all_when_no_target_name(tmp_path: Path) -> None:
     assert "--all" in output
 
 
-def test_marker_lists_unioned_future_imports(tmp_path: Path) -> None:
-    """The plan requires the marker to declare the unioned future imports."""
+def test_marker_lists_future_imports(tmp_path: Path) -> None:
+    """The marker must declare the future imports actually emitted into the file."""
 
     _write(
         tmp_path / "src/owui_ext/shared/util.py",
@@ -507,7 +570,7 @@ def test_marker_lists_unioned_future_imports(tmp_path: Path) -> None:
         '''
         """version: 0.1"""
 
-        from __future__ import annotations, generator_stop
+        from __future__ import annotations, division
 
         from owui_ext.shared.util import helper
 
@@ -524,7 +587,6 @@ def test_marker_lists_unioned_future_imports(tmp_path: Path) -> None:
     line = marker_lines[0]
     assert "annotations" in line
     assert "division" in line
-    assert "generator_stop" in line
 
 
 def test_marker_records_no_future_imports_when_absent(tmp_path: Path) -> None:
@@ -1160,7 +1222,7 @@ def test_allows_docstring_and_future_before_imports(tmp_path: Path) -> None:
 
     _write(
         tmp_path / "src/owui_ext/shared/util.py",
-        "def helper(): return 1\n",
+        "from __future__ import annotations\n\n\ndef helper(): return 1\n",
     )
     _write(
         tmp_path / "src/owui_ext/tools/demo.py",

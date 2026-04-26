@@ -15,8 +15,10 @@ Given a single target source file plus a set of declared local-import roots
    above all dep blocks; each dep's external imports stay attached to
    its own block (next to the dep body) so the per-dep
    ``externals -> body`` order is preserved across the dependency chain.
-   ``from __future__`` imports are unioned across target and deps into a
-   single line at the top.
+   The target's ``from __future__`` flags are emitted once at the top;
+   every dep must declare the exact same ``__future__`` set (verified up
+   front) so the merged compilation unit's parse semantics match every
+   source file.
 6. Emits a generated file with a do-not-edit marker.
 
 Anything that breaks these invariants -- aliases on local shared imports,
@@ -24,6 +26,7 @@ Anything that breaks these invariants -- aliases on local shared imports,
 imports, package-relative imports, top-level imports interleaved with
 non-import code, an external import that follows a local-shared import,
 a shared dep module that mixes external and local-shared imports,
+``from __future__`` flags that diverge between target and any dep,
 circular imports, or imported names that don't exist -- raises
 ``BuildError``.
 
@@ -134,6 +137,11 @@ def build_target(
     )
 
     _verify_dep_exports(deps_ordered, target_local_refs)
+    _verify_future_imports_match(
+        target_path=target_module.path,
+        target_future=target_future,
+        deps_ordered=deps_ordered,
+    )
     _verify_no_name_collisions(
         target_module=target_module,
         target_local_imports=target_local,
@@ -216,6 +224,54 @@ def _collect_future_imports(tree: ast.Module) -> list[ast.ImportFrom]:
         for node in tree.body
         if isinstance(node, ast.ImportFrom) and node.module == "__future__"
     ]
+
+
+def _future_names(nodes: list[ast.ImportFrom]) -> set[str]:
+    return {alias.name for node in nodes for alias in node.names}
+
+
+def _verify_future_imports_match(
+    *,
+    target_path: Path,
+    target_future: list[ast.ImportFrom],
+    deps_ordered: list["_DepModule"],
+) -> None:
+    """Refuse builds where any dep's ``from __future__`` set differs from the target.
+
+    ``__future__`` flags change parse-level semantics (lazy annotations,
+    integer division behavior, etc.) for the whole compilation unit. After
+    inlining, every dep body lives in the *target's* compilation unit, so
+    the dep's original future flags no longer apply -- only the target's
+    do. If the target opts out of a flag the dep relied on, the dep's
+    code may break silently; if a dep adds a flag the target lacks, the
+    target's code now runs under different semantics. Either direction is
+    a silent semantic change, so we refuse builds where the sets differ
+    rather than silently honoring an arbitrary union.
+    """
+
+    target_set = _future_names(target_future)
+    for dep in deps_ordered:
+        dep_set = _future_names(list(dep.future_imports))
+        if dep_set == target_set:
+            continue
+        missing_in_dep = sorted(target_set - dep_set)
+        extra_in_dep = sorted(dep_set - target_set)
+        bits: list[str] = []
+        if extra_in_dep:
+            bits.append(
+                f"dep adds {extra_in_dep!r} that the target does not declare"
+            )
+        if missing_in_dep:
+            bits.append(
+                f"dep is missing {missing_in_dep!r} that the target declares"
+            )
+        raise BuildError(
+            f"{dep.path}: `from __future__` imports diverge from "
+            f"{target_path} ({'; '.join(bits)}). Inlining shares one "
+            f"compilation unit, so the dep's flags must match the "
+            f"target's exactly. Align the `from __future__ import ...` "
+            f"line in both files."
+        )
 
 
 def _is_local_module(module: str | None, local_roots: Iterable[str]) -> bool:
