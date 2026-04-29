@@ -91,6 +91,30 @@ VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_CALENDAR_TOOLS": "calendar",
 }
 
+# --- inlined from src/owui_ext/shared/event_emitter.py (owui_ext.shared.event_emitter) ---
+from typing import Any, Callable, Optional
+class EventEmitter:
+    def __init__(self, event_emitter: Optional[Callable[[dict], Any]] = None):
+        self.event_emitter = event_emitter
+
+    async def emit(
+        self,
+        description: str = "Unknown state",
+        status: str = "in_progress",
+        done: bool = False,
+    ) -> None:
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "status": status,
+                        "description": description,
+                        "done": done,
+                    },
+                }
+            )
+
 # --- inlined from src/owui_ext/shared/model_features.py (owui_ext.shared.model_features) ---
 from typing import Optional
 def model_has_note_knowledge(model: Optional[dict]) -> bool:
@@ -115,6 +139,39 @@ def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
     if not isinstance(builtin_tools, dict):
         return True
     return bool(builtin_tools.get("knowledge", True))
+
+# --- inlined from src/owui_ext/shared/parsing.py (owui_ext.shared.parsing) ---
+import json
+from typing import Optional
+def safe_json_loads(text: str) -> Optional[dict]:
+    """Parse JSON, falling back to the largest ``{...}`` substring on failure.
+
+    LLM responses often surround the JSON object with prose ("Here's the
+    answer: {..}"). The fallback grabs the slice between the first ``{`` and
+    the last ``}`` and retries; if that also fails we give up.
+    """
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        candidate = text[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+    return None
+
+
+def normalize_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return str(value).strip()
 
 # --- inlined from src/owui_ext/shared/prompt_utils.py (owui_ext.shared.prompt_utils) ---
 from typing import Optional
@@ -489,59 +546,8 @@ log = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Event emitter
-# ============================================================================
-
-
-class EventEmitter:
-    def __init__(self, event_emitter: Callable[[dict], Any] = None):  # type: ignore
-        self.event_emitter = event_emitter
-
-    async def emit(
-        self, description: str = "Unknown state", status: str = "in_progress", done: bool = False
-    ) -> None:
-        if self.event_emitter:
-            await self.event_emitter(
-                {
-                    "type": "status",
-                    "data": {
-                        "status": status,
-                        "description": description,
-                        "done": done,
-                    },
-                }
-            )
-
-
-# ============================================================================
 # Helper functions (outside class - AI cannot invoke these)
 # ============================================================================
-
-
-def safe_json_loads(text: str) -> Optional[dict]:
-    if not text:
-        return None
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        candidate = text[start : end + 1]
-        try:
-            return json.loads(candidate)
-        except Exception:
-            return None
-    return None
-
-
-def normalize_text(value: Optional[str]) -> str:
-    if not value:
-        return ""
-    return str(value).strip()
 
 
 async def resolve_terminal_id_from_request_and_metadata(

@@ -37,6 +37,63 @@ async def maybe_await(value):
         return await value
     return value
 
+# --- inlined from src/owui_ext/shared/event_emitter.py (owui_ext.shared.event_emitter) ---
+from typing import Any, Callable, Optional
+class EventEmitter:
+    def __init__(self, event_emitter: Optional[Callable[[dict], Any]] = None):
+        self.event_emitter = event_emitter
+
+    async def emit(
+        self,
+        description: str = "Unknown state",
+        status: str = "in_progress",
+        done: bool = False,
+    ) -> None:
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "status": status,
+                        "description": description,
+                        "done": done,
+                    },
+                }
+            )
+
+# --- inlined from src/owui_ext/shared/parsing.py (owui_ext.shared.parsing) ---
+import json
+from typing import Optional
+def safe_json_loads(text: str) -> Optional[dict]:
+    """Parse JSON, falling back to the largest ``{...}`` substring on failure.
+
+    LLM responses often surround the JSON object with prose ("Here's the
+    answer: {..}"). The fallback grabs the slice between the first ``{`` and
+    the last ``}`` and retries; if that also fails we give up.
+    """
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        candidate = text[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+    return None
+
+
+def normalize_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return str(value).strip()
+
 # --- inlined from src/owui_ext/shared/prompt_utils.py (owui_ext.shared.prompt_utils) ---
 from typing import Optional
 def merge_prompt_sections(*sections: Optional[str]) -> str:
@@ -410,53 +467,6 @@ log = logging.getLogger(__name__)
 
 
 WEB_TOOL_NAMES = {"search_web", "fetch_url"}
-
-
-class EventEmitter:
-    def __init__(self, event_emitter: Callable[[dict], Any] = None):  # type: ignore
-        self.event_emitter = event_emitter
-
-    async def emit(
-        self, description: str = "Unknown state", status: str = "in_progress", done: bool = False
-    ) -> None:
-        if self.event_emitter:
-            await self.event_emitter(
-                {
-                    "type": "status",
-                    "data": {
-                        "status": status,
-                        "description": description,
-                        "done": done,
-                    },
-                }
-            )
-
-
-def safe_json_loads(text: str) -> Optional[dict]:
-    if not text:
-        return None
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        candidate = text[start : end + 1]
-        try:
-            return json.loads(candidate)
-        except Exception:
-            return None
-
-    return None
-
-
-def normalize_text(value: Optional[str]) -> str:
-    if not value:
-        return ""
-    return str(value).strip()
 
 
 async def resolve_terminal_id_from_request_and_metadata(
