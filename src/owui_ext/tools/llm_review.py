@@ -46,6 +46,7 @@ from owui_ext.shared.tool_servers import (
     normalize_direct_tool_servers,
     resolve_direct_tool_servers_from_request_and_metadata,
 )
+from owui_ext.shared.valves import coerce_user_valves
 
 try:
     import markdown as _markdown_mod
@@ -2586,21 +2587,6 @@ async def resolve_terminal_id_from_request_and_metadata(
         return request_terminal_id
 
     return metadata_terminal_id
-
-
-def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseModel:
-    """Normalize raw user valves into the target valves class."""
-    if isinstance(raw_valves, valves_cls):
-        return raw_valves
-    if isinstance(raw_valves, BaseModel):
-        try:
-            data = raw_valves.model_dump()
-        except Exception:
-            data = {}
-        return valves_cls.model_validate(data)
-    if isinstance(raw_valves, dict):
-        return valves_cls.model_validate(raw_valves)
-    return valves_cls.model_validate({})
 
 
 async def resolve_mcp_tools(
