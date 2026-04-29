@@ -21,6 +21,7 @@ from fastapi import Request
 from starlette.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
 
 try:
@@ -31,12 +32,6 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 _core_process_tool_result = None
-
-
-async def maybe_await(value):
-    if hasattr(value, "__await__"):
-        return await value
-    return value
 
 
 # ============================================================================

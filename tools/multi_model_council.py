@@ -21,6 +21,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 from fastapi import Request
 from pydantic import BaseModel, Field
 
+# --- inlined from src/owui_ext/shared/async_utils.py (owui_ext.shared.async_utils) ---
+async def maybe_await(value):
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
 # --- inlined from src/owui_ext/shared/tool_event_metadata.py (owui_ext.shared.tool_event_metadata) ---
 CITATION_TOOLS: set[str] = {
     "search_web",
@@ -41,12 +47,6 @@ TERMINAL_EVENT_TOOLS: set[str] = {
 log = logging.getLogger(__name__)
 
 _core_process_tool_result = None
-
-
-async def maybe_await(value):
-    if hasattr(value, "__await__"):
-        return await value
-    return value
 
 
 # ============================================================================

@@ -31,6 +31,12 @@ from typing import Any, Callable, List, Optional
 from fastapi import Request
 from pydantic import BaseModel, Field
 
+# --- inlined from src/owui_ext/shared/async_utils.py (owui_ext.shared.async_utils) ---
+async def maybe_await(value):
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
 # --- inlined from src/owui_ext/shared/tool_event_metadata.py (owui_ext.shared.tool_event_metadata) ---
 CITATION_TOOLS: set[str] = {
     "search_web",
@@ -64,12 +70,6 @@ _core_process_tool_result = None
 # ============================================================================
 # Helper functions (outside class - AI cannot invoke these)
 # ============================================================================
-
-
-async def maybe_await(value):
-    if hasattr(value, "__await__"):
-        return await value
-    return value
 
 
 async def resolve_terminal_id_from_request_and_metadata(

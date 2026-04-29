@@ -26,6 +26,7 @@ from typing import Any, Callable, List, Optional
 from fastapi import Request
 from pydantic import BaseModel, Field
 
+from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
 
 log = logging.getLogger(__name__)
@@ -44,12 +45,6 @@ _core_process_tool_result = None
 # ============================================================================
 # Helper functions (outside class - AI cannot invoke these)
 # ============================================================================
-
-
-async def maybe_await(value):
-    if hasattr(value, "__await__"):
-        return await value
-    return value
 
 
 async def resolve_terminal_id_from_request_and_metadata(
