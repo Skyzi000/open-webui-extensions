@@ -201,6 +201,77 @@ def test_rejects_target_with_future_annotations(tmp_path: Path) -> None:
         _build(tmp_path, "src/owui_ext/tools/demo.py")
 
 
+def test_rejects_target_with_semicolon_joined_statements(tmp_path: Path) -> None:
+    """``from X import y; Z = 42`` on the target is refused.
+
+    Without this guard, the line-based slicer that strips the inlined
+    ``from owui_ext.shared.util import helper`` would also remove the
+    co-located ``Z = 42`` and the generated single-file output would
+    raise ``NameError`` at runtime.
+    """
+
+    _write(
+        tmp_path / "src/owui_ext/shared/util.py",
+        "def helper() -> int:\n    return 1\n",
+    )
+    _write(
+        tmp_path / "src/owui_ext/tools/demo.py",
+        '"""version: 0.1"""\n'
+        "from owui_ext.shared.util import helper; Z = 42\n"
+        "helper()\n"
+        "print(Z)\n",
+    )
+    with pytest.raises(BuildError, match="multiple top-level statements"):
+        _build(tmp_path, "src/owui_ext/tools/demo.py")
+
+
+def test_rejects_dep_with_semicolon_joined_statements(tmp_path: Path) -> None:
+    """Same guard fires when the offending line lives in a dep module."""
+
+    _write(
+        tmp_path / "src/owui_ext/shared/util.py",
+        "import json; X = 1\n"
+        "def helper() -> int:\n    return X\n",
+    )
+    _write(
+        tmp_path / "src/owui_ext/tools/demo.py",
+        '"""version: 0.1"""\n'
+        "from owui_ext.shared.util import helper\n"
+        "helper()\n",
+    )
+    with pytest.raises(BuildError, match="multiple top-level statements"):
+        _build(tmp_path, "src/owui_ext/tools/demo.py")
+
+
+def test_rejects_multiline_import_with_trailing_semicolon(tmp_path: Path) -> None:
+    """Multi-line imports with a semicolon on the closing-paren line are caught.
+
+    ``ImportFrom.lineno`` points at the opening line and ``end_lineno``
+    at the closing-paren line; the trailing ``Z = 42``'s ``lineno`` is
+    that same closing-paren line. A naive ``lineno``-only check would
+    miss this because the import's ``lineno`` and the assign's
+    ``lineno`` are on different rows -- but the slicer drops the whole
+    ``(lineno, end_lineno)`` range, so ``Z = 42`` would still vanish
+    from the generated output.
+    """
+
+    _write(
+        tmp_path / "src/owui_ext/shared/util.py",
+        "def helper() -> int:\n    return 1\n",
+    )
+    _write(
+        tmp_path / "src/owui_ext/tools/demo.py",
+        '"""version: 0.1"""\n'
+        "from owui_ext.shared.util import (\n"
+        "    helper,\n"
+        "); Z = 42\n"
+        "helper()\n"
+        "print(Z)\n",
+    )
+    with pytest.raises(BuildError, match="multiple top-level statements"):
+        _build(tmp_path, "src/owui_ext/tools/demo.py")
+
+
 def test_target_and_dep_externals_are_emitted_in_order(tmp_path: Path) -> None:
     """Target externals lead; each dep's externals stay attached to its block.
 

@@ -112,6 +112,7 @@ def build_target(
     target_doc_range = _module_docstring_range(target_module.tree)
     target_future = _collect_future_imports(target_module.tree)
     _verify_no_future_annotations(target_module, target_future)
+    _verify_no_inline_semicolons(target_module)
     _verify_no_relative_imports(target_module)
     _verify_no_star_imports(target_module)
     _verify_no_unbounded_globals_access(target_module)
@@ -281,6 +282,45 @@ def _verify_no_future_annotations(
                     f"Drop the future import; modern Python (3.9+) "
                     f"supports `list[int]`, `X | Y`, etc. without it."
                 )
+
+
+def _verify_no_inline_semicolons(parsed: _ParsedModule) -> None:
+    """Refuse sources where multiple top-level statements share one line.
+
+    The slicer that drops inlined imports / the leading docstring
+    works on whole *physical lines* of ``parsed.source``. When two
+    top-level statements share a line via a semicolon
+    (e.g. ``from owui_ext.shared.x import y; Z = 42``), removing the
+    import range would also remove the co-located ``Z = 42`` and the
+    generated single file would raise ``NameError`` at runtime.
+
+    Walk every line each top-level node spans (``lineno``..``end_lineno``)
+    and refuse the build if a later body node touches a line already
+    claimed. This catches both the simple case (one-line import with
+    a trailing ``; Z = 42``) and the multi-line case where the
+    semicolon attaches to the closing paren's line of a parenthesised
+    ``from X import (a, b,); Z = 42`` -- ``ast`` records the import's
+    ``end_lineno`` on that final line, and the assign starts there
+    too. Refusing the pattern keeps the slicer's "line in, line out"
+    invariant simple; nobody writes ``import x; y = 1`` in real code.
+    """
+
+    occupied: dict[int, ast.stmt] = {}
+    for node in parsed.tree.body:
+        start = node.lineno
+        end = getattr(node, "end_lineno", None) or start
+        for line in range(start, end + 1):
+            if line in occupied:
+                other = occupied[line]
+                raise BuildError(
+                    f"{parsed.path}:{line}: multiple top-level "
+                    f"statements share line {line} "
+                    f"({type(other).__name__} and {type(node).__name__}). "
+                    f"Split each statement onto its own line; the inliner "
+                    f"strips imports by physical line, so a co-located "
+                    f"statement would be silently dropped from the build."
+                )
+            occupied[line] = node
 
 
 def _verify_future_imports_match(
@@ -3807,6 +3847,7 @@ def _resolve_dependency_graph(
                 f"Cannot read local shared module {path}: {exc}"
             ) from exc
         parsed = _parse_module(path, source)
+        _verify_no_inline_semicolons(parsed)
         _verify_no_relative_imports(parsed)
         _verify_no_star_imports(parsed)
         _verify_no_unbounded_globals_access(parsed)
