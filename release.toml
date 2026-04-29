@@ -18,3 +18,8 @@ output = "tools/magi_decision_support.py"
 name = "multi_model_council"
 source = "src/owui_ext/tools/multi_model_council.py"
 output = "tools/multi_model_council.py"
+
+[[targets]]
+name = "sub_agent"
+source = "src/owui_ext/tools/sub_agent.py"
+output = "tools/sub_agent.py"
