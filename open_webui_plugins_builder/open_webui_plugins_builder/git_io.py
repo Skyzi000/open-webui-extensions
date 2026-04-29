@@ -82,22 +82,41 @@ def read_baseline_blob(repo_root: Path, rel_path: str) -> str | None:
     ``origin/main`` is preferred over the local ``main`` because a stale
     local ``main`` (the dev forgot to ``git pull``) would otherwise let
     the gate read a baseline whose version is older than what is actually
-    shipped, allowing a same-version change to slip through.
+    shipped, allowing a same-version change to slip through. Once a
+    baseline ref is selected, a missing path under that ref returns
+    ``None`` (the path is genuinely new on the baseline) -- we do *not*
+    fall back to the next ref, since the next ref's blob would be the
+    same kind of stale-baseline trap we are trying to avoid.
     """
 
+    selected_ref: str | None = None
     for ref in ("origin/main", "main"):
-        try:
-            out = subprocess.run(
-                ["git", "show", f"{ref}:{rel_path}"],
-                cwd=str(repo_root),
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except FileNotFoundError as exc:
-            raise BuildError("`git` executable not found on PATH.") from exc
-        if out.returncode == 0:
-            return out.stdout
+        rev = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", ref],
+            cwd=str(repo_root),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if rev.returncode == 0:
+            selected_ref = ref
+            break
+
+    if selected_ref is None:
+        return None
+
+    try:
+        out = subprocess.run(
+            ["git", "show", f"{selected_ref}:{rel_path}"],
+            cwd=str(repo_root),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise BuildError("`git` executable not found on PATH.") from exc
+    if out.returncode == 0:
+        return out.stdout
     return None
 
 
