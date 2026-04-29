@@ -27,6 +27,7 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
+from owui_ext.shared.terminal_events import emit_terminal_tool_event
 from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
 
 log = logging.getLogger(__name__)
@@ -362,8 +363,8 @@ async def execute_single_tool(
 
         # Emit terminal:* events for display/refresh behavior in UI
         await emit_terminal_tool_event(
-            tool_name=tool_name,
-            tool_args=filtered_args,
+            tool_function_name=tool_name,
+            tool_function_params=filtered_args,
             tool_result=result,
             event_emitter=event_emitter,
         )
@@ -424,46 +425,6 @@ async def execute_single_tool(
             "tool_name": tool_name,
             "result": f"Error: {e}",
         }
-
-
-async def emit_terminal_tool_event(
-    *,
-    tool_name: str,
-    tool_args: dict,
-    tool_result: Any,
-    event_emitter: Optional[Callable],
-) -> None:
-    """Emit terminal:* UI events for Open Terminal tool results."""
-    if not event_emitter or tool_name not in TERMINAL_EVENT_TOOLS:
-        return
-
-    if tool_name == "display_file":
-        path = tool_args.get("path", "") if isinstance(tool_args, dict) else ""
-        if not isinstance(path, str) or not path:
-            return
-        parsed = tool_result
-        if isinstance(parsed, str):
-            try:
-                parsed = json.loads(parsed)
-            except Exception:
-                parsed = tool_result
-        if isinstance(parsed, dict) and parsed.get("exists") is False:
-            return
-        event = {"type": "terminal:display_file", "data": {"path": path}}
-    elif tool_name in {"write_file", "replace_file_content"}:
-        path = tool_args.get("path", "") if isinstance(tool_args, dict) else ""
-        if not isinstance(path, str) or not path:
-            return
-        event = {"type": f"terminal:{tool_name}", "data": {"path": path}}
-    elif tool_name == "run_command":
-        event = {"type": "terminal:run_command", "data": {}}
-    else:
-        return
-
-    try:
-        await event_emitter(event)
-    except Exception as e:
-        log.warning(f"Error emitting terminal event for {tool_name}: {e}")
 
 
 # ============================================================================

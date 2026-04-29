@@ -37,6 +37,69 @@ async def maybe_await(value):
         return await value
     return value
 
+# --- inlined from src/owui_ext/shared/terminal_events.py (owui_ext.shared.terminal_events) ---
+import json
+import logging
+from typing import Any, Callable, Optional
+_terminal_events_log = logging.getLogger("owui_ext.shared.terminal_events")
+
+
+async def emit_terminal_tool_event(
+    *,
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool_result: Any,
+    event_emitter: Optional[Callable],
+) -> None:
+    """Emit ``terminal:*`` UI events for Open Terminal tool results.
+
+    The function recognises only the names listed in
+    ``TERMINAL_EVENT_TOOLS`` (display_file / write_file /
+    replace_file_content / run_command) -- unknown names hit the
+    final ``else`` and silently return.
+    """
+    if not event_emitter:
+        return
+    if tool_function_name == "display_file":
+        path = (
+            tool_function_params.get("path", "")
+            if isinstance(tool_function_params, dict)
+            else ""
+        )
+        if not isinstance(path, str) or not path:
+            return
+        parsed = tool_result
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except Exception:
+                parsed = tool_result
+        if isinstance(parsed, dict) and parsed.get("exists") is False:
+            return
+        event = {"type": "terminal:display_file", "data": {"path": path}}
+    elif tool_function_name in {"write_file", "replace_file_content"}:
+        path = (
+            tool_function_params.get("path", "")
+            if isinstance(tool_function_params, dict)
+            else ""
+        )
+        if not isinstance(path, str) or not path:
+            return
+        event = {
+            "type": f"terminal:{tool_function_name}",
+            "data": {"path": path},
+        }
+    elif tool_function_name == "run_command":
+        event = {"type": "terminal:run_command", "data": {}}
+    else:
+        return
+    try:
+        await event_emitter(event)
+    except Exception as exc:
+        _terminal_events_log.warning(
+            f"Error emitting terminal event for {tool_function_name}: {exc}"
+        )
+
 # --- inlined from src/owui_ext/shared/tool_event_metadata.py (owui_ext.shared.tool_event_metadata) ---
 CITATION_TOOLS: set[str] = {
     "search_web",
@@ -376,46 +439,6 @@ async def process_tool_result(
     elif tool_result is not None and not isinstance(tool_result, str):
         tool_result = str(tool_result)
     return tool_result, [], []
-
-
-async def emit_terminal_tool_event(
-    *,
-    tool_function_name: str,
-    tool_function_params: dict,
-    tool_result: Any,
-    event_emitter: Optional[Callable],
-) -> None:
-    """Emit terminal:* UI events for Open Terminal tool results."""
-    if not event_emitter or tool_function_name not in TERMINAL_EVENT_TOOLS:
-        return
-
-    if tool_function_name == "display_file":
-        path = tool_function_params.get("path", "") if isinstance(tool_function_params, dict) else ""
-        if not isinstance(path, str) or not path:
-            return
-        parsed = tool_result
-        if isinstance(parsed, str):
-            try:
-                parsed = json.loads(parsed)
-            except Exception:
-                parsed = tool_result
-        if isinstance(parsed, dict) and parsed.get("exists") is False:
-            return
-        event = {"type": "terminal:display_file", "data": {"path": path}}
-    elif tool_function_name in {"write_file", "replace_file_content"}:
-        path = tool_function_params.get("path", "") if isinstance(tool_function_params, dict) else ""
-        if not isinstance(path, str) or not path:
-            return
-        event = {"type": f"terminal:{tool_function_name}", "data": {"path": path}}
-    elif tool_function_name == "run_command":
-        event = {"type": "terminal:run_command", "data": {}}
-    else:
-        return
-
-    try:
-        await event_emitter(event)
-    except Exception as exc:
-        log.warning(f"Error emitting terminal event for {tool_function_name}: {exc}")
 
 
 # Agent-specific characteristics based on MAGI system design

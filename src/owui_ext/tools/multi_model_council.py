@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
+from owui_ext.shared.terminal_events import emit_terminal_tool_event
 from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
 
 log = logging.getLogger(__name__)
@@ -355,44 +356,6 @@ async def process_tool_result(
     return tool_result, [], []
 
 
-async def emit_terminal_tool_event(
-    *,
-    tool_function_name: str,
-    tool_function_params: dict,
-    tool_result: Any,
-    event_emitter: Optional[Callable],
-) -> None:
-    """Emit terminal:* UI events for Open Terminal tool results."""
-    if not event_emitter or tool_function_name not in TERMINAL_EVENT_TOOLS:
-        return
-
-    if tool_function_name == "display_file":
-        path = tool_function_params.get("path", "") if isinstance(tool_function_params, dict) else ""
-        if not isinstance(path, str) or not path:
-            return
-        parsed = tool_result
-        if isinstance(parsed, str):
-            try:
-                parsed = json.loads(parsed)
-            except Exception:
-                parsed = tool_result
-        if isinstance(parsed, dict) and parsed.get("exists") is False:
-            return
-        event = {"type": "terminal:display_file", "data": {"path": path}}
-    elif tool_function_name in {"write_file", "replace_file_content"}:
-        path = tool_function_params.get("path", "") if isinstance(tool_function_params, dict) else ""
-        if not isinstance(path, str) or not path:
-            return
-        event = {"type": f"terminal:{tool_function_name}", "data": {"path": path}}
-    elif tool_function_name == "run_command":
-        event = {"type": "terminal:run_command", "data": {}}
-    else:
-        return
-
-    try:
-        await event_emitter(event)
-    except Exception as exc:
-        log.warning(f"Error emitting terminal event for {tool_function_name}: {exc}")
 
 
 def parse_model_ids(value: Any) -> List[str]:
