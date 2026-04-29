@@ -33,6 +33,11 @@ from owui_ext.shared.tool_execution import (
     normalize_terminal_tools_result,
     process_tool_result,
 )
+from owui_ext.shared.tool_servers import (
+    build_direct_tools_dict,
+    normalize_direct_tool_servers,
+    resolve_direct_tool_servers_from_request_and_metadata,
+)
 
 log = logging.getLogger(__name__)
 
@@ -94,84 +99,6 @@ async def resolve_terminal_id_from_request_and_metadata(
         return request_terminal_id
 
     return metadata_terminal_id
-
-
-def normalize_direct_tool_servers(value: Any) -> List[dict]:
-    """Normalize direct tool server payload into a list of dict copies."""
-    if not isinstance(value, list):
-        return []
-    normalized = []
-    for item in value:
-        if isinstance(item, dict):
-            normalized.append(dict(item))
-    return normalized
-
-
-async def resolve_direct_tool_servers_from_request_and_metadata(
-    *,
-    request: Optional[Request],
-    metadata: Optional[dict],
-    debug: bool = False,
-) -> List[dict]:
-    """Resolve direct tool servers from request.body() first, then metadata."""
-    metadata_servers = normalize_direct_tool_servers(
-        (metadata or {}).get("tool_servers") if isinstance(metadata, dict) else None
-    )
-
-    request_servers: List[dict] = []
-    if request is not None:
-        request_body = getattr(request, "body", None)
-        if callable(request_body):
-            try:
-                raw_body = await request_body()
-                if raw_body:
-                    body = json.loads(raw_body)
-                    if isinstance(body, dict):
-                        request_servers = normalize_direct_tool_servers(body.get("tool_servers"))
-                        if not request_servers:
-                            nested_metadata = body.get("metadata")
-                            if isinstance(nested_metadata, dict):
-                                request_servers = normalize_direct_tool_servers(
-                                    nested_metadata.get("tool_servers")
-                                )
-            except Exception:
-                request_servers = []
-
-    if request_servers:
-        if debug and metadata_servers and len(metadata_servers) != len(request_servers):
-            log.warning(
-                "[ParallelTools] tool_servers mismatch between request body and metadata; "
-                "using request body tool_servers"
-            )
-        return request_servers
-
-    return metadata_servers
-
-
-def build_direct_tools_dict(*, tool_servers: List[dict]) -> dict:
-    """Build direct tool entries compatible with Open WebUI middleware."""
-    direct_tools = {}
-    for server in tool_servers:
-        if not isinstance(server, dict):
-            continue
-        specs = server.get("specs", [])
-        if not isinstance(specs, list) or not specs:
-            continue
-
-        server_payload = {k: v for k, v in server.items() if k != "specs"}
-        for spec in specs:
-            if not isinstance(spec, dict):
-                continue
-            name = spec.get("name")
-            if not isinstance(name, str) or not name:
-                continue
-            direct_tools[name] = {
-                "spec": spec,
-                "direct": True,
-                "server": server_payload,
-                "type": "direct",
-            }
-    return direct_tools
 
 
 async def execute_direct_tool_call(
