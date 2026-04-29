@@ -10,6 +10,7 @@ from . import __version__
 from .config import ReleaseConfig, Target, load_config, parse_config
 from .errors import BuildError
 from .git_io import (
+    baseline_is_ancestor_of_head,
     is_inside_repo,
     list_changed_files,
     read_baseline_blob,
@@ -242,11 +243,17 @@ def _run_build_or_check(
             if has_repo:
                 head_output = _read_head_output(config, target)
                 baseline_output = _read_baseline_output(config, target)
+                baseline_ancestor = (
+                    baseline_is_ancestor_of_head(config.repo_root)
+                    if baseline_output is not None
+                    else False
+                )
                 error = check_version_bump(
                     target=target,
                     rebuilt_output=rebuilt,
                     head_output=head_output,
                     baseline_output=baseline_output,
+                    baseline_is_ancestor_of_head=baseline_ancestor,
                 )
                 if error:
                     print(f"VERSION-BUMP REQUIRED: {error}", file=sys.stderr)

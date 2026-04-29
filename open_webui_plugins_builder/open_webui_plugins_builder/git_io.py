@@ -69,6 +69,31 @@ def read_head_blob(repo_root: Path, rel_path: str) -> str | None:
     return out.stdout
 
 
+def _select_baseline_ref(repo_root: Path) -> str | None:
+    """Return the preferred baseline ref name, or None when none exist.
+
+    ``origin/main`` is preferred over the local ``main`` because a stale
+    local ``main`` (the dev forgot to ``git pull``) would otherwise let
+    the gate read a baseline whose version is older than what is actually
+    shipped.
+    """
+
+    try:
+        for ref in ("origin/main", "main"):
+            rev = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", ref],
+                cwd=str(repo_root),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if rev.returncode == 0:
+                return ref
+    except FileNotFoundError as exc:
+        raise BuildError("`git` executable not found on PATH.") from exc
+    return None
+
+
 def read_baseline_blob(repo_root: Path, rel_path: str) -> str | None:
     """Return ``rel_path`` from the shipping baseline (``origin/main`` / ``main``).
 
@@ -79,33 +104,16 @@ def read_baseline_blob(repo_root: Path, rel_path: str) -> str | None:
     no baseline ref is reachable, so callers can fall back to a HEAD
     comparison in that case.
 
-    ``origin/main`` is preferred over the local ``main`` because a stale
-    local ``main`` (the dev forgot to ``git pull``) would otherwise let
-    the gate read a baseline whose version is older than what is actually
-    shipped, allowing a same-version change to slip through. Once a
-    baseline ref is selected, a missing path under that ref returns
+    Once a baseline ref is selected, a missing path under that ref returns
     ``None`` (the path is genuinely new on the baseline) -- we do *not*
     fall back to the next ref, since the next ref's blob would be the
     same kind of stale-baseline trap we are trying to avoid.
     """
 
+    selected_ref = _select_baseline_ref(repo_root)
+    if selected_ref is None:
+        return None
     try:
-        selected_ref: str | None = None
-        for ref in ("origin/main", "main"):
-            rev = subprocess.run(
-                ["git", "rev-parse", "--verify", "--quiet", ref],
-                cwd=str(repo_root),
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if rev.returncode == 0:
-                selected_ref = ref
-                break
-
-        if selected_ref is None:
-            return None
-
         out = subprocess.run(
             ["git", "show", f"{selected_ref}:{rel_path}"],
             cwd=str(repo_root),
@@ -118,6 +126,34 @@ def read_baseline_blob(repo_root: Path, rel_path: str) -> str | None:
     if out.returncode == 0:
         return out.stdout
     return None
+
+
+def baseline_is_ancestor_of_head(repo_root: Path) -> bool:
+    """Return True iff the baseline ref is an ancestor of ``HEAD``.
+
+    Used by the version-bump gate to decide whether the "branch already
+    bumped past baseline" carve-out applies. Without this check, a branch
+    that was forked from an *older* main (so its HEAD's version is older
+    than the baseline's) would still satisfy ``new_version !=
+    baseline_version`` and the gate would silently allow shipping a
+    rolled-back version. Returns False when no baseline ref is reachable
+    or when the ancestry check cannot be performed.
+    """
+
+    selected_ref = _select_baseline_ref(repo_root)
+    if selected_ref is None:
+        return False
+    try:
+        out = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", selected_ref, "HEAD"],
+            cwd=str(repo_root),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise BuildError("`git` executable not found on PATH.") from exc
+    return out.returncode == 0
 
 
 def list_changed_files(repo_root: Path, *, staged: bool) -> set[str]:

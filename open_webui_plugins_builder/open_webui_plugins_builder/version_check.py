@@ -6,8 +6,14 @@ consumers have no signal that the file changed. This module enforces:
 
     "If the rebuilt output differs from HEAD's output, the docstring's
     ``version:`` field must also differ from HEAD's -- unless the rebuilt
-    output's version already differs from the shipping baseline (``main``),
-    in which case a same-cycle in-branch iteration is allowed."
+    output's version already differs from the shipping baseline (``main``)
+    *and* HEAD descends from the baseline, in which case a same-cycle
+    in-branch iteration is allowed."
+
+The HEAD-descends-from-baseline guard exists so a branch forked from an
+older ``main`` cannot satisfy ``new_version != baseline_version`` by
+carrying a *behind* version: without it, a stale fork would silently
+slip a same-or-older version through the gate.
 
 The gate is intentionally lenient about value direction (we don't enforce
 SemVer ordering) -- only that the value is not byte-identical to the
@@ -62,6 +68,7 @@ def check_version_bump(
     rebuilt_output: str,
     head_output: str | None,
     baseline_output: str | None = None,
+    baseline_is_ancestor_of_head: bool = False,
 ) -> str | None:
     """Return an error message if the version-bump gate is violated.
 
@@ -69,10 +76,13 @@ def check_version_bump(
     nothing to compare).
 
     ``baseline_output`` is the file's content on the shipping baseline
-    (``main``); when provided, a rebuilt output whose version already differs
-    from the baseline passes the gate even if HEAD has the same version.
-    This lets a feature branch iterate on the same shipping cycle without
-    requiring a fresh bump per commit.
+    (``main``); when provided *and* HEAD descends from that baseline,
+    a rebuilt output whose version already differs from the baseline
+    passes the gate even if HEAD has the same version. This lets a feature
+    branch iterate on the same shipping cycle without requiring a fresh
+    bump per commit. The ancestry guard prevents a stale fork (HEAD does
+    not descend from baseline) from satisfying ``new_version !=
+    baseline_version`` by carrying a behind/rolled-back version.
     """
 
     if head_output is None:
@@ -86,7 +96,7 @@ def check_version_bump(
             f"{target.name}: rebuilt output {target.output} is missing a "
             f"`version:` field in its leading docstring."
         )
-    if baseline_output is not None:
+    if baseline_output is not None and baseline_is_ancestor_of_head:
         baseline_version = extract_version(baseline_output)
         if baseline_version is not None and new_version != baseline_version:
             return None
