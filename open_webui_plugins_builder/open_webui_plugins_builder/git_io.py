@@ -89,23 +89,23 @@ def read_baseline_blob(repo_root: Path, rel_path: str) -> str | None:
     same kind of stale-baseline trap we are trying to avoid.
     """
 
-    selected_ref: str | None = None
-    for ref in ("origin/main", "main"):
-        rev = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", ref],
-            cwd=str(repo_root),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if rev.returncode == 0:
-            selected_ref = ref
-            break
-
-    if selected_ref is None:
-        return None
-
     try:
+        selected_ref: str | None = None
+        for ref in ("origin/main", "main"):
+            rev = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", ref],
+                cwd=str(repo_root),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if rev.returncode == 0:
+                selected_ref = ref
+                break
+
+        if selected_ref is None:
+            return None
+
         out = subprocess.run(
             ["git", "show", f"{selected_ref}:{rel_path}"],
             cwd=str(repo_root),
