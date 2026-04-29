@@ -27,36 +27,8 @@ async def maybe_await(value):
         return await value
     return value
 
-# --- inlined from src/owui_ext/shared/tool_event_metadata.py (owui_ext.shared.tool_event_metadata) ---
-CITATION_TOOLS: set[str] = {
-    "search_web",
-    "view_file",
-    "view_knowledge_file",
-    "query_knowledge_files",
-    "fetch_url",
-}
-
-
-TERMINAL_EVENT_TOOLS: set[str] = {
-    "display_file",
-    "write_file",
-    "replace_file_content",
-    "run_command",
-}
-
-log = logging.getLogger(__name__)
-
-_core_process_tool_result = None
-
-
-# ============================================================================
-# Builtin tool categories (copied from tools/sub_agent.py)
-# ============================================================================
-
-# Builtin tool categories
-# NOTE: This mapping must be updated when Open WebUI adds/removes builtin tools.
-# Check open_webui/utils/tools.py:get_builtin_tools() for the current list.
-BUILTIN_TOOL_CATEGORIES = {
+# --- inlined from src/owui_ext/shared/builtin_tools.py (owui_ext.shared.builtin_tools) ---
+BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
     "time": {"get_current_timestamp", "calculate_timestamp"},
     "web": {"search_web", "fetch_url"},
     "image": {"generate_image", "edit_image"},
@@ -102,8 +74,8 @@ BUILTIN_TOOL_CATEGORIES = {
     },
 }
 
-# Mapping from Valves field names to category names
-VALVE_TO_CATEGORY = {
+
+VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_TIME_TOOLS": "time",
     "ENABLE_WEB_TOOLS": "web",
     "ENABLE_IMAGE_TOOLS": "image",
@@ -113,10 +85,33 @@ VALVE_TO_CATEGORY = {
     "ENABLE_NOTES_TOOLS": "notes",
     "ENABLE_CHANNELS_TOOLS": "channels",
     "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
+    "ENABLE_SKILLS_TOOLS": "skills",
     "ENABLE_TASK_TOOLS": "tasks",
     "ENABLE_AUTOMATION_TOOLS": "automations",
     "ENABLE_CALENDAR_TOOLS": "calendar",
 }
+
+# --- inlined from src/owui_ext/shared/tool_event_metadata.py (owui_ext.shared.tool_event_metadata) ---
+CITATION_TOOLS: set[str] = {
+    "search_web",
+    "view_file",
+    "view_knowledge_file",
+    "query_knowledge_files",
+    "fetch_url",
+}
+
+
+TERMINAL_EVENT_TOOLS: set[str] = {
+    "display_file",
+    "write_file",
+    "replace_file_content",
+    "run_command",
+}
+
+log = logging.getLogger(__name__)
+
+_core_process_tool_result = None
+
 
 # ============================================================================
 # Event emitter

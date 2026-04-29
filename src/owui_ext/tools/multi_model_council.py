@@ -17,81 +17,13 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
+from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
 from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
 
 log = logging.getLogger(__name__)
 
 _core_process_tool_result = None
 
-
-# ============================================================================
-# Builtin tool categories (copied from tools/sub_agent.py)
-# ============================================================================
-
-# Builtin tool categories
-# NOTE: This mapping must be updated when Open WebUI adds/removes builtin tools.
-# Check open_webui/utils/tools.py:get_builtin_tools() for the current list.
-BUILTIN_TOOL_CATEGORIES = {
-    "time": {"get_current_timestamp", "calculate_timestamp"},
-    "web": {"search_web", "fetch_url"},
-    "image": {"generate_image", "edit_image"},
-    "knowledge": {
-        "list_knowledge",
-        "list_knowledge_bases",
-        "search_knowledge_bases",
-        "query_knowledge_bases",
-        "search_knowledge_files",
-        "query_knowledge_files",
-        "view_file",
-        "view_knowledge_file",
-    },
-    "chat": {"search_chats", "view_chat"},
-    "memory": {"search_memories", "add_memory", "replace_memory_content", "delete_memory", "list_memories"},
-    "notes": {
-        "search_notes",
-        "view_note",
-        "write_note",
-        "replace_note_content",
-    },
-    "channels": {
-        "search_channels",
-        "search_channel_messages",
-        "view_channel_thread",
-        "view_channel_message",
-    },
-    "code_interpreter": {"execute_code"},
-    "skills": {"view_skill"},
-    "tasks": {"create_tasks", "update_task"},
-    "automations": {
-        "create_automation",
-        "update_automation",
-        "list_automations",
-        "toggle_automation",
-        "delete_automation",
-    },
-    "calendar": {
-        "search_calendar_events",
-        "create_calendar_event",
-        "update_calendar_event",
-        "delete_calendar_event",
-    },
-}
-
-# Mapping from Valves field names to category names
-VALVE_TO_CATEGORY = {
-    "ENABLE_TIME_TOOLS": "time",
-    "ENABLE_WEB_TOOLS": "web",
-    "ENABLE_IMAGE_TOOLS": "image",
-    "ENABLE_KNOWLEDGE_TOOLS": "knowledge",
-    "ENABLE_CHAT_TOOLS": "chat",
-    "ENABLE_MEMORY_TOOLS": "memory",
-    "ENABLE_NOTES_TOOLS": "notes",
-    "ENABLE_CHANNELS_TOOLS": "channels",
-    "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
-    "ENABLE_TASK_TOOLS": "tasks",
-    "ENABLE_AUTOMATION_TOOLS": "automations",
-    "ENABLE_CALENDAR_TOOLS": "calendar",
-}
 
 # ============================================================================
 # Event emitter
