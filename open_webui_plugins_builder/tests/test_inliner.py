@@ -27,6 +27,7 @@ These tests construct fake source trees on disk under ``tmp_path`` and exercise
 
 from __future__ import annotations
 
+import sys
 import textwrap
 from pathlib import Path
 
@@ -7235,10 +7236,19 @@ def test_rejects_globals_str_via_method_call(tmp_path: Path) -> None:
 # integrate it into ``_collect_inlined_module_bindings``,
 # ``_collect_global_writes``, and ``_first_builtins_store_line`` so it
 # participates in name-collision detection and reserved-name
-# enforcement just like ``X = ...``.
+# enforcement just like ``X = ...``. Fixtures embed the new syntax in
+# source strings, so the tests can only run on a parser that understands
+# PEP 695 (Python 3.12+).
 # ---------------------------------------------------------------------------
 
 
+pep695 = pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="PEP 695 `type X = ...` syntax requires Python 3.12+",
+)
+
+
+@pep695
 def test_rejects_type_alias_collision_between_deps(tmp_path: Path) -> None:
     """``type helper = int`` in one dep collides with ``def helper()``
     in another. PoC for Codex round 8 finding 2.
@@ -7280,6 +7290,7 @@ def test_rejects_type_alias_collision_between_deps(tmp_path: Path) -> None:
         _build(tmp_path, "src/owui_ext/tools/demo.py")
 
 
+@pep695
 def test_rejects_type_alias_builtins(tmp_path: Path) -> None:
     """``type __builtins__ = int`` is a top-level binding of
     ``__builtins__`` and is refused for the same reason as
@@ -7298,6 +7309,7 @@ def test_rejects_type_alias_builtins(tmp_path: Path) -> None:
         _build(tmp_path, "src/owui_ext/tools/demo.py")
 
 
+@pep695
 def test_rejects_type_alias_via_global_in_function(tmp_path: Path) -> None:
     """A nested ``global X; type X = ...`` writes to module globals
     and is recorded by ``_collect_global_writes`` so the collision
