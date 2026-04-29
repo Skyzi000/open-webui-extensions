@@ -238,6 +238,7 @@ TERMINAL_EVENT_TOOLS: set[str] = {
 
 # --- inlined from src/owui_ext/shared/tool_execution.py (owui_ext.shared.tool_execution) ---
 import json
+import uuid
 from typing import Any, Optional
 from fastapi import Request
 _core_process_tool_result = None
@@ -307,6 +308,33 @@ async def process_tool_result(
     elif tool_result is not None and not isinstance(tool_result, str):
         tool_result = str(tool_result)
     return tool_result, [], []
+
+
+async def execute_direct_tool_call(
+    *,
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool: dict,
+    extra_params: dict,
+) -> Any:
+    """Execute direct tools through ``__event_call__`` like core middleware."""
+    event_call = extra_params.get("__event_call__")
+    if not callable(event_call):
+        raise RuntimeError("Direct tool execution requires __event_call__ context")
+    metadata = extra_params.get("__metadata__")
+    session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
+    return await event_call(
+        {
+            "type": "execute:tool",
+            "data": {
+                "id": str(uuid.uuid4()),
+                "name": tool_function_name,
+                "params": tool_function_params,
+                "server": tool.get("server", {}),
+                "session_id": session_id,
+            },
+        }
+    )
 
 
 def normalize_terminal_tools_result(
@@ -513,34 +541,6 @@ async def resolve_terminal_id_from_request_and_metadata(
         return request_terminal_id
 
     return metadata_terminal_id
-
-
-async def execute_direct_tool_call(
-    *,
-    tool_function_name: str,
-    tool_function_params: dict,
-    tool: dict,
-    extra_params: dict,
-) -> Any:
-    """Execute direct tools through __event_call__ like core middleware."""
-    event_call = extra_params.get("__event_call__")
-    if not callable(event_call):
-        raise RuntimeError("Direct tool execution requires __event_call__ context")
-
-    metadata = extra_params.get("__metadata__")
-    session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
-    return await event_call(
-        {
-            "type": "execute:tool",
-            "data": {
-                "id": str(uuid.uuid4()),
-                "name": tool_function_name,
-                "params": tool_function_params,
-                "server": tool.get("server", {}),
-                "session_id": session_id,
-            },
-        }
-    )
 
 
 # Agent-specific characteristics based on MAGI system design
