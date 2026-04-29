@@ -49,8 +49,8 @@ TERMINAL_EVENT_MODULE_CASES = [
     (
         "parallel_tools",
         parallel_tools,
-        "tool_name",
-        "tool_args",
+        "tool_function_name",
+        "tool_function_params",
     ),
 ]
 
