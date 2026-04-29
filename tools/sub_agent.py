@@ -111,6 +111,31 @@ VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_CALENDAR_TOOLS": "calendar",
 }
 
+# --- inlined from src/owui_ext/shared/model_features.py (owui_ext.shared.model_features) ---
+from typing import Optional
+def model_has_note_knowledge(model: Optional[dict]) -> bool:
+    """Return True if the current model has note-type attached knowledge."""
+    if not isinstance(model, dict):
+        return False
+    knowledge_items = model.get("info", {}).get("meta", {}).get("knowledge") or []
+    if not isinstance(knowledge_items, list):
+        return False
+    return any(
+        item.get("type") == "note"
+        for item in knowledge_items
+        if isinstance(item, dict)
+    )
+
+
+def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
+    """Return True if model-level builtin knowledge tools are enabled."""
+    if not isinstance(model, dict):
+        return True
+    builtin_tools = model.get("info", {}).get("meta", {}).get("builtinTools", {})
+    if not isinstance(builtin_tools, dict):
+        return True
+    return bool(builtin_tools.get("knowledge", True))
+
 # --- inlined from src/owui_ext/shared/notifications.py (owui_ext.shared.notifications) ---
 import logging
 from typing import Callable, Optional
@@ -403,26 +428,6 @@ def normalize_parallel_sub_agent_tasks(tasks: Any) -> tuple[Optional[list[dict[s
         validated_tasks.append({"description": description, "prompt": prompt})
 
     return validated_tasks, None
-
-
-def model_has_note_knowledge(model: Optional[dict]) -> bool:
-    """Return True if the current model has note-type attached knowledge."""
-    if not isinstance(model, dict):
-        return False
-    knowledge_items = (model.get("info", {}).get("meta", {}).get("knowledge") or [])
-    if not isinstance(knowledge_items, list):
-        return False
-    return any(item.get("type") == "note" for item in knowledge_items if isinstance(item, dict))
-
-
-def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
-    """Return True if model-level builtin knowledge tools are enabled."""
-    if not isinstance(model, dict):
-        return True
-    builtin_tools = model.get("info", {}).get("meta", {}).get("builtinTools", {})
-    if not isinstance(builtin_tools, dict):
-        return True
-    return bool(builtin_tools.get("knowledge", True))
 
 
 async def resolve_terminal_id_for_sub_agent(

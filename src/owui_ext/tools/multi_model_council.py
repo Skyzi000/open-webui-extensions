@@ -18,6 +18,10 @@ from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
+from owui_ext.shared.model_features import (
+    model_has_note_knowledge,
+    model_knowledge_tools_enabled,
+)
 from owui_ext.shared.prompt_utils import (
     _append_tool_server_prompts,
     merge_prompt_sections,
@@ -245,26 +249,6 @@ def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseMode
     else:
         data = {}
     return valves_cls.model_validate(data)
-
-
-def model_has_note_knowledge(model: Optional[dict]) -> bool:
-    """Return True if the current model has note-type attached knowledge."""
-    if not isinstance(model, dict):
-        return False
-    knowledge_items = (model.get("info", {}).get("meta", {}).get("knowledge") or [])
-    if not isinstance(knowledge_items, list):
-        return False
-    return any(item.get("type") == "note" for item in knowledge_items if isinstance(item, dict))
-
-
-def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
-    """Return True if model-level builtin knowledge tools are enabled."""
-    if not isinstance(model, dict):
-        return True
-    builtin_tools = model.get("info", {}).get("meta", {}).get("builtinTools", {})
-    if not isinstance(builtin_tools, dict):
-        return True
-    return bool(builtin_tools.get("knowledge", True))
 
 
 async def execute_direct_tool_call(
