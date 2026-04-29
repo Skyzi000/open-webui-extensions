@@ -33,6 +33,7 @@ from owui_ext.shared.prompt_utils import (
 )
 from owui_ext.shared.terminal_events import emit_terminal_tool_event
 from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
+from owui_ext.shared.users import _normalize_user
 from owui_ext.shared.voting import compute_vote_tally, decide_majority
 
 log = logging.getLogger(__name__)
@@ -287,22 +288,6 @@ async def execute_direct_tool_call(
             },
         }
     )
-
-
-def _normalize_user(user: Any) -> Any:
-    """Convert raw __user__ dict payloads into UserModel when needed."""
-    if user is None or hasattr(user, "id"):
-        return user
-    if isinstance(user, dict):
-        try:
-            from open_webui.models.users import UserModel
-
-            return UserModel(**user)
-        except Exception:
-            from types import SimpleNamespace
-
-            return SimpleNamespace(**user)
-    return user
 
 
 async def process_tool_result(

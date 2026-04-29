@@ -258,6 +258,23 @@ TERMINAL_EVENT_TOOLS: set[str] = {
     "run_command",
 }
 
+# --- inlined from src/owui_ext/shared/users.py (owui_ext.shared.users) ---
+from typing import Any
+def _normalize_user(user: Any) -> Any:
+    """Convert raw __user__ dict payloads into UserModel when needed."""
+    if user is None or hasattr(user, "id"):
+        return user
+    if isinstance(user, dict):
+        try:
+            from open_webui.models.users import UserModel
+
+            return UserModel(**user)
+        except Exception:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(**user)
+    return user
+
 # --- inlined from src/owui_ext/shared/voting.py (owui_ext.shared.voting) ---
 from typing import List
 def compute_vote_tally(votes: List[str]) -> dict:
@@ -524,22 +541,6 @@ async def execute_direct_tool_call(
             },
         }
     )
-
-
-def _normalize_user(user: Any) -> Any:
-    """Convert raw __user__ dict payloads into UserModel when needed."""
-    if user is None or hasattr(user, "id"):
-        return user
-    if isinstance(user, dict):
-        try:
-            from open_webui.models.users import UserModel
-
-            return UserModel(**user)
-        except Exception:
-            from types import SimpleNamespace
-
-            return SimpleNamespace(**user)
-    return user
 
 
 async def process_tool_result(

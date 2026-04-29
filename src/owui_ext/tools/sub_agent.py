@@ -49,6 +49,7 @@ from owui_ext.shared.prompt_utils import (
 )
 from owui_ext.shared.terminal_events import emit_terminal_tool_event
 from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
+from owui_ext.shared.users import _normalize_user
 
 log = logging.getLogger(__name__)
 
@@ -383,22 +384,6 @@ def normalize_terminal_tools_result(*, terminal_tools_result: Any, extra_params:
     if isinstance(terminal_tools, dict):
         return terminal_tools
     return {}
-
-
-def _normalize_user(user: Any) -> Any:
-    """Convert raw __user__ dict payloads into UserModel when needed."""
-    if user is None or hasattr(user, "id"):
-        return user
-    if isinstance(user, dict):
-        try:
-            from open_webui.models.users import UserModel
-
-            return UserModel(**user)
-        except Exception:
-            from types import SimpleNamespace
-
-            return SimpleNamespace(**user)
-    return user
 
 
 async def resolve_mcp_tools(
