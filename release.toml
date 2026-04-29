@@ -8,3 +8,8 @@ local_import_roots = ["owui_ext.shared"]
 name = "parallel_tools"
 source = "src/owui_ext/tools/parallel_tools.py"
 output = "tools/parallel_tools.py"
+
+[[targets]]
+name = "magi_decision_support"
+source = "src/owui_ext/tools/magi_decision_support.py"
+output = "tools/magi_decision_support.py"
