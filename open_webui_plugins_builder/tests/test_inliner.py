@@ -8699,3 +8699,70 @@ def test_rejects_constant_fstring_subscript(tmp_path: Path) -> None:
     )
     with pytest.raises(BuildError, match="__dict__"):
         _build(tmp_path, "src/owui_ext/tools/demo.py")
+
+
+def test_allows_same_source_import_read_via_globals_in_dep(
+    tmp_path: Path,
+) -> None:
+    """``import math; ...; globals()["math"]`` in the same dep is legal.
+
+    ``math`` is bound by this dep's own top-level external import; the
+    merged module also binds it via the same import, so the dynamic
+    read resolves to the same object before and after inlining. The
+    cross-source resolution check used to flag this as a silent
+    cross-module reference because top-level imports were not subtracted
+    from the dynamic-reads set.
+    """
+
+    _write(
+        tmp_path / "src/owui_ext/shared/util.py",
+        textwrap.dedent(
+            """
+            import math
+
+
+            def get_math():
+                return globals()["math"]
+
+
+            SHARED_MARKER = True
+            """
+        ).lstrip(),
+    )
+    _write(
+        tmp_path / "src/owui_ext/tools/demo.py",
+        '''
+        """version: 0.1"""
+
+        from owui_ext.shared.util import SHARED_MARKER, get_math
+
+        VALUE = (SHARED_MARKER, get_math)
+        ''',
+    )
+    # Should build without raising BuildError.
+    text = _build(tmp_path, "src/owui_ext/tools/demo.py")
+    assert "import math" in text
+
+
+def test_allows_same_source_import_read_via_globals_in_target(
+    tmp_path: Path,
+) -> None:
+    """Same as the dep case, applied to the target body."""
+
+    _write(
+        tmp_path / "src/owui_ext/tools/demo.py",
+        '''
+        """version: 0.1"""
+
+        import math
+
+
+        def get_math():
+            return globals()["math"]
+
+
+        VALUE = get_math
+        ''',
+    )
+    text = _build(tmp_path, "src/owui_ext/tools/demo.py")
+    assert "import math" in text

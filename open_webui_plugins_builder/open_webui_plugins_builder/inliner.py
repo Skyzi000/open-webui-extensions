@@ -4083,8 +4083,16 @@ def _verify_no_name_collisions(
         # too: ``globals()["helper"]`` in a dep that does not itself bind
         # ``helper`` would silently resolve to another inlined source's
         # ``helper`` after merging, while in source form it raises
-        # ``KeyError``.
-        for name in dep_dynamic_reads - dep_redefs:
+        # ``KeyError``. Names bound by this dep's own top-level externals
+        # are excluded -- ``import math; ...; globals()["math"]`` resolves
+        # to the same ``math`` before and after inlining, so it is not a
+        # cross-module reference.
+        dep_external_bound = {
+            bound
+            for node in dep.external_imports
+            for bound, _ in _bound_names_with_source(node)
+        }
+        for name in dep_dynamic_reads - dep_redefs - dep_external_bound:
             pending_refs.append(
                 (name, f"{dep.path} (dynamic globals read)")
             )
@@ -4143,7 +4151,17 @@ def _verify_no_name_collisions(
             continue
         pending_refs.append((name, f"{target_module.path} (unbound reference)"))
     # Same dynamic-read ingestion as deps, applied to the target.
-    for name in target_dynamic_reads - target_locally_bound - target_redefs:
+    target_external_bound = {
+        bound
+        for node in target_external_imports
+        for bound, _ in _bound_names_with_source(node)
+    }
+    for name in (
+        target_dynamic_reads
+        - target_locally_bound
+        - target_redefs
+        - target_external_bound
+    ):
         pending_refs.append(
             (name, f"{target_module.path} (dynamic globals read)")
         )
