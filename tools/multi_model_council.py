@@ -258,6 +258,25 @@ TERMINAL_EVENT_TOOLS: set[str] = {
     "run_command",
 }
 
+# --- inlined from src/owui_ext/shared/voting.py (owui_ext.shared.voting) ---
+from typing import List
+def compute_vote_tally(votes: List[str]) -> dict:
+    tally = {"A": 0, "B": 0, "abstain": 0}
+    for vote in votes:
+        if vote in tally:
+            tally[vote] += 1
+    return tally
+
+
+def decide_majority(tally: dict) -> str:
+    if tally.get("A", 0) > tally.get("B", 0):
+        return "A"
+    if tally.get("B", 0) > tally.get("A", 0):
+        return "B"
+    if tally.get("A", 0) == tally.get("B", 0) and tally.get("A", 0) > 0:
+        return "tie"
+    return "no_decision"
+
 log = logging.getLogger(__name__)
 
 _core_process_tool_result = None
@@ -709,24 +728,6 @@ def normalize_member_result(parsed: Optional[dict], fallback_reason: str) -> dic
         "risks": risks,
         "sources": normalized_sources,
     }
-
-
-def compute_vote_tally(votes: List[str]) -> dict:
-    tally = {"A": 0, "B": 0, "abstain": 0}
-    for vote in votes:
-        if vote in tally:
-            tally[vote] += 1
-    return tally
-
-
-def decide_majority(tally: dict) -> str:
-    if tally.get("A", 0) > tally.get("B", 0):
-        return "A"
-    if tally.get("B", 0) > tally.get("A", 0):
-        return "B"
-    if tally.get("A", 0) == tally.get("B", 0) and tally.get("A", 0) > 0:
-        return "tie"
-    return "no_decision"
 
 
 async def execute_tool_call(
