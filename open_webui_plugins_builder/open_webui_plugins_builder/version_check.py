@@ -5,10 +5,13 @@ the file. Without a visible version bump in the leading docstring, downstream
 consumers have no signal that the file changed. This module enforces:
 
     "If the rebuilt output differs from HEAD's output, the docstring's
-    ``version:`` field must also differ from HEAD's."
+    ``version:`` field must also differ from HEAD's -- unless the rebuilt
+    output's version already differs from the shipping baseline (``main``),
+    in which case a same-cycle in-branch iteration is allowed."
 
 The gate is intentionally lenient about value direction (we don't enforce
-SemVer ordering) -- only that the value is not byte-identical to HEAD.
+SemVer ordering) -- only that the value is not byte-identical to the
+relevant comparison point.
 """
 
 from __future__ import annotations
@@ -58,11 +61,18 @@ def check_version_bump(
     target: Target,
     rebuilt_output: str,
     head_output: str | None,
+    baseline_output: str | None = None,
 ) -> str | None:
     """Return an error message if the version-bump gate is violated.
 
     Returns ``None`` when the gate passes (or doesn't apply because there is
     nothing to compare).
+
+    ``baseline_output`` is the file's content on the shipping baseline
+    (``main``); when provided, a rebuilt output whose version already differs
+    from the baseline passes the gate even if HEAD has the same version.
+    This lets a feature branch iterate on the same shipping cycle without
+    requiring a fresh bump per commit.
     """
 
     if head_output is None:
@@ -71,12 +81,16 @@ def check_version_bump(
         return None
 
     new_version = extract_version(rebuilt_output)
-    old_version = extract_version(head_output)
     if new_version is None:
         return (
             f"{target.name}: rebuilt output {target.output} is missing a "
             f"`version:` field in its leading docstring."
         )
+    if baseline_output is not None:
+        baseline_version = extract_version(baseline_output)
+        if baseline_version is not None and new_version != baseline_version:
+            return None
+    old_version = extract_version(head_output)
     if old_version is not None and new_version == old_version:
         return (
             f"{target.name}: output {target.output} differs from HEAD but "

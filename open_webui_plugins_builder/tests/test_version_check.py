@@ -129,6 +129,62 @@ def test_extract_version_ignores_invalid_syntax() -> None:
     assert extract_version("def broken(:\n") is None
 
 
+def test_branch_internal_iteration_passes_when_baseline_already_bumped(
+    tmp_path: Path,
+) -> None:
+    """A feature branch that already bumped vs main may iterate without re-bumping.
+
+    Without this carve-out the gate would force a fresh version bump for
+    every commit on the branch -- so a same-cycle source correction (e.g.
+    fixing a misplaced future import in 0.1.13 before merging 0.1.13 to
+    main) would have to ship as 0.1.14 even though 0.1.13 has not landed
+    on main yet.
+    """
+
+    target = _target(tmp_path)
+    baseline = HEAD_OUTPUT  # main still has 0.1.0
+    head = HEAD_OUTPUT.replace("0.1.0", "0.1.1")  # branch already bumped to 0.1.1
+    rebuilt = head.replace('print("hi")', 'print("hi there")')  # iterate again at 0.1.1
+    error = check_version_bump(
+        target=target,
+        rebuilt_output=rebuilt,
+        head_output=head,
+        baseline_output=baseline,
+    )
+    assert error is None
+
+
+def test_baseline_with_same_version_still_requires_bump(tmp_path: Path) -> None:
+    """If branch hasn't bumped vs main, the gate still demands a bump."""
+
+    target = _target(tmp_path)
+    baseline = HEAD_OUTPUT  # main: 0.1.0
+    head = HEAD_OUTPUT  # branch unchanged: 0.1.0
+    rebuilt = head.replace('print("hi")', 'print("hi there")')  # change without bump
+    error = check_version_bump(
+        target=target,
+        rebuilt_output=rebuilt,
+        head_output=head,
+        baseline_output=baseline,
+    )
+    assert error is not None
+    assert "0.1.0" in error
+
+
+def test_missing_baseline_falls_back_to_head_check(tmp_path: Path) -> None:
+    """When main is unreachable (e.g., shallow clone), gate uses HEAD only."""
+
+    target = _target(tmp_path)
+    rebuilt = HEAD_OUTPUT.replace('print("hi")', 'print("hi there")')
+    error = check_version_bump(
+        target=target,
+        rebuilt_output=rebuilt,
+        head_output=HEAD_OUTPUT,
+        baseline_output=None,
+    )
+    assert error is not None  # same as the no-baseline-arg path
+
+
 def test_change_without_leading_docstring_version_fails(tmp_path: Path) -> None:
     """A rebuilt file whose leading docstring lacks ``version:`` must fail.
 

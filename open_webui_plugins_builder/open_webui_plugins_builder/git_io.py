@@ -69,6 +69,33 @@ def read_head_blob(repo_root: Path, rel_path: str) -> str | None:
     return out.stdout
 
 
+def read_baseline_blob(repo_root: Path, rel_path: str) -> str | None:
+    """Return ``rel_path`` from the shipping baseline (``main`` / ``origin/main``).
+
+    The version-bump gate compares against the *last shipped* version, not
+    against HEAD: when a feature branch has already bumped past main and the
+    author iterates on the same shipping cycle, the gate would otherwise
+    require a fresh bump for every commit on the branch. Returns None when
+    neither ``main`` nor ``origin/main`` is reachable, so callers can fall
+    back to a HEAD comparison in that case.
+    """
+
+    for ref in ("main", "origin/main"):
+        try:
+            out = subprocess.run(
+                ["git", "show", f"{ref}:{rel_path}"],
+                cwd=str(repo_root),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise BuildError("`git` executable not found on PATH.") from exc
+        if out.returncode == 0:
+            return out.stdout
+    return None
+
+
 def list_changed_files(repo_root: Path, *, staged: bool) -> set[str]:
     """List files differing from HEAD.
 

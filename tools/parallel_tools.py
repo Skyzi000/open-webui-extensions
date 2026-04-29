@@ -16,12 +16,10 @@ Limitations:
   parameter in the expected format.
 """
 
-from __future__ import annotations
-
 # === GENERATED FILE - DO NOT EDIT ===
 # Source: src/owui_ext/tools/parallel_tools.py
 # Regenerate with: uv run python scripts/build_release.py --target parallel_tools
-# Future imports: annotations
+# Future imports: (none)
 # See release.toml for target definitions.
 
 import asyncio

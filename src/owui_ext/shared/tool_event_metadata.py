@@ -13,9 +13,6 @@ event semantics (parallel runner, council voters, decision support, etc.) can
 import them without rolling its own copy.
 """
 
-from __future__ import annotations
-
-
 CITATION_TOOLS: set[str] = {
     "search_web",
     "view_file",

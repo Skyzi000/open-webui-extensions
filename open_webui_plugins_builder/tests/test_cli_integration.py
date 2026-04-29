@@ -64,9 +64,6 @@ def _seed_demo(repo: Path) -> None:
     shared_path.write_text(
         textwrap.dedent(
             """
-            from __future__ import annotations
-
-
             def helper(x: int) -> int:
                 return x + 1
             """
@@ -83,8 +80,6 @@ def _seed_demo(repo: Path) -> None:
             title: Demo
             version: 0.1.0
             """
-
-            from __future__ import annotations
 
             from owui_ext.shared.util import helper
 
@@ -435,7 +430,6 @@ def test_staged_resolves_shared_module_from_index_when_worktree_lacks_it(
     # Add a brand new shared module; bump version; rebuild; stage everything.
     new_shared = repo / "src/owui_ext/shared/extra.py"
     new_shared.write_text(
-        "from __future__ import annotations\n\n\n"
         "def extra() -> int:\n    return 42\n",
         encoding="utf-8",
     )

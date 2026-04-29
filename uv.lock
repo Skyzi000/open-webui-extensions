@@ -2674,7 +2674,7 @@ dev = [
 
 [[package]]
 name = "open-webui-plugins-builder"
-version = "0.1.2"
+version = "0.1.5"
 source = { editable = "open_webui_plugins_builder" }
 
 [package.metadata]

@@ -12,6 +12,7 @@ from .errors import BuildError
 from .git_io import (
     is_inside_repo,
     list_changed_files,
+    read_baseline_blob,
     read_head_blob,
     read_index_blob,
 )
@@ -240,10 +241,12 @@ def _run_build_or_check(
                 continue
             if has_repo:
                 head_output = _read_head_output(config, target)
+                baseline_output = _read_baseline_output(config, target)
                 error = check_version_bump(
                     target=target,
                     rebuilt_output=rebuilt,
                     head_output=head_output,
+                    baseline_output=baseline_output,
                 )
                 if error:
                     print(f"VERSION-BUMP REQUIRED: {error}", file=sys.stderr)
@@ -291,6 +294,11 @@ def _read_current_output(
 def _read_head_output(config: ReleaseConfig, target: Target) -> str | None:
     rel = _safe_relative(target.output, config.repo_root)
     return read_head_blob(config.repo_root, rel)
+
+
+def _read_baseline_output(config: ReleaseConfig, target: Target) -> str | None:
+    rel = _safe_relative(target.output, config.repo_root)
+    return read_baseline_blob(config.repo_root, rel)
 
 
 def _safe_relative(path: Path, repo_root: Path) -> str:
