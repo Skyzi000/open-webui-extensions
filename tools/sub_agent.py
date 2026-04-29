@@ -111,6 +111,32 @@ VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_CALENDAR_TOOLS": "calendar",
 }
 
+# --- inlined from src/owui_ext/shared/notifications.py (owui_ext.shared.notifications) ---
+import logging
+from typing import Callable, Optional
+_notifications_log = logging.getLogger("owui_ext.shared.notifications")
+
+
+async def emit_notification(
+    event_emitter: Optional[Callable], *, level: str, content: str
+) -> None:
+    """Emit a frontend notification toast when the current chat supports it."""
+    if not callable(event_emitter):
+        return
+    if not isinstance(content, str) or not content.strip():
+        return
+    try:
+        await event_emitter(
+            {
+                "type": "notification",
+                "data": {"type": level, "content": content.strip()},
+            }
+        )
+    except Exception as exc:
+        _notifications_log.debug(
+            f"Error emitting notification ({level}): {exc}"
+        )
+
 # --- inlined from src/owui_ext/shared/terminal_events.py (owui_ext.shared.terminal_events) ---
 import json
 import logging
@@ -572,32 +598,6 @@ def _normalize_user(user: Any) -> Any:
 
             return SimpleNamespace(**user)
     return user
-
-
-async def emit_notification(
-    event_emitter: Optional[Callable],
-    *,
-    level: str,
-    content: str,
-) -> None:
-    """Emit a frontend notification toast when the current chat supports it."""
-    if not callable(event_emitter):
-        return
-    if not isinstance(content, str) or not content.strip():
-        return
-
-    try:
-        await event_emitter(
-            {
-                "type": "notification",
-                "data": {
-                    "type": level,
-                    "content": content.strip(),
-                },
-            }
-        )
-    except Exception as e:
-        log.debug(f"[SubAgent] Error emitting notification ({level}): {e}")
 
 
 async def resolve_mcp_tools(

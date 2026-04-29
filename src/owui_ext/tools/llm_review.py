@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
+from owui_ext.shared.notifications import emit_notification
 from owui_ext.shared.terminal_events import emit_terminal_tool_event
 from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
 
@@ -2756,31 +2757,6 @@ def _normalize_user(user: Any) -> Any:
 
             return SimpleNamespace(**user)
     return user
-
-
-async def emit_notification(
-    event_emitter: Optional[Callable],
-    *,
-    level: str,
-    content: str,
-) -> None:
-    """Emit a frontend notification toast when the current chat supports it."""
-    if not callable(event_emitter):
-        return
-    if not isinstance(content, str) or not content.strip():
-        return
-    try:
-        await event_emitter(
-            {
-                "type": "notification",
-                "data": {
-                    "type": level,
-                    "content": content.strip(),
-                },
-            }
-        )
-    except Exception as e:
-        log.debug(f"[LLMReview] Error emitting notification ({level}): {e}")
 
 
 async def resolve_mcp_tools(
