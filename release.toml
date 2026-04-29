@@ -13,3 +13,8 @@ output = "tools/parallel_tools.py"
 name = "magi_decision_support"
 source = "src/owui_ext/tools/magi_decision_support.py"
 output = "tools/magi_decision_support.py"
+
+[[targets]]
+name = "multi_model_council"
+source = "src/owui_ext/tools/multi_model_council.py"
+output = "tools/multi_model_council.py"

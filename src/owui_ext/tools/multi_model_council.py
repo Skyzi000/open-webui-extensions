@@ -7,36 +7,16 @@ license: MIT
 required_open_webui_version: 0.7.0
 """
 
-# === GENERATED FILE - DO NOT EDIT ===
-# Source: src/owui_ext/tools/multi_model_council.py
-# Regenerate with: uv run python scripts/build_release.py --target multi_model_council
-# Future imports: (none)
-# See release.toml for target definitions.
-
 import ast
 import json
 import logging
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+
 from fastapi import Request
 from pydantic import BaseModel, Field
 
-# --- inlined from src/owui_ext/shared/tool_event_metadata.py (owui_ext.shared.tool_event_metadata) ---
-CITATION_TOOLS: set[str] = {
-    "search_web",
-    "view_file",
-    "view_knowledge_file",
-    "query_knowledge_files",
-    "fetch_url",
-}
-
-
-TERMINAL_EVENT_TOOLS: set[str] = {
-    "display_file",
-    "write_file",
-    "replace_file_content",
-    "run_command",
-}
+from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
 
 log = logging.getLogger(__name__)
 
