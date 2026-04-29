@@ -68,6 +68,10 @@ def parse_config(raw: dict, *, repo_root: Path) -> ReleaseConfig:
     """Validate already-parsed TOML and resolve paths against ``repo_root``."""
 
     meta = raw.get("meta") or {}
+    if not isinstance(meta, dict):
+        raise BuildError(
+            f"[meta] must be a table in release.toml (got {type(meta).__name__})."
+        )
     schema_version = meta.get("schema_version")
     if schema_version != SUPPORTED_SCHEMA_VERSION:
         raise BuildError(
@@ -76,6 +80,11 @@ def parse_config(raw: dict, *, repo_root: Path) -> ReleaseConfig:
         )
 
     settings = raw.get("settings") or {}
+    if not isinstance(settings, dict):
+        raise BuildError(
+            f"[settings] must be a table in release.toml (got "
+            f"{type(settings).__name__})."
+        )
     raw_roots = settings.get("local_import_roots", [])
     if not isinstance(raw_roots, list) or not all(isinstance(r, str) for r in raw_roots):
         raise BuildError(

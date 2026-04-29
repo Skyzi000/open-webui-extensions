@@ -50,6 +50,30 @@ def test_rejects_unknown_schema_version(tmp_path: Path) -> None:
         parse_config(raw, repo_root=tmp_path)
 
 
+def test_rejects_meta_as_non_table(tmp_path: Path) -> None:
+    """``meta = "x"`` is rejected with BuildError, not AttributeError.
+
+    Without an isinstance guard, ``raw.get("meta")`` returns the string
+    and the subsequent ``meta.get("schema_version")`` raised
+    ``AttributeError`` -- main() does not catch that, so the CLI / pre-
+    commit gate would exit with a stack trace instead of a clean
+    "release.toml is invalid" message.
+    """
+    raw = {"meta": "x"}
+    with pytest.raises(BuildError, match="meta"):
+        parse_config(raw, repo_root=tmp_path)
+
+
+def test_rejects_settings_as_non_table(tmp_path: Path) -> None:
+    """Same protection for ``[settings]`` -- a stringified value would
+    AttributeError on the next ``.get`` call without an isinstance
+    guard.
+    """
+    raw = {"meta": {"schema_version": 1}, "settings": "x"}
+    with pytest.raises(BuildError, match="settings"):
+        parse_config(raw, repo_root=tmp_path)
+
+
 def test_rejects_missing_local_roots(tmp_path: Path) -> None:
     raw = {
         "meta": {"schema_version": 1},
