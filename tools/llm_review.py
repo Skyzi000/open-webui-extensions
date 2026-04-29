@@ -289,10 +289,20 @@ TERMINAL_EVENT_TOOLS: set[str] = {
     "run_command",
 }
 
-# --- inlined from src/owui_ext/shared/users.py (owui_ext.shared.users) ---
-from typing import Any
+# --- inlined from src/owui_ext/shared/tool_execution.py (owui_ext.shared.tool_execution) ---
+import json
+from typing import Any, Optional
+from fastapi import Request
+_core_process_tool_result = None
+
+
+async def _maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
 def _normalize_user(user: Any) -> Any:
-    """Convert raw __user__ dict payloads into UserModel when needed."""
     if user is None or hasattr(user, "id"):
         return user
     if isinstance(user, dict):
@@ -306,14 +316,86 @@ def _normalize_user(user: Any) -> Any:
             return SimpleNamespace(**user)
     return user
 
+
+async def process_tool_result(
+    *,
+    tool_function_name: str = "tool",
+    tool_type: str,
+    tool_result: Any,
+    direct_tool: bool = False,
+    request: Optional[Request] = None,
+    metadata: Optional[dict] = None,
+    user: Any = None,
+) -> tuple[Any, list, list]:
+    """Process tool result into (payload, files, embeds) using core when available."""
+    global _core_process_tool_result
+    if _core_process_tool_result is None:
+        try:
+            from open_webui.utils.middleware import process_tool_result as fn
+
+            if fn is not None:
+                _core_process_tool_result = fn
+        except ImportError:
+            pass
+
+    if _core_process_tool_result is not None:
+        return await _maybe_await(
+            _core_process_tool_result(
+                request,
+                tool_function_name,
+                tool_result,
+                tool_type,
+                direct_tool=direct_tool,
+                metadata=metadata if isinstance(metadata, dict) else {},
+                user=_normalize_user(user),
+            )
+        )
+
+    if isinstance(tool_result, tuple):
+        tool_result = tool_result[0] if tool_result else ""
+    elif direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
+        tool_result = tool_result[0]
+    if isinstance(tool_result, (dict, list)):
+        tool_result = json.dumps(tool_result, indent=2, ensure_ascii=False)
+    elif tool_result is not None and not isinstance(tool_result, str):
+        tool_result = str(tool_result)
+    return tool_result, [], []
+
+
+def normalize_terminal_tools_result(
+    *, terminal_tools_result: Any, extra_params: Optional[dict]
+) -> dict:
+    """Normalize get_terminal_tools() return value across Open WebUI versions."""
+    terminal_system_prompt = None
+    terminal_tools = terminal_tools_result
+
+    if (
+        isinstance(terminal_tools_result, tuple)
+        and len(terminal_tools_result) == 2
+        and isinstance(terminal_tools_result[0], dict)
+    ):
+        terminal_tools = terminal_tools_result[0]
+        if isinstance(terminal_tools_result[1], str):
+            stripped_prompt = terminal_tools_result[1].strip()
+            if stripped_prompt:
+                terminal_system_prompt = stripped_prompt
+
+    if isinstance(extra_params, dict):
+        if terminal_system_prompt:
+            extra_params["__terminal_system_prompt__"] = terminal_system_prompt
+        else:
+            extra_params.pop("__terminal_system_prompt__", None)
+
+    if isinstance(terminal_tools, dict):
+        return terminal_tools
+    return {}
+
 try:
     import markdown as _markdown_mod
 except ImportError:
     _markdown_mod = None
 
 log = logging.getLogger(__name__)
-
-_core_process_tool_result = None
 
 
 # ============================================================================
@@ -3217,48 +3299,6 @@ async def cleanup_mcp_clients(mcp_clients: dict) -> None:
             log.debug(f"[LLMReview] Error cleaning up MCP client: {e}")
 
 
-async def process_tool_result(
-    *,
-    tool_function_name: str = "tool",
-    tool_type: str,
-    tool_result: Any,
-    direct_tool: bool = False,
-    request: Optional[Request] = None,
-    metadata: Optional[dict] = None,
-    user: Any = None,
-) -> tuple[Any, list, list]:
-    """Process tool result into (payload, files, embeds) using core when available."""
-    global _core_process_tool_result
-    if _core_process_tool_result is None:
-        try:
-            from open_webui.utils.middleware import process_tool_result as fn
-
-            if fn is not None:
-                _core_process_tool_result = fn
-        except ImportError:
-            pass
-    if _core_process_tool_result is not None:
-        return await maybe_await(_core_process_tool_result(
-            request,
-            tool_function_name,
-            tool_result,
-            tool_type,
-            direct_tool=direct_tool,
-            metadata=metadata if isinstance(metadata, dict) else {},
-            user=_normalize_user(user),
-        ))
-    # Fallback for Open WebUI < 0.8.x
-    if isinstance(tool_result, tuple):
-        tool_result = tool_result[0] if tool_result else ""
-    elif direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
-        tool_result = tool_result[0]
-    if isinstance(tool_result, (dict, list)):
-        tool_result = json.dumps(tool_result, indent=2, ensure_ascii=False)
-    elif tool_result is not None and not isinstance(tool_result, str):
-        tool_result = str(tool_result)
-    return tool_result, [], []
-
-
 def parse_model_ids(value: Any) -> list[str]:
     """Parse a comma-separated string or list of model IDs.
 
@@ -3286,33 +3326,6 @@ def parse_model_ids(value: Any) -> list[str]:
             continue
         result.append(text)
     return result
-
-
-def normalize_terminal_tools_result(*, terminal_tools_result: Any, extra_params: Optional[dict]) -> dict:
-    """Normalize get_terminal_tools() return value across Open WebUI versions."""
-    terminal_system_prompt = None
-    terminal_tools = terminal_tools_result
-
-    if (
-        isinstance(terminal_tools_result, tuple)
-        and len(terminal_tools_result) == 2
-        and isinstance(terminal_tools_result[0], dict)
-    ):
-        terminal_tools = terminal_tools_result[0]
-        if isinstance(terminal_tools_result[1], str):
-            stripped_prompt = terminal_tools_result[1].strip()
-            if stripped_prompt:
-                terminal_system_prompt = stripped_prompt
-
-    if isinstance(extra_params, dict):
-        if terminal_system_prompt:
-            extra_params["__terminal_system_prompt__"] = terminal_system_prompt
-        else:
-            extra_params.pop("__terminal_system_prompt__", None)
-
-    if isinstance(terminal_tools, dict):
-        return terminal_tools
-    return {}
 
 
 # ============================================================================
