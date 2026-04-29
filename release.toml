@@ -23,3 +23,8 @@ output = "tools/multi_model_council.py"
 name = "sub_agent"
 source = "src/owui_ext/tools/sub_agent.py"
 output = "tools/sub_agent.py"
+
+[[targets]]
+name = "llm_review"
+source = "src/owui_ext/tools/llm_review.py"
+output = "tools/llm_review.py"

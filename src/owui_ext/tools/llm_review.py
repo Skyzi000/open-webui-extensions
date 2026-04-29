@@ -7,12 +7,6 @@ license: MIT
 required_open_webui_version: 0.7.0
 """
 
-# === GENERATED FILE - DO NOT EDIT ===
-# Source: src/owui_ext/tools/llm_review.py
-# Regenerate with: uv run python scripts/build_release.py --target llm_review
-# Future imports: (none)
-# See release.toml for target definitions.
-
 import asyncio
 import ast
 import json
@@ -22,26 +16,12 @@ import uuid
 from collections.abc import Mapping, Sequence
 from html.parser import HTMLParser
 from typing import Any, Callable, Literal, Optional, Type
+
 from fastapi import Request
 from starlette.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-# --- inlined from src/owui_ext/shared/tool_event_metadata.py (owui_ext.shared.tool_event_metadata) ---
-CITATION_TOOLS: set[str] = {
-    "search_web",
-    "view_file",
-    "view_knowledge_file",
-    "query_knowledge_files",
-    "fetch_url",
-}
-
-
-TERMINAL_EVENT_TOOLS: set[str] = {
-    "display_file",
-    "write_file",
-    "replace_file_content",
-    "run_command",
-}
+from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
 
 try:
     import markdown as _markdown_mod
