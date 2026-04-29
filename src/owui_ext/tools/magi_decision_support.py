@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.event_emitter import EventEmitter
+from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
 from owui_ext.shared.parsing import normalize_text, safe_json_loads
 from owui_ext.shared.prompt_utils import (
     _append_tool_server_prompts,
@@ -397,41 +398,6 @@ async def execute_tool_call(
         "tool_call_id": tool_call_id,
         "content": tool_result,
     }
-
-
-async def apply_inlet_filters_if_enabled(
-    apply_inlet_filters: bool,
-    request: Request,
-    model: dict,
-    form_data: dict,
-    extra_params: dict,
-) -> dict:
-    if not apply_inlet_filters:
-        return form_data
-
-    try:
-        from open_webui.models.functions import Functions
-        from open_webui.utils.filter import get_sorted_filter_ids, process_filter_functions
-
-        filter_ids = await maybe_await(get_sorted_filter_ids(
-            request, model, form_data.get("metadata", {}).get("filter_ids", [])
-        ))
-        filter_functions = []
-        for filter_id in filter_ids:
-            function = await maybe_await(Functions.get_function_by_id(filter_id))
-            if function:
-                filter_functions.append(function)
-        form_data, _ = await process_filter_functions(
-            request=request,
-            filter_functions=filter_functions,
-            filter_type="inlet",
-            form_data=form_data,
-            extra_params=extra_params,
-        )
-    except Exception as exc:
-        log.warning(f"Error applying inlet filters: {exc}")
-
-    return form_data
 
 
 async def run_agent_loop(
