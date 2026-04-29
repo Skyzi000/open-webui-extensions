@@ -8,16 +8,20 @@ consumers have no signal that the file changed. This module enforces:
     ``version:`` field must also differ from HEAD's -- unless the rebuilt
     output's version already differs from the shipping baseline (``main``)
     *and* HEAD descends from the baseline, in which case a same-cycle
-    in-branch iteration is allowed."
+    in-branch iteration is allowed. If a baseline is reachable but HEAD
+    does not descend from it, refuse the change outright until the
+    branch incorporates main (rebase or merge)."
 
-The HEAD-descends-from-baseline guard exists so a branch forked from an
-older ``main`` cannot satisfy ``new_version != baseline_version`` by
-carrying a *behind* version: without it, a stale fork would silently
-slip a same-or-older version through the gate.
+The "rebase or merge first" rule exists because we can't compare
+versions in semver order -- a stale fork could pick a value that is
+numerically behind baseline and would still satisfy ``new_version !=
+baseline_version`` by string compare. Either operation (``git rebase``
+or ``git merge``) makes the baseline an ancestor of HEAD, so the
+carve-out becomes well-defined.
 
-The gate is intentionally lenient about value direction (we don't enforce
-SemVer ordering) -- only that the value is not byte-identical to the
-relevant comparison point.
+The gate is intentionally lenient about value direction within a single
+cycle (we don't enforce SemVer ordering) -- only that the value is not
+byte-identical to the relevant comparison point.
 """
 
 from __future__ import annotations
@@ -80,9 +84,15 @@ def check_version_bump(
     a rebuilt output whose version already differs from the baseline
     passes the gate even if HEAD has the same version. This lets a feature
     branch iterate on the same shipping cycle without requiring a fresh
-    bump per commit. The ancestry guard prevents a stale fork (HEAD does
-    not descend from baseline) from satisfying ``new_version !=
-    baseline_version`` by carrying a behind/rolled-back version.
+    bump per commit.
+
+    When a baseline is reachable but HEAD does *not* descend from it, the
+    gate refuses any output change outright: without semver ordering we
+    cannot tell "0.1.6" from "0.2.0" by string compare, so a stale
+    branch could bump locally to a value that is still numerically below
+    baseline and ship a rolled-back release. Forcing a rebase before
+    further commits is the only way to close that hole without inventing
+    a version-ordering rule.
     """
 
     if head_output is None:
@@ -95,6 +105,15 @@ def check_version_bump(
         return (
             f"{target.name}: rebuilt output {target.output} is missing a "
             f"`version:` field in its leading docstring."
+        )
+    if baseline_output is not None and not baseline_is_ancestor_of_head:
+        return (
+            f"{target.name}: output {target.output} changed on a branch "
+            f"that does not descend from the shipping baseline. Rebase "
+            f"or merge `main` (or `origin/main`) into this branch before "
+            f"regenerating -- otherwise the version cannot be checked "
+            f"against the actual last-shipped value, and a behind / "
+            f"rolled-back version could ship silently."
         )
     if baseline_output is not None and baseline_is_ancestor_of_head:
         baseline_version = extract_version(baseline_output)

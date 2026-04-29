@@ -187,47 +187,78 @@ def test_missing_baseline_falls_back_to_head_check(tmp_path: Path) -> None:
     assert error is not None  # same as the no-baseline-arg path
 
 
-def test_stale_branch_with_older_version_does_not_pass(tmp_path: Path) -> None:
-    """A branch forked from older main must not slip a behind version through.
+def test_stale_branch_demands_rebase_with_unbumped_version(tmp_path: Path) -> None:
+    """A branch that does not descend from baseline must be rebased.
 
     Scenario: ``origin/main`` already shipped 0.1.1, but the branch was
-    cut before that bump and HEAD is still 0.1.0. The author edits
-    content while leaving the version at 0.1.0. Without the
-    HEAD-descends-from-baseline guard, ``new(0.1.0) != baseline(0.1.1)``
-    would satisfy the carve-out and the gate would silently accept a
-    rolled-back release.
+    cut before that bump and HEAD is still 0.1.0. Without the rebase
+    requirement, ``new(0.1.0) != baseline(0.1.1)`` would satisfy the
+    carve-out and the gate would silently accept a rolled-back release.
     """
 
     target = _target(tmp_path)
     baseline = HEAD_OUTPUT.replace("0.1.0", "0.1.1")  # main: 0.1.1
     head = HEAD_OUTPUT  # stale branch HEAD: 0.1.0
-    rebuilt = head.replace('print("hi")', 'print("hi there")')  # change at 0.1.0
-    error = check_version_bump(
-        target=target,
-        rebuilt_output=rebuilt,
-        head_output=head,
-        baseline_output=baseline,
-        baseline_is_ancestor_of_head=False,  # branch not descended from baseline
-    )
-    assert error is not None
-    assert "0.1.0" in error
-
-
-def test_baseline_carve_out_requires_ancestor_flag(tmp_path: Path) -> None:
-    """Even when versions differ, missing the ancestor flag falls back to HEAD."""
-
-    target = _target(tmp_path)
-    baseline = HEAD_OUTPUT.replace("0.1.0", "0.1.5")  # main: 0.1.5
-    head = HEAD_OUTPUT  # branch HEAD: 0.1.0 (unrelated/stale)
     rebuilt = head.replace('print("hi")', 'print("hi there")')
     error = check_version_bump(
         target=target,
         rebuilt_output=rebuilt,
         head_output=head,
         baseline_output=baseline,
-        # Default: False -- this is the "we couldn't verify ancestry" path
+        baseline_is_ancestor_of_head=False,
     )
     assert error is not None
+    assert "Rebase" in error or "rebase" in error
+
+
+def test_stale_branch_demands_rebase_even_with_locally_bumped_version(
+    tmp_path: Path,
+) -> None:
+    """A stale branch that locally bumps to a numerically behind value
+    must still be rejected. The HEAD-only check would otherwise see
+    "version changed" and pass, but 0.1.6 < 0.2.0 is a rollback against
+    the actual baseline.
+    """
+
+    target = _target(tmp_path)
+    baseline = HEAD_OUTPUT.replace("0.1.0", "0.2.0")  # main: 0.2.0
+    head = HEAD_OUTPUT.replace("0.1.0", "0.1.5")  # stale branch: 0.1.5
+    rebuilt = head.replace("0.1.5", "0.1.6").replace(
+        'print("hi")', 'print("hi there")'
+    )
+    error = check_version_bump(
+        target=target,
+        rebuilt_output=rebuilt,
+        head_output=head,
+        baseline_output=baseline,
+        baseline_is_ancestor_of_head=False,
+    )
+    assert error is not None
+    assert "rebase" in error.lower()
+
+
+def test_baseline_present_without_ancestor_flag_demands_rebase(
+    tmp_path: Path,
+) -> None:
+    """The default ``baseline_is_ancestor_of_head=False`` is the safe
+    fallback: a baseline blob exists but ancestry could not be verified
+    (or the branch is genuinely diverged), so the gate refuses the
+    change.
+    """
+
+    target = _target(tmp_path)
+    baseline = HEAD_OUTPUT.replace("0.1.0", "0.1.5")
+    head = HEAD_OUTPUT
+    rebuilt = head.replace('print("hi")', 'print("hi there")')
+    error = check_version_bump(
+        target=target,
+        rebuilt_output=rebuilt,
+        head_output=head,
+        baseline_output=baseline,
+        # Default: False
+    )
+    assert error is not None
+    assert "rebase" in error.lower()
 
 
 def test_change_without_leading_docstring_version_fails(tmp_path: Path) -> None:
