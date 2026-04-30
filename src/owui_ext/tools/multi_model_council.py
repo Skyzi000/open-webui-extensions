@@ -28,8 +28,6 @@ from owui_ext.shared.prompt_utils import (
     merge_prompt_sections,
     truncate_text,
 )
-from owui_ext.shared.terminal_events import emit_terminal_tool_event
-from owui_ext.shared.tool_event_metadata import CITATION_TOOLS
 from owui_ext.shared.tool_execution import (
     execute_direct_tool_call,
     execute_tool_call,
@@ -411,8 +409,6 @@ async def run_agent_loop(
                         "__messages__": current_messages,
                     },
                     event_emitter=event_emitter,
-                    emit_terminal_event_fn=emit_terminal_tool_event,
-                    citation_tools=CITATION_TOOLS,
                 )
 
                 # Emit status with tool result preview

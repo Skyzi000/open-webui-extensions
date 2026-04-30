@@ -1,4 +1,4 @@
-"""Tool-call result normalization shared across owui_ext tool plugins.
+"""Tool-call orchestration shared across owui_ext tool plugins.
 
 The module owns the canonical agent-shape ``execute_tool_call`` together
 with its sub-helpers:
@@ -10,6 +10,8 @@ with its sub-helpers:
 - ``normalize_terminal_tools_result`` flattens the tuple-vs-dict return
   shape that ``get_terminal_tools()`` exposes across versions and lifts
   the terminal system prompt into ``extra_params`` for downstream use.
+- ``emit_terminal_tool_event`` translates a successful Open Terminal
+  builtin tool result into the matching ``terminal:*`` UI event.
 - ``execute_tool_call`` orchestrates the above and only injects the
   per-call dynamic context (``__messages__`` / ``__files__`` /
   ``__event_emitter__`` / ``__event_call__``) — never ``__user__`` /
@@ -18,13 +20,18 @@ with its sub-helpers:
   ``UserValves`` into ``__user__["valves"]`` and overriding it would
   silently clobber per-tool valves.
 
-The helpers carry their own private inlines of ``maybe_await`` and the
-user-payload normalizer because the inliner forbids a shared dep module
-from mixing external imports (``json``, ``fastapi.Request``, ``typing``)
-with imports from other ``owui_ext.shared.*`` modules. For the same
-reason ``execute_tool_call`` does not import ``emit_terminal_tool_event``
-or ``CITATION_TOOLS`` from neighbouring shared modules; callers inject
-them via ``emit_terminal_event_fn`` / ``citation_tools`` kwargs.
+The constants ``CITATION_TOOLS`` and ``TERMINAL_EVENT_TOOLS`` describe
+which tool names trigger citation sources / terminal UI events. They
+live here (not in a separate metadata module) so ``execute_tool_call``
+can default to them without forcing callers to inject them — the inliner
+forbids a shared dep module from mixing external imports with imports
+from other ``owui_ext.shared.*`` modules, so co-locating these helpers
+keeps the orchestrator self-contained.
+
+The module also carries its own private inlines of ``maybe_await`` and
+the user-payload normalizer for the same reason; ``shared.async_utils``
+and ``shared.users`` stay as standalone modules for plugins that need
+either helper outside this code path.
 """
 
 import ast
@@ -37,6 +44,23 @@ from fastapi import Request
 
 _tool_execution_log = logging.getLogger("owui_ext.shared.tool_execution")
 _core_process_tool_result = None
+
+
+CITATION_TOOLS: set[str] = {
+    "search_web",
+    "view_file",
+    "view_knowledge_file",
+    "query_knowledge_files",
+    "fetch_url",
+}
+
+
+TERMINAL_EVENT_TOOLS: set[str] = {
+    "display_file",
+    "write_file",
+    "replace_file_content",
+    "run_command",
+}
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -161,23 +185,69 @@ def normalize_terminal_tools_result(
     return {}
 
 
+async def emit_terminal_tool_event(
+    *,
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool_result: Any,
+    event_emitter: Optional[Callable],
+) -> None:
+    """Emit ``terminal:*`` UI events for Open Terminal tool results.
+
+    Recognises only the names listed in ``TERMINAL_EVENT_TOOLS``
+    (display_file / write_file / replace_file_content / run_command);
+    unknown names fall through silently.
+    """
+    if not event_emitter:
+        return
+    if tool_function_name == "display_file":
+        path = (
+            tool_function_params.get("path", "")
+            if isinstance(tool_function_params, dict)
+            else ""
+        )
+        if not isinstance(path, str) or not path:
+            return
+        parsed = tool_result
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except Exception:
+                parsed = tool_result
+        if isinstance(parsed, dict) and parsed.get("exists") is False:
+            return
+        event = {"type": "terminal:display_file", "data": {"path": path}}
+    elif tool_function_name in {"write_file", "replace_file_content"}:
+        path = (
+            tool_function_params.get("path", "")
+            if isinstance(tool_function_params, dict)
+            else ""
+        )
+        if not isinstance(path, str) or not path:
+            return
+        event = {
+            "type": f"terminal:{tool_function_name}",
+            "data": {"path": path},
+        }
+    elif tool_function_name == "run_command":
+        event = {"type": "terminal:run_command", "data": {}}
+    else:
+        return
+    try:
+        await event_emitter(event)
+    except Exception as exc:
+        _tool_execution_log.warning(
+            f"Error emitting terminal event for {tool_function_name}: {exc}"
+        )
+
+
 async def execute_tool_call(
     tool_call: dict,
     tools_dict: dict,
     extra_params: dict,
     event_emitter: Optional[Callable] = None,
-    *,
-    emit_terminal_event_fn: Optional[Callable] = None,
-    citation_tools: Optional[set] = None,
 ) -> dict:
-    """Execute a single tool call and return ``{tool_call_id, content}``.
-
-    ``emit_terminal_event_fn`` and ``citation_tools`` are injected by the
-    caller (typically ``shared.terminal_events.emit_terminal_tool_event``
-    and ``shared.tool_event_metadata.CITATION_TOOLS``). They cannot be
-    imported here directly because the inliner forbids a shared dep
-    module from mixing external imports with cross-shared imports.
-    """
+    """Execute a single tool call and return ``{tool_call_id, content}``."""
     if not isinstance(tool_call, dict):
         return {
             "tool_call_id": str(uuid.uuid4()),
@@ -275,13 +345,12 @@ async def execute_tool_call(
         tool_result = f"Tool '{tool_function_name}' not found"
 
     if emit_terminal_event:
-        if emit_terminal_event_fn is not None:
-            await emit_terminal_event_fn(
-                tool_function_name=tool_function_name,
-                tool_function_params=tool_function_params,
-                tool_result=tool_result,
-                event_emitter=event_emitter,
-            )
+        await emit_terminal_tool_event(
+            tool_function_name=tool_function_name,
+            tool_function_params=tool_function_params,
+            tool_result=tool_result,
+            event_emitter=event_emitter,
+        )
         if event_emitter and tool_result_files:
             await event_emitter({"type": "files", "data": {"files": tool_result_files}})
         if event_emitter and tool_result_embeds:
@@ -295,12 +364,7 @@ async def execute_tool_call(
         except Exception:
             tool_result = str(tool_result)
 
-    if (
-        event_emitter
-        and tool_result
-        and citation_tools
-        and tool_function_name in citation_tools
-    ):
+    if event_emitter and tool_result and tool_function_name in CITATION_TOOLS:
         try:
             from open_webui.utils.middleware import get_citation_source_from_tool_result
 

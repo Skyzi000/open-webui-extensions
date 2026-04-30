@@ -27,9 +27,10 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
-from owui_ext.shared.terminal_events import emit_terminal_tool_event
-from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
 from owui_ext.shared.tool_execution import (
+    CITATION_TOOLS,
+    TERMINAL_EVENT_TOOLS,
+    emit_terminal_tool_event,
     execute_direct_tool_call,
     normalize_terminal_tools_result,
     process_tool_result,
