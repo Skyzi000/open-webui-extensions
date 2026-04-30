@@ -242,7 +242,7 @@ def test_rejects_parent_traversal_in_output(tmp_path: Path) -> None:
             }
         ],
     }
-    with pytest.raises(BuildError, match="must not contain '..'"):
+    with pytest.raises(BuildError, match=r"must not contain '\.\.'"):
         parse_config(raw, repo_root=tmp_path)
 
 
