@@ -187,7 +187,16 @@ async def resolve_mcp_tools(
                 if oauth_token:
                     headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
             elif auth_type in ("oauth_2.1", "oauth_2.1_static"):
+                # Match Open WebUI core: split colon-bearing server IDs and
+                # look up OAuth tokens under the trailing segment so a
+                # server_id like ``host:port`` resolves to the same key the
+                # UI stored. ``mcp_clients`` is then cached under the
+                # normalized id, again matching core's behaviour.
                 try:
+                    splits = server_id.split(":")
+                    if len(splits) > 1:
+                        server_id = splits[-1]
+
                     oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
                         user.id, f"mcp:{server_id}"
                     )

@@ -4316,6 +4316,11 @@ CRITICAL RULES:
                 resolved_terminal_id=resolved_terminal_id,
                 resolved_direct_tool_servers=resolved_direct_tool_servers,
             )
+            # Track MCP clients before any further await so the outer
+            # finally's cleanup loop sees them even if a downstream await
+            # (register_view_skill) raises or is cancelled.
+            if mcp_clients:
+                all_mcp_clients.append(mcp_clients)
             # Manually register view_skill if the parent conversation has a
             # skills manifest and skills tools are enabled (model-attached
             # skills only — user-selected skills are inlined elsewhere).
@@ -4331,8 +4336,6 @@ CRITICAL RULES:
             ) or []
             cached = (tools_dict, terminal_prompt, list(direct_prompts))
             tools_cache[real_model_id] = cached
-            if mcp_clients:
-                all_mcp_clients.append(mcp_clients)
             return cached
 
         def make_member_extra_params(

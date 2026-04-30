@@ -779,7 +779,16 @@ async def resolve_mcp_tools(
                 if oauth_token:
                     headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
             elif auth_type in ("oauth_2.1", "oauth_2.1_static"):
+                # Match Open WebUI core: split colon-bearing server IDs and
+                # look up OAuth tokens under the trailing segment so a
+                # server_id like ``host:port`` resolves to the same key the
+                # UI stored. ``mcp_clients`` is then cached under the
+                # normalized id, again matching core's behaviour.
                 try:
+                    splits = server_id.split(":")
+                    if len(splits) > 1:
+                        server_id = splits[-1]
+
                     oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
                         user.id, f"mcp:{server_id}"
                     )
@@ -5836,6 +5845,11 @@ CRITICAL RULES:
                 resolved_terminal_id=resolved_terminal_id,
                 resolved_direct_tool_servers=resolved_direct_tool_servers,
             )
+            # Track MCP clients before any further await so the outer
+            # finally's cleanup loop sees them even if a downstream await
+            # (register_view_skill) raises or is cancelled.
+            if mcp_clients:
+                all_mcp_clients.append(mcp_clients)
             # Manually register view_skill if the parent conversation has a
             # skills manifest and skills tools are enabled (model-attached
             # skills only — user-selected skills are inlined elsewhere).
@@ -5851,8 +5865,6 @@ CRITICAL RULES:
             ) or []
             cached = (tools_dict, terminal_prompt, list(direct_prompts))
             tools_cache[real_model_id] = cached
-            if mcp_clients:
-                all_mcp_clients.append(mcp_clients)
             return cached
 
         def make_member_extra_params(
