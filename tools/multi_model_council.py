@@ -1940,10 +1940,15 @@ async def run_agent_loop(
 
             for tool_call in tool_calls:
                 tool_name = tool_call.get("function", {}).get("name", "unknown")
-                tool_args = tool_call.get("function", {}).get("arguments", "{}")
+                tool_args_raw = tool_call.get("function", {}).get("arguments", "{}")
 
                 if event_emitter:
-                    args_preview = tool_args.replace(chr(10), " ")[:80]
+                    tool_args_display = (
+                        str(tool_args_raw).replace(chr(10), " ")
+                        if tool_args_raw
+                        else "{}"
+                    )
+                    args_preview = tool_args_display[:80]
                     await event_emitter(
                         {
                             "type": "status",
