@@ -496,6 +496,61 @@ def build_direct_tools_dict(
         _tool_servers_log.info("No direct tools loaded from tool_servers")
     return direct_tools
 
+
+async def resolve_terminal_id_from_request_and_metadata(
+    *,
+    request: Optional[Request],
+    metadata: Optional[dict],
+    debug: bool = False,
+) -> str:
+    """Resolve ``terminal_id`` preferring the request body over metadata.
+
+    Open WebUI puts the active terminal binding in the request body
+    (top-level ``terminal_id`` or nested ``metadata.terminal_id``) and
+    in the inlet ``metadata`` dict the plugin is invoked with. The
+    request body is the source of truth -- metadata can be stale when
+    the user just switched terminals -- so the body wins when both are
+    present.
+    """
+
+    def _normalize(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        return value.strip()
+
+    metadata_terminal_id = ""
+    if isinstance(metadata, dict):
+        metadata_terminal_id = _normalize(metadata.get("terminal_id"))
+
+    request_terminal_id = ""
+    if request is not None:
+        request_body = getattr(request, "body", None)
+        if callable(request_body):
+            try:
+                raw_body = await request_body()
+                if raw_body:
+                    body = json.loads(raw_body)
+                    if isinstance(body, dict):
+                        request_terminal_id = _normalize(body.get("terminal_id"))
+                        if not request_terminal_id:
+                            nested_metadata = body.get("metadata")
+                            if isinstance(nested_metadata, dict):
+                                request_terminal_id = _normalize(
+                                    nested_metadata.get("terminal_id")
+                                )
+            except Exception:
+                request_terminal_id = ""
+
+    if request_terminal_id:
+        if debug and metadata_terminal_id and metadata_terminal_id != request_terminal_id:
+            _tool_servers_log.warning(
+                "terminal_id mismatch between request body and metadata; "
+                "using request body terminal_id"
+            )
+        return request_terminal_id
+
+    return metadata_terminal_id
+
 log = logging.getLogger(__name__)
 
 
@@ -509,53 +564,6 @@ class ToolCallItem(BaseModel):
 # ============================================================================
 # Helper functions (outside class - AI cannot invoke these)
 # ============================================================================
-
-
-async def resolve_terminal_id_from_request_and_metadata(
-    *,
-    request: Optional[Request],
-    metadata: Optional[dict],
-    debug: bool = False,
-) -> str:
-    """Resolve terminal_id from request.body() first, then metadata."""
-
-    def normalize_terminal_id(value: Any) -> str:
-        if not isinstance(value, str):
-            return ""
-        return value.strip()
-
-    metadata_terminal_id = ""
-    if isinstance(metadata, dict):
-        metadata_terminal_id = normalize_terminal_id(metadata.get("terminal_id"))
-
-    request_terminal_id = ""
-    if request is not None:
-        request_body = getattr(request, "body", None)
-        if callable(request_body):
-            try:
-                raw_body = await request_body()
-                if raw_body:
-                    body = json.loads(raw_body)
-                    if isinstance(body, dict):
-                        request_terminal_id = normalize_terminal_id(body.get("terminal_id"))
-                        if not request_terminal_id:
-                            nested_metadata = body.get("metadata")
-                            if isinstance(nested_metadata, dict):
-                                request_terminal_id = normalize_terminal_id(
-                                    nested_metadata.get("terminal_id")
-                                )
-            except Exception:
-                request_terminal_id = ""
-
-    if request_terminal_id:
-        if debug and metadata_terminal_id and metadata_terminal_id != request_terminal_id:
-            log.warning(
-                "[ParallelTools] terminal_id mismatch between request body and metadata; "
-                "using request body terminal_id"
-            )
-        return request_terminal_id
-
-    return metadata_terminal_id
 
 
 async def execute_single_tool(

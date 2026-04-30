@@ -44,6 +44,7 @@ from owui_ext.shared.tool_servers import (
     extract_direct_tool_server_prompts,
     normalize_direct_tool_servers,
     resolve_direct_tool_servers_from_request_and_metadata,
+    resolve_terminal_id_from_request_and_metadata,
 )
 from owui_ext.shared.valves import coerce_user_valves
 
@@ -2539,53 +2540,6 @@ def normalize_text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip()
-
-
-async def resolve_terminal_id_from_request_and_metadata(
-    *,
-    request: Optional[Request],
-    metadata: Optional[dict],
-    debug: bool = False,
-) -> str:
-    """Resolve terminal_id from request.body() first, then metadata."""
-
-    def normalize_terminal_id(value: Any) -> str:
-        if not isinstance(value, str):
-            return ""
-        return value.strip()
-
-    metadata_terminal_id = ""
-    if isinstance(metadata, dict):
-        metadata_terminal_id = normalize_terminal_id(metadata.get("terminal_id"))
-
-    request_terminal_id = ""
-    if request is not None:
-        request_body = getattr(request, "body", None)
-        if callable(request_body):
-            try:
-                raw_body = await request_body()
-                if raw_body:
-                    body = json.loads(raw_body)
-                    if isinstance(body, dict):
-                        request_terminal_id = normalize_terminal_id(body.get("terminal_id"))
-                        if not request_terminal_id:
-                            nested_metadata = body.get("metadata")
-                            if isinstance(nested_metadata, dict):
-                                request_terminal_id = normalize_terminal_id(
-                                    nested_metadata.get("terminal_id")
-                                )
-            except Exception:
-                request_terminal_id = ""
-
-    if request_terminal_id:
-        if debug and metadata_terminal_id and metadata_terminal_id != request_terminal_id:
-            log.warning(
-                "[LLMReview] terminal_id mismatch between request body and metadata; "
-                "using request body terminal_id to match parent agent behavior"
-            )
-        return request_terminal_id
-
-    return metadata_terminal_id
 
 
 async def resolve_mcp_tools(
