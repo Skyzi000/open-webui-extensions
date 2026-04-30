@@ -621,7 +621,7 @@ async def test_multi_model_council_build_tools_dict_includes_terminal(monkeypatc
     valves.ENABLE_TERMINAL_TOOLS = True
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-council"}
-    tools_dict = await multi_model_council.build_tools_dict(
+    tools_dict, _ = await multi_model_council.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
@@ -672,7 +672,7 @@ async def test_multi_model_council_resolves_terminal_from_request_body(monkeypat
 
     metadata = {"tool_ids": [], "features": {}}
     extra_params = {"__metadata__": metadata}
-    tools_dict = await multi_model_council.build_tools_dict(
+    tools_dict, _ = await multi_model_council.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
@@ -718,7 +718,7 @@ async def test_multi_model_council_resolves_terminal_once_before_parallel_member
         resolved_direct_tool_servers=None,
     ):
         build_tools_terminal_ids.append(resolved_terminal_id)
-        return {}
+        return {}, {}
 
     async def fake_run_agent_loop(**kwargs):
         return json.dumps({"vote": "A", "reasoning": "ok"})
@@ -811,7 +811,7 @@ async def test_multi_model_council_without_terminal_symbol_keeps_builtin(
     valves.ENABLE_TERMINAL_TOOLS = True
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-council-compat"}
-    tools_dict = await multi_model_council.build_tools_dict(
+    tools_dict, _ = await multi_model_council.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
@@ -1471,7 +1471,7 @@ async def test_multi_model_council_build_tools_dict_includes_direct_tools(dummy_
         ],
     }
     extra_params = {"__metadata__": metadata}
-    tools_dict = await multi_model_council.build_tools_dict(
+    tools_dict, _ = await multi_model_council.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
@@ -1538,7 +1538,7 @@ async def test_multi_model_council_build_tools_dict_ignores_unloaded_direct_tool
         ],
     }
     extra_params = {"__metadata__": metadata}
-    tools_dict = await multi_model_council.build_tools_dict(
+    tools_dict, _ = await multi_model_council.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,

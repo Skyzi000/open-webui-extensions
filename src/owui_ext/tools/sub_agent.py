@@ -53,6 +53,7 @@ from owui_ext.shared.tool_execution import (
     process_tool_result,
 )
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients, resolve_mcp_tools
+from owui_ext.shared.tool_loader import build_tools_dict
 from owui_ext.shared.skills import (
     extract_skill_manifest,
     extract_user_skill_tags,
@@ -549,53 +550,35 @@ async def load_sub_agent_tools(
     extra_params: dict,
     self_tool_id: Optional[str],
 ) -> tuple[dict, dict]:
-    """Load regular, MCP, terminal, direct, and builtin tools for sub-agent."""
-    from open_webui.utils.tools import get_builtin_tools, get_tools
+    """Load regular, MCP, terminal, direct, and builtin tools for sub-agent.
 
-    try:
-        from open_webui.utils.tools import get_terminal_tools
-    except Exception:
-        get_terminal_tools = None
-
+    Thin wrapper around ``shared.tool_loader.build_tools_dict`` that
+    parses sub_agent's ``AVAILABLE_TOOL_IDS`` / ``EXCLUDED_TOOL_IDS``
+    valves, adds ``self_tool_id`` to the exclusion set to prevent the
+    sub-agent from recursing into its own plugin, and pre-resolves the
+    terminal binding / direct tool servers so the canonical helper
+    doesn't re-read ``request.body()``.
+    """
     metadata = metadata or {}
-    model = model or {}
     extra_params = extra_params or {}
-    event_emitter = extra_params.get("__event_emitter__")
-    extra_metadata = extra_params.get("__metadata__")
+    debug = bool(getattr(valves, "DEBUG", False))
+
     terminal_id = await resolve_terminal_id_from_request_and_metadata(
         request=request,
         metadata=metadata,
-        debug=bool(getattr(valves, "DEBUG", False)),
+        debug=debug,
     )
     direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
         metadata=metadata,
         request=request,
-        debug=bool(getattr(valves, "DEBUG", False)),
+        debug=debug,
     )
 
-    if terminal_id:
-        metadata["terminal_id"] = terminal_id
-        if isinstance(extra_metadata, dict):
-            extra_metadata["terminal_id"] = terminal_id
-        else:
-            extra_params["__metadata__"] = metadata
-            extra_metadata = metadata
-
-    if direct_tool_servers:
-        metadata["tool_servers"] = direct_tool_servers
-        if isinstance(extra_metadata, dict):
-            extra_metadata["tool_servers"] = direct_tool_servers
-        else:
-            extra_params["__metadata__"] = metadata
-            extra_metadata = metadata
-
-    # Determine tool IDs
-    # Use metadata's tool_ids (main conversation's available tools)
-    available_tool_ids = []
+    available_tool_ids: list[str] = []
     if metadata.get("tool_ids"):
         available_tool_ids = list(metadata.get("tool_ids", []))
 
-    if valves.DEBUG:
+    if debug:
         log.info(f"[SubAgent] AVAILABLE_TOOL_IDS valve: '{valves.AVAILABLE_TOOL_IDS}'")
         log.info(f"[SubAgent] Available tool_ids from metadata: {available_tool_ids}")
         log.info(f"[SubAgent] self_tool_id: {self_tool_id}")
@@ -604,8 +587,7 @@ async def load_sub_agent_tools(
             f"[SubAgent] resolved direct tool servers: {len(direct_tool_servers)}"
         )
 
-    # Apply exclusions first
-    excluded = set()
+    excluded: set = set()
     if valves.EXCLUDED_TOOL_IDS.strip():
         excluded = {
             tid.strip() for tid in valves.EXCLUDED_TOOL_IDS.split(",") if tid.strip()
@@ -620,246 +602,36 @@ async def load_sub_agent_tools(
     else:
         excluded.add(self_tool_id)
 
-    if valves.DEBUG:
+    if debug:
         log.info(f"[SubAgent] EXCLUDED_TOOL_IDS valve: '{valves.EXCLUDED_TOOL_IDS}'")
         if excluded:
             log.info(f"[SubAgent] Excluded tool IDs (including self): {sorted(excluded)}")
 
-    # Determine which tools to use
     if valves.AVAILABLE_TOOL_IDS.strip():
-        # Use Valves setting (admin-configured list)
         tool_id_list = [
             tid.strip() for tid in valves.AVAILABLE_TOOL_IDS.split(",") if tid.strip()
         ]
-        if valves.DEBUG:
+        if debug:
             log.info(f"[SubAgent] Using AVAILABLE_TOOL_IDS valve: {tool_id_list}")
     else:
-        # Use all available tools from metadata
         tool_id_list = available_tool_ids
-        if valves.DEBUG:
+        if debug:
             log.info(
                 f"[SubAgent] Using all available tool_ids from metadata: {tool_id_list}"
             )
 
-    tool_id_list = [tid for tid in tool_id_list if tid not in excluded]
-
-    # Note: Builtin tools are NOT included in tool_ids.
-    # They are loaded separately via get_builtin_tools() and controlled by Valves.
-    # Regular tools only (filter out any builtin: prefixed IDs just in case)
-    regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
-    mcp_tool_ids = [tid for tid in regular_tool_ids if tid.startswith("server:mcp:")]
-    non_mcp_tool_ids = [
-        tid for tid in regular_tool_ids if not tid.startswith("server:mcp:")
-    ]
-
-    if valves.DEBUG:
-        log.info(f"[SubAgent] Regular tool IDs: {regular_tool_ids}")
-        if mcp_tool_ids:
-            log.info(f"[SubAgent] MCP tool IDs: {mcp_tool_ids}")
-        if non_mcp_tool_ids != regular_tool_ids:
-            log.info(f"[SubAgent] Non-MCP regular tool IDs: {non_mcp_tool_ids}")
-
-    # Load regular tools
-    tools_dict = {}
-    mcp_clients: dict[str, Any] = {}
-    if non_mcp_tool_ids:
-        try:
-            tools_dict = await get_tools(
-                request=request,
-                tool_ids=non_mcp_tool_ids,
-                user=user,
-                extra_params=extra_params,
-            )
-
-            if valves.DEBUG:
-                log.info(f"[SubAgent] Loaded {len(tools_dict)} regular tools")
-
-        except Exception as e:
-            log.exception(f"Error loading tools: {e}")
-            await emit_notification(
-                event_emitter,
-                level="warning",
-                content=f"Could not load tools: {e}",
-            )
-
-    if mcp_tool_ids:
-        try:
-            mcp_tools, mcp_clients = await resolve_mcp_tools(
-                request=request,
-                user=user,
-                mcp_tool_ids=mcp_tool_ids,
-                extra_params=extra_params,
-                metadata=metadata,
-                debug=bool(getattr(valves, "DEBUG", False)),
-            )
-
-            if mcp_tools:
-                duplicate_names = set(tools_dict.keys()) & set(mcp_tools.keys())
-                tools_dict.update(mcp_tools)
-                if valves.DEBUG:
-                    if duplicate_names:
-                        log.warning(
-                            "[SubAgent] MCP tools overrode existing tool names: "
-                            f"{sorted(duplicate_names)}"
-                        )
-                    log.info(f"[SubAgent] Loaded {len(mcp_tools)} MCP tools")
-        except Exception as e:
-            log.exception(f"Error loading MCP tools: {e}")
-            await emit_notification(
-                event_emitter,
-                level="warning",
-                content=f"Could not load MCP tools: {e}",
-            )
-
-    # Resolve terminal tools (if available in chat metadata)
-    if terminal_id and bool(getattr(valves, "ENABLE_TERMINAL_TOOLS", True)):
-        if get_terminal_tools is None:
-            if valves.DEBUG:
-                log.info("[SubAgent] get_terminal_tools is unavailable in this Open WebUI version")
-        else:
-            try:
-                terminal_tools_result = await get_terminal_tools(
-                    request=request,
-                    terminal_id=terminal_id,
-                    user=user,
-                    extra_params=extra_params,
-                )
-                terminal_tools = normalize_terminal_tools_result(
-                    terminal_tools_result=terminal_tools_result,
-                    extra_params=extra_params,
-                )
-                if terminal_tools:
-                    duplicate_names = set(tools_dict.keys()) & set(terminal_tools.keys())
-                    tools_dict = {**tools_dict, **terminal_tools}
-                    if valves.DEBUG:
-                        if duplicate_names:
-                            log.warning(
-                                "[SubAgent] Terminal tools overrode existing tool names: "
-                                f"{sorted(duplicate_names)}"
-                            )
-                        log.info(
-                            f"[SubAgent] Loaded {len(terminal_tools)} terminal tools for terminal_id={terminal_id}"
-                        )
-            except Exception as e:
-                log.exception(f"Error loading terminal tools: {e}")
-                await emit_notification(
-                    event_emitter,
-                    level="warning",
-                    content=f"Could not load terminal tools: {e}",
-                )
-    elif terminal_id and valves.DEBUG:
-        log.info("[SubAgent] Terminal tools disabled by ENABLE_TERMINAL_TOOLS valve")
-
-    # Resolve direct tool servers
-    if direct_tool_servers:
-        try:
-            direct_tools = build_direct_tools_dict(
-                tool_servers=direct_tool_servers,
-                debug=bool(getattr(valves, "DEBUG", False)),
-            )
-            if direct_tools:
-                duplicate_names = set(tools_dict.keys()) & set(direct_tools.keys())
-                tools_dict = {**tools_dict, **direct_tools}
-                direct_tool_server_prompts = extract_direct_tool_server_prompts(direct_tools)
-                if direct_tool_server_prompts:
-                    extra_params["__direct_tool_server_system_prompts__"] = direct_tool_server_prompts
-                else:
-                    extra_params.pop("__direct_tool_server_system_prompts__", None)
-                if valves.DEBUG:
-                    if duplicate_names:
-                        log.warning(
-                            "[SubAgent] Direct tools overrode existing tool names: "
-                            f"{sorted(duplicate_names)}"
-                        )
-                    log.info(f"[SubAgent] Loaded {len(direct_tools)} direct tools")
-            else:
-                extra_params.pop("__direct_tool_server_system_prompts__", None)
-        except Exception as e:
-            log.exception(f"Error loading direct tools: {e}")
-            extra_params.pop("__direct_tool_server_system_prompts__", None)
-            await emit_notification(
-                event_emitter,
-                level="warning",
-                content=f"Could not load direct tools: {e}",
-            )
-    else:
-        extra_params.pop("__direct_tool_server_system_prompts__", None)
-
-    # Load builtin tools
-    try:
-        # Get features from metadata (for memory, etc.)
-        features = metadata.get("features", {})
-
-        # NOTE: view_skill is NOT registered here; it's registered manually
-        # via register_view_skill() when the parent conversation's
-        # <available_skills> manifest is detected (model-attached skills).
-        builtin_extra_params = {
-            "__user__": extra_params.get("__user__"),
-            "__event_emitter__": event_emitter,
-            "__event_call__": extra_params.get("__event_call__"),
-            "__metadata__": extra_params.get("__metadata__"),
-            "__chat_id__": extra_params.get("__chat_id__"),
-            "__message_id__": extra_params.get("__message_id__"),
-            "__oauth_token__": extra_params.get("__oauth_token__"),
-        }
-
-        all_builtin_tools = await maybe_await(get_builtin_tools(
-            request=request,
-            extra_params=builtin_extra_params,
-            features=features,
-            model=model,
-        ))
-
-        # Build set of disabled tools based on Valves
-        disabled_builtin_tools = set()
-        for valve_field, category in VALVE_TO_CATEGORY.items():
-            if not getattr(valves, valve_field):
-                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES[category])
-
-        knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
-        notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
-        keep_view_note_for_knowledge = (
-            (not notes_tools_enabled)
-            and knowledge_tools_enabled
-            and model_knowledge_tools_enabled(model)
-            and model_has_note_knowledge(model)
-        )
-
-        # Filter builtin tools based on Valves settings
-        # NOTE: Regular tools take priority over builtin tools with the same name.
-        # This allows users to override builtin behavior with custom tools.
-        builtin_count = 0
-        for name, tool_dict in all_builtin_tools.items():
-            if name in disabled_builtin_tools and not (
-                name == "view_note" and keep_view_note_for_knowledge
-            ):
-                continue
-
-            if name not in tools_dict:
-                tools_dict[name] = tool_dict
-                builtin_count += 1
-            elif valves.DEBUG:
-                log.warning(
-                    f"[SubAgent] Builtin tool '{name}' skipped: "
-                    "regular tool with same name takes priority"
-                )
-
-        if valves.DEBUG:
-            log.info(
-                f"[SubAgent] Loaded {builtin_count} builtin tools "
-                f"(disabled categories: {[c for v, c in VALVE_TO_CATEGORY.items() if not getattr(valves, v)]}). "
-                f"Total tools: {len(tools_dict)}"
-            )
-
-    except Exception as e:
-        log.exception(f"Error loading builtin tools: {e}")
-        await emit_notification(
-            event_emitter,
-            level="warning",
-            content=f"Could not load builtin tools: {e}",
-        )
-
-    return tools_dict, mcp_clients
+    return await build_tools_dict(
+        request=request,
+        model=model,
+        metadata=metadata,
+        user=user,
+        valves=valves,
+        extra_params=extra_params,
+        tool_id_list=tool_id_list,
+        excluded_tool_ids=excluded,
+        resolved_terminal_id=terminal_id,
+        resolved_direct_tool_servers=direct_tool_servers,
+    )
 
 
 # ============================================================================

@@ -25,70 +25,6 @@ async def maybe_await(value):
         return await value
     return value
 
-# --- inlined from src/owui_ext/shared/builtin_tools.py (owui_ext.shared.builtin_tools) ---
-BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
-    "time": {"get_current_timestamp", "calculate_timestamp"},
-    "web": {"search_web", "fetch_url"},
-    "image": {"generate_image", "edit_image"},
-    "knowledge": {
-        "list_knowledge",
-        "list_knowledge_bases",
-        "search_knowledge_bases",
-        "query_knowledge_bases",
-        "search_knowledge_files",
-        "query_knowledge_files",
-        "view_file",
-        "view_knowledge_file",
-    },
-    "chat": {"search_chats", "view_chat"},
-    "memory": {"search_memories", "add_memory", "replace_memory_content", "delete_memory", "list_memories"},
-    "notes": {
-        "search_notes",
-        "view_note",
-        "write_note",
-        "replace_note_content",
-    },
-    "channels": {
-        "search_channels",
-        "search_channel_messages",
-        "view_channel_thread",
-        "view_channel_message",
-    },
-    "code_interpreter": {"execute_code"},
-    "skills": {"view_skill"},
-    "tasks": {"create_tasks", "update_task"},
-    "automations": {
-        "create_automation",
-        "update_automation",
-        "list_automations",
-        "toggle_automation",
-        "delete_automation",
-    },
-    "calendar": {
-        "search_calendar_events",
-        "create_calendar_event",
-        "update_calendar_event",
-        "delete_calendar_event",
-    },
-}
-
-
-VALVE_TO_CATEGORY: dict[str, str] = {
-    "ENABLE_TIME_TOOLS": "time",
-    "ENABLE_WEB_TOOLS": "web",
-    "ENABLE_IMAGE_TOOLS": "image",
-    "ENABLE_KNOWLEDGE_TOOLS": "knowledge",
-    "ENABLE_CHAT_TOOLS": "chat",
-    "ENABLE_MEMORY_TOOLS": "memory",
-    "ENABLE_NOTES_TOOLS": "notes",
-    "ENABLE_CHANNELS_TOOLS": "channels",
-    "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
-    "ENABLE_SKILLS_TOOLS": "skills",
-    "ENABLE_TASK_TOOLS": "tasks",
-    "ENABLE_AUTOMATION_TOOLS": "automations",
-    "ENABLE_CALENDAR_TOOLS": "calendar",
-}
-
 # --- inlined from src/owui_ext/shared/event_emitter.py (owui_ext.shared.event_emitter) ---
 from typing import Any, Callable, Optional
 class EventEmitter:
@@ -171,6 +107,280 @@ async def apply_inlet_filters_if_enabled(
         _inlet_filters_log.warning(f"Error applying inlet filters: {exc}")
     return form_data
 
+# --- inlined from src/owui_ext/shared/mcp_tools.py (owui_ext.shared.mcp_tools) ---
+import asyncio
+import logging
+import re
+from typing import Any, Callable, Optional
+from fastapi import Request
+_mcp_tools_log = logging.getLogger("owui_ext.shared.mcp_tools")
+
+
+async def _mcp_maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+async def _emit_warning_notification(
+    event_emitter: Optional[Callable], content: str
+) -> None:
+    if not callable(event_emitter):
+        return
+    if not isinstance(content, str) or not content.strip():
+        return
+    try:
+        await event_emitter(
+            {
+                "type": "notification",
+                "data": {"type": "warning", "content": content.strip()},
+            }
+        )
+    except Exception as exc:
+        _mcp_tools_log.debug(f"Error emitting MCP warning notification: {exc}")
+
+
+async def resolve_mcp_tools(
+    request: Request,
+    user: Any,
+    mcp_tool_ids: list[str],
+    extra_params: dict,
+    metadata: dict,
+    debug: bool = False,
+) -> tuple[dict, dict]:
+    """Resolve MCP ``server:mcp:`` tool IDs into tool callables and live clients.
+
+    Returns ``(mcp_tools_dict, mcp_clients)``. ``mcp_tools_dict`` maps
+    prefixed tool names to ``{"spec", "callable", "type": "mcp", "direct"}``
+    entries compatible with Open WebUI's tool-call middleware.
+    ``mcp_clients`` maps server IDs to the live ``MCPClient`` instances
+    so the caller can ``cleanup_mcp_clients`` them when the agent loop
+    ends.
+    """
+    try:
+        from open_webui.utils.mcp.client import MCPClient
+    except ImportError:
+        if debug and mcp_tool_ids:
+            _mcp_tools_log.info(
+                "MCPClient unavailable; skipping MCP tool resolution"
+            )
+        return {}, {}
+
+    from open_webui.utils.misc import is_string_allowed
+    from open_webui.utils.headers import include_user_info_headers
+    from open_webui.env import ENABLE_FORWARD_USER_INFO_HEADERS
+
+    try:
+        from open_webui.utils.access_control import has_connection_access
+    except ImportError:
+        from open_webui.utils.tools import (
+            has_tool_server_access as has_connection_access,
+        )
+
+    try:
+        from open_webui.env import (
+            FORWARD_SESSION_INFO_HEADER_CHAT_ID,
+            FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
+        )
+    except ImportError:
+        FORWARD_SESSION_INFO_HEADER_CHAT_ID = None
+        FORWARD_SESSION_INFO_HEADER_MESSAGE_ID = None
+
+    event_emitter = (extra_params or {}).get("__event_emitter__")
+
+    async def emit_warning(description: str) -> None:
+        await _emit_warning_notification(event_emitter, description)
+
+    metadata = metadata or {}
+    extra_params = extra_params or {}
+    mcp_tools_dict: dict[str, dict] = {}
+    mcp_clients: dict[str, Any] = {}
+    server_connections = (
+        getattr(getattr(request.app.state, "config", None), "TOOL_SERVER_CONNECTIONS", [])
+        or []
+    )
+
+    ordered_server_ids: list[str] = []
+    seen_server_ids: set[str] = set()
+    for tool_id in mcp_tool_ids:
+        if not isinstance(tool_id, str) or not tool_id.startswith("server:mcp:"):
+            continue
+        server_id = tool_id[len("server:mcp:") :].strip()
+        if not server_id:
+            continue
+        if server_id not in seen_server_ids:
+            seen_server_ids.add(server_id)
+            ordered_server_ids.append(server_id)
+
+    for server_id in ordered_server_ids:
+        client = None
+        try:
+            mcp_server_connection = next(
+                (
+                    server_connection
+                    for server_connection in server_connections
+                    if server_connection.get("type", "") == "mcp"
+                    and server_connection.get("info", {}).get("id") == server_id
+                ),
+                None,
+            )
+
+            if not mcp_server_connection:
+                _mcp_tools_log.warning(f"MCP server with id {server_id} not found")
+                await emit_warning(f"MCP server '{server_id}' was not found")
+                continue
+
+            if not mcp_server_connection.get("config", {}).get("enable", True):
+                if debug:
+                    _mcp_tools_log.info(
+                        f"MCP server {server_id} is disabled; skipping"
+                    )
+                await emit_warning(f"MCP server '{server_id}' is disabled")
+                continue
+
+            try:
+                has_access = await _mcp_maybe_await(
+                    has_connection_access(user, mcp_server_connection)
+                )
+            except TypeError:
+                has_access = await _mcp_maybe_await(
+                    has_connection_access(user, mcp_server_connection, None)
+                )
+
+            if not has_access:
+                _mcp_tools_log.warning(
+                    f"Access denied to MCP server {server_id} for user {user.id}"
+                )
+                await emit_warning(f"Access denied to MCP server '{server_id}'")
+                continue
+
+            auth_type = mcp_server_connection.get("auth_type", "")
+            headers: dict[str, Any] = {}
+            if auth_type == "bearer":
+                headers["Authorization"] = f'Bearer {mcp_server_connection.get("key", "")}'
+            elif auth_type == "none":
+                pass
+            elif auth_type == "session":
+                token = getattr(getattr(request.state, "token", None), "credentials", "")
+                headers["Authorization"] = f"Bearer {token}"
+            elif auth_type == "system_oauth":
+                oauth_token = extra_params.get("__oauth_token__", None)
+                if oauth_token:
+                    headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
+            elif auth_type in ("oauth_2.1", "oauth_2.1_static"):
+                try:
+                    oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
+                        user.id, f"mcp:{server_id}"
+                    )
+
+                    if oauth_token:
+                        headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
+                except Exception as e:
+                    _mcp_tools_log.error(
+                        f"Error getting OAuth token for MCP server {server_id}: {e}"
+                    )
+
+            connection_headers = mcp_server_connection.get("headers", None)
+            if connection_headers and isinstance(connection_headers, dict):
+                headers.update(connection_headers)
+
+            if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+                headers = include_user_info_headers(headers, user)
+                if FORWARD_SESSION_INFO_HEADER_CHAT_ID and metadata.get("chat_id"):
+                    headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata["chat_id"]
+                if FORWARD_SESSION_INFO_HEADER_MESSAGE_ID and metadata.get("message_id"):
+                    headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID] = metadata["message_id"]
+
+            function_name_filter_list = mcp_server_connection.get("config", {}).get(
+                "function_name_filter_list", ""
+            )
+            if isinstance(function_name_filter_list, str):
+                function_name_filter_list = [
+                    item.strip()
+                    for item in function_name_filter_list.split(",")
+                    if item.strip()
+                ]
+
+            client = MCPClient()
+            client_lock = asyncio.Lock()
+            setattr(client, "_sub_agent_lock", client_lock)
+
+            await client.connect(
+                url=mcp_server_connection.get("url", ""),
+                headers=headers if headers else None,
+            )
+
+            tool_specs = await client.list_tool_specs() or []
+
+            def make_tool_function(
+                mcp_client: Any,
+                function_name: str,
+                lock: asyncio.Lock,
+            ) -> Callable[..., Any]:
+                async def tool_function(**kwargs):
+                    async with lock:
+                        return await mcp_client.call_tool(
+                            function_name,
+                            function_args=kwargs,
+                        )
+
+                return tool_function
+
+            loaded_tool_count = 0
+            for tool_spec in tool_specs:
+                if not isinstance(tool_spec, dict):
+                    continue
+
+                tool_name = tool_spec.get("name")
+                if not isinstance(tool_name, str) or not tool_name:
+                    continue
+
+                if function_name_filter_list and not is_string_allowed(
+                    tool_name, function_name_filter_list
+                ):
+                    continue
+
+                safe_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", server_id)
+                prefixed_name = f"{safe_prefix}_{tool_name}"
+                mcp_tools_dict[prefixed_name] = {
+                    "spec": {
+                        **tool_spec,
+                        "name": prefixed_name,
+                    },
+                    "callable": make_tool_function(client, tool_name, client_lock),
+                    "type": "mcp",
+                    "direct": False,
+                }
+                loaded_tool_count += 1
+
+            mcp_clients[server_id] = client
+
+            if debug:
+                _mcp_tools_log.info(
+                    f"Loaded {loaded_tool_count} MCP tools from server {server_id}"
+                )
+        except Exception as e:
+            _mcp_tools_log.warning(
+                f"Failed to load MCP tools from {server_id}: {e}"
+            )
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            await emit_warning(f"Could not load MCP tools from '{server_id}': {e}")
+
+    return mcp_tools_dict, mcp_clients
+
+
+async def cleanup_mcp_clients(mcp_clients: dict) -> None:
+    """Disconnect all MCP clients, mirroring Open WebUI task cleanup."""
+    for client in reversed(list((mcp_clients or {}).values())):
+        try:
+            await client.disconnect()
+        except Exception as e:
+            _mcp_tools_log.debug(f"Error cleaning up MCP client: {e}")
+
 # --- inlined from src/owui_ext/shared/models.py (owui_ext.shared.models) ---
 import logging
 from typing import Any
@@ -215,31 +425,6 @@ def extract_model_ids(models: list[dict]) -> list[str]:
             seen.add(model_id)
             ids.append(model_id)
     return ids
-
-# --- inlined from src/owui_ext/shared/model_features.py (owui_ext.shared.model_features) ---
-from typing import Optional
-def model_has_note_knowledge(model: Optional[dict]) -> bool:
-    """Return True if the current model has note-type attached knowledge."""
-    if not isinstance(model, dict):
-        return False
-    knowledge_items = model.get("info", {}).get("meta", {}).get("knowledge") or []
-    if not isinstance(knowledge_items, list):
-        return False
-    return any(
-        item.get("type") == "note"
-        for item in knowledge_items
-        if isinstance(item, dict)
-    )
-
-
-def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
-    """Return True if model-level builtin knowledge tools are enabled."""
-    if not isinstance(model, dict):
-        return True
-    builtin_tools = model.get("info", {}).get("meta", {}).get("builtinTools", {})
-    if not isinstance(builtin_tools, dict):
-        return True
-    return bool(builtin_tools.get("knowledge", True))
 
 # --- inlined from src/owui_ext/shared/parsing.py (owui_ext.shared.parsing) ---
 import json
@@ -688,6 +873,121 @@ async def execute_tool_call(
         "content": tool_result,
     }
 
+# --- inlined from src/owui_ext/shared/builtin_tools.py (owui_ext.shared.builtin_tools) ---
+BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
+    "time": {"get_current_timestamp", "calculate_timestamp"},
+    "web": {"search_web", "fetch_url"},
+    "image": {"generate_image", "edit_image"},
+    "knowledge": {
+        "list_knowledge",
+        "list_knowledge_bases",
+        "search_knowledge_bases",
+        "query_knowledge_bases",
+        "search_knowledge_files",
+        "query_knowledge_files",
+        "view_file",
+        "view_knowledge_file",
+    },
+    "chat": {"search_chats", "view_chat"},
+    "memory": {"search_memories", "add_memory", "replace_memory_content", "delete_memory", "list_memories"},
+    "notes": {
+        "search_notes",
+        "view_note",
+        "write_note",
+        "replace_note_content",
+    },
+    "channels": {
+        "search_channels",
+        "search_channel_messages",
+        "view_channel_thread",
+        "view_channel_message",
+    },
+    "code_interpreter": {"execute_code"},
+    "skills": {"view_skill"},
+    "tasks": {"create_tasks", "update_task"},
+    "automations": {
+        "create_automation",
+        "update_automation",
+        "list_automations",
+        "toggle_automation",
+        "delete_automation",
+    },
+    "calendar": {
+        "search_calendar_events",
+        "create_calendar_event",
+        "update_calendar_event",
+        "delete_calendar_event",
+    },
+}
+
+
+VALVE_TO_CATEGORY: dict[str, str] = {
+    "ENABLE_TIME_TOOLS": "time",
+    "ENABLE_WEB_TOOLS": "web",
+    "ENABLE_IMAGE_TOOLS": "image",
+    "ENABLE_KNOWLEDGE_TOOLS": "knowledge",
+    "ENABLE_CHAT_TOOLS": "chat",
+    "ENABLE_MEMORY_TOOLS": "memory",
+    "ENABLE_NOTES_TOOLS": "notes",
+    "ENABLE_CHANNELS_TOOLS": "channels",
+    "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
+    "ENABLE_SKILLS_TOOLS": "skills",
+    "ENABLE_TASK_TOOLS": "tasks",
+    "ENABLE_AUTOMATION_TOOLS": "automations",
+    "ENABLE_CALENDAR_TOOLS": "calendar",
+}
+
+# --- inlined from src/owui_ext/shared/model_features.py (owui_ext.shared.model_features) ---
+from typing import Optional
+def model_has_note_knowledge(model: Optional[dict]) -> bool:
+    """Return True if the current model has note-type attached knowledge."""
+    if not isinstance(model, dict):
+        return False
+    knowledge_items = model.get("info", {}).get("meta", {}).get("knowledge") or []
+    if not isinstance(knowledge_items, list):
+        return False
+    return any(
+        item.get("type") == "note"
+        for item in knowledge_items
+        if isinstance(item, dict)
+    )
+
+
+def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
+    """Return True if model-level builtin knowledge tools are enabled."""
+    if not isinstance(model, dict):
+        return True
+    builtin_tools = model.get("info", {}).get("meta", {}).get("builtinTools", {})
+    if not isinstance(builtin_tools, dict):
+        return True
+    return bool(builtin_tools.get("knowledge", True))
+
+# --- inlined from src/owui_ext/shared/notifications.py (owui_ext.shared.notifications) ---
+import logging
+from typing import Callable, Optional
+_notifications_log = logging.getLogger("owui_ext.shared.notifications")
+
+
+async def emit_notification(
+    event_emitter: Optional[Callable], *, level: str, content: str
+) -> None:
+    """Emit a frontend notification toast when the current chat supports it."""
+    if not callable(event_emitter):
+        return
+    if not isinstance(content, str) or not content.strip():
+        return
+    try:
+        await event_emitter(
+            {
+                "type": "notification",
+                "data": {"type": level, "content": content.strip()},
+            }
+        )
+    except Exception as exc:
+        _notifications_log.debug(
+            f"Error emitting notification ({level}): {exc}"
+        )
+
 # --- inlined from src/owui_ext/shared/tool_servers.py (owui_ext.shared.tool_servers) ---
 import json
 import logging
@@ -849,6 +1149,297 @@ async def resolve_terminal_id_from_request_and_metadata(
         return request_terminal_id
 
     return metadata_terminal_id
+
+# --- inlined from src/owui_ext/shared/tool_loader.py (owui_ext.shared.tool_loader) ---
+async def build_tools_dict(
+    request,
+    model,
+    metadata,
+    user,
+    valves,
+    extra_params,
+    tool_id_list,
+    excluded_tool_ids,
+    resolved_terminal_id=None,
+    resolved_direct_tool_servers=None,
+):
+    """Assemble the agent-loop tools_dict from regular, MCP, terminal,
+    direct, and builtin sources.
+
+    Returns ``(tools_dict, mcp_clients)``. Caller must call
+    ``shared.mcp_tools.cleanup_mcp_clients(mcp_clients)`` once the
+    agent loop is done so MCP connections don't leak. ``mcp_clients``
+    is empty when no ``server:mcp:`` tool IDs are present.
+
+    ``resolved_terminal_id`` / ``resolved_direct_tool_servers`` are
+    optional pre-resolved values: when omitted, the helper resolves
+    them from ``request.body()`` / ``metadata`` itself. Pre-resolving
+    avoids re-reading ``request.body()`` when the caller already did
+    so for its own bookkeeping.
+    """
+    import logging
+
+    log = logging.getLogger("owui_ext.shared.tool_loader")
+    debug = bool(getattr(valves, "DEBUG", False))
+
+    from open_webui.utils.tools import get_builtin_tools, get_tools
+
+    try:
+        from open_webui.utils.tools import get_terminal_tools
+    except Exception:
+        get_terminal_tools = None
+
+    metadata = metadata or {}
+    extra_params = extra_params or {}
+    model = model or {}
+    tools_dict: dict = {}
+    extra_metadata = extra_params.get("__metadata__")
+    event_emitter = extra_params.get("__event_emitter__")
+
+    if resolved_terminal_id is None:
+        terminal_id = await resolve_terminal_id_from_request_and_metadata(
+            request=request,
+            metadata=metadata,
+            debug=debug,
+        )
+    elif isinstance(resolved_terminal_id, str):
+        terminal_id = resolved_terminal_id.strip()
+    else:
+        terminal_id = ""
+
+    if terminal_id:
+        metadata["terminal_id"] = terminal_id
+        extra_metadata = extra_params.get("__metadata__")
+        if isinstance(extra_metadata, dict):
+            extra_metadata["terminal_id"] = terminal_id
+        else:
+            extra_params["__metadata__"] = metadata
+            extra_metadata = metadata
+
+    if resolved_direct_tool_servers is None:
+        direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
+            request=request,
+            metadata=metadata,
+            debug=debug,
+        )
+    else:
+        direct_tool_servers = normalize_direct_tool_servers(resolved_direct_tool_servers)
+
+    if direct_tool_servers:
+        metadata["tool_servers"] = direct_tool_servers
+        if isinstance(extra_metadata, dict):
+            extra_metadata["tool_servers"] = direct_tool_servers
+        else:
+            extra_params["__metadata__"] = metadata
+            extra_metadata = metadata
+
+    # Open WebUI's get_tools() silently skips ``server:mcp:`` entries, so
+    # split them out and resolve via resolve_mcp_tools().
+    regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
+    if excluded_tool_ids:
+        regular_tool_ids = [tid for tid in regular_tool_ids if tid not in excluded_tool_ids]
+
+    mcp_tool_ids = [tid for tid in regular_tool_ids if tid.startswith("server:mcp:")]
+    non_mcp_tool_ids = [
+        tid for tid in regular_tool_ids if not tid.startswith("server:mcp:")
+    ]
+
+    if debug:
+        log.info(f"Regular tool IDs: {regular_tool_ids}")
+        if mcp_tool_ids:
+            log.info(f"MCP tool IDs: {mcp_tool_ids}")
+        if non_mcp_tool_ids != regular_tool_ids:
+            log.info(f"Non-MCP regular tool IDs: {non_mcp_tool_ids}")
+
+    mcp_clients: dict = {}
+
+    if non_mcp_tool_ids:
+        try:
+            tools_dict = await get_tools(
+                request=request,
+                tool_ids=non_mcp_tool_ids,
+                user=user,
+                extra_params=extra_params,
+            )
+            if debug:
+                log.info(f"Loaded {len(tools_dict)} regular tools")
+        except Exception as e:
+            log.exception(f"Error loading tools: {e}")
+            await emit_notification(
+                event_emitter,
+                level="warning",
+                content=f"Could not load tools: {e}",
+            )
+
+    if mcp_tool_ids:
+        try:
+            mcp_tools, mcp_clients = await resolve_mcp_tools(
+                request=request,
+                user=user,
+                mcp_tool_ids=mcp_tool_ids,
+                extra_params=extra_params,
+                metadata=metadata,
+                debug=debug,
+            )
+            if mcp_tools:
+                duplicate_names = set(tools_dict.keys()) & set(mcp_tools.keys())
+                tools_dict.update(mcp_tools)
+                if debug:
+                    if duplicate_names:
+                        log.warning(
+                            "MCP tools overrode existing tool names: "
+                            f"{sorted(duplicate_names)}"
+                        )
+                    log.info(f"Loaded {len(mcp_tools)} MCP tools")
+        except Exception as e:
+            log.exception(f"Error loading MCP tools: {e}")
+            await emit_notification(
+                event_emitter,
+                level="warning",
+                content=f"Could not load MCP tools: {e}",
+            )
+
+    if terminal_id and bool(getattr(valves, "ENABLE_TERMINAL_TOOLS", True)):
+        if get_terminal_tools is None:
+            if debug:
+                log.info("get_terminal_tools is unavailable in this Open WebUI version")
+        else:
+            try:
+                terminal_tools_result = await get_terminal_tools(
+                    request=request,
+                    terminal_id=terminal_id,
+                    user=user,
+                    extra_params=extra_params,
+                )
+                terminal_tools = normalize_terminal_tools_result(
+                    terminal_tools_result=terminal_tools_result,
+                    extra_params=extra_params,
+                )
+                if terminal_tools:
+                    duplicate_names = set(tools_dict.keys()) & set(terminal_tools.keys())
+                    tools_dict = {**tools_dict, **terminal_tools}
+                    if debug:
+                        if duplicate_names:
+                            log.warning(
+                                "Terminal tools overrode existing tool names: "
+                                f"{sorted(duplicate_names)}"
+                            )
+                        log.info(
+                            f"Loaded {len(terminal_tools)} terminal tools for terminal_id={terminal_id}"
+                        )
+            except Exception as e:
+                log.exception(f"Error loading terminal tools: {e}")
+                await emit_notification(
+                    event_emitter,
+                    level="warning",
+                    content=f"Could not load terminal tools: {e}",
+                )
+    elif terminal_id and debug:
+        log.info("Terminal tools disabled by ENABLE_TERMINAL_TOOLS valve")
+
+    if direct_tool_servers:
+        try:
+            direct_tools = build_direct_tools_dict(
+                tool_servers=direct_tool_servers,
+                debug=debug,
+            )
+            if direct_tools:
+                duplicate_names = set(tools_dict.keys()) & set(direct_tools.keys())
+                tools_dict = {**tools_dict, **direct_tools}
+                direct_tool_server_prompts = extract_direct_tool_server_prompts(direct_tools)
+                if direct_tool_server_prompts:
+                    extra_params["__direct_tool_server_system_prompts__"] = direct_tool_server_prompts
+                else:
+                    extra_params.pop("__direct_tool_server_system_prompts__", None)
+                if debug:
+                    if duplicate_names:
+                        log.warning(
+                            "Direct tools overrode existing tool names: "
+                            f"{sorted(duplicate_names)}"
+                        )
+                    log.info(f"Loaded {len(direct_tools)} direct tools")
+            else:
+                extra_params.pop("__direct_tool_server_system_prompts__", None)
+        except Exception as e:
+            log.exception(f"Error loading direct tools: {e}")
+            extra_params.pop("__direct_tool_server_system_prompts__", None)
+            await emit_notification(
+                event_emitter,
+                level="warning",
+                content=f"Could not load direct tools: {e}",
+            )
+    else:
+        extra_params.pop("__direct_tool_server_system_prompts__", None)
+
+    try:
+        features = metadata.get("features", {})
+
+        # NOTE: view_skill is NOT registered here; the plugin registers it
+        # manually via shared.skills.register_view_skill() when the parent
+        # conversation's <available_skills> manifest is detected
+        # (model-attached skills).
+        builtin_extra_params = {
+            "__user__": extra_params.get("__user__"),
+            "__event_emitter__": extra_params.get("__event_emitter__"),
+            "__event_call__": extra_params.get("__event_call__"),
+            "__metadata__": extra_params.get("__metadata__"),
+            "__chat_id__": extra_params.get("__chat_id__"),
+            "__message_id__": extra_params.get("__message_id__"),
+            "__oauth_token__": extra_params.get("__oauth_token__"),
+        }
+
+        all_builtin_tools = await maybe_await(get_builtin_tools(
+            request=request,
+            extra_params=builtin_extra_params,
+            features=features,
+            model=model,
+        ))
+
+        disabled_builtin_tools: set = set()
+        for valve_field, category in VALVE_TO_CATEGORY.items():
+            if not getattr(valves, valve_field, True):
+                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
+
+        knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
+        notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
+        keep_view_note_for_knowledge = (
+            (not notes_tools_enabled)
+            and knowledge_tools_enabled
+            and model_knowledge_tools_enabled(model)
+            and model_has_note_knowledge(model)
+        )
+
+        # Regular tools take priority over builtin tools with the same name.
+        builtin_count = 0
+        for name, tool_dict in all_builtin_tools.items():
+            if name in disabled_builtin_tools and not (
+                name == "view_note" and keep_view_note_for_knowledge
+            ):
+                continue
+            if name not in tools_dict:
+                tools_dict[name] = tool_dict
+                builtin_count += 1
+            elif debug:
+                log.warning(
+                    f"Builtin tool '{name}' skipped: "
+                    "regular tool with same name takes priority"
+                )
+
+        if debug:
+            log.info(
+                f"Loaded {builtin_count} builtin tools "
+                f"(disabled categories: {[c for v, c in VALVE_TO_CATEGORY.items() if not getattr(valves, v, True)]}). "
+                f"Total tools: {len(tools_dict)}"
+            )
+    except Exception as e:
+        log.exception(f"Error loading builtin tools: {e}")
+        await emit_notification(
+            event_emitter,
+            level="warning",
+            content=f"Could not load builtin tools: {e}",
+        )
+
+    return tools_dict, mcp_clients
 
 # --- inlined from src/owui_ext/shared/valves.py (owui_ext.shared.valves) ---
 from typing import Any, Type
@@ -1276,162 +1867,6 @@ async def run_agent_loop(
     return "Council agent reached maximum iterations without providing a final response."
 
 
-async def build_tools_dict(
-    request: Request,
-    model: dict,
-    metadata: Optional[dict],
-    user: Any,
-    valves: Any,
-    extra_params: dict,
-    tool_id_list: List[str],
-    excluded_tool_ids: Optional[set],
-    resolved_terminal_id: Optional[str] = None,
-    resolved_direct_tool_servers: Optional[List[dict]] = None,
-) -> dict:
-    from open_webui.utils.tools import get_builtin_tools, get_tools
-
-    try:
-        from open_webui.utils.tools import get_terminal_tools
-    except Exception:
-        get_terminal_tools = None
-
-    metadata = metadata or {}
-    tools_dict: Dict[str, dict] = {}
-    extra_metadata = extra_params.get("__metadata__")
-    if resolved_terminal_id is None:
-        terminal_id = await resolve_terminal_id_from_request_and_metadata(
-            request=request,
-            metadata=metadata,
-            debug=bool(getattr(valves, "DEBUG", False)),
-        )
-    else:
-        terminal_id = normalize_text(resolved_terminal_id)
-    if terminal_id:
-        metadata["terminal_id"] = terminal_id
-        extra_metadata = extra_params.get("__metadata__")
-        if isinstance(extra_metadata, dict):
-            extra_metadata["terminal_id"] = terminal_id
-        else:
-            extra_params["__metadata__"] = metadata
-            extra_metadata = metadata
-
-    if resolved_direct_tool_servers is None:
-        direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
-            request=request,
-            metadata=metadata,
-            debug=bool(getattr(valves, "DEBUG", False)),
-        )
-    else:
-        direct_tool_servers = normalize_direct_tool_servers(resolved_direct_tool_servers)
-
-    if direct_tool_servers:
-        metadata["tool_servers"] = direct_tool_servers
-        if isinstance(extra_metadata, dict):
-            extra_metadata["tool_servers"] = direct_tool_servers
-        else:
-            extra_params["__metadata__"] = metadata
-            extra_metadata = metadata
-
-    # Load regular tools available to the main agent
-    regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
-    if excluded_tool_ids:
-        regular_tool_ids = [tid for tid in regular_tool_ids if tid not in excluded_tool_ids]
-
-    if regular_tool_ids:
-        try:
-            tools_dict = await get_tools(
-                request=request,
-                tool_ids=regular_tool_ids,
-                user=user,
-                extra_params=extra_params,
-            )
-        except Exception as exc:
-            log.exception(f"Error loading regular tools: {exc}")
-
-    # Load terminal tools (if available in chat metadata)
-    if terminal_id and bool(getattr(valves, "ENABLE_TERMINAL_TOOLS", True)):
-        if get_terminal_tools is None:
-            if getattr(valves, "DEBUG", False):
-                log.info("[MultiModelCouncil] get_terminal_tools is unavailable in this Open WebUI version")
-        else:
-            try:
-                terminal_tools_result = await get_terminal_tools(
-                    request=request,
-                    terminal_id=terminal_id,
-                    user=user,
-                    extra_params=extra_params,
-                )
-                terminal_tools = normalize_terminal_tools_result(
-                    terminal_tools_result=terminal_tools_result,
-                    extra_params=extra_params,
-                )
-                if terminal_tools:
-                    tools_dict = {**tools_dict, **terminal_tools}
-            except Exception as exc:
-                log.exception(f"Error loading terminal tools: {exc}")
-
-    # Load direct tools from metadata.tool_servers
-    if direct_tool_servers:
-        try:
-            direct_tools = build_direct_tools_dict(tool_servers=direct_tool_servers)
-            if direct_tools:
-                tools_dict = {**tools_dict, **direct_tools}
-                direct_tool_server_prompts = extract_direct_tool_server_prompts(direct_tools)
-                if direct_tool_server_prompts:
-                    extra_params["__direct_tool_server_system_prompts__"] = direct_tool_server_prompts
-                else:
-                    extra_params.pop("__direct_tool_server_system_prompts__", None)
-            else:
-                extra_params.pop("__direct_tool_server_system_prompts__", None)
-        except Exception as exc:
-            log.exception(f"Error loading direct tools: {exc}")
-            extra_params.pop("__direct_tool_server_system_prompts__", None)
-    else:
-        extra_params.pop("__direct_tool_server_system_prompts__", None)
-
-    # Load builtin tools
-    features = metadata.get("features", {})
-    all_builtin_tools = await maybe_await(get_builtin_tools(
-        request=request,
-        extra_params={
-            "__user__": extra_params.get("__user__"),
-            "__event_emitter__": extra_params.get("__event_emitter__"),
-            "__event_call__": extra_params.get("__event_call__"),
-            "__metadata__": extra_params.get("__metadata__"),
-            "__chat_id__": extra_params.get("__chat_id__"),
-            "__message_id__": extra_params.get("__message_id__"),
-            "__oauth_token__": extra_params.get("__oauth_token__"),
-        },
-        features=features,
-        model=model,
-    ))
-
-    # Build set of disabled tools based on Valves categories
-    disabled_builtin_tools = set()
-    for valve_field, category in VALVE_TO_CATEGORY.items():
-        if not getattr(valves, valve_field, True):
-            disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
-
-    knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
-    notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
-    keep_view_note_for_knowledge = (
-        (not notes_tools_enabled)
-        and knowledge_tools_enabled
-        and model_knowledge_tools_enabled(model)
-        and model_has_note_knowledge(model)
-    )
-
-    for name, tool_dict in all_builtin_tools.items():
-        if name in disabled_builtin_tools and not (
-            name == "view_note" and keep_view_note_for_knowledge
-        ):
-            continue
-        if name not in tools_dict:
-            tools_dict[name] = tool_dict
-
-    return tools_dict
-
-
 # ============================================================================
 # Tools class
 # ============================================================================
@@ -1827,7 +2262,11 @@ CRITICAL RULES:
             done=False,
         )
 
-        tools_cache: Dict[str, dict] = {}
+        # Cache tuple of (tools_dict, mcp_clients) per member model so the
+        # builtin tool catalogue is computed once per distinct model. MCP
+        # clients live alongside their tools_dict so the finally block below
+        # can close every connection regardless of which member raised.
+        tools_cache: Dict[str, Tuple[dict, dict]] = {}
 
         async def run_single_member(member_model_id: str) -> Tuple[str, str, dict]:
             """Run one council member and return (model_id, raw_output, parsed_result)."""
@@ -1840,9 +2279,9 @@ CRITICAL RULES:
                 "__model__": member_model,
             }
 
-            tools_dict = tools_cache.get(member_model_id)
-            if tools_dict is None:
-                tools_dict = await build_tools_dict(
+            cached = tools_cache.get(member_model_id)
+            if cached is None:
+                cached = await build_tools_dict(
                     request=request,
                     model=member_model,
                     metadata=metadata,
@@ -1854,7 +2293,8 @@ CRITICAL RULES:
                     resolved_terminal_id=resolved_terminal_id,
                     resolved_direct_tool_servers=resolved_direct_tool_servers,
                 )
-                tools_cache[member_model_id] = tools_dict
+                tools_cache[member_model_id] = cached
+            tools_dict, _ = cached
 
             content = await run_agent_loop(
                 request=__request__,
@@ -1878,7 +2318,12 @@ CRITICAL RULES:
         import asyncio
 
         member_tasks = [run_single_member(mid) for mid in model_ids]
-        results = await asyncio.gather(*member_tasks, return_exceptions=True)
+        try:
+            results = await asyncio.gather(*member_tasks, return_exceptions=True)
+        finally:
+            for _tools, mcp_clients in tools_cache.values():
+                if mcp_clients:
+                    await cleanup_mcp_clients(mcp_clients)
 
         members: Dict[str, dict] = {}
         raw_outputs: Dict[str, str] = {}

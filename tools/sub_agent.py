@@ -906,168 +906,6 @@ async def cleanup_mcp_clients(mcp_clients: dict) -> None:
         except Exception as e:
             _mcp_tools_log.debug(f"Error cleaning up MCP client: {e}")
 
-# --- inlined from src/owui_ext/shared/skills.py (owui_ext.shared.skills) ---
-import logging
-import re
-from typing import Any, Optional
-from fastapi import Request
-_skills_log = logging.getLogger("owui_ext.shared.skills")
-
-_SKILLS_MANIFEST_START = "<available_skills>"
-_SKILLS_MANIFEST_END = "</available_skills>"
-_SKILL_TAG_PATTERN = re.compile(
-    r"<skill name=.*?>\n.*?\n</skill>", re.DOTALL
-)
-
-
-async def _skills_maybe_await(value: Any) -> Any:
-    if hasattr(value, "__await__"):
-        return await value
-    return value
-
-
-def _find_manifest_in_text(text: str) -> str:
-    """Return the <available_skills>…</available_skills> substring, or ""."""
-    start = text.find(_SKILLS_MANIFEST_START)
-    if start == -1:
-        return ""
-    end = text.find(_SKILLS_MANIFEST_END, start)
-    if end == -1:
-        return ""
-    return text[start : end + len(_SKILLS_MANIFEST_END)]
-
-
-def _find_skill_tags_in_text(text: str) -> list[str]:
-    """Return all ``<skill name="...">…</skill>`` blocks found in *text*."""
-    return _SKILL_TAG_PATTERN.findall(text)
-
-
-def _extract_from_system_messages(
-    messages: Optional[list],
-    extractor,
-):
-    """Walk system messages and apply *extractor* to each text chunk.
-
-    ``extractor`` is called with a single ``str`` argument and should return a
-    list of results (or a single truthy result).  The function handles both
-    plain-string content and list-of-parts content
-    (``[{"type": "text", "text": "..."}]``).
-    """
-    results: list = []
-    if not messages:
-        return results
-    for msg in messages:
-        if msg.get("role") != "system":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            found = extractor(content)
-            if found:
-                results.append(found) if isinstance(found, str) else results.extend(
-                    found
-                )
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    found = extractor(part.get("text") or "")
-                    if found:
-                        results.append(found) if isinstance(
-                            found, str
-                        ) else results.extend(found)
-    return results
-
-
-def extract_skill_manifest(messages: Optional[list]) -> str:
-    """Extract the ``<available_skills>`` manifest from the parent
-    conversation's system messages.
-
-    Since v0.8.2, only **model-attached** skills appear in this manifest.
-    User-selected skills are injected as full ``<skill>`` tags instead
-    (see :func:`extract_user_skill_tags`).
-
-    Args:
-        messages: The parent conversation messages (``__messages__``).
-
-    Returns:
-        The manifest XML string, or empty string if not found.
-    """
-    results = _extract_from_system_messages(messages, _find_manifest_in_text)
-    return results[0] if results else ""
-
-
-def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
-    """Extract ``<skill name="...">content</skill>`` tags from the parent
-    conversation's system messages.
-
-    Since Open WebUI v0.8.2, user-selected skills are injected as individual
-    ``<skill>`` tags with full content (as opposed to the lazy-loading
-    manifest used for model-attached skills).
-
-    Args:
-        messages: The parent conversation messages (``__messages__``).
-
-    Returns:
-        A list of ``<skill …>…</skill>`` strings, possibly empty.
-    """
-    return _extract_from_system_messages(messages, _find_skill_tags_in_text)
-
-
-async def register_view_skill(
-    tools_dict: dict,
-    request: Request,
-    extra_params: dict,
-) -> None:
-    """Manually register the view_skill builtin tool in tools_dict.
-
-    This is needed for **model-attached** skills whose content is not injected
-    inline.  The agent loop can call ``view_skill`` to lazily load their
-    content from the ``<available_skills>`` manifest.
-
-    Since v0.8.2, user-selected skills are injected as full ``<skill>`` tags
-    and do NOT require ``view_skill``; they are passed directly in the system
-    message.
-
-    Args:
-        tools_dict: The tools dict to add view_skill to (modified in-place).
-        request: FastAPI request object.
-        extra_params: Extra parameters for tool binding.
-    """
-    if "view_skill" in tools_dict:
-        return
-
-    try:
-        from open_webui.tools.builtin import view_skill
-        from open_webui.utils.tools import (
-            get_async_tool_function_and_apply_extra_params,
-            convert_function_to_pydantic_model,
-            convert_pydantic_model_to_openai_function_spec,
-        )
-
-        callable_fn = await _skills_maybe_await(get_async_tool_function_and_apply_extra_params(
-            view_skill,
-            {
-                "__request__": request,
-                "__user__": extra_params.get("__user__", {}),
-                "__event_emitter__": extra_params.get("__event_emitter__"),
-                "__event_call__": extra_params.get("__event_call__"),
-                "__metadata__": extra_params.get("__metadata__"),
-                "__chat_id__": extra_params.get("__chat_id__"),
-                "__message_id__": extra_params.get("__message_id__"),
-            },
-        ))
-
-        pydantic_model = convert_function_to_pydantic_model(view_skill)
-        spec = convert_pydantic_model_to_openai_function_spec(pydantic_model)
-
-        tools_dict["view_skill"] = {
-            "tool_id": "builtin:view_skill",
-            "callable": callable_fn,
-            "spec": spec,
-            "type": "builtin",
-        }
-    except Exception as e:
-        _skills_log.warning(f"Failed to register view_skill: {e}")
-
 # --- inlined from src/owui_ext/shared/tool_servers.py (owui_ext.shared.tool_servers) ---
 import json
 import logging
@@ -1229,6 +1067,459 @@ async def resolve_terminal_id_from_request_and_metadata(
         return request_terminal_id
 
     return metadata_terminal_id
+
+# --- inlined from src/owui_ext/shared/tool_loader.py (owui_ext.shared.tool_loader) ---
+async def build_tools_dict(
+    request,
+    model,
+    metadata,
+    user,
+    valves,
+    extra_params,
+    tool_id_list,
+    excluded_tool_ids,
+    resolved_terminal_id=None,
+    resolved_direct_tool_servers=None,
+):
+    """Assemble the agent-loop tools_dict from regular, MCP, terminal,
+    direct, and builtin sources.
+
+    Returns ``(tools_dict, mcp_clients)``. Caller must call
+    ``shared.mcp_tools.cleanup_mcp_clients(mcp_clients)`` once the
+    agent loop is done so MCP connections don't leak. ``mcp_clients``
+    is empty when no ``server:mcp:`` tool IDs are present.
+
+    ``resolved_terminal_id`` / ``resolved_direct_tool_servers`` are
+    optional pre-resolved values: when omitted, the helper resolves
+    them from ``request.body()`` / ``metadata`` itself. Pre-resolving
+    avoids re-reading ``request.body()`` when the caller already did
+    so for its own bookkeeping.
+    """
+    import logging
+
+    log = logging.getLogger("owui_ext.shared.tool_loader")
+    debug = bool(getattr(valves, "DEBUG", False))
+
+    from open_webui.utils.tools import get_builtin_tools, get_tools
+
+    try:
+        from open_webui.utils.tools import get_terminal_tools
+    except Exception:
+        get_terminal_tools = None
+
+    metadata = metadata or {}
+    extra_params = extra_params or {}
+    model = model or {}
+    tools_dict: dict = {}
+    extra_metadata = extra_params.get("__metadata__")
+    event_emitter = extra_params.get("__event_emitter__")
+
+    if resolved_terminal_id is None:
+        terminal_id = await resolve_terminal_id_from_request_and_metadata(
+            request=request,
+            metadata=metadata,
+            debug=debug,
+        )
+    elif isinstance(resolved_terminal_id, str):
+        terminal_id = resolved_terminal_id.strip()
+    else:
+        terminal_id = ""
+
+    if terminal_id:
+        metadata["terminal_id"] = terminal_id
+        extra_metadata = extra_params.get("__metadata__")
+        if isinstance(extra_metadata, dict):
+            extra_metadata["terminal_id"] = terminal_id
+        else:
+            extra_params["__metadata__"] = metadata
+            extra_metadata = metadata
+
+    if resolved_direct_tool_servers is None:
+        direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
+            request=request,
+            metadata=metadata,
+            debug=debug,
+        )
+    else:
+        direct_tool_servers = normalize_direct_tool_servers(resolved_direct_tool_servers)
+
+    if direct_tool_servers:
+        metadata["tool_servers"] = direct_tool_servers
+        if isinstance(extra_metadata, dict):
+            extra_metadata["tool_servers"] = direct_tool_servers
+        else:
+            extra_params["__metadata__"] = metadata
+            extra_metadata = metadata
+
+    # Open WebUI's get_tools() silently skips ``server:mcp:`` entries, so
+    # split them out and resolve via resolve_mcp_tools().
+    regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
+    if excluded_tool_ids:
+        regular_tool_ids = [tid for tid in regular_tool_ids if tid not in excluded_tool_ids]
+
+    mcp_tool_ids = [tid for tid in regular_tool_ids if tid.startswith("server:mcp:")]
+    non_mcp_tool_ids = [
+        tid for tid in regular_tool_ids if not tid.startswith("server:mcp:")
+    ]
+
+    if debug:
+        log.info(f"Regular tool IDs: {regular_tool_ids}")
+        if mcp_tool_ids:
+            log.info(f"MCP tool IDs: {mcp_tool_ids}")
+        if non_mcp_tool_ids != regular_tool_ids:
+            log.info(f"Non-MCP regular tool IDs: {non_mcp_tool_ids}")
+
+    mcp_clients: dict = {}
+
+    if non_mcp_tool_ids:
+        try:
+            tools_dict = await get_tools(
+                request=request,
+                tool_ids=non_mcp_tool_ids,
+                user=user,
+                extra_params=extra_params,
+            )
+            if debug:
+                log.info(f"Loaded {len(tools_dict)} regular tools")
+        except Exception as e:
+            log.exception(f"Error loading tools: {e}")
+            await emit_notification(
+                event_emitter,
+                level="warning",
+                content=f"Could not load tools: {e}",
+            )
+
+    if mcp_tool_ids:
+        try:
+            mcp_tools, mcp_clients = await resolve_mcp_tools(
+                request=request,
+                user=user,
+                mcp_tool_ids=mcp_tool_ids,
+                extra_params=extra_params,
+                metadata=metadata,
+                debug=debug,
+            )
+            if mcp_tools:
+                duplicate_names = set(tools_dict.keys()) & set(mcp_tools.keys())
+                tools_dict.update(mcp_tools)
+                if debug:
+                    if duplicate_names:
+                        log.warning(
+                            "MCP tools overrode existing tool names: "
+                            f"{sorted(duplicate_names)}"
+                        )
+                    log.info(f"Loaded {len(mcp_tools)} MCP tools")
+        except Exception as e:
+            log.exception(f"Error loading MCP tools: {e}")
+            await emit_notification(
+                event_emitter,
+                level="warning",
+                content=f"Could not load MCP tools: {e}",
+            )
+
+    if terminal_id and bool(getattr(valves, "ENABLE_TERMINAL_TOOLS", True)):
+        if get_terminal_tools is None:
+            if debug:
+                log.info("get_terminal_tools is unavailable in this Open WebUI version")
+        else:
+            try:
+                terminal_tools_result = await get_terminal_tools(
+                    request=request,
+                    terminal_id=terminal_id,
+                    user=user,
+                    extra_params=extra_params,
+                )
+                terminal_tools = normalize_terminal_tools_result(
+                    terminal_tools_result=terminal_tools_result,
+                    extra_params=extra_params,
+                )
+                if terminal_tools:
+                    duplicate_names = set(tools_dict.keys()) & set(terminal_tools.keys())
+                    tools_dict = {**tools_dict, **terminal_tools}
+                    if debug:
+                        if duplicate_names:
+                            log.warning(
+                                "Terminal tools overrode existing tool names: "
+                                f"{sorted(duplicate_names)}"
+                            )
+                        log.info(
+                            f"Loaded {len(terminal_tools)} terminal tools for terminal_id={terminal_id}"
+                        )
+            except Exception as e:
+                log.exception(f"Error loading terminal tools: {e}")
+                await emit_notification(
+                    event_emitter,
+                    level="warning",
+                    content=f"Could not load terminal tools: {e}",
+                )
+    elif terminal_id and debug:
+        log.info("Terminal tools disabled by ENABLE_TERMINAL_TOOLS valve")
+
+    if direct_tool_servers:
+        try:
+            direct_tools = build_direct_tools_dict(
+                tool_servers=direct_tool_servers,
+                debug=debug,
+            )
+            if direct_tools:
+                duplicate_names = set(tools_dict.keys()) & set(direct_tools.keys())
+                tools_dict = {**tools_dict, **direct_tools}
+                direct_tool_server_prompts = extract_direct_tool_server_prompts(direct_tools)
+                if direct_tool_server_prompts:
+                    extra_params["__direct_tool_server_system_prompts__"] = direct_tool_server_prompts
+                else:
+                    extra_params.pop("__direct_tool_server_system_prompts__", None)
+                if debug:
+                    if duplicate_names:
+                        log.warning(
+                            "Direct tools overrode existing tool names: "
+                            f"{sorted(duplicate_names)}"
+                        )
+                    log.info(f"Loaded {len(direct_tools)} direct tools")
+            else:
+                extra_params.pop("__direct_tool_server_system_prompts__", None)
+        except Exception as e:
+            log.exception(f"Error loading direct tools: {e}")
+            extra_params.pop("__direct_tool_server_system_prompts__", None)
+            await emit_notification(
+                event_emitter,
+                level="warning",
+                content=f"Could not load direct tools: {e}",
+            )
+    else:
+        extra_params.pop("__direct_tool_server_system_prompts__", None)
+
+    try:
+        features = metadata.get("features", {})
+
+        # NOTE: view_skill is NOT registered here; the plugin registers it
+        # manually via shared.skills.register_view_skill() when the parent
+        # conversation's <available_skills> manifest is detected
+        # (model-attached skills).
+        builtin_extra_params = {
+            "__user__": extra_params.get("__user__"),
+            "__event_emitter__": extra_params.get("__event_emitter__"),
+            "__event_call__": extra_params.get("__event_call__"),
+            "__metadata__": extra_params.get("__metadata__"),
+            "__chat_id__": extra_params.get("__chat_id__"),
+            "__message_id__": extra_params.get("__message_id__"),
+            "__oauth_token__": extra_params.get("__oauth_token__"),
+        }
+
+        all_builtin_tools = await maybe_await(get_builtin_tools(
+            request=request,
+            extra_params=builtin_extra_params,
+            features=features,
+            model=model,
+        ))
+
+        disabled_builtin_tools: set = set()
+        for valve_field, category in VALVE_TO_CATEGORY.items():
+            if not getattr(valves, valve_field, True):
+                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
+
+        knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
+        notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
+        keep_view_note_for_knowledge = (
+            (not notes_tools_enabled)
+            and knowledge_tools_enabled
+            and model_knowledge_tools_enabled(model)
+            and model_has_note_knowledge(model)
+        )
+
+        # Regular tools take priority over builtin tools with the same name.
+        builtin_count = 0
+        for name, tool_dict in all_builtin_tools.items():
+            if name in disabled_builtin_tools and not (
+                name == "view_note" and keep_view_note_for_knowledge
+            ):
+                continue
+            if name not in tools_dict:
+                tools_dict[name] = tool_dict
+                builtin_count += 1
+            elif debug:
+                log.warning(
+                    f"Builtin tool '{name}' skipped: "
+                    "regular tool with same name takes priority"
+                )
+
+        if debug:
+            log.info(
+                f"Loaded {builtin_count} builtin tools "
+                f"(disabled categories: {[c for v, c in VALVE_TO_CATEGORY.items() if not getattr(valves, v, True)]}). "
+                f"Total tools: {len(tools_dict)}"
+            )
+    except Exception as e:
+        log.exception(f"Error loading builtin tools: {e}")
+        await emit_notification(
+            event_emitter,
+            level="warning",
+            content=f"Could not load builtin tools: {e}",
+        )
+
+    return tools_dict, mcp_clients
+
+# --- inlined from src/owui_ext/shared/skills.py (owui_ext.shared.skills) ---
+import logging
+import re
+from typing import Any, Optional
+from fastapi import Request
+_skills_log = logging.getLogger("owui_ext.shared.skills")
+
+_SKILLS_MANIFEST_START = "<available_skills>"
+_SKILLS_MANIFEST_END = "</available_skills>"
+_SKILL_TAG_PATTERN = re.compile(
+    r"<skill name=.*?>\n.*?\n</skill>", re.DOTALL
+)
+
+
+async def _skills_maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _find_manifest_in_text(text: str) -> str:
+    """Return the <available_skills>…</available_skills> substring, or ""."""
+    start = text.find(_SKILLS_MANIFEST_START)
+    if start == -1:
+        return ""
+    end = text.find(_SKILLS_MANIFEST_END, start)
+    if end == -1:
+        return ""
+    return text[start : end + len(_SKILLS_MANIFEST_END)]
+
+
+def _find_skill_tags_in_text(text: str) -> list[str]:
+    """Return all ``<skill name="...">…</skill>`` blocks found in *text*."""
+    return _SKILL_TAG_PATTERN.findall(text)
+
+
+def _extract_from_system_messages(
+    messages: Optional[list],
+    extractor,
+):
+    """Walk system messages and apply *extractor* to each text chunk.
+
+    ``extractor`` is called with a single ``str`` argument and should return a
+    list of results (or a single truthy result).  The function handles both
+    plain-string content and list-of-parts content
+    (``[{"type": "text", "text": "..."}]``).
+    """
+    results: list = []
+    if not messages:
+        return results
+    for msg in messages:
+        if msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            found = extractor(content)
+            if found:
+                results.append(found) if isinstance(found, str) else results.extend(
+                    found
+                )
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    found = extractor(part.get("text") or "")
+                    if found:
+                        results.append(found) if isinstance(
+                            found, str
+                        ) else results.extend(found)
+    return results
+
+
+def extract_skill_manifest(messages: Optional[list]) -> str:
+    """Extract the ``<available_skills>`` manifest from the parent
+    conversation's system messages.
+
+    Since v0.8.2, only **model-attached** skills appear in this manifest.
+    User-selected skills are injected as full ``<skill>`` tags instead
+    (see :func:`extract_user_skill_tags`).
+
+    Args:
+        messages: The parent conversation messages (``__messages__``).
+
+    Returns:
+        The manifest XML string, or empty string if not found.
+    """
+    results = _extract_from_system_messages(messages, _find_manifest_in_text)
+    return results[0] if results else ""
+
+
+def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
+    """Extract ``<skill name="...">content</skill>`` tags from the parent
+    conversation's system messages.
+
+    Since Open WebUI v0.8.2, user-selected skills are injected as individual
+    ``<skill>`` tags with full content (as opposed to the lazy-loading
+    manifest used for model-attached skills).
+
+    Args:
+        messages: The parent conversation messages (``__messages__``).
+
+    Returns:
+        A list of ``<skill …>…</skill>`` strings, possibly empty.
+    """
+    return _extract_from_system_messages(messages, _find_skill_tags_in_text)
+
+
+async def register_view_skill(
+    tools_dict: dict,
+    request: Request,
+    extra_params: dict,
+) -> None:
+    """Manually register the view_skill builtin tool in tools_dict.
+
+    This is needed for **model-attached** skills whose content is not injected
+    inline.  The agent loop can call ``view_skill`` to lazily load their
+    content from the ``<available_skills>`` manifest.
+
+    Since v0.8.2, user-selected skills are injected as full ``<skill>`` tags
+    and do NOT require ``view_skill``; they are passed directly in the system
+    message.
+
+    Args:
+        tools_dict: The tools dict to add view_skill to (modified in-place).
+        request: FastAPI request object.
+        extra_params: Extra parameters for tool binding.
+    """
+    if "view_skill" in tools_dict:
+        return
+
+    try:
+        from open_webui.tools.builtin import view_skill
+        from open_webui.utils.tools import (
+            get_async_tool_function_and_apply_extra_params,
+            convert_function_to_pydantic_model,
+            convert_pydantic_model_to_openai_function_spec,
+        )
+
+        callable_fn = await _skills_maybe_await(get_async_tool_function_and_apply_extra_params(
+            view_skill,
+            {
+                "__request__": request,
+                "__user__": extra_params.get("__user__", {}),
+                "__event_emitter__": extra_params.get("__event_emitter__"),
+                "__event_call__": extra_params.get("__event_call__"),
+                "__metadata__": extra_params.get("__metadata__"),
+                "__chat_id__": extra_params.get("__chat_id__"),
+                "__message_id__": extra_params.get("__message_id__"),
+            },
+        ))
+
+        pydantic_model = convert_function_to_pydantic_model(view_skill)
+        spec = convert_pydantic_model_to_openai_function_spec(pydantic_model)
+
+        tools_dict["view_skill"] = {
+            "tool_id": "builtin:view_skill",
+            "callable": callable_fn,
+            "spec": spec,
+            "type": "builtin",
+        }
+    except Exception as e:
+        _skills_log.warning(f"Failed to register view_skill: {e}")
 
 # --- inlined from src/owui_ext/shared/valves.py (owui_ext.shared.valves) ---
 from typing import Any, Type
@@ -1734,53 +2025,35 @@ async def load_sub_agent_tools(
     extra_params: dict,
     self_tool_id: Optional[str],
 ) -> tuple[dict, dict]:
-    """Load regular, MCP, terminal, direct, and builtin tools for sub-agent."""
-    from open_webui.utils.tools import get_builtin_tools, get_tools
+    """Load regular, MCP, terminal, direct, and builtin tools for sub-agent.
 
-    try:
-        from open_webui.utils.tools import get_terminal_tools
-    except Exception:
-        get_terminal_tools = None
-
+    Thin wrapper around ``shared.tool_loader.build_tools_dict`` that
+    parses sub_agent's ``AVAILABLE_TOOL_IDS`` / ``EXCLUDED_TOOL_IDS``
+    valves, adds ``self_tool_id`` to the exclusion set to prevent the
+    sub-agent from recursing into its own plugin, and pre-resolves the
+    terminal binding / direct tool servers so the canonical helper
+    doesn't re-read ``request.body()``.
+    """
     metadata = metadata or {}
-    model = model or {}
     extra_params = extra_params or {}
-    event_emitter = extra_params.get("__event_emitter__")
-    extra_metadata = extra_params.get("__metadata__")
+    debug = bool(getattr(valves, "DEBUG", False))
+
     terminal_id = await resolve_terminal_id_from_request_and_metadata(
         request=request,
         metadata=metadata,
-        debug=bool(getattr(valves, "DEBUG", False)),
+        debug=debug,
     )
     direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
         metadata=metadata,
         request=request,
-        debug=bool(getattr(valves, "DEBUG", False)),
+        debug=debug,
     )
 
-    if terminal_id:
-        metadata["terminal_id"] = terminal_id
-        if isinstance(extra_metadata, dict):
-            extra_metadata["terminal_id"] = terminal_id
-        else:
-            extra_params["__metadata__"] = metadata
-            extra_metadata = metadata
-
-    if direct_tool_servers:
-        metadata["tool_servers"] = direct_tool_servers
-        if isinstance(extra_metadata, dict):
-            extra_metadata["tool_servers"] = direct_tool_servers
-        else:
-            extra_params["__metadata__"] = metadata
-            extra_metadata = metadata
-
-    # Determine tool IDs
-    # Use metadata's tool_ids (main conversation's available tools)
-    available_tool_ids = []
+    available_tool_ids: list[str] = []
     if metadata.get("tool_ids"):
         available_tool_ids = list(metadata.get("tool_ids", []))
 
-    if valves.DEBUG:
+    if debug:
         log.info(f"[SubAgent] AVAILABLE_TOOL_IDS valve: '{valves.AVAILABLE_TOOL_IDS}'")
         log.info(f"[SubAgent] Available tool_ids from metadata: {available_tool_ids}")
         log.info(f"[SubAgent] self_tool_id: {self_tool_id}")
@@ -1789,8 +2062,7 @@ async def load_sub_agent_tools(
             f"[SubAgent] resolved direct tool servers: {len(direct_tool_servers)}"
         )
 
-    # Apply exclusions first
-    excluded = set()
+    excluded: set = set()
     if valves.EXCLUDED_TOOL_IDS.strip():
         excluded = {
             tid.strip() for tid in valves.EXCLUDED_TOOL_IDS.split(",") if tid.strip()
@@ -1805,246 +2077,36 @@ async def load_sub_agent_tools(
     else:
         excluded.add(self_tool_id)
 
-    if valves.DEBUG:
+    if debug:
         log.info(f"[SubAgent] EXCLUDED_TOOL_IDS valve: '{valves.EXCLUDED_TOOL_IDS}'")
         if excluded:
             log.info(f"[SubAgent] Excluded tool IDs (including self): {sorted(excluded)}")
 
-    # Determine which tools to use
     if valves.AVAILABLE_TOOL_IDS.strip():
-        # Use Valves setting (admin-configured list)
         tool_id_list = [
             tid.strip() for tid in valves.AVAILABLE_TOOL_IDS.split(",") if tid.strip()
         ]
-        if valves.DEBUG:
+        if debug:
             log.info(f"[SubAgent] Using AVAILABLE_TOOL_IDS valve: {tool_id_list}")
     else:
-        # Use all available tools from metadata
         tool_id_list = available_tool_ids
-        if valves.DEBUG:
+        if debug:
             log.info(
                 f"[SubAgent] Using all available tool_ids from metadata: {tool_id_list}"
             )
 
-    tool_id_list = [tid for tid in tool_id_list if tid not in excluded]
-
-    # Note: Builtin tools are NOT included in tool_ids.
-    # They are loaded separately via get_builtin_tools() and controlled by Valves.
-    # Regular tools only (filter out any builtin: prefixed IDs just in case)
-    regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
-    mcp_tool_ids = [tid for tid in regular_tool_ids if tid.startswith("server:mcp:")]
-    non_mcp_tool_ids = [
-        tid for tid in regular_tool_ids if not tid.startswith("server:mcp:")
-    ]
-
-    if valves.DEBUG:
-        log.info(f"[SubAgent] Regular tool IDs: {regular_tool_ids}")
-        if mcp_tool_ids:
-            log.info(f"[SubAgent] MCP tool IDs: {mcp_tool_ids}")
-        if non_mcp_tool_ids != regular_tool_ids:
-            log.info(f"[SubAgent] Non-MCP regular tool IDs: {non_mcp_tool_ids}")
-
-    # Load regular tools
-    tools_dict = {}
-    mcp_clients: dict[str, Any] = {}
-    if non_mcp_tool_ids:
-        try:
-            tools_dict = await get_tools(
-                request=request,
-                tool_ids=non_mcp_tool_ids,
-                user=user,
-                extra_params=extra_params,
-            )
-
-            if valves.DEBUG:
-                log.info(f"[SubAgent] Loaded {len(tools_dict)} regular tools")
-
-        except Exception as e:
-            log.exception(f"Error loading tools: {e}")
-            await emit_notification(
-                event_emitter,
-                level="warning",
-                content=f"Could not load tools: {e}",
-            )
-
-    if mcp_tool_ids:
-        try:
-            mcp_tools, mcp_clients = await resolve_mcp_tools(
-                request=request,
-                user=user,
-                mcp_tool_ids=mcp_tool_ids,
-                extra_params=extra_params,
-                metadata=metadata,
-                debug=bool(getattr(valves, "DEBUG", False)),
-            )
-
-            if mcp_tools:
-                duplicate_names = set(tools_dict.keys()) & set(mcp_tools.keys())
-                tools_dict.update(mcp_tools)
-                if valves.DEBUG:
-                    if duplicate_names:
-                        log.warning(
-                            "[SubAgent] MCP tools overrode existing tool names: "
-                            f"{sorted(duplicate_names)}"
-                        )
-                    log.info(f"[SubAgent] Loaded {len(mcp_tools)} MCP tools")
-        except Exception as e:
-            log.exception(f"Error loading MCP tools: {e}")
-            await emit_notification(
-                event_emitter,
-                level="warning",
-                content=f"Could not load MCP tools: {e}",
-            )
-
-    # Resolve terminal tools (if available in chat metadata)
-    if terminal_id and bool(getattr(valves, "ENABLE_TERMINAL_TOOLS", True)):
-        if get_terminal_tools is None:
-            if valves.DEBUG:
-                log.info("[SubAgent] get_terminal_tools is unavailable in this Open WebUI version")
-        else:
-            try:
-                terminal_tools_result = await get_terminal_tools(
-                    request=request,
-                    terminal_id=terminal_id,
-                    user=user,
-                    extra_params=extra_params,
-                )
-                terminal_tools = normalize_terminal_tools_result(
-                    terminal_tools_result=terminal_tools_result,
-                    extra_params=extra_params,
-                )
-                if terminal_tools:
-                    duplicate_names = set(tools_dict.keys()) & set(terminal_tools.keys())
-                    tools_dict = {**tools_dict, **terminal_tools}
-                    if valves.DEBUG:
-                        if duplicate_names:
-                            log.warning(
-                                "[SubAgent] Terminal tools overrode existing tool names: "
-                                f"{sorted(duplicate_names)}"
-                            )
-                        log.info(
-                            f"[SubAgent] Loaded {len(terminal_tools)} terminal tools for terminal_id={terminal_id}"
-                        )
-            except Exception as e:
-                log.exception(f"Error loading terminal tools: {e}")
-                await emit_notification(
-                    event_emitter,
-                    level="warning",
-                    content=f"Could not load terminal tools: {e}",
-                )
-    elif terminal_id and valves.DEBUG:
-        log.info("[SubAgent] Terminal tools disabled by ENABLE_TERMINAL_TOOLS valve")
-
-    # Resolve direct tool servers
-    if direct_tool_servers:
-        try:
-            direct_tools = build_direct_tools_dict(
-                tool_servers=direct_tool_servers,
-                debug=bool(getattr(valves, "DEBUG", False)),
-            )
-            if direct_tools:
-                duplicate_names = set(tools_dict.keys()) & set(direct_tools.keys())
-                tools_dict = {**tools_dict, **direct_tools}
-                direct_tool_server_prompts = extract_direct_tool_server_prompts(direct_tools)
-                if direct_tool_server_prompts:
-                    extra_params["__direct_tool_server_system_prompts__"] = direct_tool_server_prompts
-                else:
-                    extra_params.pop("__direct_tool_server_system_prompts__", None)
-                if valves.DEBUG:
-                    if duplicate_names:
-                        log.warning(
-                            "[SubAgent] Direct tools overrode existing tool names: "
-                            f"{sorted(duplicate_names)}"
-                        )
-                    log.info(f"[SubAgent] Loaded {len(direct_tools)} direct tools")
-            else:
-                extra_params.pop("__direct_tool_server_system_prompts__", None)
-        except Exception as e:
-            log.exception(f"Error loading direct tools: {e}")
-            extra_params.pop("__direct_tool_server_system_prompts__", None)
-            await emit_notification(
-                event_emitter,
-                level="warning",
-                content=f"Could not load direct tools: {e}",
-            )
-    else:
-        extra_params.pop("__direct_tool_server_system_prompts__", None)
-
-    # Load builtin tools
-    try:
-        # Get features from metadata (for memory, etc.)
-        features = metadata.get("features", {})
-
-        # NOTE: view_skill is NOT registered here; it's registered manually
-        # via register_view_skill() when the parent conversation's
-        # <available_skills> manifest is detected (model-attached skills).
-        builtin_extra_params = {
-            "__user__": extra_params.get("__user__"),
-            "__event_emitter__": event_emitter,
-            "__event_call__": extra_params.get("__event_call__"),
-            "__metadata__": extra_params.get("__metadata__"),
-            "__chat_id__": extra_params.get("__chat_id__"),
-            "__message_id__": extra_params.get("__message_id__"),
-            "__oauth_token__": extra_params.get("__oauth_token__"),
-        }
-
-        all_builtin_tools = await maybe_await(get_builtin_tools(
-            request=request,
-            extra_params=builtin_extra_params,
-            features=features,
-            model=model,
-        ))
-
-        # Build set of disabled tools based on Valves
-        disabled_builtin_tools = set()
-        for valve_field, category in VALVE_TO_CATEGORY.items():
-            if not getattr(valves, valve_field):
-                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES[category])
-
-        knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
-        notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
-        keep_view_note_for_knowledge = (
-            (not notes_tools_enabled)
-            and knowledge_tools_enabled
-            and model_knowledge_tools_enabled(model)
-            and model_has_note_knowledge(model)
-        )
-
-        # Filter builtin tools based on Valves settings
-        # NOTE: Regular tools take priority over builtin tools with the same name.
-        # This allows users to override builtin behavior with custom tools.
-        builtin_count = 0
-        for name, tool_dict in all_builtin_tools.items():
-            if name in disabled_builtin_tools and not (
-                name == "view_note" and keep_view_note_for_knowledge
-            ):
-                continue
-
-            if name not in tools_dict:
-                tools_dict[name] = tool_dict
-                builtin_count += 1
-            elif valves.DEBUG:
-                log.warning(
-                    f"[SubAgent] Builtin tool '{name}' skipped: "
-                    "regular tool with same name takes priority"
-                )
-
-        if valves.DEBUG:
-            log.info(
-                f"[SubAgent] Loaded {builtin_count} builtin tools "
-                f"(disabled categories: {[c for v, c in VALVE_TO_CATEGORY.items() if not getattr(valves, v)]}). "
-                f"Total tools: {len(tools_dict)}"
-            )
-
-    except Exception as e:
-        log.exception(f"Error loading builtin tools: {e}")
-        await emit_notification(
-            event_emitter,
-            level="warning",
-            content=f"Could not load builtin tools: {e}",
-        )
-
-    return tools_dict, mcp_clients
+    return await build_tools_dict(
+        request=request,
+        model=model,
+        metadata=metadata,
+        user=user,
+        valves=valves,
+        extra_params=extra_params,
+        tool_id_list=tool_id_list,
+        excluded_tool_ids=excluded,
+        resolved_terminal_id=terminal_id,
+        resolved_direct_tool_servers=direct_tool_servers,
+    )
 
 
 # ============================================================================

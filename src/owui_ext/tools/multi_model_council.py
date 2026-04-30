@@ -15,14 +15,10 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
-from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
 from owui_ext.shared.event_emitter import EventEmitter
 from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
+from owui_ext.shared.mcp_tools import cleanup_mcp_clients
 from owui_ext.shared.models import extract_model_ids, get_available_models
-from owui_ext.shared.model_features import (
-    model_has_note_knowledge,
-    model_knowledge_tools_enabled,
-)
 from owui_ext.shared.parsing import normalize_text, safe_json_loads
 from owui_ext.shared.prompt_utils import (
     _append_tool_server_prompts,
@@ -32,13 +28,10 @@ from owui_ext.shared.prompt_utils import (
 from owui_ext.shared.tool_execution import (
     execute_direct_tool_call,
     execute_tool_call,
-    normalize_terminal_tools_result,
     process_tool_result,
 )
+from owui_ext.shared.tool_loader import build_tools_dict
 from owui_ext.shared.tool_servers import (
-    build_direct_tools_dict,
-    extract_direct_tool_server_prompts,
-    normalize_direct_tool_servers,
     resolve_direct_tool_servers_from_request_and_metadata,
     resolve_terminal_id_from_request_and_metadata,
 )
@@ -426,162 +419,6 @@ async def run_agent_loop(
         log.exception(f"Error getting final council agent response: {exc}")
 
     return "Council agent reached maximum iterations without providing a final response."
-
-
-async def build_tools_dict(
-    request: Request,
-    model: dict,
-    metadata: Optional[dict],
-    user: Any,
-    valves: Any,
-    extra_params: dict,
-    tool_id_list: List[str],
-    excluded_tool_ids: Optional[set],
-    resolved_terminal_id: Optional[str] = None,
-    resolved_direct_tool_servers: Optional[List[dict]] = None,
-) -> dict:
-    from open_webui.utils.tools import get_builtin_tools, get_tools
-
-    try:
-        from open_webui.utils.tools import get_terminal_tools
-    except Exception:
-        get_terminal_tools = None
-
-    metadata = metadata or {}
-    tools_dict: Dict[str, dict] = {}
-    extra_metadata = extra_params.get("__metadata__")
-    if resolved_terminal_id is None:
-        terminal_id = await resolve_terminal_id_from_request_and_metadata(
-            request=request,
-            metadata=metadata,
-            debug=bool(getattr(valves, "DEBUG", False)),
-        )
-    else:
-        terminal_id = normalize_text(resolved_terminal_id)
-    if terminal_id:
-        metadata["terminal_id"] = terminal_id
-        extra_metadata = extra_params.get("__metadata__")
-        if isinstance(extra_metadata, dict):
-            extra_metadata["terminal_id"] = terminal_id
-        else:
-            extra_params["__metadata__"] = metadata
-            extra_metadata = metadata
-
-    if resolved_direct_tool_servers is None:
-        direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
-            request=request,
-            metadata=metadata,
-            debug=bool(getattr(valves, "DEBUG", False)),
-        )
-    else:
-        direct_tool_servers = normalize_direct_tool_servers(resolved_direct_tool_servers)
-
-    if direct_tool_servers:
-        metadata["tool_servers"] = direct_tool_servers
-        if isinstance(extra_metadata, dict):
-            extra_metadata["tool_servers"] = direct_tool_servers
-        else:
-            extra_params["__metadata__"] = metadata
-            extra_metadata = metadata
-
-    # Load regular tools available to the main agent
-    regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
-    if excluded_tool_ids:
-        regular_tool_ids = [tid for tid in regular_tool_ids if tid not in excluded_tool_ids]
-
-    if regular_tool_ids:
-        try:
-            tools_dict = await get_tools(
-                request=request,
-                tool_ids=regular_tool_ids,
-                user=user,
-                extra_params=extra_params,
-            )
-        except Exception as exc:
-            log.exception(f"Error loading regular tools: {exc}")
-
-    # Load terminal tools (if available in chat metadata)
-    if terminal_id and bool(getattr(valves, "ENABLE_TERMINAL_TOOLS", True)):
-        if get_terminal_tools is None:
-            if getattr(valves, "DEBUG", False):
-                log.info("[MultiModelCouncil] get_terminal_tools is unavailable in this Open WebUI version")
-        else:
-            try:
-                terminal_tools_result = await get_terminal_tools(
-                    request=request,
-                    terminal_id=terminal_id,
-                    user=user,
-                    extra_params=extra_params,
-                )
-                terminal_tools = normalize_terminal_tools_result(
-                    terminal_tools_result=terminal_tools_result,
-                    extra_params=extra_params,
-                )
-                if terminal_tools:
-                    tools_dict = {**tools_dict, **terminal_tools}
-            except Exception as exc:
-                log.exception(f"Error loading terminal tools: {exc}")
-
-    # Load direct tools from metadata.tool_servers
-    if direct_tool_servers:
-        try:
-            direct_tools = build_direct_tools_dict(tool_servers=direct_tool_servers)
-            if direct_tools:
-                tools_dict = {**tools_dict, **direct_tools}
-                direct_tool_server_prompts = extract_direct_tool_server_prompts(direct_tools)
-                if direct_tool_server_prompts:
-                    extra_params["__direct_tool_server_system_prompts__"] = direct_tool_server_prompts
-                else:
-                    extra_params.pop("__direct_tool_server_system_prompts__", None)
-            else:
-                extra_params.pop("__direct_tool_server_system_prompts__", None)
-        except Exception as exc:
-            log.exception(f"Error loading direct tools: {exc}")
-            extra_params.pop("__direct_tool_server_system_prompts__", None)
-    else:
-        extra_params.pop("__direct_tool_server_system_prompts__", None)
-
-    # Load builtin tools
-    features = metadata.get("features", {})
-    all_builtin_tools = await maybe_await(get_builtin_tools(
-        request=request,
-        extra_params={
-            "__user__": extra_params.get("__user__"),
-            "__event_emitter__": extra_params.get("__event_emitter__"),
-            "__event_call__": extra_params.get("__event_call__"),
-            "__metadata__": extra_params.get("__metadata__"),
-            "__chat_id__": extra_params.get("__chat_id__"),
-            "__message_id__": extra_params.get("__message_id__"),
-            "__oauth_token__": extra_params.get("__oauth_token__"),
-        },
-        features=features,
-        model=model,
-    ))
-
-    # Build set of disabled tools based on Valves categories
-    disabled_builtin_tools = set()
-    for valve_field, category in VALVE_TO_CATEGORY.items():
-        if not getattr(valves, valve_field, True):
-            disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
-
-    knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
-    notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
-    keep_view_note_for_knowledge = (
-        (not notes_tools_enabled)
-        and knowledge_tools_enabled
-        and model_knowledge_tools_enabled(model)
-        and model_has_note_knowledge(model)
-    )
-
-    for name, tool_dict in all_builtin_tools.items():
-        if name in disabled_builtin_tools and not (
-            name == "view_note" and keep_view_note_for_knowledge
-        ):
-            continue
-        if name not in tools_dict:
-            tools_dict[name] = tool_dict
-
-    return tools_dict
 
 
 # ============================================================================
@@ -979,7 +816,11 @@ CRITICAL RULES:
             done=False,
         )
 
-        tools_cache: Dict[str, dict] = {}
+        # Cache tuple of (tools_dict, mcp_clients) per member model so the
+        # builtin tool catalogue is computed once per distinct model. MCP
+        # clients live alongside their tools_dict so the finally block below
+        # can close every connection regardless of which member raised.
+        tools_cache: Dict[str, Tuple[dict, dict]] = {}
 
         async def run_single_member(member_model_id: str) -> Tuple[str, str, dict]:
             """Run one council member and return (model_id, raw_output, parsed_result)."""
@@ -992,9 +833,9 @@ CRITICAL RULES:
                 "__model__": member_model,
             }
 
-            tools_dict = tools_cache.get(member_model_id)
-            if tools_dict is None:
-                tools_dict = await build_tools_dict(
+            cached = tools_cache.get(member_model_id)
+            if cached is None:
+                cached = await build_tools_dict(
                     request=request,
                     model=member_model,
                     metadata=metadata,
@@ -1006,7 +847,8 @@ CRITICAL RULES:
                     resolved_terminal_id=resolved_terminal_id,
                     resolved_direct_tool_servers=resolved_direct_tool_servers,
                 )
-                tools_cache[member_model_id] = tools_dict
+                tools_cache[member_model_id] = cached
+            tools_dict, _ = cached
 
             content = await run_agent_loop(
                 request=__request__,
@@ -1030,7 +872,12 @@ CRITICAL RULES:
         import asyncio
 
         member_tasks = [run_single_member(mid) for mid in model_ids]
-        results = await asyncio.gather(*member_tasks, return_exceptions=True)
+        try:
+            results = await asyncio.gather(*member_tasks, return_exceptions=True)
+        finally:
+            for _tools, mcp_clients in tools_cache.values():
+                if mcp_clients:
+                    await cleanup_mcp_clients(mcp_clients)
 
         members: Dict[str, dict] = {}
         raw_outputs: Dict[str, str] = {}
