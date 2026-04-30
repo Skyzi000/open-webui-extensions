@@ -88,6 +88,12 @@ async def apply_inlet_filters_if_enabled(
             process_filter_functions,
         )
 
+        # Isolate __user__ so filter UserValves injection doesn't leak out
+        # and pollute subsequent tool calls under a different tool id.
+        local_extra_params = dict(extra_params or {})
+        if isinstance(local_extra_params.get("__user__"), dict):
+            local_extra_params["__user__"] = dict(local_extra_params["__user__"])
+
         filter_ids = await _inlet_filters_maybe_await(
             get_sorted_filter_ids(
                 request,
@@ -105,7 +111,7 @@ async def apply_inlet_filters_if_enabled(
             filter_functions=filter_functions,
             filter_type="inlet",
             form_data=form_data,
-            extra_params=extra_params,
+            extra_params=local_extra_params,
         )
     except Exception as exc:
         _inlet_filters_log.warning(f"Error applying inlet filters: {exc}")

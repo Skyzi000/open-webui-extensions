@@ -109,6 +109,64 @@ VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_CALENDAR_TOOLS": "calendar",
 }
 
+# --- inlined from src/owui_ext/shared/inlet_filters.py (owui_ext.shared.inlet_filters) ---
+import logging
+from typing import Any
+from fastapi import Request
+_inlet_filters_log = logging.getLogger("owui_ext.shared.inlet_filters")
+
+
+async def _inlet_filters_maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+async def apply_inlet_filters_if_enabled(
+    apply_inlet_filters: bool,
+    request: Request,
+    model: dict,
+    form_data: dict,
+    extra_params: dict,
+) -> dict:
+    if not apply_inlet_filters:
+        return form_data
+    try:
+        from open_webui.models.functions import Functions
+        from open_webui.utils.filter import (
+            get_sorted_filter_ids,
+            process_filter_functions,
+        )
+
+        # Isolate __user__ so filter UserValves injection doesn't leak out
+        # and pollute subsequent tool calls under a different tool id.
+        local_extra_params = dict(extra_params or {})
+        if isinstance(local_extra_params.get("__user__"), dict):
+            local_extra_params["__user__"] = dict(local_extra_params["__user__"])
+
+        filter_ids = await _inlet_filters_maybe_await(
+            get_sorted_filter_ids(
+                request,
+                model,
+                form_data.get("metadata", {}).get("filter_ids", []),
+            )
+        )
+        filter_functions = []
+        for filter_id in filter_ids:
+            function = await _inlet_filters_maybe_await(Functions.get_function_by_id(filter_id))
+            if function:
+                filter_functions.append(function)
+        form_data, _ = await process_filter_functions(
+            request=request,
+            filter_functions=filter_functions,
+            filter_type="inlet",
+            form_data=form_data,
+            extra_params=local_extra_params,
+        )
+    except Exception as exc:
+        _inlet_filters_log.warning(f"Error applying inlet filters: {exc}")
+    return form_data
+
 # --- inlined from src/owui_ext/shared/model_features.py (owui_ext.shared.model_features) ---
 from typing import Optional
 def model_has_note_knowledge(model: Optional[dict]) -> bool:
@@ -1088,58 +1146,6 @@ async def cleanup_mcp_clients(mcp_clients: dict) -> None:
             await client.disconnect()
         except Exception as e:
             log.debug(f"[SubAgent] Error cleaning up MCP client: {e}")
-
-
-async def apply_inlet_filters_if_enabled(
-    apply_inlet_filters: bool,
-    request: Request,
-    model: dict,
-    form_data: dict,
-    extra_params: dict,
-) -> dict:
-    """Apply inlet filters to form_data if enabled.
-
-    Args:
-        apply_inlet_filters: Whether to apply inlet filters
-        request: FastAPI request object
-        model: Model info dict
-        form_data: Form data dict to process
-        extra_params: Extra parameters for filter processing
-
-    Returns:
-        Processed form_data (may be modified by filters)
-    """
-    if not apply_inlet_filters:
-        return form_data
-
-    try:
-        from open_webui.models.functions import Functions
-        from open_webui.utils.filter import get_sorted_filter_ids, process_filter_functions
-
-        # Isolate __user__ so filter UserValves injection doesn't leak out.
-        local_extra_params = dict(extra_params or {})
-        if isinstance(local_extra_params.get("__user__"), dict):
-            local_extra_params["__user__"] = dict(local_extra_params["__user__"])
-
-        filter_ids = await maybe_await(get_sorted_filter_ids(
-            request, model, form_data.get("metadata", {}).get("filter_ids", [])
-        ))
-        filter_functions = []
-        for filter_id in filter_ids:
-            function = await maybe_await(Functions.get_function_by_id(filter_id))
-            if function:
-                filter_functions.append(function)
-        form_data, _ = await process_filter_functions(
-            request=request,
-            filter_functions=filter_functions,
-            filter_type="inlet",
-            form_data=form_data,
-            extra_params=local_extra_params,
-        )
-    except Exception as e:
-        log.warning(f"Error applying inlet filters: {e}")
-
-    return form_data
 
 
 async def run_sub_agent_loop(
