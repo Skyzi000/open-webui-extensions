@@ -793,18 +793,21 @@ async def resolve_mcp_tools(
                 if oauth_token:
                     headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
             elif auth_type in ("oauth_2.1", "oauth_2.1_static"):
-                # Match Open WebUI core: split colon-bearing server IDs and
-                # look up OAuth tokens under the trailing segment so a
-                # server_id like ``host:port`` resolves to the same key the
-                # UI stored. ``mcp_clients`` is then cached under the
-                # normalized id, again matching core's behaviour.
+                # Open WebUI core (utils/middleware.py) looks up OAuth
+                # tokens under the colon-trailing segment of ``server_id``
+                # so that ``host:port`` style ids resolve to the key the
+                # UI stored. Mirror that for the lookup only -- keep the
+                # full ``server_id`` for the ``mcp_clients`` cache key,
+                # otherwise two servers sharing a trailing segment (e.g.
+                # ``alpha:443`` and ``beta:443``) would collide on
+                # ``mcp_clients[443]`` and the earlier client would be
+                # overwritten without being added to the cleanup set.
                 try:
                     splits = server_id.split(":")
-                    if len(splits) > 1:
-                        server_id = splits[-1]
+                    oauth_lookup_id = splits[-1] if len(splits) > 1 else server_id
 
                     oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
-                        user.id, f"mcp:{server_id}"
+                        user.id, f"mcp:{oauth_lookup_id}"
                     )
 
                     if oauth_token:

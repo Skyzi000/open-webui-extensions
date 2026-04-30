@@ -330,7 +330,9 @@ async def test_sub_agent_resolve_mcp_tools_supports_oauth_2_1_static(monkeypatch
         debug=False,
     )
 
-    assert oauth_calls == [("u1", "mcp:suite:ctx7")]
+    # OAuth lookup uses the trailing colon segment to match Open WebUI core,
+    # while the mcp_clients cache key below stays on the full id.
+    assert oauth_calls == [("u1", "mcp:ctx7")]
     assert connected_headers == [
         {
             "url": "https://mcp.example.com",
