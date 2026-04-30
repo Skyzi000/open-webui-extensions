@@ -1862,9 +1862,39 @@ class Tools:
             default=True,
             description="Apply inlet filters (e.g., user_info_injector) to MAGI agent requests.",
         )
+
+        # Builtin tool category toggles
+        ENABLE_TIME_TOOLS: bool = Field(
+            default=True,
+            description="Enable time utilities (get_current_timestamp, calculate_timestamp).",
+        )
         ENABLE_WEB_TOOLS: bool = Field(
             default=True,
             description="Enable web search tools (search_web, fetch_url) for MAGI agents.",
+        )
+        ENABLE_IMAGE_TOOLS: bool = Field(
+            default=True,
+            description="Enable image generation tools (generate_image, edit_image).",
+        )
+        ENABLE_KNOWLEDGE_TOOLS: bool = Field(
+            default=True,
+            description="Enable knowledge base tools (list/search/query knowledge bases and files).",
+        )
+        ENABLE_CHAT_TOOLS: bool = Field(
+            default=True,
+            description="Enable chat history tools (search_chats, view_chat).",
+        )
+        ENABLE_MEMORY_TOOLS: bool = Field(
+            default=True,
+            description="Enable memory tools (search_memories, add_memory, replace_memory_content).",
+        )
+        ENABLE_NOTES_TOOLS: bool = Field(
+            default=True,
+            description="Enable notes tools (search_notes, view_note, write_note, replace_note_content).",
+        )
+        ENABLE_CHANNELS_TOOLS: bool = Field(
+            default=True,
+            description="Enable channels tools (search_channels, search_channel_messages, etc.).",
         )
         ENABLE_TERMINAL_TOOLS: bool = Field(
             default=True,
@@ -1872,6 +1902,22 @@ class Tools:
                 "Enable Open Terminal tools when terminal_id is available in chat metadata "
                 "(e.g., run_command, list_files, read_file, write_file, display_file)."
             ),
+        )
+        ENABLE_CODE_INTERPRETER_TOOLS: bool = Field(
+            default=True,
+            description="Enable code interpreter tools (execute_code).",
+        )
+        ENABLE_TASK_TOOLS: bool = Field(
+            default=True,
+            description="Enable task management tools (create_tasks, update_task).",
+        )
+        ENABLE_AUTOMATION_TOOLS: bool = Field(
+            default=True,
+            description="Enable automation tools (create/update/list/toggle/delete automations).",
+        )
+        ENABLE_CALENDAR_TOOLS: bool = Field(
+            default=True,
+            description="Enable calendar tools (search/create/update/delete calendar events).",
         )
         DEBUG: bool = Field(
             default=False,
