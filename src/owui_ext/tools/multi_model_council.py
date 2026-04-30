@@ -877,12 +877,15 @@ CRITICAL RULES:
                     resolved_terminal_id=resolved_terminal_id,
                     resolved_direct_tool_servers=resolved_direct_tool_servers,
                 )
+                # Cache before any further awaits so the outer finally's
+                # cleanup_mcp_clients always sees the live MCP clients,
+                # even if register_view_skill below raises or is cancelled.
+                tools_cache[member_model_id] = cached
                 cached_tools_dict, _ = cached
                 if skills_enabled and skill_manifest:
                     await register_view_skill(
                         cached_tools_dict, request, member_extra_params
                     )
-                tools_cache[member_model_id] = cached
             tools_dict, _ = cached
 
             content = await run_agent_loop(
