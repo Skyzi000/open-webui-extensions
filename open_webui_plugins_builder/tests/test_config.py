@@ -246,6 +246,45 @@ def test_rejects_parent_traversal_in_output(tmp_path: Path) -> None:
         parse_config(raw, repo_root=tmp_path)
 
 
+def test_rejects_whitespace_only_local_import_root(tmp_path: Path) -> None:
+    raw = {
+        "meta": {"schema_version": 1},
+        "settings": {"local_import_roots": ["   "]},
+        "targets": [
+            {"name": "demo", "source": "src/a.py", "output": "tools/demo.py"}
+        ],
+    }
+    with pytest.raises(BuildError, match="non-empty shared root"):
+        parse_config(raw, repo_root=tmp_path)
+
+
+def test_rejects_whitespace_only_source_root(tmp_path: Path) -> None:
+    raw = {
+        "meta": {"schema_version": 1},
+        "settings": {
+            "local_import_roots": ["owui_ext.shared"],
+            "source_root": "   ",
+        },
+        "targets": [
+            {"name": "demo", "source": "src/a.py", "output": "tools/demo.py"}
+        ],
+    }
+    with pytest.raises(BuildError, match="source_root must be a non-empty"):
+        parse_config(raw, repo_root=tmp_path)
+
+
+def test_rejects_whitespace_only_target_field(tmp_path: Path) -> None:
+    raw = {
+        "meta": {"schema_version": 1},
+        "settings": {"local_import_roots": ["owui_ext.shared"]},
+        "targets": [
+            {"name": "   ", "source": "src/a.py", "output": "tools/demo.py"}
+        ],
+    }
+    with pytest.raises(BuildError, match="non-empty 'name'"):
+        parse_config(raw, repo_root=tmp_path)
+
+
 def test_rejects_symlink_escape_via_resolve(tmp_path: Path) -> None:
     """A path that resolves outside the repo must be refused even without ``..``.
 

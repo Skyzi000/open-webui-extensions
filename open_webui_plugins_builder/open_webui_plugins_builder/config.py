@@ -90,20 +90,20 @@ def parse_config(raw: dict, *, repo_root: Path) -> ReleaseConfig:
         raise BuildError(
             "settings.local_import_roots must be a list of strings in release.toml."
         )
-    if not raw_roots:
+    if not raw_roots or not all(r.strip() for r in raw_roots):
         raise BuildError(
-            "settings.local_import_roots must declare at least one shared root."
+            "settings.local_import_roots must declare at least one non-empty shared root."
         )
-    local_import_roots = tuple(raw_roots)
+    local_import_roots = tuple(r.strip() for r in raw_roots)
 
     raw_source_root = settings.get("source_root", DEFAULT_SOURCE_ROOT)
-    if not isinstance(raw_source_root, str) or not raw_source_root:
+    if not isinstance(raw_source_root, str) or not raw_source_root.strip():
         raise BuildError(
             "settings.source_root must be a non-empty string in release.toml."
         )
     # Only strip trailing slashes -- leading slashes signal an absolute path
     # that the validator must reject rather than silently coerce away.
-    source_root = raw_source_root.rstrip("/")
+    source_root = raw_source_root.strip().rstrip("/")
     if not source_root:
         raise BuildError(
             "settings.source_root must be a non-empty string in release.toml."
@@ -125,16 +125,19 @@ def parse_config(raw: dict, *, repo_root: Path) -> ReleaseConfig:
         name = entry.get("name")
         source = entry.get("source")
         output = entry.get("output")
-        if not isinstance(name, str) or not name:
+        if not isinstance(name, str) or not name.strip():
             raise BuildError("Each [[targets]] entry must have a non-empty 'name'.")
-        if not isinstance(source, str) or not source:
+        name = name.strip()
+        if not isinstance(source, str) or not source.strip():
             raise BuildError(
                 f"Target {name!r} must declare a non-empty 'source' path."
             )
-        if not isinstance(output, str) or not output:
+        source = source.strip()
+        if not isinstance(output, str) or not output.strip():
             raise BuildError(
                 f"Target {name!r} must declare a non-empty 'output' path."
             )
+        output = output.strip()
         if name in seen_names:
             raise BuildError(f"Duplicate target name in release.toml: {name!r}")
         seen_names.add(name)
