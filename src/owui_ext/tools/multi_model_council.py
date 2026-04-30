@@ -7,10 +7,8 @@ license: MIT
 required_open_webui_version: 0.7.0
 """
 
-import ast
 import json
 import logging
-import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 from fastapi import Request
@@ -31,9 +29,10 @@ from owui_ext.shared.prompt_utils import (
     truncate_text,
 )
 from owui_ext.shared.terminal_events import emit_terminal_tool_event
-from owui_ext.shared.tool_event_metadata import CITATION_TOOLS, TERMINAL_EVENT_TOOLS
+from owui_ext.shared.tool_event_metadata import CITATION_TOOLS
 from owui_ext.shared.tool_execution import (
     execute_direct_tool_call,
+    execute_tool_call,
     normalize_terminal_tools_result,
     process_tool_result,
 )
@@ -235,133 +234,6 @@ def normalize_member_result(parsed: Optional[dict], fallback_reason: str) -> dic
     }
 
 
-async def execute_tool_call(
-    tool_call: dict,
-    tools_dict: dict,
-    extra_params: dict,
-    event_emitter: Optional[Callable] = None,
-) -> dict:
-    tool_call_id = tool_call.get("id", "")
-    tool_function_name = tool_call.get("function", {}).get("name", "")
-    tool_args_str = tool_call.get("function", {}).get("arguments", "{}")
-
-    tool_function_params = {}
-    try:
-        tool_function_params = ast.literal_eval(tool_args_str)
-    except Exception:
-        try:
-            tool_function_params = json.loads(tool_args_str)
-        except Exception as exc:
-            return {
-                "tool_call_id": tool_call_id,
-                "content": f"Error parsing arguments: {exc}",
-            }
-    if not isinstance(tool_function_params, dict):
-        tool_function_params = {}
-
-    tool_result_files: list[dict] = []
-    tool_result_embeds: list[Any] = []
-    emit_terminal_event = False
-    if tool_function_name in tools_dict:
-        tool = tools_dict[tool_function_name]
-        spec = tool.get("spec", {})
-        direct_tool = bool(tool.get("direct", False))
-        try:
-            allowed_params = spec.get("parameters", {}).get("properties", {}).keys()
-            tool_function_params = {
-                k: v for k, v in tool_function_params.items() if k in allowed_params
-            }
-
-            if direct_tool:
-                tool_result = await execute_direct_tool_call(
-                    tool_function_name=tool_function_name,
-                    tool_function_params=tool_function_params,
-                    tool=tool,
-                    extra_params=extra_params,
-                )
-            else:
-                tool_function = tool["callable"]
-
-                from open_webui.utils.tools import get_updated_tool_function
-
-                tool_function = await maybe_await(get_updated_tool_function(
-                    function=tool_function,
-                    extra_params={
-                        "__messages__": extra_params.get("__messages__", []),
-                        "__files__": extra_params.get("__files__", []),
-                        "__user__": extra_params.get("__user__"),
-                        "__request__": extra_params.get("__request__"),
-                        "__model__": extra_params.get("__model__"),
-                        "__metadata__": extra_params.get("__metadata__"),
-                        "__event_emitter__": extra_params.get("__event_emitter__"),
-                        "__event_call__": extra_params.get("__event_call__"),
-                        "__chat_id__": extra_params.get("__chat_id__"),
-                        "__message_id__": extra_params.get("__message_id__"),
-                    },
-                ))
-
-                tool_result = await tool_function(**tool_function_params)
-            tool_result, tool_result_files, tool_result_embeds = await process_tool_result(
-                tool_function_name=tool_function_name,
-                tool_type=tool.get("type", ""),
-                tool_result=tool_result,
-                direct_tool=direct_tool,
-                request=extra_params.get("__request__"),
-                metadata=extra_params.get("__metadata__"),
-                user=extra_params.get("__user__"),
-            )
-            emit_terminal_event = True
-        except Exception as exc:
-            log.exception(f"Error executing tool {tool_function_name}: {exc}")
-            tool_result = f"Error: {exc}"
-    else:
-        tool_result = f"Tool '{tool_function_name}' not found"
-
-    if emit_terminal_event:
-        await emit_terminal_tool_event(
-            tool_function_name=tool_function_name,
-            tool_function_params=tool_function_params,
-            tool_result=tool_result,
-            event_emitter=event_emitter,
-        )
-        if event_emitter and tool_result_files:
-            await event_emitter({"type": "files", "data": {"files": tool_result_files}})
-        if event_emitter and tool_result_embeds:
-            await event_emitter({"type": "embeds", "data": {"embeds": tool_result_embeds}})
-
-    if tool_result is None:
-        tool_result = ""
-    elif not isinstance(tool_result, str):
-        try:
-            tool_result = json.dumps(tool_result, ensure_ascii=False, default=str)
-        except Exception:
-            tool_result = str(tool_result)
-
-    # Extract and emit citation sources for tools that generate them
-    if event_emitter and tool_result and tool_function_name in CITATION_TOOLS:
-        try:
-            from open_webui.utils.middleware import get_citation_source_from_tool_result
-
-            tool_id = tools_dict.get(tool_function_name, {}).get("tool_id", "")
-            citation_sources = get_citation_source_from_tool_result(
-                tool_name=tool_function_name,
-                tool_params=tool_function_params,
-                tool_result=tool_result,
-                tool_id=tool_id,
-            )
-            for source in citation_sources:
-                await event_emitter({"type": "source", "data": source})
-        except Exception as exc:
-            log.warning(
-                f"Error extracting citation sources from {tool_function_name}: {exc}"
-            )
-
-    return {
-        "tool_call_id": tool_call_id,
-        "content": tool_result,
-    }
-
-
 async def run_agent_loop(
     request: Request,
     user: Any,
@@ -539,6 +411,8 @@ async def run_agent_loop(
                         "__messages__": current_messages,
                     },
                     event_emitter=event_emitter,
+                    emit_terminal_event_fn=emit_terminal_tool_event,
+                    citation_tools=CITATION_TOOLS,
                 )
 
                 # Emit status with tool result preview
