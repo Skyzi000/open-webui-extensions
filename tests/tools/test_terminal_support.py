@@ -851,13 +851,12 @@ async def test_magi_build_tools_dict_includes_terminal(monkeypatch, dummy_reques
     monkeypatch.setattr(ow_tools, "get_terminal_tools", fake_get_terminal_tools)
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-magi"}
-    tools_dict = await magi_decision_support.build_tools_dict(
+    tools_dict, _ = await magi_decision_support.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params={"__metadata__": metadata},
         tool_id_list=[],
         excluded_tool_ids=None,
@@ -902,13 +901,12 @@ async def test_magi_build_tools_dict_resolves_terminal_from_request_body(
 
     metadata = {"tool_ids": [], "features": {}}
     extra_params = {"__metadata__": metadata}
-    tools_dict = await magi_decision_support.build_tools_dict(
+    tools_dict, _ = await magi_decision_support.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params=extra_params,
         tool_id_list=[],
         excluded_tool_ids=None,
@@ -943,13 +941,12 @@ async def test_magi_build_tools_dict_without_terminal_symbol_keeps_builtin(
     monkeypatch.delattr(ow_tools, "get_terminal_tools", raising=False)
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-magi-compat"}
-    tools_dict = await magi_decision_support.build_tools_dict(
+    tools_dict, _ = await magi_decision_support.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params={"__metadata__": metadata},
         tool_id_list=[],
         excluded_tool_ids=None,
@@ -1571,13 +1568,12 @@ async def test_magi_build_tools_dict_includes_direct_tools(dummy_request):
         ],
     }
     extra_params = {"__metadata__": metadata}
-    tools_dict = await magi_decision_support.build_tools_dict(
+    tools_dict, _ = await magi_decision_support.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params=extra_params,
         tool_id_list=[],
         excluded_tool_ids=None,
@@ -1611,8 +1607,7 @@ async def test_magi_build_tools_dict_collects_direct_tool_server_system_prompts(
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params=extra_params,
         tool_id_list=[],
         excluded_tool_ids=None,
@@ -1634,13 +1629,12 @@ async def test_magi_build_tools_dict_ignores_unloaded_direct_tool_prompts(dummy_
         ],
     }
     extra_params = {"__metadata__": metadata}
-    tools_dict = await magi_decision_support.build_tools_dict(
+    tools_dict, _ = await magi_decision_support.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params=extra_params,
         tool_id_list=[],
         excluded_tool_ids=None,

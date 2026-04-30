@@ -24,9 +24,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fastapi import Request
 from pydantic import BaseModel, Field
 
-from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.event_emitter import EventEmitter
 from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
+from owui_ext.shared.mcp_tools import cleanup_mcp_clients
 from owui_ext.shared.parsing import normalize_text, safe_json_loads
 from owui_ext.shared.prompt_utils import (
     _append_tool_server_prompts,
@@ -35,22 +35,12 @@ from owui_ext.shared.prompt_utils import (
 from owui_ext.shared.tool_execution import (
     execute_direct_tool_call,
     execute_tool_call,
-    normalize_terminal_tools_result,
     process_tool_result,
 )
-from owui_ext.shared.tool_servers import (
-    build_direct_tools_dict,
-    extract_direct_tool_server_prompts,
-    normalize_direct_tool_servers,
-    resolve_direct_tool_servers_from_request_and_metadata,
-    resolve_terminal_id_from_request_and_metadata,
-)
+from owui_ext.shared.tool_loader import build_tools_dict
 from owui_ext.shared.voting import compute_vote_tally, decide_majority
 
 log = logging.getLogger(__name__)
-
-
-WEB_TOOL_NAMES = {"search_web", "fetch_url"}
 
 
 # Agent-specific characteristics based on MAGI system design
@@ -471,136 +461,6 @@ async def run_agent_loop(
     return "MAGI agent reached maximum iterations without providing a final response."
 
 
-async def build_tools_dict(
-    request: Request,
-    model: dict,
-    metadata: Optional[dict],
-    user: Any,
-    enable_web_tools: bool,
-    enable_terminal_tools: bool,
-    extra_params: dict,
-    tool_id_list: List[str],
-    excluded_tool_ids: Optional[set],
-) -> dict:
-    from open_webui.utils.tools import get_builtin_tools, get_tools
-
-    try:
-        from open_webui.utils.tools import get_terminal_tools
-    except Exception:
-        get_terminal_tools = None
-
-    metadata = metadata or {}
-    tools_dict: Dict[str, dict] = {}
-    extra_metadata = extra_params.get("__metadata__")
-    terminal_id = await resolve_terminal_id_from_request_and_metadata(
-        request=request,
-        metadata=metadata,
-        debug=log.isEnabledFor(logging.DEBUG),
-    )
-    if terminal_id:
-        metadata["terminal_id"] = terminal_id
-        extra_metadata = extra_params.get("__metadata__")
-        if isinstance(extra_metadata, dict):
-            extra_metadata["terminal_id"] = terminal_id
-        else:
-            extra_params["__metadata__"] = metadata
-            extra_metadata = metadata
-
-    direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
-        request=request,
-        metadata=metadata,
-        debug=log.isEnabledFor(logging.DEBUG),
-    )
-    if direct_tool_servers:
-        metadata["tool_servers"] = direct_tool_servers
-        if isinstance(extra_metadata, dict):
-            extra_metadata["tool_servers"] = direct_tool_servers
-        else:
-            extra_params["__metadata__"] = metadata
-
-    # Load regular tools available to the main agent
-    regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
-    if excluded_tool_ids:
-        regular_tool_ids = [tid for tid in regular_tool_ids if tid not in excluded_tool_ids]
-
-    if regular_tool_ids:
-        try:
-            tools_dict = await get_tools(
-                request=request,
-                tool_ids=regular_tool_ids,
-                user=user,
-                extra_params=extra_params,
-            )
-        except Exception as exc:
-            log.exception(f"Error loading regular tools: {exc}")
-
-    # Load terminal tools (if available in chat metadata)
-    if terminal_id and enable_terminal_tools:
-        if get_terminal_tools is None:
-            if log.isEnabledFor(logging.DEBUG):
-                log.debug("get_terminal_tools is unavailable in this Open WebUI version")
-        else:
-            try:
-                terminal_tools_result = await get_terminal_tools(
-                    request=request,
-                    terminal_id=terminal_id,
-                    user=user,
-                    extra_params=extra_params,
-                )
-                terminal_tools = normalize_terminal_tools_result(
-                    terminal_tools_result=terminal_tools_result,
-                    extra_params=extra_params,
-                )
-                if terminal_tools:
-                    tools_dict = {**tools_dict, **terminal_tools}
-            except Exception as exc:
-                log.exception(f"Error loading terminal tools: {exc}")
-
-    # Load direct tools from metadata.tool_servers
-    if direct_tool_servers:
-        try:
-            direct_tools = build_direct_tools_dict(tool_servers=direct_tool_servers)
-            if direct_tools:
-                tools_dict = {**tools_dict, **direct_tools}
-                direct_tool_server_prompts = extract_direct_tool_server_prompts(direct_tools)
-                if direct_tool_server_prompts:
-                    extra_params["__direct_tool_server_system_prompts__"] = direct_tool_server_prompts
-                else:
-                    extra_params.pop("__direct_tool_server_system_prompts__", None)
-            else:
-                extra_params.pop("__direct_tool_server_system_prompts__", None)
-        except Exception as exc:
-            log.exception(f"Error loading direct tools: {exc}")
-            extra_params.pop("__direct_tool_server_system_prompts__", None)
-    else:
-        extra_params.pop("__direct_tool_server_system_prompts__", None)
-
-    # Load builtin tools
-    features = metadata.get("features", {})
-    all_builtin_tools = await maybe_await(get_builtin_tools(
-        request=request,
-        extra_params={
-            "__user__": extra_params.get("__user__"),
-            "__event_emitter__": extra_params.get("__event_emitter__"),
-            "__event_call__": extra_params.get("__event_call__"),
-            "__metadata__": extra_params.get("__metadata__"),
-            "__chat_id__": extra_params.get("__chat_id__"),
-            "__message_id__": extra_params.get("__message_id__"),
-            "__oauth_token__": extra_params.get("__oauth_token__"),
-        },
-        features=features,
-        model=model,
-    ))
-
-    for name, tool_dict in all_builtin_tools.items():
-        if not enable_web_tools and name in WEB_TOOL_NAMES:
-            continue
-        if name not in tools_dict:
-            tools_dict[name] = tool_dict
-
-    return tools_dict
-
-
 class Tools:
     """MAGI decision support tool."""
 
@@ -757,13 +617,12 @@ class Tools:
         if __id__:
             excluded_tool_ids.add(__id__)
 
-        tools_dict = await build_tools_dict(
+        tools_dict, mcp_clients = await build_tools_dict(
             request=__request__,
             model=__model__ or {},
             metadata=__metadata__ or {},
             user=user,
-            enable_web_tools=self.valves.ENABLE_WEB_TOOLS,
-            enable_terminal_tools=self.valves.ENABLE_TERMINAL_TOOLS,
+            valves=self.valves,
             extra_params=extra_params,
             tool_id_list=tool_id_list,
             excluded_tool_ids=excluded_tool_ids,
@@ -823,7 +682,11 @@ class Tools:
         import asyncio
 
         agent_tasks = [run_single_agent(role_name, perspective) for role_name, perspective in roles]
-        results = await asyncio.gather(*agent_tasks, return_exceptions=True)
+        try:
+            results = await asyncio.gather(*agent_tasks, return_exceptions=True)
+        finally:
+            if mcp_clients:
+                await cleanup_mcp_clients(mcp_clients)
 
         for result in results:
             if isinstance(result, Exception):
