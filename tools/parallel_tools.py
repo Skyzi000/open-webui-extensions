@@ -624,6 +624,8 @@ async def execute_single_tool(
                 extra_params={
                     "__messages__": extra_params.get("__messages__", []),
                     "__files__": extra_params.get("__files__", []),
+                    "__event_emitter__": extra_params.get("__event_emitter__"),
+                    "__event_call__": extra_params.get("__event_call__"),
                 },
             ))
 
