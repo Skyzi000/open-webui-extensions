@@ -32,6 +32,11 @@ from owui_ext.shared.prompt_utils import (
     _append_tool_server_prompts,
     merge_prompt_sections,
 )
+from owui_ext.shared.skills import (
+    extract_skill_manifest,
+    extract_user_skill_tags,
+    register_view_skill,
+)
 from owui_ext.shared.tool_execution import (
     execute_direct_tool_call,
     execute_tool_call,
@@ -522,6 +527,16 @@ class Tools:
             default=True,
             description="Enable code interpreter tools (execute_code).",
         )
+        ENABLE_SKILLS_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable skill context for MAGI agents. When the parent "
+                "conversation has a <available_skills> manifest, the manifest "
+                "is appended to each agent's system prompt and view_skill is "
+                "registered as a tool so agents can lazy-load skill contents. "
+                "User-selected <skill> tags are also inlined when present."
+            ),
+        )
         ENABLE_TASK_TOOLS: bool = Field(
             default=True,
             description="Enable task management tools (create_tasks, update_task).",
@@ -560,6 +575,7 @@ class Tools:
         __request__: Request = None,
         __model__: dict = None,
         __metadata__: dict = None,
+        __messages__: Optional[list] = None,
         __id__: str = None,
         __event_emitter__: Callable[[dict], Any] = None,  # type: ignore
         __event_call__: Callable[[dict], Any] = None,  # type: ignore
@@ -663,6 +679,13 @@ class Tools:
         if __id__:
             excluded_tool_ids.add(__id__)
 
+        # Skill context from the parent conversation. The agent loop bypasses
+        # the core middleware that would normally bind view_skill, so it has
+        # to be registered manually after build_tools_dict returns.
+        skills_enabled = bool(getattr(self.valves, "ENABLE_SKILLS_TOOLS", True))
+        skill_manifest = extract_skill_manifest(__messages__) if skills_enabled else ""
+        user_skill_tags = extract_user_skill_tags(__messages__) if skills_enabled else []
+
         tools_dict, mcp_clients = await build_tools_dict(
             request=__request__,
             model=__model__ or {},
@@ -678,6 +701,9 @@ class Tools:
         # try/finally has to start *here* so an exception or cancellation in
         # the status emit / setup steps below still triggers cleanup.
         try:
+            if skills_enabled and skill_manifest:
+                await register_view_skill(tools_dict, __request__, extra_params)
+
             roles = [
                 ("MELCHIOR", "scientific/technical"),
                 ("BALTHASAR", "legal/ethical"),
@@ -695,7 +721,7 @@ class Tools:
 
             async def run_single_agent(role_name: str, perspective: str) -> Tuple[str, str, dict]:
                 """Run a single MAGI agent and return (role_name, raw_output, parsed_result)."""
-                system_prompt, user_prompt = build_agent_prompts(
+                base_system_prompt, user_prompt = build_agent_prompts(
                     role_name=role_name,
                     perspective=perspective,
                     proposition=prop,
@@ -704,6 +730,14 @@ class Tools:
                     option_b=opt_b,
                     include_sources=include_sources,
                 )
+                if skills_enabled and (user_skill_tags or skill_manifest):
+                    system_prompt = merge_prompt_sections(
+                        base_system_prompt,
+                        *user_skill_tags,
+                        skill_manifest,
+                    )
+                else:
+                    system_prompt = base_system_prompt
                 content = await run_agent_loop(
                     request=__request__,
                     user=user,

@@ -25,6 +25,11 @@ from owui_ext.shared.prompt_utils import (
     merge_prompt_sections,
     truncate_text,
 )
+from owui_ext.shared.skills import (
+    extract_skill_manifest,
+    extract_user_skill_tags,
+    register_view_skill,
+)
 from owui_ext.shared.tool_execution import (
     execute_direct_tool_call,
     execute_tool_call,
@@ -495,6 +500,16 @@ class Tools:
             default=True,
             description="Enable code interpreter tools (execute_code).",
         )
+        ENABLE_SKILLS_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable skill context for council members. When the parent "
+                "conversation has a <available_skills> manifest, the manifest "
+                "is appended to each member's system prompt and view_skill is "
+                "registered as a tool so members can lazy-load skill contents. "
+                "User-selected <skill> tags are also inlined when present."
+            ),
+        )
         ENABLE_TASK_TOOLS: bool = Field(
             default=True,
             description="Enable task management tools (create_tasks, update_task).",
@@ -608,6 +623,7 @@ CRITICAL RULES:
         __request__: Optional[Request] = None,
         __model__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
+        __messages__: Optional[list] = None,
         __id__: Optional[str] = None,
         __event_emitter__: Callable[[dict], Any] = None,  # type: ignore
         __event_call__: Callable[[dict], Any] = None,  # type: ignore
@@ -810,6 +826,20 @@ CRITICAL RULES:
         )
         user_prompt = build_council_user_prompt(prop, prereq, opt_a, opt_b)
 
+        # Skill context from the parent conversation. The agent loop bypasses
+        # the core middleware that would normally bind view_skill, so it has
+        # to be registered manually after build_tools_dict returns.
+        skills_enabled = bool(getattr(self.valves, "ENABLE_SKILLS_TOOLS", True))
+        skill_manifest = extract_skill_manifest(__messages__) if skills_enabled else ""
+        user_skill_tags = extract_user_skill_tags(__messages__) if skills_enabled else []
+
+        if skills_enabled and (user_skill_tags or skill_manifest):
+            base_system_prompt = merge_prompt_sections(
+                base_system_prompt,
+                *user_skill_tags,
+                skill_manifest,
+            )
+
         await emitter.emit(
             description=f"Council Starting: {prop}",
             status="agents_starting",
@@ -847,6 +877,11 @@ CRITICAL RULES:
                     resolved_terminal_id=resolved_terminal_id,
                     resolved_direct_tool_servers=resolved_direct_tool_servers,
                 )
+                cached_tools_dict, _ = cached
+                if skills_enabled and skill_manifest:
+                    await register_view_skill(
+                        cached_tools_dict, request, member_extra_params
+                    )
                 tools_cache[member_model_id] = cached
             tools_dict, _ = cached
 

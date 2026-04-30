@@ -480,6 +480,168 @@ def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
     form_data["messages"] = messages
     return form_data
 
+# --- inlined from src/owui_ext/shared/skills.py (owui_ext.shared.skills) ---
+import logging
+import re
+from typing import Any, Optional
+from fastapi import Request
+_skills_log = logging.getLogger("owui_ext.shared.skills")
+
+_SKILLS_MANIFEST_START = "<available_skills>"
+_SKILLS_MANIFEST_END = "</available_skills>"
+_SKILL_TAG_PATTERN = re.compile(
+    r"<skill name=.*?>\n.*?\n</skill>", re.DOTALL
+)
+
+
+async def _skills_maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _find_manifest_in_text(text: str) -> str:
+    """Return the <available_skills>…</available_skills> substring, or ""."""
+    start = text.find(_SKILLS_MANIFEST_START)
+    if start == -1:
+        return ""
+    end = text.find(_SKILLS_MANIFEST_END, start)
+    if end == -1:
+        return ""
+    return text[start : end + len(_SKILLS_MANIFEST_END)]
+
+
+def _find_skill_tags_in_text(text: str) -> list[str]:
+    """Return all ``<skill name="...">…</skill>`` blocks found in *text*."""
+    return _SKILL_TAG_PATTERN.findall(text)
+
+
+def _extract_from_system_messages(
+    messages: Optional[list],
+    extractor,
+):
+    """Walk system messages and apply *extractor* to each text chunk.
+
+    ``extractor`` is called with a single ``str`` argument and should return a
+    list of results (or a single truthy result).  The function handles both
+    plain-string content and list-of-parts content
+    (``[{"type": "text", "text": "..."}]``).
+    """
+    results: list = []
+    if not messages:
+        return results
+    for msg in messages:
+        if msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            found = extractor(content)
+            if found:
+                results.append(found) if isinstance(found, str) else results.extend(
+                    found
+                )
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    found = extractor(part.get("text") or "")
+                    if found:
+                        results.append(found) if isinstance(
+                            found, str
+                        ) else results.extend(found)
+    return results
+
+
+def extract_skill_manifest(messages: Optional[list]) -> str:
+    """Extract the ``<available_skills>`` manifest from the parent
+    conversation's system messages.
+
+    Since v0.8.2, only **model-attached** skills appear in this manifest.
+    User-selected skills are injected as full ``<skill>`` tags instead
+    (see :func:`extract_user_skill_tags`).
+
+    Args:
+        messages: The parent conversation messages (``__messages__``).
+
+    Returns:
+        The manifest XML string, or empty string if not found.
+    """
+    results = _extract_from_system_messages(messages, _find_manifest_in_text)
+    return results[0] if results else ""
+
+
+def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
+    """Extract ``<skill name="...">content</skill>`` tags from the parent
+    conversation's system messages.
+
+    Since Open WebUI v0.8.2, user-selected skills are injected as individual
+    ``<skill>`` tags with full content (as opposed to the lazy-loading
+    manifest used for model-attached skills).
+
+    Args:
+        messages: The parent conversation messages (``__messages__``).
+
+    Returns:
+        A list of ``<skill …>…</skill>`` strings, possibly empty.
+    """
+    return _extract_from_system_messages(messages, _find_skill_tags_in_text)
+
+
+async def register_view_skill(
+    tools_dict: dict,
+    request: Request,
+    extra_params: dict,
+) -> None:
+    """Manually register the view_skill builtin tool in tools_dict.
+
+    This is needed for **model-attached** skills whose content is not injected
+    inline.  The agent loop can call ``view_skill`` to lazily load their
+    content from the ``<available_skills>`` manifest.
+
+    Since v0.8.2, user-selected skills are injected as full ``<skill>`` tags
+    and do NOT require ``view_skill``; they are passed directly in the system
+    message.
+
+    Args:
+        tools_dict: The tools dict to add view_skill to (modified in-place).
+        request: FastAPI request object.
+        extra_params: Extra parameters for tool binding.
+    """
+    if "view_skill" in tools_dict:
+        return
+
+    try:
+        from open_webui.tools.builtin import view_skill
+        from open_webui.utils.tools import (
+            get_async_tool_function_and_apply_extra_params,
+            convert_function_to_pydantic_model,
+            convert_pydantic_model_to_openai_function_spec,
+        )
+
+        callable_fn = await _skills_maybe_await(get_async_tool_function_and_apply_extra_params(
+            view_skill,
+            {
+                "__request__": request,
+                "__user__": extra_params.get("__user__", {}),
+                "__event_emitter__": extra_params.get("__event_emitter__"),
+                "__event_call__": extra_params.get("__event_call__"),
+                "__metadata__": extra_params.get("__metadata__"),
+                "__chat_id__": extra_params.get("__chat_id__"),
+                "__message_id__": extra_params.get("__message_id__"),
+            },
+        ))
+
+        pydantic_model = convert_function_to_pydantic_model(view_skill)
+        spec = convert_pydantic_model_to_openai_function_spec(pydantic_model)
+
+        tools_dict["view_skill"] = {
+            "tool_id": "builtin:view_skill",
+            "callable": callable_fn,
+            "spec": spec,
+            "type": "builtin",
+        }
+    except Exception as e:
+        _skills_log.warning(f"Failed to register view_skill: {e}")
+
 # --- inlined from src/owui_ext/shared/tool_execution.py (owui_ext.shared.tool_execution) ---
 import ast
 import json
@@ -1907,6 +2069,16 @@ class Tools:
             default=True,
             description="Enable code interpreter tools (execute_code).",
         )
+        ENABLE_SKILLS_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable skill context for MAGI agents. When the parent "
+                "conversation has a <available_skills> manifest, the manifest "
+                "is appended to each agent's system prompt and view_skill is "
+                "registered as a tool so agents can lazy-load skill contents. "
+                "User-selected <skill> tags are also inlined when present."
+            ),
+        )
         ENABLE_TASK_TOOLS: bool = Field(
             default=True,
             description="Enable task management tools (create_tasks, update_task).",
@@ -1945,6 +2117,7 @@ class Tools:
         __request__: Request = None,
         __model__: dict = None,
         __metadata__: dict = None,
+        __messages__: Optional[list] = None,
         __id__: str = None,
         __event_emitter__: Callable[[dict], Any] = None,  # type: ignore
         __event_call__: Callable[[dict], Any] = None,  # type: ignore
@@ -2048,6 +2221,13 @@ class Tools:
         if __id__:
             excluded_tool_ids.add(__id__)
 
+        # Skill context from the parent conversation. The agent loop bypasses
+        # the core middleware that would normally bind view_skill, so it has
+        # to be registered manually after build_tools_dict returns.
+        skills_enabled = bool(getattr(self.valves, "ENABLE_SKILLS_TOOLS", True))
+        skill_manifest = extract_skill_manifest(__messages__) if skills_enabled else ""
+        user_skill_tags = extract_user_skill_tags(__messages__) if skills_enabled else []
+
         tools_dict, mcp_clients = await build_tools_dict(
             request=__request__,
             model=__model__ or {},
@@ -2063,6 +2243,9 @@ class Tools:
         # try/finally has to start *here* so an exception or cancellation in
         # the status emit / setup steps below still triggers cleanup.
         try:
+            if skills_enabled and skill_manifest:
+                await register_view_skill(tools_dict, __request__, extra_params)
+
             roles = [
                 ("MELCHIOR", "scientific/technical"),
                 ("BALTHASAR", "legal/ethical"),
@@ -2080,7 +2263,7 @@ class Tools:
 
             async def run_single_agent(role_name: str, perspective: str) -> Tuple[str, str, dict]:
                 """Run a single MAGI agent and return (role_name, raw_output, parsed_result)."""
-                system_prompt, user_prompt = build_agent_prompts(
+                base_system_prompt, user_prompt = build_agent_prompts(
                     role_name=role_name,
                     perspective=perspective,
                     proposition=prop,
@@ -2089,6 +2272,14 @@ class Tools:
                     option_b=opt_b,
                     include_sources=include_sources,
                 )
+                if skills_enabled and (user_skill_tags or skill_manifest):
+                    system_prompt = merge_prompt_sections(
+                        base_system_prompt,
+                        *user_skill_tags,
+                        skill_manifest,
+                    )
+                else:
+                    system_prompt = base_system_prompt
                 content = await run_agent_loop(
                     request=__request__,
                     user=user,
