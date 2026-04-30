@@ -40,6 +40,7 @@ from owui_ext.shared.tool_execution import (
     process_tool_result,
 )
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients, resolve_mcp_tools
+from owui_ext.shared.models import extract_model_ids, get_available_models
 from owui_ext.shared.skills import (
     extract_skill_manifest,
     extract_user_skill_tags,
@@ -3721,34 +3722,6 @@ async def build_tools_dict(
         )
 
     return tools_dict, mcp_clients
-
-
-async def get_available_models(
-    request: Request,
-    user: Any,
-) -> list[dict]:
-    from open_webui.utils.models import get_all_models, get_filtered_models
-
-    all_models = await get_all_models(request, refresh=False, user=user)
-
-    filtered = []
-    for model in all_models:
-        if "pipeline" in model and model["pipeline"].get("type") == "filter":
-            continue
-        filtered.append(model)
-
-    return await maybe_await(get_filtered_models(filtered, user))
-
-
-def extract_model_ids(models: list[dict]) -> list[str]:
-    ids = []
-    seen = set()
-    for model in models:
-        model_id = normalize_text(model.get("id"))
-        if model_id and model_id not in seen:
-            seen.add(model_id)
-            ids.append(model_id)
-    return ids
 
 
 def resolve_chat_model_id(

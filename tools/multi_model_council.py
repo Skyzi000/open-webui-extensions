@@ -171,6 +171,51 @@ async def apply_inlet_filters_if_enabled(
         _inlet_filters_log.warning(f"Error applying inlet filters: {exc}")
     return form_data
 
+# --- inlined from src/owui_ext/shared/models.py (owui_ext.shared.models) ---
+import logging
+from typing import Any
+from fastapi import Request
+_models_log = logging.getLogger("owui_ext.shared.models")
+
+
+async def _models_maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+async def get_available_models(
+    request: Request,
+    user: Any,
+) -> list[dict]:
+    """Return models visible to *user* with filter-type pipelines removed."""
+    from open_webui.utils.models import get_all_models, get_filtered_models
+
+    all_models = await get_all_models(request, refresh=False, user=user)
+
+    filtered = []
+    for model in all_models:
+        if "pipeline" in model and model["pipeline"].get("type") == "filter":
+            continue
+        filtered.append(model)
+
+    return await _models_maybe_await(get_filtered_models(filtered, user))
+
+
+def extract_model_ids(models: list[dict]) -> list[str]:
+    """Extract unique non-empty string IDs from *models* in source order."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for model in models:
+        model_id = model.get("id")
+        if not isinstance(model_id, str):
+            continue
+        model_id = model_id.strip()
+        if model_id and model_id not in seen:
+            seen.add(model_id)
+            ids.append(model_id)
+    return ids
+
 # --- inlined from src/owui_ext/shared/model_features.py (owui_ext.shared.model_features) ---
 from typing import Optional
 def model_has_note_knowledge(model: Optional[dict]) -> bool:
@@ -1385,34 +1430,6 @@ async def build_tools_dict(
             tools_dict[name] = tool_dict
 
     return tools_dict
-
-
-async def get_available_models(
-    request: Request,
-    user: Any,
-) -> List[dict]:
-    from open_webui.utils.models import get_all_models, get_filtered_models
-
-    all_models = await get_all_models(request, refresh=False, user=user)
-
-    filtered = []
-    for model in all_models:
-        if "pipeline" in model and model["pipeline"].get("type") == "filter":
-            continue
-        filtered.append(model)
-
-    return await maybe_await(get_filtered_models(filtered, user))
-
-
-def extract_model_ids(models: List[dict]) -> List[str]:
-    ids = []
-    seen = set()
-    for model in models:
-        model_id = normalize_text(model.get("id"))
-        if model_id and model_id not in seen:
-            seen.add(model_id)
-            ids.append(model_id)
-    return ids
 
 
 # ============================================================================

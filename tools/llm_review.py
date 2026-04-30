@@ -892,6 +892,51 @@ async def cleanup_mcp_clients(mcp_clients: dict) -> None:
         except Exception as e:
             _mcp_tools_log.debug(f"Error cleaning up MCP client: {e}")
 
+# --- inlined from src/owui_ext/shared/models.py (owui_ext.shared.models) ---
+import logging
+from typing import Any
+from fastapi import Request
+_models_log = logging.getLogger("owui_ext.shared.models")
+
+
+async def _models_maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+async def get_available_models(
+    request: Request,
+    user: Any,
+) -> list[dict]:
+    """Return models visible to *user* with filter-type pipelines removed."""
+    from open_webui.utils.models import get_all_models, get_filtered_models
+
+    all_models = await get_all_models(request, refresh=False, user=user)
+
+    filtered = []
+    for model in all_models:
+        if "pipeline" in model and model["pipeline"].get("type") == "filter":
+            continue
+        filtered.append(model)
+
+    return await _models_maybe_await(get_filtered_models(filtered, user))
+
+
+def extract_model_ids(models: list[dict]) -> list[str]:
+    """Extract unique non-empty string IDs from *models* in source order."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for model in models:
+        model_id = model.get("id")
+        if not isinstance(model_id, str):
+            continue
+        model_id = model_id.strip()
+        if model_id and model_id not in seen:
+            seen.add(model_id)
+            ids.append(model_id)
+    return ids
+
 # --- inlined from src/owui_ext/shared/skills.py (owui_ext.shared.skills) ---
 import logging
 import re
@@ -4907,34 +4952,6 @@ async def build_tools_dict(
         )
 
     return tools_dict, mcp_clients
-
-
-async def get_available_models(
-    request: Request,
-    user: Any,
-) -> list[dict]:
-    from open_webui.utils.models import get_all_models, get_filtered_models
-
-    all_models = await get_all_models(request, refresh=False, user=user)
-
-    filtered = []
-    for model in all_models:
-        if "pipeline" in model and model["pipeline"].get("type") == "filter":
-            continue
-        filtered.append(model)
-
-    return await maybe_await(get_filtered_models(filtered, user))
-
-
-def extract_model_ids(models: list[dict]) -> list[str]:
-    ids = []
-    seen = set()
-    for model in models:
-        model_id = normalize_text(model.get("id"))
-        if model_id and model_id not in seen:
-            seen.add(model_id)
-            ids.append(model_id)
-    return ids
 
 
 def resolve_chat_model_id(

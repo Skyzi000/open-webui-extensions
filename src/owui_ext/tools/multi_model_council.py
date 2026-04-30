@@ -18,6 +18,7 @@ from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
 from owui_ext.shared.event_emitter import EventEmitter
 from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
+from owui_ext.shared.models import extract_model_ids, get_available_models
 from owui_ext.shared.model_features import (
     model_has_note_knowledge,
     model_knowledge_tools_enabled,
@@ -581,34 +582,6 @@ async def build_tools_dict(
             tools_dict[name] = tool_dict
 
     return tools_dict
-
-
-async def get_available_models(
-    request: Request,
-    user: Any,
-) -> List[dict]:
-    from open_webui.utils.models import get_all_models, get_filtered_models
-
-    all_models = await get_all_models(request, refresh=False, user=user)
-
-    filtered = []
-    for model in all_models:
-        if "pipeline" in model and model["pipeline"].get("type") == "filter":
-            continue
-        filtered.append(model)
-
-    return await maybe_await(get_filtered_models(filtered, user))
-
-
-def extract_model_ids(models: List[dict]) -> List[str]:
-    ids = []
-    seen = set()
-    for model in models:
-        model_id = normalize_text(model.get("id"))
-        if model_id and model_id not in seen:
-            seen.add(model_id)
-            ids.append(model_id)
-    return ids
 
 
 # ============================================================================
