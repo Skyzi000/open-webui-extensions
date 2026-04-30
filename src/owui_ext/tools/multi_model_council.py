@@ -9,7 +9,7 @@ required_open_webui_version: 0.7.0
 
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import Request
 from pydantic import BaseModel, Field
@@ -40,6 +40,7 @@ from owui_ext.shared.tool_servers import (
     normalize_direct_tool_servers,
     resolve_direct_tool_servers_from_request_and_metadata,
 )
+from owui_ext.shared.valves import coerce_user_valves
 from owui_ext.shared.voting import compute_vote_tally, decide_majority
 
 log = logging.getLogger(__name__)
@@ -96,21 +97,6 @@ async def resolve_terminal_id_from_request_and_metadata(
 
     return metadata_terminal_id
 
-
-
-def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseModel:
-    if isinstance(raw_valves, valves_cls):
-        return raw_valves
-    if hasattr(raw_valves, "model_dump"):
-        try:
-            data = raw_valves.model_dump()
-        except Exception:
-            data = {}
-    elif isinstance(raw_valves, dict):
-        data = raw_valves
-    else:
-        data = {}
-    return valves_cls.model_validate(data)
 
 
 def parse_model_ids(value: Any) -> List[str]:

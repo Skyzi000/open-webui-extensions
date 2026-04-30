@@ -15,7 +15,7 @@ required_open_webui_version: 0.7.0
 
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from fastapi import Request
 from pydantic import BaseModel, Field
 
@@ -750,6 +750,30 @@ def build_direct_tools_dict(
         _tool_servers_log.info("No direct tools loaded from tool_servers")
     return direct_tools
 
+# --- inlined from src/owui_ext/shared/valves.py (owui_ext.shared.valves) ---
+from typing import Any, Type
+from pydantic import BaseModel
+def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseModel:
+    """Normalize raw user valves into the target valves class.
+
+    Open WebUI hands ``raw_valves`` over from filter context, where it can
+    arrive as the target class itself, a different ``BaseModel`` subclass
+    (when the user-valve schema has drifted between plugin versions), a raw
+    dict, or anything else. Always return a fresh ``valves_cls`` instance so
+    callers can rely on the field set being current.
+    """
+    if isinstance(raw_valves, valves_cls):
+        return raw_valves
+    if isinstance(raw_valves, BaseModel):
+        try:
+            data = raw_valves.model_dump()
+        except Exception:
+            data = {}
+        return valves_cls.model_validate(data)
+    if isinstance(raw_valves, dict):
+        return valves_cls.model_validate(raw_valves)
+    return valves_cls.model_validate({})
+
 # --- inlined from src/owui_ext/shared/voting.py (owui_ext.shared.voting) ---
 from typing import List
 def compute_vote_tally(votes: List[str]) -> dict:
@@ -822,21 +846,6 @@ async def resolve_terminal_id_from_request_and_metadata(
         return request_terminal_id
 
     return metadata_terminal_id
-
-
-def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseModel:
-    if isinstance(raw_valves, valves_cls):
-        return raw_valves
-    if hasattr(raw_valves, "model_dump"):
-        try:
-            data = raw_valves.model_dump()
-        except Exception:
-            data = {}
-    elif isinstance(raw_valves, dict):
-        data = raw_valves
-    else:
-        data = {}
-    return valves_cls.model_validate(data)
 
 
 def parse_model_ids(value: Any) -> List[str]:
