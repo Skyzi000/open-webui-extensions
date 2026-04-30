@@ -16,9 +16,9 @@ with its sub-helpers:
   per-call dynamic context (``__messages__`` / ``__files__`` /
   ``__event_emitter__`` / ``__event_call__``) — never ``__user__`` /
   ``__request__`` / ``__model__`` / ``__metadata__`` / ``__chat_id__`` /
-  ``__message_id__``, because ``get_tools()`` already baked tool-specific
-  ``UserValves`` into ``__user__["valves"]`` and overriding it would
-  silently clobber per-tool valves.
+  ``__message_id__``, because ``get_tools()`` already attached tool-specific
+  ``UserValves`` to ``__user__["valves"]`` and overriding it would
+  silently overwrite per-tool valves.
 
 The constants ``CITATION_TOOLS`` and ``TERMINAL_EVENT_TOOLS`` describe
 which tool names trigger citation sources / terminal UI events. They

@@ -7,16 +7,16 @@ deduplicated list. The two implementations were byte-identical except
 for ``list`` vs ``typing.List`` annotations.
 
 Lives in its own shared dep so non-using plugins (sub_agent / magi /
-parallel_tools) don't drag this code into their bundle -- the inliner
-has no tree-shaking, see ``feedback_inliner_no_treeshake``. Same
-shared-dep "no mixing external + cross-shared imports" rule that
-already shaped ``shared.tool_execution`` / ``shared.mcp_tools`` /
-``shared.skills`` -- the tiny ``maybe_await`` helper is inlined
-privately rather than imported from ``shared.async_utils``.
+parallel_tools) don't include this code in their bundle; the inliner
+has no tree-shaking. It follows the same shared-dep "no mixing external
++ cross-shared imports" rule that already shaped
+``shared.tool_execution`` / ``shared.mcp_tools`` / ``shared.skills``:
+the tiny ``maybe_await`` helper is inlined privately rather than
+imported from ``shared.async_utils``.
 
 Note: ``parse_model_ids`` is **not** here. The two plugins'
 ``parse_model_ids`` copies look almost identical but diverge on a
-load-bearing detail: ``llm_review`` preserves duplicates intentionally
+behaviorally important detail: ``llm_review`` preserves duplicates intentionally
 (same model + different personas → multiple agent slots), while
 ``multi_model_council`` deduplicates (no point in two votes from the
 same model). Each plugin keeps its own version.

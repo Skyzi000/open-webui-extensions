@@ -73,7 +73,7 @@ def _select_baseline_ref(repo_root: Path) -> str | None:
     """Return the preferred baseline ref name, or None when none exist.
 
     ``origin/main`` is preferred over the local ``main`` because a stale
-    local ``main`` (the dev forgot to ``git pull``) would otherwise let
+    local ``main`` would otherwise let
     the gate read a baseline whose version is older than what is actually
     shipped.
     """

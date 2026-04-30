@@ -211,7 +211,7 @@ def test_rejects_absolute_source_path(tmp_path: Path) -> None:
         "meta": {"schema_version": 1},
         "settings": {"local_import_roots": ["owui_ext.shared"]},
         "targets": [
-            {"name": "evil", "source": "/etc/passwd", "output": "out.py"}
+            {"name": "invalid", "source": "/outside/source.py", "output": "out.py"}
         ],
     }
     with pytest.raises(BuildError, match="must be a relative path"):
@@ -223,7 +223,7 @@ def test_rejects_absolute_output_path(tmp_path: Path) -> None:
         "meta": {"schema_version": 1},
         "settings": {"local_import_roots": ["owui_ext.shared"]},
         "targets": [
-            {"name": "evil", "source": "src/a.py", "output": "/tmp/evil.py"}
+            {"name": "invalid", "source": "src/a.py", "output": "/tmp/out.py"}
         ],
     }
     with pytest.raises(BuildError, match="must be a relative path"):
@@ -236,9 +236,9 @@ def test_rejects_parent_traversal_in_output(tmp_path: Path) -> None:
         "settings": {"local_import_roots": ["owui_ext.shared"]},
         "targets": [
             {
-                "name": "evil",
+                "name": "invalid",
                 "source": "src/a.py",
-                "output": "../../tmp/evil.py",
+                "output": "../../tmp/out.py",
             }
         ],
     }

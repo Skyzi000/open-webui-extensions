@@ -14,8 +14,8 @@ direct-tool-server helpers in ``shared.tool_servers``) on purpose:
 ``mc`` / ``magi`` / ``parallel_tools`` import from ``shared.tool_servers``
 but never call the MCP helpers, and the inliner has no tree-shaking. If
 the MCP code lived in ``tool_servers``, every plugin that imports any
-direct-tool helper would drag the ~270-line MCP block into its bundle
-as dead weight.
+direct-tool helper would include the ~270-line MCP block in its bundle
+as unused code.
 
 The module also can't import from sibling shared modules
 (``shared.notifications`` / ``shared.async_utils``) because the inliner

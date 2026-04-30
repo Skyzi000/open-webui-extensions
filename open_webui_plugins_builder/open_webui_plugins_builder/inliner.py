@@ -1978,8 +1978,8 @@ def _verify_no_builtins_rebinding(parsed: _ParsedModule) -> None:
 # explicit binding / rebinding via def / class / import as / type
 # alias / global write / dynamic globals call, refuse explicit
 # deletion. ``__annotations__`` was the original motivation; the
-# rest are module metadata dunders Codex flagged as similar leak
-# vectors.
+# remaining module metadata dunders have the same per-module leak
+# pattern after inlining.
 _RESERVED_MODULE_DUNDERS = (
     "__annotations__",
     "__name__",
@@ -2796,7 +2796,7 @@ def _verify_no_unbounded_globals_access(parsed: _ParsedModule) -> None:
         )
 
 
-# Allowlist of dict methods we know how to statically reason about on
+# Dict methods we know how to statically reason about on
 # the merged module's globals dict. Anything else (``__repr__``,
 # ``__or__``, ``fromkeys``, ``__ior__``, ``pop``, ``clear``,
 # ``setdefault``, ``__init__``, ``copy``, ``keys``, ``items``,
@@ -2844,17 +2844,17 @@ def _verify_no_unknown_globals_mutation(parsed: _ParsedModule) -> None:
        cross-source collisions. Subscript reads are handled in
        ``_verify_no_unknown_globals_reads``.
 
-    2. **Method calls outside the allowlist** --
+    2. **Method calls outside the permitted method set** --
        ``globals().METHOD(...)`` (and the equivalent
        ``dict.METHOD(globals(), ...)`` descriptor form, normalized in
        ``_GlobalsMutationVisitor``) is refused unless ``METHOD`` is in
-       ``_PERMITTED_GLOBALS_METHODS``. For methods in the allowlist,
+       ``_PERMITTED_GLOBALS_METHODS``. For permitted methods,
        per-method validation enforces literal-key constraints
        (``__setitem__`` / ``__delitem__`` / ``__getitem__`` / ``get`` /
        ``__contains__`` need a literal first argument, ``update`` needs
        a literal-keyed dict literal).
 
-       Allowlist-by-default catches ``globals().__repr__()``,
+       Deny-by-default catches ``globals().__repr__()``,
        ``globals().__or__(...)``, ``dict.fromkeys(globals())``,
        ``globals().pop(...)``, ``.clear()``, ``.setdefault(...)``,
        ``.__init__(...)``, ``.__ior__(...)``, ``.keys()``, ``.items()``,

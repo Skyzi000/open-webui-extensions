@@ -4314,9 +4314,8 @@ def test_rejects_builtins_rebinding_in_dep_that_would_leak_to_other_dep(
     general name-collision detector cannot catch (it tracks named
     definitions, not the implicit builtin lookup chain).
 
-    This is the exact attack scenario flagged by the adversarial
-    review: rebinding ``__builtins__`` is a backdoor around the
-    collision detector.
+    This regression case demonstrates why rebinding ``__builtins__``
+    must be treated as a bypass of the collision detector.
     """
 
     _write(
@@ -5987,9 +5986,9 @@ def test_rejects_module_scope_locals_update_builtins(
 
 def test_rejects_locals_collision_between_deps(tmp_path: Path) -> None:
     """``locals()['name'] = X`` at module scope of one dep collides
-    with another dep's binding of the same name. Codex round 6
-    finding 1 PoC: shared_a uses ``locals()`` at module scope to
-    smuggle a value, shared_b independently binds the same name.
+    with another dep's binding of the same name. Regression:
+    shared_a writes a value through module-scope ``locals()`` while
+    shared_b independently binds the same name.
     """
 
     _write(
@@ -6124,7 +6123,7 @@ def test_rejects_dict_setitem_descriptor_builtins(
 ) -> None:
     """``dict.__setitem__(globals(), '__builtins__', X)`` is the dict-
     descriptor form of ``globals()['__builtins__'] = X`` and must be
-    refused for the same reason. Codex round 6 finding 2 PoC.
+    refused for the same reason.
     """
 
     _write(
@@ -6372,8 +6371,8 @@ def test_rejects_dict_setitem_descriptor_with_locals_at_module_scope(
 def test_rejects_globals_subscript_read_resolved_by_other_dep(
     tmp_path: Path,
 ) -> None:
-    """Codex round 6 finding 3 PoC: shared_b reads ``globals()["helper"]``
-    without binding ``helper`` itself; shared_a defines ``helper``.
+    """Regression: shared_b reads ``globals()["helper"]`` without
+    binding ``helper`` itself; shared_a defines ``helper``.
     Pre-merge ``shared_b.run()`` would raise ``KeyError`` because
     shared_b's globals dict has no ``helper`` key. Post-merge it
     silently picks up shared_a's ``helper``. Refuse the build.
@@ -6796,8 +6795,8 @@ def test_rejects_globals_contains_with_non_literal_key(
 
 
 def test_rejects_globals_alias_assignment(tmp_path: Path) -> None:
-    """Codex round 7 finding 1: ``g = globals()`` saves the merged
-    globals dict into an alias, after which ``g[K] = V`` mutates module
+    """Regression: ``g = globals()`` saves the merged globals dict
+    into an alias, after which ``g[K] = V`` mutates module
     globals without ever syntactically touching ``globals()`` again --
     bypassing every per-shape mutation collector. Refuse the alias
     assignment outright.
@@ -6837,8 +6836,8 @@ def test_rejects_globals_bound_method_alias(tmp_path: Path) -> None:
 
 
 def test_rejects_globals_passed_to_dict_unpack(tmp_path: Path) -> None:
-    """Codex round 7 finding 2 PoC: ``dict(**globals())`` reads every
-    key of the merged globals dict, so adding a binding in another
+    """Regression: ``dict(**globals())`` reads every key of the
+    merged globals dict, so adding a binding in another
     inlined source silently changes the result.
     """
 
@@ -7075,8 +7074,8 @@ def test_allows_function_local_locals_alias(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # __builtins__ destructive write regression tests.
 #
-# Codex round 7 finding 3: ``del __builtins__`` and the dynamic-delete
-# equivalents are just as disruptive as rebinding because subsequent
+# ``del __builtins__`` and the dynamic-delete equivalents are just as
+# disruptive as rebinding because subsequent
 # inlined sources that read ``globals()['__builtins__']`` would see a
 # KeyError instead of whatever was there in source form.
 # ---------------------------------------------------------------------------
@@ -7184,12 +7183,12 @@ def test_rejects_locals_delitem_builtins(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Allowlist refusal regression tests (Codex round 8 finding 1).
+# Unknown globals-method refusal regression tests.
 #
 # ``_verify_no_unknown_globals_mutation`` deny-by-default refuses any
-# method on globals() that isn't one of ``__getitem__``, ``get``,
+# method on globals() that is not one of ``__getitem__``, ``get``,
 # ``__contains__``, ``__setitem__``, ``__delitem__``, ``update``. This
-# closes the bypass where blacklist-only logic let through arbitrary
+# closes the bypass where method-specific denial logic let through
 # whole-dict observation methods like ``__repr__``, ``__or__``,
 # ``fromkeys``, ``__reduce__``, etc.
 # ---------------------------------------------------------------------------
@@ -7301,7 +7300,7 @@ def test_rejects_globals_str_via_method_call(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# PEP 695 type alias regression tests (Codex round 8 finding 2).
+# PEP 695 type alias regression tests.
 #
 # ``type X = ...`` (Python 3.12+) binds ``X`` at the enclosing scope. We
 # integrate it into ``_collect_inlined_module_bindings``,
@@ -7322,7 +7321,7 @@ pep695 = pytest.mark.skipif(
 @pep695
 def test_rejects_type_alias_collision_between_deps(tmp_path: Path) -> None:
     """``type helper = int`` in one dep collides with ``def helper()``
-    in another. PoC for Codex round 8 finding 2.
+    in another.
     """
 
     _write(
@@ -7428,7 +7427,7 @@ def test_rejects_type_alias_via_global_in_function(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# __annotations__ regression tests (Codex round 8 finding 3).
+# __annotations__ regression tests.
 #
 # Module-scope ``AnnAssign`` implicitly populates ``__annotations__``,
 # so every inlined source's annotations land in one shared dict after
@@ -7526,7 +7525,7 @@ def test_rejects_globals_subscript_annotations(tmp_path: Path) -> None:
 
 def test_rejects_annotations_dep_collision(tmp_path: Path) -> None:
     """A dep that reads ``__annotations__`` while another binds it
-    must be refused. PoC for Codex round 8 finding 3.
+    must be refused.
     """
 
     _write(
@@ -7567,7 +7566,7 @@ def test_rejects_annotations_dep_collision(tmp_path: Path) -> None:
 
 
 def test_rejects_function_local_annotations_read(tmp_path: Path) -> None:
-    """Codex round 9 finding 1: inside a function body, an unbound
+    """Regression: inside a function body, an unbound
     ``__annotations__`` reference resolves to module globals (Python
     treats it as any other free variable). After inlining, that means
     the function reads the *merged module's* annotations dict, not
@@ -7627,8 +7626,8 @@ def test_rejects_def_annotations_at_module_scope(tmp_path: Path) -> None:
 
 
 def test_rejects_class_body_annotations_read(tmp_path: Path) -> None:
-    """Codex round 9 finding 1 (continued): inside a class body, an
-    unbound ``__annotations__`` reference resolves to the *module*
+    """Regression: inside a class body, an unbound
+    ``__annotations__`` reference resolves to the *module*
     globals after inlining. Class bodies have their own implicit
     ``__annotations__`` dict, but a naked Name reads through to module
     scope. Refused at all depths.
@@ -7667,8 +7666,8 @@ def test_rejects_comprehension_annotations_read(tmp_path: Path) -> None:
 
 
 def test_rejects_chained_compare_globals_contains(tmp_path: Path) -> None:
-    """Codex round 9 finding 2: chained comparison
-    ``"x" in globals() in Probe()`` -- the ``__contains__`` synthesis
+    """Regression: chained comparison ``"x" in globals() in Probe()``
+    -- the ``__contains__`` synthesis
     in ``visit_Compare`` must not normalize chained compares (only
     simple binary form), since chained semantics differ. Refuse to
     keep the analysis safe.
@@ -7710,8 +7709,8 @@ def test_rejects_compare_globals_with_non_string_key(tmp_path: Path) -> None:
 
 
 def test_rejects_module_dunder_name_read(tmp_path: Path) -> None:
-    """Codex round 9 finding 3: ``__name__`` inside a dependency
-    silently shifts from the dep's own module identity to the merged
+    """Regression: ``__name__`` inside a dependency silently shifts
+    from the dep's own module identity to the merged
     target module's name. Refused as reserved dunder.
     """
 
@@ -7976,8 +7975,8 @@ def test_target_still_rejects_file_dunder_read(tmp_path: Path) -> None:
 
 
 def test_rejects_future_annotations_in_dep(tmp_path: Path) -> None:
-    """Codex round 10 finding 5 (F5): under PEP 563 a dep's
-    annotations become strings; callers like ``typing.get_type_hints``
+    """Regression: under PEP 563 a dep's annotations become strings;
+    callers like ``typing.get_type_hints``
     later evaluate them against the merged target's globals, so a
     name that was not visible in the original dep can silently
     resolve after inlining. Refuse the future import in deps.
@@ -8064,8 +8063,8 @@ def test_target_still_rejects_annotations_dict_read(tmp_path: Path) -> None:
 
 
 def test_rejects_builtins_globals_attribute_call(tmp_path: Path) -> None:
-    """Codex round 10 finding 1: ``builtins.globals()`` bypasses the
-    bare-name detector because ``_is_module_globals_call`` only sees
+    """Regression: ``builtins.globals()`` bypasses the bare-name
+    detector because ``_is_module_globals_call`` only sees
     ``Call(Name("globals"))``. Refused via attribute-call ban.
     """
 
@@ -8166,8 +8165,8 @@ def test_rejects_from_builtins_import_dir(tmp_path: Path) -> None:
 
 
 def test_rejects_function_dunder_globals_access(tmp_path: Path) -> None:
-    """Codex round 10 finding 2: every function's ``.__globals__``
-    attribute is the merged target module's dict. A dep can mutate
+    """Regression: every function's ``.__globals__`` attribute is the
+    merged target module's dict. A dep can mutate
     ``__builtins__`` via ``(lambda: None).__globals__["__builtins__"]
     = ...`` without ever calling ``globals()``. Refused.
     """
@@ -8205,8 +8204,8 @@ def test_rejects_function_dunder_globals_subscript_write(tmp_path: Path) -> None
 
 
 def test_rejects_bare_dir_at_module_scope(tmp_path: Path) -> None:
-    """Codex round 10 finding 3: bare ``dir()`` at module scope
-    returns the merged module's full namespace -- every other inlined
+    """Regression: bare ``dir()`` at module scope returns the merged
+    module's full namespace -- every other inlined
     dep's identifiers leak in. Refused.
     """
 
@@ -8281,8 +8280,8 @@ def test_allows_dir_inside_function(tmp_path: Path) -> None:
 
 
 def test_rejects_globals_name_aliasing(tmp_path: Path) -> None:
-    """Codex round 11 finding 1: ``G = globals; G()`` aliases the
-    builtin to a local name. The bare-name detector only sees
+    """Regression: ``G = globals; G()`` aliases the builtin to a
+    local name. The bare-name detector only sees
     ``globals()`` Calls -- the rebound ``G`` is invisible. Refuse any
     Name(Load) reference to the builtins outside an immediate call.
     """
@@ -8335,8 +8334,8 @@ def test_rejects_globals_passed_as_argument(tmp_path: Path) -> None:
 
 
 def test_rejects_getattr_dunder_globals_literal(tmp_path: Path) -> None:
-    """Codex round 11 finding 2: ``getattr(fn, "__globals__")`` with a
-    literal attribute name routes around the direct attribute ban.
+    """Regression: ``getattr(fn, "__globals__")`` with a literal
+    attribute name routes around the direct attribute ban.
     """
 
     _write(
@@ -8429,8 +8428,8 @@ def test_rejects_getattr_globals_string_literal(tmp_path: Path) -> None:
 
 
 def test_rejects_dunder_dict_globals_subscript(tmp_path: Path) -> None:
-    """Codex round 11 finding 3: ``builtins.__dict__["globals"]()``
-    accesses the builtin via Subscript on ``__dict__``. Refused.
+    """Regression: ``builtins.__dict__["globals"]()`` accesses the
+    builtin via Subscript on ``__dict__``. Refused.
     """
 
     _write(
@@ -8470,7 +8469,7 @@ def test_rejects_dunder_dict_globals_dunder_subscript(tmp_path: Path) -> None:
     """``fn.__dict__["__globals__"]`` -- function objects don't
     actually keep ``__globals__`` in ``__dict__``, but the form is
     refused symmetrically with the others. The ``.__dict__``
-    attribute itself is now banned (round 12 finding 4), which fires
+    attribute itself is now banned by the ``.__dict__`` check, which fires
     before the subscript check.
     """
 
@@ -8489,8 +8488,8 @@ def test_rejects_dunder_dict_globals_dunder_subscript(tmp_path: Path) -> None:
 
 
 def test_rejects_dir_in_function_default_argument(tmp_path: Path) -> None:
-    """Codex round 11 finding 4: ``def f(snapshot=dir())`` evaluates
-    ``dir()`` at module scope (default arguments are evaluated when
+    """Regression: ``def f(snapshot=dir())`` evaluates ``dir()`` at
+    module scope (default arguments are evaluated when
     the function is defined). The visitor must descend into headers
     at the enclosing depth, not the function body's depth.
     """
@@ -8550,8 +8549,8 @@ def test_rejects_dir_in_decorator(tmp_path: Path) -> None:
 
 
 def test_rejects_globals_starred_call(tmp_path: Path) -> None:
-    """Codex round 12 finding 1: ``globals(*())`` is syntactically a
-    call with one Starred arg, evaluating to ``globals()``. The
+    """Regression: ``globals(*())`` is syntactically a call with one
+    Starred arg, evaluating to ``globals()``. The
     bare-name detector requires no args, but the splat hides the
     empty args. Refused via the strict legitimate-call shape.
     """
@@ -8584,8 +8583,8 @@ def test_rejects_dir_kwargs_unpack(tmp_path: Path) -> None:
 
 
 def test_rejects_getattr_starred_args(tmp_path: Path) -> None:
-    """Codex round 12 finding 2: ``getattr(*(fn, "__globals__"))``
-    routes through Starred, hiding the literal from positional check.
+    """Regression: ``getattr(*(fn, "__globals__"))`` routes through
+    Starred, hiding the literal from positional check.
     Refused outright when starred / `**` unpacking is present.
     """
 
@@ -8623,7 +8622,7 @@ def test_rejects_dunder_getattribute_starred_args(tmp_path: Path) -> None:
 
 
 def test_rejects_getattr_aliasing(tmp_path: Path) -> None:
-    """Codex round 12 finding 3: ``READ = object.__getattribute__;
+    """Regression: ``READ = object.__getattribute__;
     READ(fn, "__globals__")`` aliases the dunder accessor. The
     aliasing trips on ``object.__getattribute__`` Attribute access
     (``.__getattribute__`` is not directly banned, but aliasing the
@@ -8694,8 +8693,8 @@ def test_rejects_from_builtins_import_getattr(tmp_path: Path) -> None:
 
 
 def test_rejects_dunder_dict_get_method(tmp_path: Path) -> None:
-    """Codex round 12 finding 4: ``builtins.__dict__.get("globals")``
-    -- the ``.get`` method form of dict subscript. The ``.__dict__``
+    """Regression: ``builtins.__dict__.get("globals")`` -- the
+    ``.get`` method form of dict subscript. The ``.__dict__``
     attribute access ban catches this on the receiver.
     """
 
@@ -8734,8 +8733,8 @@ def test_rejects_aliased_dict_subscript(tmp_path: Path) -> None:
 
 
 def test_rejects_constant_fstring_attr_literal(tmp_path: Path) -> None:
-    """Codex round 12 finding 5: ``getattr(fn, f"__globals__")`` --
-    a constant-only f-string is semantically the same as the plain
+    """Regression: ``getattr(fn, f"__globals__")`` -- a
+    constant-only f-string is semantically the same as the plain
     string. ``_string_constant`` now folds these.
     """
 

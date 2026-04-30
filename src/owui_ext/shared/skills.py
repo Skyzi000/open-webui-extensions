@@ -19,13 +19,12 @@ agent loop bypasses the core middleware that would normally bind
 builtin tools.
 
 Lives in its own shared dep (rather than ``shared.tool_servers`` or a
-larger generic module) so plugins that don't use skills don't drag
-this code into their bundle -- the inliner has no tree-shaking, see
-``feedback_inliner_no_treeshake``. Same shared-dep "no mixing
-external + cross-shared imports" rule that already shaped
-``shared.tool_execution`` / ``shared.mcp_tools`` -- the tiny
-``maybe_await`` helper is inlined privately rather than imported
-from ``shared.async_utils``.
+larger generic module) so plugins that don't use skills don't include
+this code in their bundle; the inliner has no tree-shaking. It follows
+the same shared-dep "no mixing external + cross-shared imports" rule
+that already shaped ``shared.tool_execution`` / ``shared.mcp_tools``:
+the tiny ``maybe_await`` helper is inlined privately rather than
+imported from ``shared.async_utils``.
 """
 
 import logging

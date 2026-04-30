@@ -228,7 +228,7 @@ def test_staged_check_passes_when_index_is_consistent(
     _git(repo, "add", "-A")
 
     src.write_text(
-        "# bogus stray content not staged\n" + src.read_text(encoding="utf-8"),
+        "# unstaged sentinel content\n" + src.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
 
@@ -480,9 +480,9 @@ def test_release_toml_absolute_output_is_rejected(
             local_import_roots = ["owui_ext.shared"]
 
             [[targets]]
-            name = "evil"
+            name = "invalid"
             source = "src/owui_ext/tools/demo.py"
-            output = "{tmp_path / 'evil.py'}"
+            output = "{tmp_path / 'invalid.py'}"
             """
         ).lstrip(),
         encoding="utf-8",
@@ -493,4 +493,4 @@ def test_release_toml_absolute_output_is_rejected(
     captured = capsys.readouterr()
     assert rc == 2
     assert "must be a relative path" in captured.err
-    assert not (tmp_path / "evil.py").exists()
+    assert not (tmp_path / "invalid.py").exists()
