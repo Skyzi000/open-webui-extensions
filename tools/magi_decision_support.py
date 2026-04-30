@@ -2059,61 +2059,64 @@ class Tools:
             excluded_tool_ids=excluded_tool_ids,
         )
 
-        roles = [
-            ("MELCHIOR", "scientific/technical"),
-            ("BALTHASAR", "legal/ethical"),
-            ("CASPER", "emotional/trend"),
-        ]
-
-        agent_results: Dict[str, dict] = {}
-        raw_outputs: Dict[str, str] = {}
-
-        await emitter.emit(
-            description=f"MAGI Starting: {prop}",
-            status="agents_starting",
-            done=False,
-        )
-
-        async def run_single_agent(role_name: str, perspective: str) -> Tuple[str, str, dict]:
-            """Run a single MAGI agent and return (role_name, raw_output, parsed_result)."""
-            system_prompt, user_prompt = build_agent_prompts(
-                role_name=role_name,
-                perspective=perspective,
-                proposition=prop,
-                prerequisites=prereq,
-                option_a=opt_a,
-                option_b=opt_b,
-                include_sources=include_sources,
-            )
-            content = await run_agent_loop(
-                request=__request__,
-                user=user,
-                model_id=model_id,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                tools_dict=tools_dict,
-                max_iterations=self.valves.MAX_ITERATIONS,
-                extra_params=extra_params,
-                apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
-                agent_name=role_name,
-                event_emitter=__event_emitter__,
-            )
-
-            parsed = safe_json_loads(content) or {
-                "vote": "abstain",
-                "reasoning": content,
-                "benefits": [],
-                "risks": [],
-                "sources": [],
-            }
-            return role_name, content, parsed
-
-        import asyncio
-
-        agent_tasks = [run_single_agent(role_name, perspective) for role_name, perspective in roles]
+        # MCP clients are live as soon as build_tools_dict returns; the
+        # try/finally has to start *here* so an exception or cancellation in
+        # the status emit / setup steps below still triggers cleanup.
         try:
+            roles = [
+                ("MELCHIOR", "scientific/technical"),
+                ("BALTHASAR", "legal/ethical"),
+                ("CASPER", "emotional/trend"),
+            ]
+
+            agent_results: Dict[str, dict] = {}
+            raw_outputs: Dict[str, str] = {}
+
+            await emitter.emit(
+                description=f"MAGI Starting: {prop}",
+                status="agents_starting",
+                done=False,
+            )
+
+            async def run_single_agent(role_name: str, perspective: str) -> Tuple[str, str, dict]:
+                """Run a single MAGI agent and return (role_name, raw_output, parsed_result)."""
+                system_prompt, user_prompt = build_agent_prompts(
+                    role_name=role_name,
+                    perspective=perspective,
+                    proposition=prop,
+                    prerequisites=prereq,
+                    option_a=opt_a,
+                    option_b=opt_b,
+                    include_sources=include_sources,
+                )
+                content = await run_agent_loop(
+                    request=__request__,
+                    user=user,
+                    model_id=model_id,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    tools_dict=tools_dict,
+                    max_iterations=self.valves.MAX_ITERATIONS,
+                    extra_params=extra_params,
+                    apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                    agent_name=role_name,
+                    event_emitter=__event_emitter__,
+                )
+
+                parsed = safe_json_loads(content) or {
+                    "vote": "abstain",
+                    "reasoning": content,
+                    "benefits": [],
+                    "risks": [],
+                    "sources": [],
+                }
+                return role_name, content, parsed
+
+            import asyncio
+
+            agent_tasks = [run_single_agent(role_name, perspective) for role_name, perspective in roles]
             results = await asyncio.gather(*agent_tasks, return_exceptions=True)
         finally:
             if mcp_clients:
