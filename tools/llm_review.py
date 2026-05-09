@@ -101,6 +101,12 @@ from starlette.responses import JSONResponse, Response
 _RESPONSE_BODY_PREVIEW_CHARS = 1024
 
 
+def _truncate_preview(text: str) -> str:
+    if len(text) > _RESPONSE_BODY_PREVIEW_CHARS:
+        return text[:_RESPONSE_BODY_PREVIEW_CHARS] + "...[truncated]"
+    return text
+
+
 def _decode_response_body(response: Response) -> str:
     body = getattr(response, "body", None)
     if body is None:
@@ -112,10 +118,7 @@ def _decode_response_body(response: Response) -> str:
             text = repr(body)
     else:
         text = str(body)
-    text = text.strip()
-    if len(text) > _RESPONSE_BODY_PREVIEW_CHARS:
-        text = text[:_RESPONSE_BODY_PREVIEW_CHARS] + "...[truncated]"
-    return text
+    return _truncate_preview(text.strip())
 
 
 def _extract_json_response_error(response: JSONResponse) -> str:
@@ -129,15 +132,15 @@ def _extract_json_response_error(response: JSONResponse) -> str:
         if isinstance(error_field, dict):
             msg = error_field.get("message")
             if isinstance(msg, str) and msg:
-                return f"API error: {msg}"
-            return f"API error: {error_data}"
+                return f"API error: {_truncate_preview(msg)}"
+            return f"API error: {_truncate_preview(str(error_data))}"
         if isinstance(error_field, str) and error_field:
-            return f"API error: {error_field}"
+            return f"API error: {_truncate_preview(error_field)}"
         msg = error_data.get("message")
         if isinstance(msg, str) and msg:
-            return f"API error: {msg}"
-        return f"API error: {error_data}"
-    return f"API error: {error_data}"
+            return f"API error: {_truncate_preview(msg)}"
+        return f"API error: {_truncate_preview(str(error_data))}"
+    return f"API error: {_truncate_preview(str(error_data))}"
 
 
 def format_chat_completion_error(response: Any) -> Optional[str]:

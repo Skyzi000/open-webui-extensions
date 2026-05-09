@@ -47,6 +47,42 @@ def test_json_response_with_unparseable_body_falls_back_to_status():
     assert result == "API error (status 500): Failed to parse response"
 
 
+def test_json_response_truncates_long_message_field():
+    long_msg = "x" * (_RESPONSE_BODY_PREVIEW_CHARS + 200)
+    response = JSONResponse(
+        status_code=400,
+        content={"error": {"message": long_msg}},
+    )
+    result = format_chat_completion_error(response)
+    assert result.startswith("API error: ")
+    assert result.endswith("...[truncated]")
+    body_part = result.split(": ", 1)[1]
+    assert len(body_part) == _RESPONSE_BODY_PREVIEW_CHARS + len("...[truncated]")
+
+
+def test_json_response_truncates_long_string_error_field():
+    long_msg = "y" * (_RESPONSE_BODY_PREVIEW_CHARS + 50)
+    response = JSONResponse(status_code=502, content={"error": long_msg})
+    result = format_chat_completion_error(response)
+    assert result.endswith("...[truncated]")
+
+
+def test_json_response_truncates_long_top_level_message():
+    long_msg = "z" * (_RESPONSE_BODY_PREVIEW_CHARS + 50)
+    response = JSONResponse(status_code=429, content={"message": long_msg})
+    result = format_chat_completion_error(response)
+    assert result.endswith("...[truncated]")
+
+
+def test_json_response_truncates_unrecognized_dict_fallback():
+    # No known message/error fields — falls back to str(error_data).
+    long_value = "q" * (_RESPONSE_BODY_PREVIEW_CHARS + 50)
+    response = JSONResponse(status_code=400, content={"unknown_field": long_value})
+    result = format_chat_completion_error(response)
+    assert result.startswith("API error: ")
+    assert result.endswith("...[truncated]")
+
+
 def test_plain_text_response_includes_status_type_and_body():
     response = PlainTextResponse(
         status_code=504,
