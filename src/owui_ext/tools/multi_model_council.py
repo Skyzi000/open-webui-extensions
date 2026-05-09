@@ -450,11 +450,20 @@ class Tools:
         )
         AVAILABLE_TOOL_IDS: str = Field(
             default="",
-            description="Comma-separated list of tool IDs available to council members. Leave empty to use all tools.",
+            description=(
+                "[Advanced] Comma-separated list of regular tool IDs available to council members. "
+                "Leave empty (recommended) to use regular tools enabled in the chat UI. "
+                "This controls regular tools only; builtin tools are controlled by the ENABLE_*_TOOLS "
+                "toggles below, terminal tools by ENABLE_TERMINAL_TOOLS, and direct/OpenAPI tool "
+                "servers by the current chat metadata."
+            ),
         )
         EXCLUDED_TOOL_IDS: str = Field(
             default="",
-            description="Comma-separated list of tool IDs to exclude from council members.",
+            description=(
+                "Comma-separated list of regular tool IDs to exclude from council members. "
+                "This controls regular tools only; to disable builtin tools, use the ENABLE_*_TOOLS toggles."
+            ),
         )
         APPLY_INLET_FILTERS: bool = Field(
             default=True,

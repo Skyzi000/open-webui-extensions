@@ -211,11 +211,19 @@ class Tools:
     class Valves(BaseModel):
         AVAILABLE_TOOL_IDS: str = Field(
             default="",
-            description="Comma-separated list of tool IDs available for parallel execution. Leave empty to use all tools.",
+            description=(
+                "[Advanced] Comma-separated list of regular tool IDs available for parallel execution. "
+                "Leave empty (recommended) to use regular tools enabled in the chat UI. "
+                "This controls regular tools only; terminal tools are controlled by ENABLE_TERMINAL_TOOLS, "
+                "and builtin/direct tools follow the current chat metadata."
+            ),
         )
         EXCLUDED_TOOL_IDS: str = Field(
             default="",
-            description="Comma-separated list of tool IDs to exclude from parallel execution.",
+            description=(
+                "Comma-separated list of regular tool IDs to exclude from parallel execution. "
+                "This controls regular tools only; it is not a security boundary for tools the main AI can call directly."
+            ),
         )
         ENABLE_TERMINAL_TOOLS: bool = Field(
             default=True,
