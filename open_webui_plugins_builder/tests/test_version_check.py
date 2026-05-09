@@ -80,6 +80,24 @@ def test_missing_version_field_fails(tmp_path: Path) -> None:
     assert "version:" in error
 
 
+def test_missing_head_version_field_fails_when_output_changes(
+    tmp_path: Path,
+) -> None:
+    """If HEAD has no leading-docstring version, the gate cannot compare safely."""
+
+    target = _target(tmp_path)
+    head = '"""title: Demo"""\nprint("hi")\n'
+    rebuilt = HEAD_OUTPUT.replace('print("hi")', 'print("hi there")')
+    error = check_version_bump(
+        target=target,
+        rebuilt_output=rebuilt,
+        head_output=head,
+    )
+    assert error is not None
+    assert "HEAD" in error
+    assert "version:" in error
+
+
 def test_extract_version_ignores_comment_lines() -> None:
     """A ``# version: 0.2.0`` comment must not satisfy the gate.
 

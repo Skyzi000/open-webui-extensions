@@ -115,12 +115,19 @@ def check_version_bump(
             f"against the actual last-shipped value, and a behind / "
             f"rolled-back version could ship silently."
         )
+    old_version = extract_version(head_output)
+    if old_version is None:
+        return (
+            f"{target.name}: HEAD output {target.output} is missing a "
+            f"`version:` field in its leading docstring, so the version "
+            f"bump cannot be checked. Restore the leading-docstring "
+            f"`version:` field before regenerating."
+        )
     if baseline_output is not None and baseline_is_ancestor_of_head:
         baseline_version = extract_version(baseline_output)
         if baseline_version is not None and new_version != baseline_version:
             return None
-    old_version = extract_version(head_output)
-    if old_version is not None and new_version == old_version:
+    if new_version == old_version:
         return (
             f"{target.name}: output {target.output} differs from HEAD but "
             f"`version:` was not bumped (still {new_version!r}). "
