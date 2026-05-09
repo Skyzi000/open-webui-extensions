@@ -829,6 +829,78 @@ async def test_multi_model_council_without_terminal_symbol_keeps_builtin(
 
 
 @pytest.mark.asyncio
+async def test_magi_default_model_resolves_model_for_tool_loading(
+    monkeypatch, dummy_request, mock_user
+):
+    selected_model = {
+        "id": "model-b",
+        "info": {"meta": {"builtinTools": {"knowledge": False}}},
+    }
+    setattr(
+        dummy_request.app.state,
+        "MODELS",
+        {
+            "model-a": {"id": "model-a"},
+            "model-b": selected_model,
+        },
+    )
+
+    captured = {}
+
+    async def fake_build_tools_dict(**kwargs):
+        captured["model"] = kwargs["model"]
+        captured["extra_model"] = kwargs["extra_params"]["__model__"]
+        return {}, {}
+
+    async def fake_run_agent_loop(**kwargs):
+        return json.dumps(
+            {
+                "vote": "A",
+                "reasoning": "resolved model",
+                "benefits": [],
+                "risks": [],
+                "sources": [],
+            }
+        )
+
+    async def fake_generate_single_completion(**kwargs):
+        return "summary"
+
+    monkeypatch.setattr(magi_decision_support, "build_tools_dict", fake_build_tools_dict)
+    monkeypatch.setattr(magi_decision_support, "run_agent_loop", fake_run_agent_loop)
+    monkeypatch.setattr(
+        magi_decision_support,
+        "generate_single_completion",
+        fake_generate_single_completion,
+    )
+
+    tool = magi_decision_support.Tools()
+    tool.valves.DEFAULT_MODEL = "model-b"
+
+    user_payload = {
+        **mock_user,
+        "last_active_at": 0,
+        "updated_at": 0,
+        "created_at": 0,
+    }
+
+    result_json = await tool.magi_decide(
+        proposition="Choose a model",
+        option_a="A",
+        option_b="B",
+        __user__=user_payload,
+        __request__=dummy_request,
+        __model__={"id": "model-a"},
+        __metadata__={"tool_ids": [], "features": {}},
+    )
+
+    payload = json.loads(result_json)
+    assert payload["decision"] == "A"
+    assert captured["model"] is selected_model
+    assert captured["extra_model"] is selected_model
+
+
+@pytest.mark.asyncio
 async def test_magi_build_tools_dict_includes_terminal(monkeypatch, dummy_request):
     import open_webui.utils.tools as ow_tools
 

@@ -2217,12 +2217,24 @@ class Tools:
                 ensure_ascii=False,
             )
 
+        # Keep tool loading and injected __model__ aligned with the actual
+        # model used for MAGI completions when DEFAULT_MODEL overrides the
+        # parent chat model.
+        resolved_model = __model__ or {}
+        if model_id and model_id != resolved_model.get("id", ""):
+            try:
+                resolved_model = __request__.app.state.MODELS.get(
+                    model_id, resolved_model
+                )
+            except Exception:
+                pass  # Fall back to parent model metadata.
+
         extra_params = {
             "__user__": __user__,
             "__event_emitter__": __event_emitter__,
             "__event_call__": __event_call__,
             "__request__": __request__,
-            "__model__": __model__,
+            "__model__": resolved_model,
             "__metadata__": __metadata__ or {},
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
@@ -2247,7 +2259,7 @@ class Tools:
 
         tools_dict, mcp_clients = await build_tools_dict(
             request=__request__,
-            model=__model__ or {},
+            model=resolved_model,
             metadata=__metadata__ or {},
             user=user,
             valves=self.valves,
