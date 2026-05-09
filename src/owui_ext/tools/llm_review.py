@@ -17,11 +17,11 @@ from html.parser import HTMLParser
 from typing import Any, Callable, Literal, Optional, Type
 
 from fastapi import Request
-from starlette.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
+from owui_ext.shared.completion_response import format_chat_completion_error
 from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
 from owui_ext.shared.model_features import (
     model_has_note_knowledge,
@@ -3033,20 +3033,12 @@ async def run_agent_loop(
             log.exception(f"Error in review agent completion: {e}")
             return f"Error during review agent execution: {e}"
 
-        # Handle JSONResponse (returned on HTTP errors like 400+)
-        if isinstance(response, JSONResponse):
-            try:
-                error_data = json.loads(bytes(response.body).decode("utf-8"))
-                error_field = error_data.get("error") if isinstance(error_data, dict) else None
-                if isinstance(error_field, dict):
-                    error_msg = error_field.get("message", str(error_data))
-                elif isinstance(error_field, str):
-                    error_msg = error_field
-                else:
-                    error_msg = error_data.get("message", str(error_data)) if isinstance(error_data, dict) else str(error_data)
-                return f"API error: {error_msg}"
-            except Exception:
-                return f"API error (status {response.status_code}): Failed to parse response"
+        # Surface upstream errors (JSONResponse, PlainTextResponse, etc.)
+        # verbatim so the parent loop sees the real cause instead of an
+        # opaque ``Unexpected response type``.
+        error_msg = format_chat_completion_error(response)
+        if error_msg is not None:
+            return error_msg
 
         if isinstance(response, dict):
             choices = response.get("choices", [])
@@ -3264,10 +3256,6 @@ async def run_agent_loop(
                 # would be drift past the agent's own completion signal.
                 return content or ""
 
-        else:
-            # Unexpected response type
-            return f"Unexpected response type: {type(response)}"
-
     # Max iterations reached
     if event_emitter:
         await event_emitter(
@@ -3363,6 +3351,9 @@ async def run_agent_loop(
             user=user_obj,
             bypass_filter=True,  # We handle filters manually above
         )
+        error_msg = format_chat_completion_error(response)
+        if error_msg is not None:
+            return error_msg
         if isinstance(response, dict):
             choices = response.get("choices", [])
             if choices:

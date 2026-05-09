@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fastapi import Request
 from pydantic import BaseModel, Field
 
+from owui_ext.shared.completion_response import format_chat_completion_error
 from owui_ext.shared.event_emitter import EventEmitter
 from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients
@@ -217,6 +218,10 @@ async def generate_single_completion(
         bypass_filter=True,
     )
 
+    error_msg = format_chat_completion_error(response)
+    if error_msg is not None:
+        return error_msg
+
     if isinstance(response, dict):
         choices = response.get("choices", [])
         if choices:
@@ -311,6 +316,10 @@ async def run_agent_loop(
         except Exception as exc:
             log.exception(f"Error in MAGI agent completion: {exc}")
             return f"Error during MAGI agent execution: {exc}"
+
+        error_msg = format_chat_completion_error(response)
+        if error_msg is not None:
+            return error_msg
 
         if isinstance(response, dict):
             choices = response.get("choices", [])
@@ -419,8 +428,6 @@ async def run_agent_loop(
                         "content": result["content"],
                     }
                 )
-        else:
-            return f"Unexpected response type: {type(response)}"
 
     # Max iterations reached
     if event_emitter:
@@ -462,6 +469,9 @@ async def run_agent_loop(
             user=user_obj,
             bypass_filter=True,
         )
+        error_msg = format_chat_completion_error(response)
+        if error_msg is not None:
+            return error_msg
         if isinstance(response, dict):
             choices = response.get("choices", [])
             if choices:
