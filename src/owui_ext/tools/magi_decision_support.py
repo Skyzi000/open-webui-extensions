@@ -43,6 +43,7 @@ from owui_ext.shared.tool_execution import (
     process_tool_result,
 )
 from owui_ext.shared.tool_loader import build_tools_dict
+from owui_ext.shared.valves import coerce_user_valves
 from owui_ext.shared.voting import compute_vote_tally, decide_majority
 
 log = logging.getLogger(__name__)
@@ -625,7 +626,8 @@ class Tools:
         from open_webui.models.users import UserModel
 
         user = UserModel(**__user__)
-        user_valves = self.UserValves.model_validate((__user__ or {}).get("valves", {}))
+        raw_user_valves = (__user__ or {}).get("valves", {})
+        user_valves = coerce_user_valves(raw_user_valves, self.UserValves)
 
         include_sources = bool(user_valves.INCLUDE_SOURCES)
 

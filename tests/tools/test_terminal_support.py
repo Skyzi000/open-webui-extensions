@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import BaseModel
 
 # Add tools directory to path
 tools_dir = Path(__file__).parent.parent.parent / "tools"
@@ -898,6 +899,75 @@ async def test_magi_default_model_resolves_model_for_tool_loading(
     assert payload["decision"] == "A"
     assert captured["model"] is selected_model
     assert captured["extra_model"] is selected_model
+
+
+@pytest.mark.asyncio
+async def test_magi_accepts_basemodel_user_valves(
+    monkeypatch, dummy_request, mock_user
+):
+    class LegacyMagiUserValves(BaseModel):
+        INCLUDE_SOURCES: bool = False
+
+    captured_include_sources = []
+
+    async def fake_build_tools_dict(**kwargs):
+        return {}, {}
+
+    def fake_build_agent_prompts(**kwargs):
+        captured_include_sources.append(kwargs["include_sources"])
+        return "system", "user"
+
+    async def fake_run_agent_loop(**kwargs):
+        return json.dumps(
+            {
+                "vote": "A",
+                "reasoning": "coerced valves",
+                "benefits": [],
+                "risks": [],
+                "sources": [],
+            }
+        )
+
+    async def fake_generate_single_completion(**kwargs):
+        return "summary"
+
+    monkeypatch.setattr(magi_decision_support, "build_tools_dict", fake_build_tools_dict)
+    monkeypatch.setattr(
+        magi_decision_support,
+        "build_agent_prompts",
+        fake_build_agent_prompts,
+    )
+    monkeypatch.setattr(magi_decision_support, "run_agent_loop", fake_run_agent_loop)
+    monkeypatch.setattr(
+        magi_decision_support,
+        "generate_single_completion",
+        fake_generate_single_completion,
+    )
+
+    user_payload = {
+        **mock_user,
+        "last_active_at": 0,
+        "updated_at": 0,
+        "created_at": 0,
+        "valves": LegacyMagiUserValves(INCLUDE_SOURCES=False),
+    }
+
+    try:
+        result_json = await magi_decision_support.Tools().magi_decide(
+            proposition="Use inherited valves",
+            option_a="A",
+            option_b="B",
+            __user__=user_payload,
+            __request__=dummy_request,
+            __model__={"id": "model-a"},
+            __metadata__={"tool_ids": [], "features": {}},
+        )
+    except Exception as exc:
+        pytest.fail(f"magi_decide should accept BaseModel user valves: {exc}")
+
+    payload = json.loads(result_json)
+    assert payload["decision"] == "A"
+    assert captured_include_sources == [False, False, False]
 
 
 @pytest.mark.asyncio

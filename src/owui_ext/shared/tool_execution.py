@@ -29,9 +29,8 @@ from other ``owui_ext.shared.*`` modules, so co-locating these helpers
 keeps the orchestrator self-contained.
 
 The module also carries its own private inlines of ``maybe_await`` and
-the user-payload normalizer for the same reason; ``shared.async_utils``
-and ``shared.users`` stay as standalone modules for plugins that need
-either helper outside this code path.
+the user-payload normalizer for the same reason, so the orchestrator
+does not depend on another shared module while being inlined.
 """
 
 import ast
