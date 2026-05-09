@@ -1,0 +1,30 @@
+[meta]
+schema_version = 1
+
+[settings]
+local_import_roots = ["owui_ext.shared"]
+
+[[targets]]
+name = "parallel_tools"
+source = "src/owui_ext/tools/parallel_tools.py"
+output = "tools/parallel_tools.py"
+
+[[targets]]
+name = "magi_decision_support"
+source = "src/owui_ext/tools/magi_decision_support.py"
+output = "tools/magi_decision_support.py"
+
+[[targets]]
+name = "multi_model_council"
+source = "src/owui_ext/tools/multi_model_council.py"
+output = "tools/multi_model_council.py"
+
+[[targets]]
+name = "sub_agent"
+source = "src/owui_ext/tools/sub_agent.py"
+output = "tools/sub_agent.py"
+
+[[targets]]
+name = "llm_review"
+source = "src/owui_ext/tools/llm_review.py"
+output = "tools/llm_review.py"

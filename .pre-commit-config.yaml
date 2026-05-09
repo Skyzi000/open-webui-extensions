@@ -7,3 +7,13 @@ repos:
         language: python
         files: \.py$
         pass_filenames: true
+      - id: release-builder-check
+        name: Verify single-file release outputs are up-to-date and version-bumped
+        # --no-sync stops uv from re-resolving the dev group (which pulls in
+        # open-webui's editable install + frontend build) on every commit. The
+        # hook needs the builder pre-installed in the active venv -- run
+        # `uv sync` or `uv pip install -e ./open_webui_plugins_builder` once.
+        entry: uv run --no-sync python scripts/build_release.py --changed --check --staged
+        language: system
+        pass_filenames: false
+        files: ^(src/owui_ext/|tools/|functions/filter/|release\.toml|open_webui_plugins_builder/|scripts/build_release\.py).*$

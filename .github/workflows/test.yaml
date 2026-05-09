@@ -52,7 +52,11 @@ jobs:
         run: uv sync --extra test --group dev
 
       - name: Run all tests
-        run: uv run pytest tests/ -v --tb=short
+        # No path argument: `testpaths` in pyproject.toml drives discovery
+        # (currently `tests/` + `open_webui_plugins_builder/tests/`).
+        # Passing an explicit path here would silently shadow `testpaths`
+        # and skip whichever directory wasn't named.
+        run: uv run pytest -v --tb=short
         env:
           ENV: dev
           WEBUI_SECRET_KEY: test-secret-key

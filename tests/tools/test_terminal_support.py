@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import BaseModel
 
 # Add tools directory to path
 tools_dir = Path(__file__).parent.parent.parent / "tools"
@@ -49,8 +50,8 @@ TERMINAL_EVENT_MODULE_CASES = [
     (
         "parallel_tools",
         parallel_tools,
-        "tool_name",
-        "tool_args",
+        "tool_function_name",
+        "tool_function_params",
     ),
 ]
 
@@ -330,7 +331,9 @@ async def test_sub_agent_resolve_mcp_tools_supports_oauth_2_1_static(monkeypatch
         debug=False,
     )
 
-    assert oauth_calls == [("u1", "mcp:suite:ctx7")]
+    # OAuth lookup uses the trailing colon segment to match Open WebUI core,
+    # while the mcp_clients cache key below stays on the full id.
+    assert oauth_calls == [("u1", "mcp:ctx7")]
     assert connected_headers == [
         {
             "url": "https://mcp.example.com",
@@ -621,7 +624,7 @@ async def test_multi_model_council_build_tools_dict_includes_terminal(monkeypatc
     valves.ENABLE_TERMINAL_TOOLS = True
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-council"}
-    tools_dict = await multi_model_council.build_tools_dict(
+    tools_dict, _ = await multi_model_council.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
@@ -672,7 +675,7 @@ async def test_multi_model_council_resolves_terminal_from_request_body(monkeypat
 
     metadata = {"tool_ids": [], "features": {}}
     extra_params = {"__metadata__": metadata}
-    tools_dict = await multi_model_council.build_tools_dict(
+    tools_dict, _ = await multi_model_council.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
@@ -718,7 +721,7 @@ async def test_multi_model_council_resolves_terminal_once_before_parallel_member
         resolved_direct_tool_servers=None,
     ):
         build_tools_terminal_ids.append(resolved_terminal_id)
-        return {}
+        return {}, {}
 
     async def fake_run_agent_loop(**kwargs):
         return json.dumps({"vote": "A", "reasoning": "ok"})
@@ -811,7 +814,7 @@ async def test_multi_model_council_without_terminal_symbol_keeps_builtin(
     valves.ENABLE_TERMINAL_TOOLS = True
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-council-compat"}
-    tools_dict = await multi_model_council.build_tools_dict(
+    tools_dict, _ = await multi_model_council.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
@@ -824,6 +827,147 @@ async def test_multi_model_council_without_terminal_symbol_keeps_builtin(
 
     assert "search_web" in tools_dict
     assert tools_dict["search_web"]["type"] == "builtin"
+
+
+@pytest.mark.asyncio
+async def test_magi_default_model_resolves_model_for_tool_loading(
+    monkeypatch, dummy_request, mock_user
+):
+    selected_model = {
+        "id": "model-b",
+        "info": {"meta": {"builtinTools": {"knowledge": False}}},
+    }
+    setattr(
+        dummy_request.app.state,
+        "MODELS",
+        {
+            "model-a": {"id": "model-a"},
+            "model-b": selected_model,
+        },
+    )
+
+    captured = {}
+
+    async def fake_build_tools_dict(**kwargs):
+        captured["model"] = kwargs["model"]
+        captured["extra_model"] = kwargs["extra_params"]["__model__"]
+        return {}, {}
+
+    async def fake_run_agent_loop(**kwargs):
+        return json.dumps(
+            {
+                "vote": "A",
+                "reasoning": "resolved model",
+                "benefits": [],
+                "risks": [],
+                "sources": [],
+            }
+        )
+
+    async def fake_generate_single_completion(**kwargs):
+        return "summary"
+
+    monkeypatch.setattr(magi_decision_support, "build_tools_dict", fake_build_tools_dict)
+    monkeypatch.setattr(magi_decision_support, "run_agent_loop", fake_run_agent_loop)
+    monkeypatch.setattr(
+        magi_decision_support,
+        "generate_single_completion",
+        fake_generate_single_completion,
+    )
+
+    tool = magi_decision_support.Tools()
+    tool.valves.DEFAULT_MODEL = "model-b"
+
+    user_payload = {
+        **mock_user,
+        "last_active_at": 0,
+        "updated_at": 0,
+        "created_at": 0,
+    }
+
+    result_json = await tool.magi_decide(
+        proposition="Choose a model",
+        option_a="A",
+        option_b="B",
+        __user__=user_payload,
+        __request__=dummy_request,
+        __model__={"id": "model-a"},
+        __metadata__={"tool_ids": [], "features": {}},
+    )
+
+    payload = json.loads(result_json)
+    assert payload["decision"] == "A"
+    assert captured["model"] is selected_model
+    assert captured["extra_model"] is selected_model
+
+
+@pytest.mark.asyncio
+async def test_magi_accepts_basemodel_user_valves(
+    monkeypatch, dummy_request, mock_user
+):
+    class LegacyMagiUserValves(BaseModel):
+        INCLUDE_SOURCES: bool = False
+
+    captured_include_sources = []
+
+    async def fake_build_tools_dict(**kwargs):
+        return {}, {}
+
+    def fake_build_agent_prompts(**kwargs):
+        captured_include_sources.append(kwargs["include_sources"])
+        return "system", "user"
+
+    async def fake_run_agent_loop(**kwargs):
+        return json.dumps(
+            {
+                "vote": "A",
+                "reasoning": "coerced valves",
+                "benefits": [],
+                "risks": [],
+                "sources": [],
+            }
+        )
+
+    async def fake_generate_single_completion(**kwargs):
+        return "summary"
+
+    monkeypatch.setattr(magi_decision_support, "build_tools_dict", fake_build_tools_dict)
+    monkeypatch.setattr(
+        magi_decision_support,
+        "build_agent_prompts",
+        fake_build_agent_prompts,
+    )
+    monkeypatch.setattr(magi_decision_support, "run_agent_loop", fake_run_agent_loop)
+    monkeypatch.setattr(
+        magi_decision_support,
+        "generate_single_completion",
+        fake_generate_single_completion,
+    )
+
+    user_payload = {
+        **mock_user,
+        "last_active_at": 0,
+        "updated_at": 0,
+        "created_at": 0,
+        "valves": LegacyMagiUserValves(INCLUDE_SOURCES=False),
+    }
+
+    try:
+        result_json = await magi_decision_support.Tools().magi_decide(
+            proposition="Use inherited valves",
+            option_a="A",
+            option_b="B",
+            __user__=user_payload,
+            __request__=dummy_request,
+            __model__={"id": "model-a"},
+            __metadata__={"tool_ids": [], "features": {}},
+        )
+    except Exception as exc:
+        pytest.fail(f"magi_decide should accept BaseModel user valves: {exc}")
+
+    payload = json.loads(result_json)
+    assert payload["decision"] == "A"
+    assert captured_include_sources == [False, False, False]
 
 
 @pytest.mark.asyncio
@@ -851,13 +995,12 @@ async def test_magi_build_tools_dict_includes_terminal(monkeypatch, dummy_reques
     monkeypatch.setattr(ow_tools, "get_terminal_tools", fake_get_terminal_tools)
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-magi"}
-    tools_dict = await magi_decision_support.build_tools_dict(
+    tools_dict, _ = await magi_decision_support.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params={"__metadata__": metadata},
         tool_id_list=[],
         excluded_tool_ids=None,
@@ -902,13 +1045,12 @@ async def test_magi_build_tools_dict_resolves_terminal_from_request_body(
 
     metadata = {"tool_ids": [], "features": {}}
     extra_params = {"__metadata__": metadata}
-    tools_dict = await magi_decision_support.build_tools_dict(
+    tools_dict, _ = await magi_decision_support.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params=extra_params,
         tool_id_list=[],
         excluded_tool_ids=None,
@@ -943,13 +1085,12 @@ async def test_magi_build_tools_dict_without_terminal_symbol_keeps_builtin(
     monkeypatch.delattr(ow_tools, "get_terminal_tools", raising=False)
 
     metadata = {"tool_ids": [], "features": {}, "terminal_id": "term-magi-compat"}
-    tools_dict = await magi_decision_support.build_tools_dict(
+    tools_dict, _ = await magi_decision_support.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params={"__metadata__": metadata},
         tool_id_list=[],
         excluded_tool_ids=None,
@@ -1471,7 +1612,7 @@ async def test_multi_model_council_build_tools_dict_includes_direct_tools(dummy_
         ],
     }
     extra_params = {"__metadata__": metadata}
-    tools_dict = await multi_model_council.build_tools_dict(
+    tools_dict, _ = await multi_model_council.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
@@ -1538,7 +1679,7 @@ async def test_multi_model_council_build_tools_dict_ignores_unloaded_direct_tool
         ],
     }
     extra_params = {"__metadata__": metadata}
-    tools_dict = await multi_model_council.build_tools_dict(
+    tools_dict, _ = await multi_model_council.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
@@ -1571,13 +1712,12 @@ async def test_magi_build_tools_dict_includes_direct_tools(dummy_request):
         ],
     }
     extra_params = {"__metadata__": metadata}
-    tools_dict = await magi_decision_support.build_tools_dict(
+    tools_dict, _ = await magi_decision_support.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params=extra_params,
         tool_id_list=[],
         excluded_tool_ids=None,
@@ -1611,8 +1751,7 @@ async def test_magi_build_tools_dict_collects_direct_tool_server_system_prompts(
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params=extra_params,
         tool_id_list=[],
         excluded_tool_ids=None,
@@ -1634,13 +1773,12 @@ async def test_magi_build_tools_dict_ignores_unloaded_direct_tool_prompts(dummy_
         ],
     }
     extra_params = {"__metadata__": metadata}
-    tools_dict = await magi_decision_support.build_tools_dict(
+    tools_dict, _ = await magi_decision_support.build_tools_dict(
         request=dummy_request,
         model={},
         metadata=metadata,
         user=SimpleNamespace(id="u1"),
-        enable_web_tools=True,
-        enable_terminal_tools=True,
+        valves=magi_decision_support.Tools().valves,
         extra_params=extra_params,
         tool_id_list=[],
         excluded_tool_ids=None,

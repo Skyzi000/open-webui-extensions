@@ -17,18 +17,20 @@ test = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
-pythonpath = [".", "references/open-webui/backend"]
+testpaths = ["tests", "open_webui_plugins_builder/tests"]
+pythonpath = [".", "src", "references/open-webui/backend"]
 
 [tool.pyright]
-extraPaths = ["references/open-webui/backend"]
+extraPaths = ["src", "references/open-webui/backend"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 
 [tool.uv.sources]
 open-webui = { path = "references/open-webui", editable = true }
+open-webui-plugins-builder = { path = "open_webui_plugins_builder", editable = true }
 
 [dependency-groups]
 dev = [
     "open-webui",
+    "open-webui-plugins-builder",
 ]

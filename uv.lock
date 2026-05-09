@@ -2654,6 +2654,7 @@ test = [
 [package.dev-dependencies]
 dev = [
     { name = "open-webui" },
+    { name = "open-webui-plugins-builder" },
 ]
 
 [package.metadata]
@@ -2666,7 +2667,19 @@ requires-dist = [
 provides-extras = ["test"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "open-webui", editable = "references/open-webui" }]
+dev = [
+    { name = "open-webui", editable = "references/open-webui" },
+    { name = "open-webui-plugins-builder", editable = "open_webui_plugins_builder" },
+]
+
+[[package]]
+name = "open-webui-plugins-builder"
+version = "0.1.5"
+source = { editable = "open_webui_plugins_builder" }
+
+[package.metadata]
+requires-dist = [{ name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" }]
+provides-extras = ["test"]
 
 [[package]]
 name = "openai"
