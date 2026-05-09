@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.5.3
+version: 0.5.4
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -903,7 +903,7 @@ async def resolve_mcp_tools(
             if client is not None:
                 try:
                     await client.disconnect()
-                except Exception:
+                except BaseException:
                     pass
             await emit_warning(f"Could not load MCP tools from '{server_id}': {e}")
 
@@ -911,11 +911,20 @@ async def resolve_mcp_tools(
 
 
 async def cleanup_mcp_clients(mcp_clients: dict) -> None:
-    """Disconnect all MCP clients, mirroring Open WebUI task cleanup."""
+    """Disconnect all MCP clients, absorbing non-Exception failures.
+
+    Some callers open MCP clients inside child tasks (e.g. coroutines
+    fed to ``asyncio.gather``) and close them from an outer ``finally``.
+    Catching ``BaseException`` keeps anyio cancel-scope failures (raised
+    outside the ``Exception`` hierarchy on cross-task cleanup) and
+    ``asyncio.CancelledError`` from escaping the caller and discarding
+    the tool's response. Matches upstream Open WebUI main.py chat
+    handler MCP cleanup (#24105).
+    """
     for client in reversed(list((mcp_clients or {}).values())):
         try:
             await client.disconnect()
-        except Exception as e:
+        except BaseException as e:
             _mcp_tools_log.debug(f"Error cleaning up MCP client: {e}")
 
 # --- inlined from src/owui_ext/shared/tool_servers.py (owui_ext.shared.tool_servers) ---

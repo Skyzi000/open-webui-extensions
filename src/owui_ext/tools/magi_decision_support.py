@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.8
+version: 0.2.9
 license: MIT
 required_open_webui_version: 0.7.0
 
