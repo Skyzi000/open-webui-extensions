@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.1
+version: 0.5.2
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -22,7 +22,6 @@ from collections.abc import Mapping, Sequence
 from html.parser import HTMLParser
 from typing import Any, Callable, Literal, Optional, Type
 from fastapi import Request
-from starlette.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 # --- inlined from src/owui_ext/shared/async_utils.py (owui_ext.shared.async_utils) ---
@@ -94,6 +93,83 @@ VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_AUTOMATION_TOOLS": "automations",
     "ENABLE_CALENDAR_TOOLS": "calendar",
 }
+
+# --- inlined from src/owui_ext/shared/completion_response.py (owui_ext.shared.completion_response) ---
+import json
+from typing import Any, Optional
+from starlette.responses import JSONResponse, Response
+_RESPONSE_BODY_PREVIEW_CHARS = 1024
+
+
+def _truncate_preview(text: str) -> str:
+    if len(text) > _RESPONSE_BODY_PREVIEW_CHARS:
+        return text[:_RESPONSE_BODY_PREVIEW_CHARS] + "...[truncated]"
+    return text
+
+
+def _decode_response_body(response: Response) -> str:
+    body = getattr(response, "body", None)
+    if body is None:
+        return ""
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            text = bytes(body).decode("utf-8", errors="replace")
+        except Exception:
+            text = repr(body)
+    else:
+        text = str(body)
+    return _truncate_preview(text.strip())
+
+
+def _extract_json_response_error(response: JSONResponse) -> str:
+    status = getattr(response, "status_code", "unknown")
+    try:
+        error_data = json.loads(bytes(response.body).decode("utf-8"))
+    except Exception:
+        return f"API error (status {status}): Failed to parse response"
+    if isinstance(error_data, dict):
+        error_field = error_data.get("error")
+        if isinstance(error_field, dict):
+            msg = error_field.get("message")
+            if isinstance(msg, str) and msg:
+                return f"API error: {_truncate_preview(msg)}"
+            return f"API error: {_truncate_preview(str(error_data))}"
+        if isinstance(error_field, str) and error_field:
+            return f"API error: {_truncate_preview(error_field)}"
+        msg = error_data.get("message")
+        if isinstance(msg, str) and msg:
+            return f"API error: {_truncate_preview(msg)}"
+        return f"API error: {_truncate_preview(str(error_data))}"
+    return f"API error: {_truncate_preview(str(error_data))}"
+
+
+def format_chat_completion_error(response: Any) -> Optional[str]:
+    """Classify a ``generate_chat_completion`` response.
+
+    Returns:
+        ``None`` when ``response`` is a ``dict`` (success path); the
+        caller should proceed to read ``response['choices']``.
+
+        ``str`` describing the upstream failure for any other shape.
+        ``JSONResponse`` bodies are unwrapped to surface the provider's
+        error message; other ``Response`` subclasses (notably
+        ``PlainTextResponse`` returned by Open WebUI core when the
+        provider replies with non-JSON 400+ content) are reported with
+        their status code and a truncated body preview so the caller
+        can show the real cause to the parent loop.
+    """
+    if isinstance(response, dict):
+        return None
+    if isinstance(response, JSONResponse):
+        return _extract_json_response_error(response)
+    if isinstance(response, Response):
+        status = getattr(response, "status_code", "unknown")
+        body_text = _decode_response_body(response)
+        type_name = type(response).__name__
+        if body_text:
+            return f"API error (status {status}, {type_name}): {body_text}"
+        return f"API error (status {status}, {type_name}): empty body"
+    return f"Unexpected response type: {type(response).__name__}"
 
 # --- inlined from src/owui_ext/shared/inlet_filters.py (owui_ext.shared.inlet_filters) ---
 import logging
@@ -889,7 +965,7 @@ async def resolve_mcp_tools(
             if client is not None:
                 try:
                     await client.disconnect()
-                except Exception:
+                except BaseException:
                     pass
             await emit_warning(f"Could not load MCP tools from '{server_id}': {e}")
 
@@ -897,11 +973,20 @@ async def resolve_mcp_tools(
 
 
 async def cleanup_mcp_clients(mcp_clients: dict) -> None:
-    """Disconnect all MCP clients, mirroring Open WebUI task cleanup."""
+    """Disconnect all MCP clients, absorbing non-Exception failures.
+
+    Some callers open MCP clients inside child tasks (e.g. coroutines
+    fed to ``asyncio.gather``) and close them from an outer ``finally``.
+    Catching ``BaseException`` keeps anyio cancel-scope failures (raised
+    outside the ``Exception`` hierarchy on cross-task cleanup) and
+    ``asyncio.CancelledError`` from escaping the caller and discarding
+    the tool's response. Matches upstream Open WebUI main.py chat
+    handler MCP cleanup (#24105).
+    """
     for client in reversed(list((mcp_clients or {}).values())):
         try:
             await client.disconnect()
-        except Exception as e:
+        except BaseException as e:
             _mcp_tools_log.debug(f"Error cleaning up MCP client: {e}")
 
 # --- inlined from src/owui_ext/shared/models.py (owui_ext.shared.models) ---
@@ -4565,20 +4650,12 @@ async def run_agent_loop(
             log.exception(f"Error in review agent completion: {e}")
             return f"Error during review agent execution: {e}"
 
-        # Handle JSONResponse (returned on HTTP errors like 400+)
-        if isinstance(response, JSONResponse):
-            try:
-                error_data = json.loads(bytes(response.body).decode("utf-8"))
-                error_field = error_data.get("error") if isinstance(error_data, dict) else None
-                if isinstance(error_field, dict):
-                    error_msg = error_field.get("message", str(error_data))
-                elif isinstance(error_field, str):
-                    error_msg = error_field
-                else:
-                    error_msg = error_data.get("message", str(error_data)) if isinstance(error_data, dict) else str(error_data)
-                return f"API error: {error_msg}"
-            except Exception:
-                return f"API error (status {response.status_code}): Failed to parse response"
+        # Surface upstream errors (JSONResponse, PlainTextResponse, etc.)
+        # verbatim so the parent loop sees the real cause instead of an
+        # opaque ``Unexpected response type``.
+        error_msg = format_chat_completion_error(response)
+        if error_msg is not None:
+            return error_msg
 
         if isinstance(response, dict):
             choices = response.get("choices", [])
@@ -4796,10 +4873,6 @@ async def run_agent_loop(
                 # would be drift past the agent's own completion signal.
                 return content or ""
 
-        else:
-            # Unexpected response type
-            return f"Unexpected response type: {type(response)}"
-
     # Max iterations reached
     if event_emitter:
         await event_emitter(
@@ -4895,6 +4968,9 @@ async def run_agent_loop(
             user=user_obj,
             bypass_filter=True,  # We handle filters manually above
         )
+        error_msg = format_chat_completion_error(response)
+        if error_msg is not None:
+            return error_msg
         if isinstance(response, dict):
             choices = response.get("choices", [])
             if choices:
