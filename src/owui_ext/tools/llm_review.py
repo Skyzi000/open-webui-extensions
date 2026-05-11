@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.2
+version: 0.5.3
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -62,6 +62,13 @@ except ImportError:
     _markdown_mod = None
 
 log = logging.getLogger(__name__)
+
+
+def _is_regular_chat_id(chat_id: Optional[str]) -> bool:
+    """Return True for chat IDs backed by Open WebUI's Chats table."""
+    if not chat_id:
+        return False
+    return not str(chat_id).startswith(("local:", "channel:"))
 
 
 # ============================================================================
@@ -1703,7 +1710,7 @@ class EventEmitter:
         # finalize() rebuild a correct live view, and the follow-up
         # live-fix below keeps them visible during the whole run.
         pre_existing: list = []
-        if self._chat_id and self._message_id:
+        if _is_regular_chat_id(self._chat_id) and self._message_id:
             try:
                 from open_webui.models.chats import Chats
 

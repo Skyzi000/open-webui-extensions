@@ -1,6 +1,9 @@
 """Tests for functions/filter/full_context_mode_toggle.py."""
 
-from functions.filter.full_context_mode_toggle import Filter
+import sys
+import types
+
+from functions.filter.full_context_mode_toggle import Filter, folder_knowledge_file_ids
 
 
 async def test_inlet_marks_both_payload_shapes_when_they_are_distinct():
@@ -230,3 +233,25 @@ async def test_inlet_supports_legacy_parent_message_key():
     result = await f.inlet(body)
 
     assert result["files"][0]["context"] == "full"
+
+
+async def test_folder_knowledge_skips_channel_chat_lookup(monkeypatch):
+    calls = []
+
+    class FakeChats:
+        @staticmethod
+        async def get_chat_folder_id(chat_id, user_id):
+            calls.append((chat_id, user_id))
+            return "folder-id"
+
+    chats_module = types.ModuleType("open_webui.models.chats")
+    chats_module.Chats = FakeChats
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
+
+    result = await folder_knowledge_file_ids(
+        {"chat_id": "channel:abc123"},
+        {"id": "user-1"},
+    )
+
+    assert result == set()
+    assert calls == []

@@ -2,6 +2,8 @@
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -51,3 +53,30 @@ class TestGraphitiMemoryFilterInstantiation:
         f = Filter()
         assert hasattr(f, "outlet")
         assert callable(f.outlet)
+
+    @pytest.mark.asyncio
+    async def test_channel_chat_runs_inlet_search(self):
+        """Open WebUI 0.9.5 channel requests run through the full filter pipeline."""
+        from graphiti_memory import Filter
+
+        f = Filter()
+        f._ensure_graphiti_initialized = AsyncMock(return_value=True)
+        f.graphiti = SimpleNamespace(
+            search_=AsyncMock(
+                return_value=SimpleNamespace(edges=[], nodes=[])
+            )
+        )
+
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+        user = {"id": "u1", "email": "u1@example.com", "role": "user", "valves": {}}
+
+        result = await f.inlet(
+            body,
+            __event_emitter__=AsyncMock(),
+            __user__=user,
+            __metadata__={"chat_id": "channel:abc123", "message_id": "m1"},
+        )
+
+        assert result is body
+        f._ensure_graphiti_initialized.assert_awaited_once()
+        f.graphiti.search_.assert_awaited_once()

@@ -3,7 +3,7 @@ title: Full Context Mode
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Toggle full context mode for user-attached files at once. Sets the "context": "full" flag to leverage Open WebUI's native full context processing (RAG template with citations, etc.). Auto-injected model/folder knowledge entries are left untouched so large knowledge bases keep their normal chunk-based retrieval. Note: if the global RAG_FULL_CONTEXT setting is already enabled, this filter has no additional effect.
-version: 1.1.1
+version: 1.1.2
 license: MIT
 """
 
@@ -27,6 +27,12 @@ def file_ids(files: list | None) -> set[str]:
     if not isinstance(files, list):
         return set()
     return {id_ for file in files if (id_ := file_id(file))}
+
+
+def is_regular_chat_id(chat_id: str | None) -> bool:
+    if not chat_id:
+        return False
+    return not str(chat_id).startswith(("local:", "channel:"))
 
 
 def model_knowledge_file_ids(metadata: dict) -> set[str]:
@@ -54,7 +60,7 @@ async def folder_knowledge_file_ids(metadata: dict, __user__: dict | None) -> se
     chat_id = metadata.get("chat_id")
 
     try:
-        if not folder_id and chat_id and not chat_id.startswith("local:"):
+        if not folder_id and is_regular_chat_id(chat_id):
             from open_webui.models.chats import Chats
 
             folder_id = await maybe_await(Chats.get_chat_folder_id(chat_id, user_id))
