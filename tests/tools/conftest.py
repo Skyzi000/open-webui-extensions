@@ -8,6 +8,7 @@ rest of the suite can still import the real modules.
 """
 
 import importlib
+import json
 import sys
 import types
 
@@ -53,9 +54,30 @@ def install_open_webui_tool_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "open_webui.utils.tools", tools_module)
     monkeypatch.setattr(utils_package, "tools", tools_module, raising=False)
 
+    async def _process_tool_result(
+        request,
+        tool_function_name,
+        tool_result,
+        tool_type,
+        direct_tool=False,
+        metadata=None,
+        user=None,
+    ):
+        if isinstance(tool_result, tuple):
+            tool_result = tool_result[0] if tool_result else ""
+        elif direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
+            tool_result = tool_result[0]
+
+        if isinstance(tool_result, (dict, list)):
+            tool_result = json.dumps(tool_result, indent=2, ensure_ascii=False)
+        elif tool_result is not None and not isinstance(tool_result, str):
+            tool_result = str(tool_result)
+
+        return tool_result, [], []
+
     middleware_module = _build_module(
         "open_webui.utils.middleware",
-        process_tool_result=None,
+        process_tool_result=_process_tool_result,
         get_citation_source_from_tool_result=lambda *a, **kw: [],
         get_file_url_from_base64=None,
     )

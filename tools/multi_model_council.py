@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.16
+version: 0.1.17
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -840,39 +840,30 @@ async def process_tool_result(
     metadata: Optional[dict] = None,
     user: Any = None,
 ) -> tuple[Any, list, list]:
-    """Process tool result into (payload, files, embeds) using core when available."""
+    """Process tool result into (payload, files, embeds) using core."""
     global _core_process_tool_result
     if _core_process_tool_result is None:
         try:
             from open_webui.utils.middleware import process_tool_result as fn
+        except ImportError as exc:
+            raise RuntimeError(
+                "Open WebUI process_tool_result helper is required"
+            ) from exc
+        if not callable(fn):
+            raise RuntimeError("Open WebUI process_tool_result helper is not callable")
+        _core_process_tool_result = fn
 
-            if fn is not None:
-                _core_process_tool_result = fn
-        except ImportError:
-            pass
-
-    if _core_process_tool_result is not None:
-        return await _maybe_await(
-            _core_process_tool_result(
-                request,
-                tool_function_name,
-                tool_result,
-                tool_type,
-                direct_tool=direct_tool,
-                metadata=metadata if isinstance(metadata, dict) else {},
-                user=_normalize_user(user),
-            )
+    return await _maybe_await(
+        _core_process_tool_result(
+            request,
+            tool_function_name,
+            tool_result,
+            tool_type,
+            direct_tool=direct_tool,
+            metadata=metadata if isinstance(metadata, dict) else {},
+            user=_normalize_user(user),
         )
-
-    if isinstance(tool_result, tuple):
-        tool_result = tool_result[0] if tool_result else ""
-    elif direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
-        tool_result = tool_result[0]
-    if isinstance(tool_result, (dict, list)):
-        tool_result = json.dumps(tool_result, indent=2, ensure_ascii=False)
-    elif tool_result is not None and not isinstance(tool_result, str):
-        tool_result = str(tool_result)
-    return tool_result, [], []
+    )
 
 
 async def execute_direct_tool_call(
