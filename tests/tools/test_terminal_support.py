@@ -1207,6 +1207,134 @@ async def test_parallel_tools_resolves_terminal_from_request_body(
 
 
 @pytest.mark.asyncio
+async def test_parallel_tools_run_tools_parallel_resolves_mcp_tools(
+    monkeypatch, mock_user
+):
+    from types import ModuleType
+
+    import open_webui
+    import open_webui.env as ow_env
+    import open_webui.utils.tools as ow_tools
+
+    connected = []
+    disconnected = []
+    tool_calls = []
+
+    class FakeMCPClient:
+        async def connect(self, url: str, headers=None):
+            connected.append({"url": url, "headers": headers})
+
+        async def list_tool_specs(self):
+            return [
+                {
+                    "name": "lookup_docs",
+                    "description": "Lookup docs",
+                    "parameters": {
+                        "properties": {"query": {"type": "string"}},
+                    },
+                }
+            ]
+
+        async def call_tool(self, name: str, function_args=None):
+            tool_calls.append({"name": name, "args": function_args})
+            return {"answer": f"docs:{function_args['query']}"}
+
+        async def disconnect(self):
+            disconnected.append(True)
+
+    async def fake_get_tools(request, tool_ids, user, extra_params):
+        assert all(not tool_id.startswith("server:mcp:") for tool_id in tool_ids)
+        return {}
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {}
+
+    _always_allow = lambda user, connection, user_group_ids=None: True
+    monkeypatch.setattr(ow_tools, "get_tools", fake_get_tools)
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+    monkeypatch.setattr(
+        ow_tools,
+        "has_tool_server_access",
+        _always_allow,
+        raising=False,
+    )
+    monkeypatch.setattr(ow_env, "ENABLE_FORWARD_USER_INFO_HEADERS", False, raising=False)
+
+    utils_package = open_webui.utils
+    fake_misc_module = ModuleType("open_webui.utils.misc")
+    fake_misc_module.is_string_allowed = lambda value, allowlist: True
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", fake_misc_module)
+    monkeypatch.setattr(utils_package, "misc", fake_misc_module, raising=False)
+
+    fake_headers_module = ModuleType("open_webui.utils.headers")
+    fake_headers_module.include_user_info_headers = lambda headers, user: headers
+    monkeypatch.setitem(sys.modules, "open_webui.utils.headers", fake_headers_module)
+    monkeypatch.setattr(utils_package, "headers", fake_headers_module, raising=False)
+
+    fake_mcp_package = ModuleType("open_webui.utils.mcp")
+    fake_mcp_client_module = ModuleType("open_webui.utils.mcp.client")
+    fake_mcp_client_module.MCPClient = FakeMCPClient
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp", fake_mcp_package)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp.client", fake_mcp_client_module)
+    monkeypatch.setattr(utils_package, "mcp", fake_mcp_package, raising=False)
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                config=SimpleNamespace(
+                    TERMINAL_SERVER_CONNECTIONS=[],
+                    TOOL_SERVER_CONNECTIONS=[
+                        {
+                            "type": "mcp",
+                            "url": "https://mcp.example.com",
+                            "auth_type": "bearer",
+                            "key": "mcp-token",
+                            "headers": {"X-Test": "1"},
+                            "config": {"enable": True},
+                            "info": {"id": "suite:ctx7"},
+                        }
+                    ],
+                ),
+            )
+        )
+    )
+    user_payload = {
+        **mock_user,
+        "last_active_at": 0,
+        "updated_at": 0,
+        "created_at": 0,
+    }
+
+    tool = parallel_tools.Tools()
+    result_json = await tool.run_tools_parallel(
+        tool_calls=[
+            {"name": "suite_ctx7_lookup_docs", "args": {"query": "parallel"}}
+        ],
+        __user__=user_payload,
+        __request__=request,
+        __metadata__={
+            "tool_ids": ["server:mcp:suite:ctx7"],
+            "features": {},
+        },
+    )
+
+    payload = json.loads(result_json)
+    assert payload["results"][0]["tool_name"] == "suite_ctx7_lookup_docs"
+    assert payload["results"][0]["result"]["answer"] == "docs:parallel"
+    assert connected == [
+        {
+            "url": "https://mcp.example.com",
+            "headers": {
+                "Authorization": "Bearer mcp-token",
+                "X-Test": "1",
+            },
+        }
+    ]
+    assert tool_calls == [{"name": "lookup_docs", "args": {"query": "parallel"}}]
+    assert disconnected == [True]
+
+
+@pytest.mark.asyncio
 async def test_sub_agent_execute_tool_call_not_found_does_not_emit_terminal_event():
     events = []
 

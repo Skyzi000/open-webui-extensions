@@ -730,10 +730,10 @@ async def resolve_mcp_tools(
 
     Returns ``(mcp_tools_dict, mcp_clients)``. ``mcp_tools_dict`` maps
     prefixed tool names to ``{"spec", "callable", "type": "mcp", "direct"}``
-    entries compatible with Open WebUI's tool-call middleware.
+    entries compatible with the shared tool execution path.
     ``mcp_clients`` maps server IDs to the live ``MCPClient`` instances
-    so the caller can ``cleanup_mcp_clients`` them when the agent loop
-    ends.
+    so the caller can ``cleanup_mcp_clients`` them when tool execution
+    is complete.
     """
     try:
         from open_webui.utils.mcp.client import MCPClient
@@ -1362,12 +1362,12 @@ async def build_tools_dict(
     resolved_terminal_id=None,
     resolved_direct_tool_servers=None,
 ):
-    """Assemble the agent-loop tools_dict from regular, MCP, terminal,
-    direct, and builtin sources.
+    """Assemble a tools_dict from regular, MCP, terminal, direct, and
+    builtin sources.
 
     Returns ``(tools_dict, mcp_clients)``. Caller must call
-    ``shared.mcp_tools.cleanup_mcp_clients(mcp_clients)`` once the
-    agent loop is done so MCP connections don't leak. ``mcp_clients``
+    ``shared.mcp_tools.cleanup_mcp_clients(mcp_clients)`` once tool
+    execution is done so MCP connections don't leak. ``mcp_clients``
     is empty when no ``server:mcp:`` tool IDs are present.
 
     ``resolved_terminal_id`` / ``resolved_direct_tool_servers`` are

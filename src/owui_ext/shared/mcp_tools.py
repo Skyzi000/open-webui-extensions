@@ -1,21 +1,20 @@
-"""MCP tool resolution shared by ``llm_review`` and ``sub_agent``.
+"""MCP tool resolution shared by agent-loop and batch tool plugins.
 
 Open WebUI's tool catalogue can include ``server:mcp:<id>`` entries that
-``open_webui.utils.tools.get_tools()`` silently skips, so each agent-loop
-plugin that wants MCP support has to resolve these IDs itself: look up
-the server connection, run access control, build auth headers, connect
-an ``MCPClient``, list its tool specs, and wrap them in callables that
-the tool-call middleware can invoke. ``cleanup_mcp_clients`` is the
-matching teardown that disconnects each client when the agent loop
-ends.
+``open_webui.utils.tools.get_tools()`` silently skips, so callers that
+want MCP support have to resolve these IDs themselves: look up the
+server connection, run access control, build auth headers, connect an
+``MCPClient``, list its tool specs, and wrap them in callables that are
+compatible with the shared tool execution path. ``cleanup_mcp_clients``
+is the matching teardown that disconnects each client when the caller is
+done using those tools.
 
 This module is its own shared dep (rather than living next to the
 direct-tool-server helpers in ``shared.tool_servers``) on purpose:
-``mc`` / ``magi`` / ``parallel_tools`` import from ``shared.tool_servers``
-but never call the MCP helpers, and the inliner has no tree-shaking. If
-the MCP code lived in ``tool_servers``, every plugin that imports any
-direct-tool helper would include the ~270-line MCP block in its bundle
-as unused code.
+Some plugins import from ``shared.tool_servers`` without needing MCP,
+and the inliner has no tree-shaking. If the MCP code lived in
+``tool_servers``, every plugin that imports any direct-tool helper would
+include the MCP block in its bundle as unused code.
 
 The module also can't import from sibling shared modules
 (``shared.notifications`` / ``shared.async_utils``) because the inliner
@@ -71,10 +70,10 @@ async def resolve_mcp_tools(
 
     Returns ``(mcp_tools_dict, mcp_clients)``. ``mcp_tools_dict`` maps
     prefixed tool names to ``{"spec", "callable", "type": "mcp", "direct"}``
-    entries compatible with Open WebUI's tool-call middleware.
+    entries compatible with the shared tool execution path.
     ``mcp_clients`` maps server IDs to the live ``MCPClient`` instances
-    so the caller can ``cleanup_mcp_clients`` them when the agent loop
-    ends.
+    so the caller can ``cleanup_mcp_clients`` them when tool execution
+    is complete.
     """
     try:
         from open_webui.utils.mcp.client import MCPClient

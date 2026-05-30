@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.1.14
+version: 0.2.0
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -20,7 +20,6 @@ import asyncio
 import ast
 import json
 import logging
-import uuid
 from typing import Any, Callable, List, Optional
 
 from fastapi import Request
@@ -29,18 +28,12 @@ from pydantic import BaseModel, Field
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.tool_execution import (
     CITATION_TOOLS,
-    TERMINAL_EVENT_TOOLS,
     emit_terminal_tool_event,
     execute_direct_tool_call,
-    normalize_terminal_tools_result,
     process_tool_result,
 )
-from owui_ext.shared.tool_servers import (
-    build_direct_tools_dict,
-    normalize_direct_tool_servers,
-    resolve_direct_tool_servers_from_request_and_metadata,
-    resolve_terminal_id_from_request_and_metadata,
-)
+from owui_ext.shared.mcp_tools import cleanup_mcp_clients
+from owui_ext.shared.tool_loader import build_tools_dict
 
 log = logging.getLogger(__name__)
 
@@ -212,17 +205,17 @@ class Tools:
         AVAILABLE_TOOL_IDS: str = Field(
             default="",
             description=(
-                "[Advanced] Comma-separated list of regular tool IDs available for parallel execution. "
-                "Leave empty (recommended) to use regular tools enabled in the chat UI. "
-                "This controls regular tools only; terminal tools are controlled by ENABLE_TERMINAL_TOOLS, "
-                "and builtin/direct tools follow the current chat metadata."
+                "[Advanced] Comma-separated list of regular or MCP tool IDs available for parallel execution. "
+                "Leave empty (recommended) to use regular and MCP tools enabled in the chat UI. "
+                "Tool server IDs require their full prefix (e.g., 'server:mcp:context7' or 'server:context7'). "
+                "Terminal tools are controlled by ENABLE_TERMINAL_TOOLS, and builtin/direct tools follow the current chat metadata."
             ),
         )
         EXCLUDED_TOOL_IDS: str = Field(
             default="",
             description=(
-                "Comma-separated list of regular tool IDs to exclude from parallel execution. "
-                "This controls regular tools only; it is not a security boundary for tools the main AI can call directly."
+                "Comma-separated list of regular or MCP tool IDs to exclude from parallel execution. "
+                "This is not a security boundary for tools the main AI can call directly."
             ),
         )
         ENABLE_TERMINAL_TOOLS: bool = Field(
@@ -359,26 +352,9 @@ class Tools:
 
         # Import here to avoid issues when not running in Open WebUI
         from open_webui.models.users import UserModel
-        from open_webui.utils.tools import get_tools
 
         user = UserModel(**__user__)
         __metadata__ = __metadata__ or {}
-
-        terminal_id = await resolve_terminal_id_from_request_and_metadata(
-            request=__request__,
-            metadata=__metadata__,
-            debug=self.valves.DEBUG,
-        )
-        if terminal_id:
-            __metadata__["terminal_id"] = terminal_id
-
-        direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
-            request=__request__,
-            metadata=__metadata__,
-            debug=self.valves.DEBUG,
-        )
-        if direct_tool_servers:
-            __metadata__["tool_servers"] = direct_tool_servers
 
         extra_params = {
             "__user__": __user__,
@@ -394,7 +370,7 @@ class Tools:
         }
 
         # Determine which tools to use
-        available_tool_ids = []
+        available_tool_ids: list[str] = []
         if __metadata__ and __metadata__.get("tool_ids"):
             available_tool_ids = list(__metadata__.get("tool_ids", []))
 
@@ -420,166 +396,91 @@ class Tools:
         if __id__:
             excluded.add(__id__)
 
-        tool_id_list = [tid for tid in tool_id_list if tid not in excluded]
-
-        # Filter out builtin: prefixed IDs
-        regular_tool_ids = [
-            tid for tid in tool_id_list if not tid.startswith("builtin:")
-        ]
-
         if self.valves.DEBUG:
-            log.info(f"[ParallelTools] Tool IDs: {regular_tool_ids}")
+            log.info(f"[ParallelTools] Tool IDs: {tool_id_list}")
+            if excluded:
+                log.info(f"[ParallelTools] Excluded tool IDs: {sorted(excluded)}")
 
-        # Load tools
-        tools_dict = {}
-        if regular_tool_ids:
-            try:
-                tools_dict = await get_tools(
-                    request=__request__,
-                    tool_ids=regular_tool_ids,
-                    user=user,
-                    extra_params=extra_params,
-                )
-
-                if self.valves.DEBUG:
-                    log.info(f"[ParallelTools] Loaded {len(tools_dict)} tools")
-
-            except Exception as e:
-                log.exception(f"Error loading tools: {e}")
-                return json.dumps({"error": f"Failed to load tools: {e}"})
-
-        # Load terminal tools
-        if terminal_id and self.valves.ENABLE_TERMINAL_TOOLS:
-            try:
-                from open_webui.utils.tools import get_terminal_tools
-
-                terminal_tools_result = await get_terminal_tools(
-                    request=__request__,
-                    terminal_id=terminal_id,
-                    user=user,
-                    extra_params=extra_params,
-                )
-                terminal_tools = normalize_terminal_tools_result(
-                    terminal_tools_result=terminal_tools_result,
-                    extra_params=extra_params,
-                )
-                if terminal_tools:
-                    tools_dict = {**tools_dict, **terminal_tools}
-                    if self.valves.DEBUG:
-                        log.info(
-                            f"[ParallelTools] Loaded {len(terminal_tools)} terminal tools for terminal_id={terminal_id}"
-                        )
-            except Exception as e:
-                log.exception(f"Error loading terminal tools: {e}")
-
-        # Load direct tools from metadata.tool_servers
-        if direct_tool_servers:
-            try:
-                direct_tools = build_direct_tools_dict(tool_servers=direct_tool_servers)
-                if direct_tools:
-                    tools_dict = {**tools_dict, **direct_tools}
-                    if self.valves.DEBUG:
-                        log.info(f"[ParallelTools] Loaded {len(direct_tools)} direct tools")
-            except Exception as e:
-                log.exception(f"Error loading direct tools: {e}")
-
-        # Load builtin tools
         try:
-            from open_webui.utils.tools import get_builtin_tools
-
-            features = __metadata__.get("features", {}) if __metadata__ else {}
-            model = __model__ or {}
-
-            builtin_extra_params = {
-                "__user__": __user__,
-                "__event_emitter__": __event_emitter__,
-                "__event_call__": __event_call__,
-                "__metadata__": __metadata__,
-                "__chat_id__": __chat_id__,
-                "__message_id__": __message_id__,
-                "__oauth_token__": __oauth_token__,
-            }
-
-            all_builtin_tools = await maybe_await(get_builtin_tools(
+            tools_dict, mcp_clients = await build_tools_dict(
                 request=__request__,
-                extra_params=builtin_extra_params,
-                features=features,
-                model=model,
-            ))
+                model=__model__ or {},
+                metadata=__metadata__,
+                user=user,
+                valves=self.valves,
+                extra_params=extra_params,
+                tool_id_list=tool_id_list,
+                excluded_tool_ids=excluded,
+            )
+        except Exception as e:
+            log.exception(f"Error loading tools: {e}")
+            return json.dumps({"error": f"Failed to load tools: {e}"})
 
-            # Add builtin tools (regular tools take priority)
-            for name, tool_dict in all_builtin_tools.items():
-                if name not in tools_dict:
-                    tools_dict[name] = tool_dict
-
+        try:
             if self.valves.DEBUG:
                 log.info(f"[ParallelTools] Total tools available: {len(tools_dict)}")
 
-        except Exception as e:
-            log.exception(f"Error loading builtin tools: {e}")
+            # Prepare extra params for execution. Reuse the loader params so
+            # metadata mutations such as resolved terminal/direct bindings stay
+            # visible to direct, terminal, and MCP result processing.
+            exec_extra_params = {
+                **extra_params,
+                "__messages__": __messages__ or [],
+                "__defer_artifact_events__": True,
+            }
 
-        # Prepare extra params for execution
-        exec_extra_params = {
-            "__user__": __user__,
-            "__request__": __request__,
-            "__model__": __model__,
-            "__metadata__": __metadata__,
-            "__event_emitter__": __event_emitter__,
-            "__event_call__": __event_call__,
-            "__chat_id__": __chat_id__,
-            "__message_id__": __message_id__,
-            "__oauth_token__": __oauth_token__,
-            "__messages__": __messages__ or [],
-            "__files__": __metadata__.get("files", []) if __metadata__ else [],
-            "__defer_artifact_events__": True,
-        }
-
-        # Execute all tools in parallel
-        tasks = [
-            execute_single_tool(
-                tool_name=call.get("name", ""),
-                tool_args=call.get("arguments", {}),
-                tools_dict=tools_dict,
-                extra_params=exec_extra_params,
-                event_emitter=__event_emitter__,
-            )
-            for call in calls
-        ]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Process results
-        processed_results = []
-        aggregated_files = []
-        aggregated_embeds = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                processed_results.append(
-                    {
-                        "tool_name": calls[i].get("name", "unknown"),
-                        "result": f"Error: {result}",
-                    }
+            # Execute all tools in parallel
+            tasks = [
+                execute_single_tool(
+                    tool_name=call.get("name", ""),
+                    tool_args=call.get("arguments", {}),
+                    tools_dict=tools_dict,
+                    extra_params=exec_extra_params,
+                    event_emitter=__event_emitter__,
                 )
-            else:
-                if isinstance(result, dict):
-                    files = result.get("files", [])
-                    embeds = result.get("embeds", [])
-                    if isinstance(files, list):
-                        aggregated_files.extend(files)
-                        if __event_emitter__:
-                            result = {k: v for k, v in result.items() if k != "files"}
-                    if isinstance(embeds, list):
-                        aggregated_embeds.extend(embeds)
-                        if __event_emitter__:
-                            result = {k: v for k, v in result.items() if k != "embeds"}
-                processed_results.append(result)
+                for call in calls
+            ]
 
-        if __event_emitter__ and aggregated_files:
-            await __event_emitter__({"type": "files", "data": {"files": aggregated_files}})
-        if __event_emitter__ and aggregated_embeds:
-            await __event_emitter__({"type": "embeds", "data": {"embeds": aggregated_embeds}})
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        return json.dumps(
-            {"results": processed_results},
-            ensure_ascii=False,
-        )
+            # Process results
+            processed_results = []
+            aggregated_files = []
+            aggregated_embeds = []
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    processed_results.append(
+                        {
+                            "tool_name": calls[i].get("name", "unknown"),
+                            "result": f"Error: {result}",
+                        }
+                    )
+                else:
+                    if isinstance(result, dict):
+                        files = result.get("files", [])
+                        embeds = result.get("embeds", [])
+                        if isinstance(files, list):
+                            aggregated_files.extend(files)
+                            if __event_emitter__:
+                                result = {k: v for k, v in result.items() if k != "files"}
+                        if isinstance(embeds, list):
+                            aggregated_embeds.extend(embeds)
+                            if __event_emitter__:
+                                result = {k: v for k, v in result.items() if k != "embeds"}
+                    processed_results.append(result)
+
+            if __event_emitter__ and aggregated_files:
+                await __event_emitter__(
+                    {"type": "files", "data": {"files": aggregated_files}}
+                )
+            if __event_emitter__ and aggregated_embeds:
+                await __event_emitter__(
+                    {"type": "embeds", "data": {"embeds": aggregated_embeds}}
+                )
+
+            return json.dumps(
+                {"results": processed_results},
+                ensure_ascii=False,
+            )
+        finally:
+            await cleanup_mcp_clients(mcp_clients)
