@@ -263,6 +263,131 @@ def find_openai_chat_completion_form():
     return None
 
 
+def find_mcp_connection_access_helper():
+    """Find the MCP/tool-server access helper across Open WebUI versions."""
+    possible_paths = [
+        ("open_webui.utils.access_control", "has_connection_access"),
+        ("open_webui.utils.tools", "has_tool_server_access"),
+    ]
+
+    for module_path, function_name in possible_paths:
+        try:
+            module = __import__(module_path, fromlist=[function_name])
+        except ImportError:
+            continue
+        helper = getattr(module, function_name, None)
+        if callable(helper):
+            return module_path, function_name, helper
+    return None, None, None
+
+
+def mcp_access_helper_signature_error(
+    module_path: str, function_name: str, helper
+) -> str | None:
+    """Return an error when the MCP access helper no longer matches our positional call."""
+    try:
+        sig = inspect.signature(helper)
+    except (TypeError, ValueError) as exc:
+        return f"Cannot inspect {module_path}.{function_name} signature: {exc}"
+
+    positional_params = [
+        param
+        for param in sig.parameters.values()
+        if param.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+
+    if len(positional_params) < 2:
+        return (
+            f"{module_path}.{function_name} signature has changed. "
+            "Extensions call it positionally as (user, connection), so it must "
+            "declare at least two positional parameters. "
+            f"Got: {sig}"
+        )
+
+    first_param = positional_params[0]
+    second_param = positional_params[1]
+    if not _is_user_param(first_param) or not _is_connection_param(second_param):
+        return (
+            f"{module_path}.{function_name} signature has changed. "
+            "Extensions call it positionally as (user, connection), so the "
+            "first two positional parameters must be user then "
+            f"connection/server_connection. Got: {sig}"
+        )
+
+    unsupported_required_params = []
+    if len(positional_params) >= 3:
+        third_param = positional_params[2]
+        if (
+            third_param.default is inspect.Signature.empty
+            and third_param.name != "user_group_ids"
+        ):
+            unsupported_required_params.append(third_param.name)
+
+    unsupported_required_params.extend(
+        param.name
+        for param in positional_params[3:]
+        if param.default is inspect.Signature.empty
+    )
+    unsupported_required_params.extend(
+        param.name
+        for param in sig.parameters.values()
+        if param.kind is inspect.Parameter.KEYWORD_ONLY
+        and param.default is inspect.Signature.empty
+    )
+    if unsupported_required_params:
+        return (
+            f"{module_path}.{function_name} signature has changed. "
+            "Extensions can only call it as (user, connection) or "
+            "(user, connection, None), so it must not add unsupported required "
+            f"parameters. Got unsupported required parameters: {unsupported_required_params}. "
+            f"Full signature: {sig}"
+        )
+
+    return None
+
+
+def _is_user_param(param: inspect.Parameter) -> bool:
+    if param.name == "user":
+        return True
+    return "UserModel" in _annotation_text(param.annotation)
+
+
+def _is_connection_param(param: inspect.Parameter) -> bool:
+    if param.name in {"connection", "server_connection"}:
+        return True
+
+    annotation = param.annotation
+    origin = get_origin(annotation)
+    if annotation is dict or origin is dict:
+        return True
+
+    annotation_text = _annotation_text(annotation)
+    return "Mapping" in annotation_text or "dict" in annotation_text
+
+
+def _annotation_text(annotation) -> str:
+    if annotation is inspect.Signature.empty:
+        return ""
+
+    origin = get_origin(annotation)
+    parts = [str(annotation)]
+    if origin is not None:
+        parts.append(str(origin))
+        origin_name = getattr(origin, "__name__", "")
+        if origin_name:
+            parts.append(origin_name)
+
+    annotation_name = getattr(annotation, "__name__", "")
+    if annotation_name:
+        parts.append(annotation_name)
+
+    return " ".join(parts)
+
+
 # =============================================================================
 # UserModel Tests (__user__ structure)
 # =============================================================================
@@ -987,6 +1112,140 @@ class TestModelsModule:
         params = list(sig.parameters.keys())
         assert "id" in params, \
             signature_changed_message("Models", "get_model_by_id", "id", str(params))
+
+
+class TestMCPToolServerAccessCompatibility:
+    """Test Open WebUI MCP/tool-server access helper compatibility.
+
+    Current Open WebUI uses ``open_webui.utils.access_control.has_connection_access``.
+    Older Open WebUI versions exposed ``open_webui.utils.tools.has_tool_server_access``.
+    Extensions support both import paths, so at least one compatible helper must exist.
+    """
+
+    @pytest.fixture
+    def access_helper(self):
+        module_path, function_name, helper = find_mcp_connection_access_helper()
+        if helper is None:
+            pytest.fail(
+                "Cannot find MCP/tool-server access helper. Expected either "
+                "open_webui.utils.access_control.has_connection_access "
+                "or legacy open_webui.utils.tools.has_tool_server_access."
+            )
+        return module_path, function_name, helper
+
+    def test_mcp_connection_access_helper_exists(self, access_helper):
+        """Verify Open WebUI exposes a supported MCP/tool-server access helper."""
+        module_path, function_name, helper = access_helper
+
+        assert callable(helper), f"{module_path}.{function_name} should be callable"
+
+    def test_mcp_connection_access_helper_signature_check_rejects_swapped_args(self):
+        """Verify this compatibility check catches user/connection order changes."""
+        def swapped_helper(connection, user, user_group_ids=None):
+            return True
+
+        error = mcp_access_helper_signature_error(
+            "test.module",
+            "has_connection_access",
+            swapped_helper,
+        )
+
+        assert error is not None
+        assert "first two positional parameters" in error
+
+    def test_mcp_connection_access_helper_signature_check_accepts_known_core_args(self):
+        """Verify this compatibility check accepts current and legacy Core signatures."""
+        def current_helper(user, connection, user_group_ids=None):
+            return True
+
+        def legacy_helper(user, server_connection, user_group_ids=None):
+            return True
+
+        def required_group_helper(user, connection, user_group_ids):
+            return True
+
+        assert (
+            mcp_access_helper_signature_error(
+                "test.module",
+                "has_connection_access",
+                current_helper,
+            )
+            is None
+        )
+        assert (
+            mcp_access_helper_signature_error(
+                "test.module",
+                "has_tool_server_access",
+                legacy_helper,
+            )
+            is None
+        )
+        assert (
+            mcp_access_helper_signature_error(
+                "test.module",
+                "has_connection_access",
+                required_group_helper,
+            )
+            is None
+        )
+
+    def test_mcp_connection_access_helper_signature_check_accepts_annotated_positional_contract(self):
+        """Verify renamed parameters pass when annotations preserve the positional contract."""
+        class UserModel:
+            pass
+
+        def renamed_helper(principal: UserModel, conn: dict, user_group_ids=None):
+            return True
+
+        assert (
+            mcp_access_helper_signature_error(
+                "test.module",
+                "has_connection_access",
+                renamed_helper,
+            )
+            is None
+        )
+
+    def test_mcp_connection_access_helper_signature_check_rejects_extra_required_args(self):
+        """Verify helpers do not require arguments our resolver cannot pass."""
+        def renamed_third_arg_helper(user, connection, access_scope):
+            return True
+
+        def extra_positional_helper(user, connection, user_group_ids, access_scope):
+            return True
+
+        def required_keyword_helper(user, connection, *, access_scope):
+            return True
+
+        third_arg_error = mcp_access_helper_signature_error(
+            "test.module",
+            "has_connection_access",
+            renamed_third_arg_helper,
+        )
+        positional_error = mcp_access_helper_signature_error(
+            "test.module",
+            "has_connection_access",
+            extra_positional_helper,
+        )
+        keyword_error = mcp_access_helper_signature_error(
+            "test.module",
+            "has_connection_access",
+            required_keyword_helper,
+        )
+
+        assert third_arg_error is not None
+        assert "unsupported required parameters" in third_arg_error
+        assert positional_error is not None
+        assert "unsupported required parameters" in positional_error
+        assert keyword_error is not None
+        assert "unsupported required parameters" in keyword_error
+
+    def test_mcp_connection_access_helper_accepts_user_and_connection(self, access_helper):
+        """Verify the access helper still accepts user and connection arguments."""
+        module_path, function_name, helper = access_helper
+        error = mcp_access_helper_signature_error(module_path, function_name, helper)
+
+        assert error is None, error
 
 
 # =============================================================================

@@ -13,6 +13,7 @@ tools_dir = Path(__file__).parent.parent.parent / "tools"
 sys.path.insert(0, str(tools_dir))
 
 import magi_decision_support  # noqa: E402
+import llm_review  # noqa: E402
 import multi_model_council  # noqa: E402
 import parallel_tools  # noqa: E402
 import sub_agent  # noqa: E402
@@ -62,10 +63,29 @@ RESULT_HELPER_MODULES = [
     ("parallel_tools", parallel_tools),
 ]
 
+MCP_RESOLVE_MODULES = [
+    pytest.param(sub_agent, id="sub_agent"),
+    pytest.param(multi_model_council, id="multi_model_council"),
+    pytest.param(magi_decision_support, id="magi_decision_support"),
+    pytest.param(parallel_tools, id="parallel_tools"),
+    pytest.param(llm_review, id="llm_review"),
+]
+
 BUILTIN_KNOWLEDGE_MODULES = [
     ("sub_agent", sub_agent),
     ("multi_model_council", multi_model_council),
 ]
+
+
+def test_mcp_resolve_module_matrix_covers_generated_mcp_resolvers():
+    """Verify the MCP compatibility matrix covers every generated resolver."""
+    assert {param.values[0] for param in MCP_RESOLVE_MODULES} == {
+        sub_agent,
+        multi_model_council,
+        magi_decision_support,
+        parallel_tools,
+        llm_review,
+    }
 
 
 @pytest.fixture
@@ -244,10 +264,11 @@ async def test_sub_agent_resolve_mcp_tools_supports_oauth_2_1_static(monkeypatch
 
     import open_webui
     import open_webui.env as ow_env
-    import open_webui.utils.tools as ow_tools
+    import open_webui.utils.access_control as ow_ac
 
     oauth_calls = []
     connected_headers = []
+    access_calls = []
 
     class FakeOAuthClientManager:
         async def get_oauth_token(self, user_id, client_id):
@@ -270,18 +291,17 @@ async def test_sub_agent_resolve_mcp_tools_supports_oauth_2_1_static(monkeypatch
         async def disconnect(self):
             return None
 
-    _always_allow = lambda user, connection, user_group_ids=None: True
-    monkeypatch.setattr(
-        ow_tools,
-        "has_tool_server_access",
-        _always_allow,
-        raising=False,
-    )
-    try:
-        import open_webui.utils.access_control as ow_ac
-        monkeypatch.setattr(ow_ac, "has_connection_access", _always_allow, raising=False)
-    except ImportError:
-        pass
+    def fake_has_connection_access(user, connection, user_group_ids=None):
+        access_calls.append(
+            (
+                user.id,
+                connection.get("info", {}).get("id"),
+                user_group_ids,
+            )
+        )
+        return True
+
+    monkeypatch.setattr(ow_ac, "has_connection_access", fake_has_connection_access)
     monkeypatch.setattr(ow_env, "ENABLE_FORWARD_USER_INFO_HEADERS", False, raising=False)
 
     utils_package = open_webui.utils
@@ -334,6 +354,7 @@ async def test_sub_agent_resolve_mcp_tools_supports_oauth_2_1_static(monkeypatch
     # OAuth lookup uses the trailing colon segment to match Open WebUI core,
     # while the mcp_clients cache key below stays on the full id.
     assert oauth_calls == [("u1", "mcp:ctx7")]
+    assert access_calls == [("u1", "suite:ctx7", None)]
     assert connected_headers == [
         {
             "url": "https://mcp.example.com",
@@ -346,6 +367,119 @@ async def test_sub_agent_resolve_mcp_tools_supports_oauth_2_1_static(monkeypatch
     assert "suite_ctx7_lookup_docs" in tools_dict
     assert isinstance(mcp_clients, dict)
     assert "suite:ctx7" in mcp_clients
+
+
+@pytest.mark.parametrize("tool_module", MCP_RESOLVE_MODULES)
+@pytest.mark.asyncio
+async def test_resolve_mcp_tools_supports_legacy_tool_server_access(
+    monkeypatch, tool_module
+):
+    from types import ModuleType
+
+    import open_webui
+    import open_webui.utils.tools as ow_tools
+
+    access_calls = []
+    connected = []
+    disconnected = []
+
+    class FakeMCPClient:
+        async def connect(self, url: str, headers=None):
+            connected.append({"url": url, "headers": headers})
+
+        async def list_tool_specs(self):
+            return [
+                {
+                    "name": "lookup_docs",
+                    "description": "Lookup docs",
+                    "parameters": {"properties": {"query": {"type": "string"}}},
+                }
+            ]
+
+        async def disconnect(self):
+            disconnected.append(True)
+
+    def fake_has_tool_server_access(user, connection, user_group_ids=None):
+        access_calls.append(
+            (
+                user.id,
+                connection.get("info", {}).get("id"),
+                user_group_ids,
+            )
+        )
+        return True
+
+    monkeypatch.delitem(sys.modules, "open_webui.utils.access_control", raising=False)
+    monkeypatch.delattr(open_webui.utils, "access_control", raising=False)
+    monkeypatch.setattr(
+        ow_tools,
+        "has_tool_server_access",
+        fake_has_tool_server_access,
+        raising=False,
+    )
+
+    utils_package = open_webui.utils
+    fake_misc_module = ModuleType("open_webui.utils.misc")
+    fake_misc_module.is_string_allowed = lambda value, allowlist: True
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", fake_misc_module)
+    monkeypatch.setattr(utils_package, "misc", fake_misc_module, raising=False)
+
+    fake_headers_module = ModuleType("open_webui.utils.headers")
+    fake_headers_module.include_user_info_headers = lambda headers, user: headers
+    monkeypatch.setitem(sys.modules, "open_webui.utils.headers", fake_headers_module)
+    monkeypatch.setattr(utils_package, "headers", fake_headers_module, raising=False)
+
+    fake_mcp_package = ModuleType("open_webui.utils.mcp")
+    fake_mcp_client_module = ModuleType("open_webui.utils.mcp.client")
+    fake_mcp_client_module.MCPClient = FakeMCPClient
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp", fake_mcp_package)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp.client", fake_mcp_client_module)
+    monkeypatch.setattr(utils_package, "mcp", fake_mcp_package, raising=False)
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                config=SimpleNamespace(
+                    TOOL_SERVER_CONNECTIONS=[
+                        {
+                            "type": "mcp",
+                            "url": "https://mcp.example.com",
+                            "auth_type": "bearer",
+                            "key": "legacy-token",
+                            "headers": {"X-Test": "1"},
+                            "config": {"enable": True},
+                            "info": {"id": "suite:ctx7"},
+                        }
+                    ],
+                ),
+            )
+        )
+    )
+
+    tools_dict, mcp_clients = await tool_module.resolve_mcp_tools(
+        request=request,
+        user=SimpleNamespace(id="legacy-user", role="user"),
+        mcp_tool_ids=["server:mcp:suite:ctx7"],
+        extra_params={},
+        metadata={},
+        debug=False,
+    )
+
+    assert access_calls == [("legacy-user", "suite:ctx7", None)]
+    assert connected == [
+        {
+            "url": "https://mcp.example.com",
+            "headers": {
+                "Authorization": "Bearer legacy-token",
+                "X-Test": "1",
+            },
+        }
+    ]
+    assert "suite_ctx7_lookup_docs" in tools_dict
+    assert "suite:ctx7" in mcp_clients
+
+    await tool_module.cleanup_mcp_clients(mcp_clients)
+    assert disconnected == [True]
 
 
 @pytest.mark.asyncio
@@ -1249,15 +1383,8 @@ async def test_parallel_tools_run_tools_parallel_resolves_mcp_tools(
     def fake_get_builtin_tools(request, extra_params, features=None, model=None):
         return {}
 
-    _always_allow = lambda user, connection, user_group_ids=None: True
     monkeypatch.setattr(ow_tools, "get_tools", fake_get_tools)
     monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
-    monkeypatch.setattr(
-        ow_tools,
-        "has_tool_server_access",
-        _always_allow,
-        raising=False,
-    )
     monkeypatch.setattr(ow_env, "ENABLE_FORWARD_USER_INFO_HEADERS", False, raising=False)
 
     utils_package = open_webui.utils
