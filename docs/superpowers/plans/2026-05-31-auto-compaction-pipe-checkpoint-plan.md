@@ -66,8 +66,8 @@ This Pipe exists to prevent long-running chats from stopping because the accumul
 
 Use a manifold Pipe, not one manually configured Pipe per real model.
 
-- Wrapper id format: `auto_compact.<encoded target model id>`.
-- The sub-pipe id must safely round-trip target model ids containing dots, slashes, colons, and provider prefixes.
+- Wrapper id format: `auto_compact.<target model id>`.
+- The sub-pipe id must keep target model ids human-readable and must round-trip ids containing dots, slashes, colons, and provider prefixes.
 - The wrapper list must be generated from currently known Open WebUI model caches and filtered by admin Valves.
 - Wrapper Model records must be synchronized for generated wrappers so normal users can see wrappers through Open WebUI's normal model filtering.
 - Because Open WebUI calls `pipes()` without `request` or `user`, v1 must treat the Function id as a required install contract: the Pipe must be imported with the base Function id `auto_compact`. The Pipe may then use that id to read its Function owner from Open WebUI's Functions table when synchronizing wrapper Model records.
@@ -192,7 +192,7 @@ Required unique lookup key:
 
 `summary_model` affects only generation on a checkpoint miss. Once a checkpoint is ready, changing `summary_model` or changing the prompt used for future summaries must not invalidate that `summary_text`. If a future implementation introduces a truly incompatible summary format, it should add a legacy reader or a new table/schema version rather than casually changing the v1 `profile_hash` and breaking continuation of existing long chats.
 
-`pipe_model_id` in checkpoint keys means the base Pipe function id before the manifold suffix, not the full selected wrapper id. The encoded target model suffix must not indirectly scope checkpoint reuse.
+`pipe_model_id` in checkpoint keys means the base Pipe function id before the manifold suffix, not the full selected wrapper id. The target model suffix must not indirectly scope checkpoint reuse.
 
 `source_hash` must be computed from a canonical JSON serialization of the exact stable prefix being summarized. Canonicalization must avoid transient values such as signed URLs, volatile file metadata, generated temporary ids, and provider-specific decoration that is not semantically part of the conversation. If an active multimodal/file reference cannot be canonicalized safely, keep that message in the retained tail or skip compaction.
 
@@ -204,7 +204,7 @@ Do not store message ids or output indexes in v1. They are not needed for the pl
 
 1. Pipe receives `body`, `__metadata__`, `__request__`, and `__user__`.
 2. Pipe deep-copies `body` into an inner request payload.
-3. Pipe resolves `pipe_model_id` and `target_model` by decoding the selected manifold wrapper id from original `body["model"]`.
+3. Pipe resolves `pipe_model_id` and `target_model` by stripping the selected manifold wrapper prefix from original `body["model"]`.
 4. Pipe rejects malformed wrapper ids, unknown target models, this Pipe's own generated wrapper models, arena models, and target models the current user may not access.
 5. Pipe restores forwarded metadata from `__metadata__`.
 6. Pipe sets only the copied inner payload model to `target_model`.

@@ -1,0 +1,1980 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+import asyncio
+import sys
+import types
+
+import pytest
+from fastapi import HTTPException
+from starlette.background import BackgroundTask
+from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
+
+from functions.pipe import auto_compaction_pipe as mod
+
+
+def install_fake_open_webui_user_model(monkeypatch):
+    class FakeUserModel:
+        def __init__(self, **data):
+            self.__dict__.update(data)
+
+    users_module = types.ModuleType("open_webui.models.users")
+    users_module.UserModel = FakeUserModel
+    monkeypatch.setitem(sys.modules, "open_webui.models.users", users_module)
+    return FakeUserModel
+
+
+def test_target_filter_excludes_own_wrappers_and_arena_but_allows_other_pipes():
+    models = {
+        "gpt-4.1": {"id": "gpt-4.1", "name": "GPT"},
+        mod.build_wrapper_model_id("auto_compact", "gpt-4.1"): {
+            "id": mod.build_wrapper_model_id("auto_compact", "gpt-4.1"),
+            "name": "wrapped",
+            "pipe": {"type": "pipe"},
+        },
+        "arena-model": {"id": "arena-model", "name": "Arena", "owned_by": "arena", "arena": True},
+        "other_pipe.child": {"id": "other_pipe.child", "name": "Other Pipe", "pipe": {"type": "pipe"}},
+    }
+
+    targets = mod.filter_target_models(models.values(), mod.Pipe.Valves())
+
+    assert [m["id"] for m in targets] == ["gpt-4.1", "other_pipe.child"]
+
+
+def test_include_exclude_patterns_match_id_and_name_and_deduplicate_targets():
+    valves = mod.Pipe.Valves(
+        include_model_patterns="*gpt*,Anthropic*",
+        exclude_model_patterns="*mini*",
+    )
+    models = [
+        {"id": "gpt-4.1", "name": "GPT"},
+        {"id": "gpt-4.1", "name": "duplicate"},
+        {"id": "gpt-4.1-mini", "name": "GPT Mini"},
+        {"id": "claude-sonnet", "name": "Anthropic Claude"},
+        {"id": "llama", "name": "Local"},
+    ]
+
+    targets = mod.filter_target_models(models, valves)
+
+    assert [m["id"] for m in targets] == ["gpt-4.1", "claude-sonnet"]
+
+
+def test_wrapper_model_records_are_built_for_full_wrapper_id_with_function_owner():
+    target = {
+        "id": "gpt-4.1",
+        "name": "GPT",
+        "info": {
+            "access_grants": [
+                {
+                    "id": "grant-1",
+                    "principal_type": "group",
+                    "principal_id": "team-1",
+                    "permission": "read",
+                }
+            ]
+        },
+    }
+
+    form = mod.build_wrapper_model_form(
+        pipe_model_id="auto_compact",
+        function_owner_user_id="owner-1",
+        target_model=target,
+        valves=mod.Pipe.Valves(model_name_prefix="Compact: "),
+    )
+
+    assert form["id"] == mod.build_wrapper_model_id("auto_compact", "gpt-4.1")
+    assert form["user_id"] == "owner-1"
+    assert form["base_model_id"] is None
+    assert form["name"] == "Compact: GPT"
+    assert form["access_grants"] == [
+        {
+            "id": "grant-1",
+            "principal_type": "group",
+            "principal_id": "team-1",
+            "permission": "read",
+        }
+    ]
+
+
+def test_wrapper_model_form_grants_target_owner_read_when_owner_differs_from_function_owner():
+    target = {
+        "id": "private-target",
+        "name": "Private Target",
+        "info": {"user_id": "target-owner", "access_grants": []},
+    }
+
+    form = mod.build_wrapper_model_form(
+        pipe_model_id="auto_compact",
+        function_owner_user_id="function-owner",
+        target_model=target,
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert {
+        "principal_type": "user",
+        "principal_id": "target-owner",
+        "permission": "read",
+    } in form["access_grants"]
+
+
+def test_wrapper_model_form_preserves_public_read_grant_for_normal_user_visibility():
+    target = {
+        "id": "public-target",
+        "name": "Public Target",
+        "info": {
+            "access_grants": [
+                {
+                    "principal_type": "user",
+                    "principal_id": "*",
+                    "permission": "read",
+                }
+            ]
+        },
+    }
+
+    form = mod.build_wrapper_model_form(
+        pipe_model_id="auto_compact",
+        function_owner_user_id="function-owner",
+        target_model=target,
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert {
+        "principal_type": "user",
+        "principal_id": "*",
+        "permission": "read",
+    } in form["access_grants"]
+
+
+def test_wrapper_model_form_inherits_target_meta_used_by_core_middleware():
+    target = {
+        "id": "target-with-meta",
+        "name": "Target With Meta",
+        "info": {
+            "meta": {
+                "filterIds": ["model-filter"],
+                "actionIds": ["model-action"],
+                "knowledge": [{"id": "knowledge-1", "name": "Knowledge"}],
+                "capabilities": {"file_context": False, "builtin_tools": False},
+                "skillIds": ["skill-1"],
+                "toolIds": ["tool-1"],
+                "defaultFeatureIds": ["web_search"],
+                "terminalId": "terminal-1",
+                "tags": [{"name": "target-tag"}],
+                "description": "Target description",
+            }
+        },
+    }
+
+    form = mod.build_wrapper_model_form(
+        pipe_model_id="auto_compact",
+        function_owner_user_id="function-owner",
+        target_model=target,
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert form["meta"]["filterIds"] == ["model-filter"]
+    assert form["meta"]["actionIds"] == ["model-action"]
+    assert form["meta"]["knowledge"] == [{"id": "knowledge-1", "name": "Knowledge"}]
+    assert form["meta"]["capabilities"] == {"file_context": False, "builtin_tools": False}
+    assert form["meta"]["skillIds"] == ["skill-1"]
+    assert form["meta"]["toolIds"] == ["tool-1"]
+    assert form["meta"]["defaultFeatureIds"] == ["web_search"]
+    assert form["meta"]["terminalId"] == "terminal-1"
+    assert form["meta"]["tags"] == [{"name": "target-tag"}]
+    assert form["meta"]["description"] == "Auto-compacting wrapper for target-with-meta"
+    assert form["meta"]["auto_compaction"] == {
+        "pipe_model_id": "auto_compact",
+        "target_model_id": "target-with-meta",
+    }
+
+
+def test_wrapper_model_form_keeps_only_core_metadata_params_and_forces_streaming():
+    target_model_info = SimpleNamespace(
+        params=SimpleNamespace(
+            model_dump=lambda **kwargs: {
+                "function_calling": "native",
+                "stream_delta_chunk_size": 4,
+                "reasoning_tags": ["think"],
+                "stream_response": False,
+                "system": "Target system prompt",
+                "temperature": 0.2,
+            }
+        ),
+        meta=SimpleNamespace(model_dump=lambda **kwargs: {}),
+        access_grants=[],
+        user_id="target-owner",
+    )
+
+    form = mod.build_wrapper_model_form(
+        pipe_model_id="auto_compact",
+        function_owner_user_id="target-owner",
+        target_model={"id": "target-with-params", "name": "Target With Params"},
+        target_model_info=target_model_info,
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert form["params"] == {
+        "function_calling": "native",
+        "stream_delta_chunk_size": 4,
+        "reasoning_tags": ["think"],
+        "stream_response": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_wrapper_sync_uses_function_owner_and_scoped_generated_wrapper_ids(monkeypatch):
+    calls = {"insert": [], "update": []}
+
+    class FakeFunction:
+        user_id = "function-owner"
+
+    class FakeFunctions:
+        @staticmethod
+        async def get_function_by_id(function_id):
+            assert function_id == "auto_compact"
+            return FakeFunction()
+
+    class FakeModelParams:
+        def __init__(self, **kwargs):
+            self.payload = kwargs
+
+    class FakeModelMeta:
+        def __init__(self, **kwargs):
+            self.payload = kwargs
+
+    class FakeModelForm:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id.startswith("auto_compact.")
+            if model_id.endswith(mod.encode_target_model_id("existing-target")):
+                return {
+                    "id": model_id,
+                    "base_model_id": None,
+                    "name": "Stale wrapper",
+                    "params": {},
+                    "meta": {},
+                    "access_grants": [],
+                    "is_active": True,
+                }
+            return None
+
+        @staticmethod
+        async def update_model_by_id(model_id, model_form):
+            calls["update"].append((model_id, model_form))
+
+        @staticmethod
+        async def insert_new_model(model_form, user_id):
+            calls["insert"].append((user_id, model_form))
+
+    functions_module = types.ModuleType("open_webui.models.functions")
+    functions_module.Functions = FakeFunctions
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.ModelForm = FakeModelForm
+    models_module.ModelMeta = FakeModelMeta
+    models_module.ModelParams = FakeModelParams
+    models_module.Models = FakeModels
+    monkeypatch.setitem(sys.modules, "open_webui.models.functions", functions_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+
+    await mod.sync_wrapper_model_records(
+        pipe_model_id="auto_compact",
+        target_models=[
+            {"id": "existing-target", "name": "Existing", "info": {"access_grants": []}},
+            {"id": "new-target", "name": "New", "info": {"access_grants": []}},
+        ],
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert [call[0] for call in calls["update"]] == [mod.build_wrapper_model_id("auto_compact", "existing-target")]
+    assert calls["insert"][0][0] == "function-owner"
+    assert calls["insert"][0][1].id == mod.build_wrapper_model_id("auto_compact", "new-target")
+
+
+@pytest.mark.asyncio
+async def test_wrapper_sync_uses_target_model_record_params_for_wrapper_record(monkeypatch):
+    calls = {"insert": [], "update": []}
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target-with-record")
+
+    class FakeFunction:
+        user_id = "function-owner"
+
+    class FakeFunctions:
+        @staticmethod
+        async def get_function_by_id(function_id):
+            return FakeFunction()
+
+    class FakeModelParams:
+        def __init__(self, **kwargs):
+            self.payload = kwargs
+
+        def model_dump(self, **kwargs):
+            return dict(self.payload)
+
+    class FakeModelMeta:
+        def __init__(self, **kwargs):
+            self.payload = kwargs
+
+        def model_dump(self, **kwargs):
+            return dict(self.payload)
+
+    class FakeModelForm:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            if model_id == "target-with-record":
+                return SimpleNamespace(
+                    params=SimpleNamespace(
+                        model_dump=lambda **kwargs: {
+                            "function_calling": "native",
+                            "temperature": 0.2,
+                        }
+                    ),
+                    meta=SimpleNamespace(model_dump=lambda **kwargs: {"capabilities": {"builtin_tools": False}}),
+                    access_grants=[],
+                    user_id="function-owner",
+                )
+            if model_id == wrapper_id:
+                return None
+            raise AssertionError(f"unexpected model id: {model_id}")
+
+        @staticmethod
+        async def update_model_by_id(model_id, model_form):
+            calls["update"].append((model_id, model_form))
+
+        @staticmethod
+        async def insert_new_model(model_form, user_id):
+            calls["insert"].append((user_id, model_form))
+
+    functions_module = types.ModuleType("open_webui.models.functions")
+    functions_module.Functions = FakeFunctions
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.ModelForm = FakeModelForm
+    models_module.ModelMeta = FakeModelMeta
+    models_module.ModelParams = FakeModelParams
+    models_module.Models = FakeModels
+    monkeypatch.setitem(sys.modules, "open_webui.models.functions", functions_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+
+    await mod.sync_wrapper_model_records(
+        pipe_model_id="auto_compact",
+        target_models=[{"id": "target-with-record", "name": "Target With Record", "info": {"meta": {}}}],
+        valves=mod.Pipe.Valves(),
+    )
+
+    inserted = calls["insert"][0][1]
+    assert inserted.id == wrapper_id
+    assert inserted.params.payload == {"function_calling": "native", "stream_response": True}
+    assert inserted.meta.payload["capabilities"] == {"builtin_tools": False}
+
+
+@pytest.mark.asyncio
+async def test_wrapper_sync_does_not_make_base_target_public_without_model_info(monkeypatch):
+    calls = {"insert": [], "update": []}
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "base-target")
+
+    class FakeFunction:
+        user_id = "function-owner"
+
+    class FakeFunctions:
+        @staticmethod
+        async def get_function_by_id(function_id):
+            return FakeFunction()
+
+    class FakeModelParams:
+        def __init__(self, **kwargs):
+            self.payload = kwargs
+
+    class FakeModelMeta:
+        def __init__(self, **kwargs):
+            self.payload = kwargs
+
+    class FakeModelForm:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == wrapper_id
+            return {
+                "id": wrapper_id,
+                "base_model_id": None,
+                "name": "Compact: Base Target",
+                "params": {},
+                "meta": {
+                    "auto_compaction": {
+                        "pipe_model_id": "auto_compact",
+                        "target_model_id": "base-target",
+                    },
+                },
+                "access_grants": [],
+                "is_active": True,
+            }
+
+        @staticmethod
+        async def update_model_by_id(model_id, model_form):
+            calls["update"].append((model_id, model_form))
+
+        @staticmethod
+        async def insert_new_model(model_form, user_id):
+            calls["insert"].append((user_id, model_form))
+
+    functions_module = types.ModuleType("open_webui.models.functions")
+    functions_module.Functions = FakeFunctions
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.ModelForm = FakeModelForm
+    models_module.ModelMeta = FakeModelMeta
+    models_module.ModelParams = FakeModelParams
+    models_module.Models = FakeModels
+    monkeypatch.setitem(sys.modules, "open_webui.models.functions", functions_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+
+    await mod.sync_wrapper_model_records(
+        pipe_model_id="auto_compact",
+        target_models=[{"id": "base-target", "name": "Base Target", "owned_by": "openai"}],
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert calls["update"][0][0] == wrapper_id
+    assert calls["update"][0][1].access_grants == []
+    assert calls["insert"] == []
+
+
+@pytest.mark.asyncio
+async def test_wrapper_sync_skips_update_when_existing_record_matches(monkeypatch):
+    calls = {"insert": [], "update": []}
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "same-target")
+
+    class FakeFunction:
+        user_id = "function-owner"
+
+    class FakeFunctions:
+        @staticmethod
+        async def get_function_by_id(function_id):
+            return FakeFunction()
+
+    class FakeModelParams:
+        def __init__(self, **kwargs):
+            self.payload = kwargs
+
+        def model_dump(self, **kwargs):
+            return dict(self.payload)
+
+    class FakeModelMeta:
+        def __init__(self, **kwargs):
+            self.payload = kwargs
+
+        def model_dump(self, **kwargs):
+            return dict(self.payload)
+
+    class FakeModelForm:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    target = {
+        "id": "same-target",
+        "name": "Same Target",
+        "info": {
+            "access_grants": [
+                {
+                    "principal_type": "user",
+                    "principal_id": "*",
+                    "permission": "read",
+                }
+            ]
+        },
+    }
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == wrapper_id
+            return {
+                "id": wrapper_id,
+                "base_model_id": None,
+                "name": "Compact: Same Target",
+                "params": {"stream_response": True},
+                "meta": {
+                    "description": "Auto-compacting wrapper for same-target",
+                    "auto_compaction": {
+                        "pipe_model_id": "auto_compact",
+                        "target_model_id": "same-target",
+                    },
+                },
+                "access_grants": [
+                    {
+                        "id": "grant-db-id",
+                        "principal_type": "user",
+                        "principal_id": "*",
+                        "permission": "read",
+                    }
+                ],
+                "is_active": True,
+            }
+
+        @staticmethod
+        async def update_model_by_id(model_id, model_form):
+            calls["update"].append((model_id, model_form))
+
+        @staticmethod
+        async def insert_new_model(model_form, user_id):
+            calls["insert"].append((user_id, model_form))
+
+    functions_module = types.ModuleType("open_webui.models.functions")
+    functions_module.Functions = FakeFunctions
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.ModelForm = FakeModelForm
+    models_module.ModelMeta = FakeModelMeta
+    models_module.ModelParams = FakeModelParams
+    models_module.Models = FakeModels
+    monkeypatch.setitem(sys.modules, "open_webui.models.functions", functions_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+
+    await mod.sync_wrapper_model_records(
+        pipe_model_id="auto_compact",
+        target_models=[target],
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert calls == {"insert": [], "update": []}
+
+
+@pytest.mark.asyncio
+async def test_target_access_uses_core_chat_model_dict_access_check(monkeypatch, pipe_request, pipe_user):
+    fake_user_model = install_fake_open_webui_user_model(monkeypatch)
+    target_model = {"id": "target", "name": "Target", "owned_by": "openai"}
+    pipe_request.app.state.MODELS = {"target": target_model}
+    captured = {}
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            raise AssertionError("target access should use the app-state model dict, not the DB Model record")
+
+    async def check_model_access(user, model, db=None):
+        captured["user_type"] = type(user)
+        captured["user_id"] = user.id
+        captured["model"] = model
+
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+
+    await mod._validate_target_access(target_model_id="target", request=pipe_request, user=pipe_user)
+
+    assert captured == {"user_type": fake_user_model, "user_id": "user-1", "model": target_model}
+
+
+@pytest.mark.asyncio
+async def test_target_access_bypasses_core_access_check_for_admin_when_admin_bypass_enabled(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    pipe_request.app.state.MODELS = {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+    admin_user = {**pipe_user, "role": "admin"}
+
+    async def check_model_access(user, model, db=None):
+        raise AssertionError("admin target validation should match core chat path and skip per-model grants")
+
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    config_module = types.ModuleType("open_webui.config")
+    config_module.BYPASS_ADMIN_ACCESS_CONTROL = True
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.config", config_module)
+
+    await mod._validate_target_access(target_model_id="target", request=pipe_request, user=admin_user)
+
+
+@pytest.mark.asyncio
+async def test_target_access_checks_admin_when_admin_bypass_disabled(monkeypatch, pipe_request, pipe_user):
+    fake_user_model = install_fake_open_webui_user_model(monkeypatch)
+    target_model = {"id": "target", "name": "Target", "owned_by": "openai"}
+    pipe_request.app.state.MODELS = {"target": target_model}
+    admin_user = {**pipe_user, "role": "admin"}
+    captured = {}
+
+    async def check_model_access(user, model, db=None):
+        captured["user_type"] = type(user)
+        captured["user_role"] = user.role
+        captured["model"] = model
+
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    config_module = types.ModuleType("open_webui.config")
+    config_module.BYPASS_ADMIN_ACCESS_CONTROL = False
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.config", config_module)
+
+    await mod._validate_target_access(target_model_id="target", request=pipe_request, user=admin_user)
+
+    assert captured == {"user_type": fake_user_model, "user_role": "admin", "model": target_model}
+
+
+@pytest.mark.asyncio
+async def test_target_access_honors_global_model_access_bypass(monkeypatch, pipe_request, pipe_user):
+    install_fake_open_webui_user_model(monkeypatch)
+    pipe_request.app.state.MODELS = {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+
+    async def check_model_access(user, model, db=None):
+        raise AssertionError("global BYPASS_MODEL_ACCESS_CONTROL should skip per-model grants")
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.BYPASS_MODEL_ACCESS_CONTROL = True
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+
+    await mod._validate_target_access(target_model_id="target", request=pipe_request, user=pipe_user)
+
+
+@pytest.mark.asyncio
+async def test_target_access_can_resolve_targets_from_base_model_cache(monkeypatch, pipe_request, pipe_user):
+    install_fake_open_webui_user_model(monkeypatch)
+    target_model = {"id": "LiteLLM.glm-5.1", "name": "GLM", "owned_by": "openai"}
+    pipe_request.app.state.MODELS = {
+        mod.build_wrapper_model_id("auto_compact", "LiteLLM.glm-5.1"): {
+            "id": mod.build_wrapper_model_id("auto_compact", "LiteLLM.glm-5.1"),
+            "name": "Compact: GLM",
+            "pipe": {"type": "pipe"},
+        }
+    }
+    pipe_request.app.state.BASE_MODELS = [target_model]
+    captured = {}
+
+    async def check_model_access(user, model, db=None):
+        captured["model"] = model
+
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+
+    await mod._validate_target_access(target_model_id="LiteLLM.glm-5.1", request=pipe_request, user=pipe_user)
+
+    assert captured["model"] == target_model
+
+
+@pytest.mark.asyncio
+async def test_forward_target_injects_resolved_base_model_into_request_models(monkeypatch, pipe_request, pipe_user):
+    target_model = {"id": "LiteLLM.glm-5.1", "name": "GLM", "owned_by": "openai"}
+    pipe_request.app.state.MODELS = {}
+    pipe_request.app.state.BASE_MODELS = [target_model]
+    captured = {}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False):
+        captured["has_target"] = form_data["model"] in request.app.state.MODELS
+        captured["target_model"] = request.app.state.MODELS.get(form_data["model"])
+        return StreamingResponse(
+            iter([b'data: {"choices": [{"delta": {"content": "ok"}}]}\n\n']),
+            media_type="text/event-stream",
+        )
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    response = await mod._forward_streaming_target(
+        request=pipe_request,
+        user=pipe_user,
+        body={"model": "LiteLLM.glm-5.1", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id=mod.build_wrapper_model_id("auto_compact", "LiteLLM.glm-5.1"),
+    )
+    async for _ in response.body_iterator:
+        pass
+
+    assert captured == {"has_target": True, "target_model": target_model}
+
+
+def test_summary_model_validation_allows_pipe_backed_and_rejects_arena():
+    models = {
+        "target": {"id": "target", "name": "Target"},
+        "pipe.summary": {"id": "pipe.summary", "pipe": {"type": "pipe"}, "name": "Summary Pipe"},
+        "arena": {"id": "arena", "owned_by": "arena", "arena": True},
+    }
+
+    assert mod.validate_summary_model_id("", "target", models) == "target"
+    assert mod.validate_summary_model_id("pipe.summary", "target", models) == "pipe.summary"
+
+    with pytest.raises(ValueError, match="arena"):
+        mod.validate_summary_model_id("arena", "target", models)
+
+
+def test_summary_model_validation_rejects_missing_configured_model():
+    models = {"target": {"id": "target", "name": "Target"}}
+
+    with pytest.raises(ValueError, match="not found"):
+        mod.validate_summary_model_id("missing.summary", "target", models)
+
+
+def test_valve_defaults_are_conservative_for_v1_continuation():
+    valves = mod.Pipe.Valves()
+
+    assert valves.trigger_total_tokens == 100000
+    assert valves.force_include_usage is True
+    assert valves.keep_tail_messages == 6
+    assert valves.preserve_latest_tool_rounds == 1
+
+
+def test_usage_extraction_handles_chat_completions_and_responses_api_shapes():
+    chat = {"usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+    response = {
+        "type": "response.completed",
+        "response": {"usage": {"input_tokens": 7, "output_tokens": 3}},
+    }
+
+    assert mod.extract_usage_from_stream_payload(chat) == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+    }
+    assert mod.extract_usage_from_stream_payload(response)["total_tokens"] == 10
+
+
+def test_request_scoped_usage_precedes_persisted_and_message_usage():
+    request = SimpleNamespace(state=SimpleNamespace())
+    key = mod.usage_state_key("chat-1", "message-1", "auto_compact.target")
+    setattr(request.state, key, {"total_tokens": 999, "input_tokens": 900, "output_tokens": 99})
+
+    usage = mod.choose_usage_signal(
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+        persisted_usage={"total_tokens": 100},
+        messages=[{"role": "assistant", "usage": {"total_tokens": 200}}],
+    )
+
+    assert usage["total_tokens"] == 999
+
+
+def test_usage_option_injection_preserves_existing_stream_options():
+    body = {
+        "stream": True,
+        "stream_options": {"other": "value"},
+    }
+
+    out = mod.inject_stream_usage_options(body)
+
+    assert out is not body
+    assert out["stream_options"] == {"other": "value", "include_usage": True}
+
+
+def test_context_window_classifier_handles_structured_responses_and_http_exception():
+    assert mod.is_retryable_context_error(
+        JSONResponse(
+            {"error": {"code": "context_length_exceeded", "message": "too long"}},
+            status_code=400,
+        )
+    )
+    assert mod.is_retryable_context_error(
+        PlainTextResponse("maximum context length exceeded", status_code=413)
+    )
+    assert mod.is_retryable_context_error(
+        HTTPException(status_code=400, detail={"error": {"type": "context_window_exceeded"}})
+    )
+    assert mod.is_retryable_context_error(Exception("maximum context length exceeded"))
+
+
+def test_context_window_classifier_avoids_rate_limit_quota_and_tpm_false_positives():
+    assert not mod.is_retryable_context_error(
+        JSONResponse(
+            {"error": {"message": "too many tokens per minute for this organization"}},
+            status_code=429,
+        )
+    )
+    assert not mod.is_retryable_context_error(
+        {"error": {"code": "insufficient_quota", "message": "quota exceeded"}},
+    )
+    assert not mod.is_retryable_context_error(
+        {"error": {"message": "token-per-minute limit exceeded"}},
+    )
+
+
+def test_context_window_message_fallback_uses_only_error_message_fields():
+    body_with_unrelated_serialized_text = {
+        "metadata": {"raw": "maximum context length exceeded"},
+        "error": {"message": "ordinary bad request"},
+    }
+    body_with_error_message = {"error": {"message": "input is too long for the context window"}}
+
+    assert not mod.is_retryable_context_error(body_with_unrelated_serialized_text, status_code=400)
+    assert mod.is_retryable_context_error(body_with_error_message, status_code=400)
+
+
+def test_sse_error_payload_is_classified_before_any_content():
+    chunk = b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+
+    assert mod.extract_sse_json_events(chunk) == [
+        {"error": {"code": "context_length_exceeded", "message": "too long"}}
+    ]
+    assert mod.first_chunk_is_retryable_context_error(chunk)
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_surfaces_context_error_after_first_non_error_event():
+    async def chunks():
+        yield b'data: {"usage": {"prompt_tokens": 1, "completion_tokens": 0}}\n\n'
+        yield b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    emitted = []
+    async for chunk in prepared.body_iterator:
+        emitted.append(chunk)
+
+    assert emitted == [
+        b'data: {"usage": {"prompt_tokens": 1, "completion_tokens": 0}}\n\n',
+        b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_retries_iterator_context_exception_before_visible_output():
+    closed = False
+    background_ran = False
+    restored = False
+
+    async def chunks():
+        nonlocal closed
+        try:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": {"code": "context_length_exceeded", "message": "too long"}},
+            )
+            yield b""
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_ran
+        background_ran = True
+
+    def restore():
+        nonlocal restored
+        restored = True
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(
+        chunks(),
+        media_type="text/event-stream",
+        background=BackgroundTask(background),
+    )
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+            restore=restore,
+        )
+
+    assert restored is True
+    assert closed is True
+    assert background_ran is True
+
+
+@pytest.mark.asyncio
+async def test_non_context_json_response_is_returned_as_sse_event():
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = JSONResponse({"error": {"code": "provider_error", "message": "unavailable"}}, status_code=500)
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    emitted = []
+    async for chunk in prepared.body_iterator:
+        emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+
+    assert emitted == ['data: {"error":{"code":"provider_error","message":"unavailable"}}\n\n']
+
+
+@pytest.mark.asyncio
+async def test_non_context_plain_text_response_is_returned_as_sse_error_event():
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = PlainTextResponse("provider unavailable", status_code=500)
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    emitted = []
+    async for chunk in prepared.body_iterator:
+        emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+
+    assert emitted == ['data: {"error": {"code": "provider_error", "message": "provider unavailable"}}\n\n']
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_normalizes_dict_chunks_to_sse_events():
+    async def chunks():
+        yield {"usage": {"prompt_tokens": 2, "completion_tokens": 0}}
+        yield {"choices": [{"delta": {"content": "hello"}}]}
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    emitted = []
+    async for chunk in prepared.body_iterator:
+        emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+
+    assert emitted == [
+        'data: {"usage": {"prompt_tokens": 2, "completion_tokens": 0}}\n\n',
+        'data: {"choices": [{"delta": {"content": "hello"}}]}\n\n',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_surfaces_context_error_after_visible_output():
+    async def chunks():
+        yield b'data: {"choices": [{"delta": {"content": "hello"}}]}\n\n'
+        yield b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    emitted = []
+    async for chunk in prepared.body_iterator:
+        emitted.append(chunk)
+
+    assert emitted == [
+        b'data: {"choices": [{"delta": {"content": "hello"}}]}\n\n',
+        b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_closes_inner_stream_after_visible_output_early_stop():
+    closed = False
+    background_ran = False
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield b'data: {"choices": [{"delta": {"content": "hello"}}]}\n\n'
+            await asyncio.sleep(60)
+            yield b'data: {"choices": [{"delta": {"content": "late"}}]}\n\n'
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_ran
+        background_ran = True
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(
+        chunks(),
+        media_type="text/event-stream",
+        background=BackgroundTask(background),
+    )
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    iterator = prepared.body_iterator.__aiter__()
+    first = await iterator.__anext__()
+    assert first == b'data: {"choices": [{"delta": {"content": "hello"}}]}\n\n'
+
+    await iterator.aclose()
+
+    assert closed is True
+    assert background_ran is True
+
+
+def test_request_state_snapshot_restores_bypass_and_metadata():
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            bypass_filter=False,
+            metadata={"selected_model_id": "arena-a", "chat_id": "chat-1"},
+        )
+    )
+
+    snapshot = mod.RequestStateSnapshot(request)
+    snapshot.apply_bypass(True)
+    request.state.metadata.pop("selected_model_id")
+    request.state.metadata["new"] = "value"
+    snapshot.restore()
+
+    assert request.state.bypass_filter is False
+    assert request.state.metadata == {"selected_model_id": "arena-a", "chat_id": "chat-1"}
+
+
+def test_summary_task_metadata_removes_tool_and_arena_state():
+    metadata = {
+        "chat_id": "chat-1",
+        "selected_model_id": "arena-a",
+        "tools": {"tool": {}},
+        "tool_ids": ["tool"],
+    }
+
+    summary_metadata = mod.build_summary_task_metadata(metadata)
+
+    assert summary_metadata["chat_id"] == "chat-1"
+    assert summary_metadata["task"] == mod.INTERNAL_SUMMARY_TASK
+    assert summary_metadata["tools"] == {}
+    assert summary_metadata["tool_ids"] == []
+    assert "selected_model_id" not in summary_metadata
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_overrides_request_state_metadata(monkeypatch, pipe_request, pipe_user):
+    captured = {}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False):
+        captured["state_metadata"] = dict(request.state.metadata)
+        captured["form_metadata"] = dict(form_data["metadata"])
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    pipe_request.state.metadata = {"selected_model_id": "arena-a", "tools": {"bad": {}}, "tool_ids": ["bad"]}
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1", "selected_model_id": "arena-a", "tools": {"bad": {}}, "tool_ids": ["bad"]},
+        summary_model_id="target",
+        source_messages=[{"role": "user", "content": "old"}],
+    )
+
+    assert result == "summary"
+    assert captured["state_metadata"]["task"] == mod.INTERNAL_SUMMARY_TASK
+    assert captured["state_metadata"]["tools"] == {}
+    assert captured["state_metadata"]["tool_ids"] == []
+    assert "selected_model_id" not in captured["state_metadata"]
+    assert captured["form_metadata"] == captured["state_metadata"]
+    assert pipe_request.state.metadata == {
+        "selected_model_id": "arena-a",
+        "tools": {"bad": {}},
+        "tool_ids": ["bad"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_decodes_own_wrapper_summary_model(monkeypatch, pipe_request, pipe_user):
+    captured = {}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False):
+        captured["model"] = form_data["model"]
+        captured["stream"] = form_data["stream"]
+        captured["metadata"] = dict(form_data["metadata"])
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    wrapper_summary_model = mod.build_wrapper_model_id("auto_compact", "target.summary")
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id=wrapper_summary_model,
+        source_messages=[{"role": "user", "content": "old"}],
+    )
+
+    assert result == "summary"
+    assert captured["model"] == "target.summary"
+    assert captured["stream"] is False
+    assert captured["metadata"]["task"] == mod.INTERNAL_SUMMARY_TASK
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_passes_open_webui_user_model_to_inner_completion(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    fake_user_model = install_fake_open_webui_user_model(monkeypatch)
+    captured = {}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False):
+        captured["user_id"] = user.id
+        captured["user_role"] = user.role
+        captured["user_type"] = type(user)
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        source_messages=[{"role": "user", "content": "old"}],
+    )
+
+    assert result == "summary"
+    assert captured == {"user_id": "user-1", "user_role": "user", "user_type": fake_user_model}
+
+
+@pytest.mark.asyncio
+async def test_tool_result_summary_wraps_tool_message_as_user_text(monkeypatch, pipe_request, pipe_user):
+    captured = {}
+
+    async def generate_summary_text(**kwargs):
+        captured["source_messages"] = kwargs["source_messages"]
+        return "tool summary"
+
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    result = await mod._generate_tool_result_summary(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        tool_message={"role": "tool", "tool_call_id": "call-1", "content": {"value": 42}},
+    )
+
+    assert result == "tool summary"
+    assert [message["role"] for message in captured["source_messages"]] == ["user"]
+    assert "tool_call_id: call-1" in captured["source_messages"][0]["content"]
+    assert '"value": 42' in captured["source_messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_from_streaming_response():
+    async def chunks():
+        yield b'data: {"choices": [{"delta": {"content": "hello "}}]}\n\n'
+        yield b'data: {"choices": [{"delta": {"content": "world"}}]}\n\n'
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    assert await mod.extract_text_from_completion_response(response) == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_lookup_persisted_usage_reads_current_branch(monkeypatch):
+    class FakeChats:
+        @staticmethod
+        async def get_messages_map_by_chat_id(chat_id):
+            assert chat_id == "chat-1"
+            return {
+                "root": {"id": "root", "role": "user", "content": "root"},
+                "assistant-old": {
+                    "id": "assistant-old",
+                    "parentId": "root",
+                    "role": "assistant",
+                    "content": "old",
+                    "usage": {"total_tokens": 10},
+                },
+                "assistant-current": {
+                    "id": "assistant-current",
+                    "parentId": "assistant-old",
+                    "role": "assistant",
+                    "content": "current",
+                    "info": {"usage": {"prompt_tokens": 100, "completion_tokens": 23}},
+                },
+                "sibling": {
+                    "id": "sibling",
+                    "parentId": "root",
+                    "role": "assistant",
+                    "content": "other branch",
+                    "usage": {"total_tokens": 999},
+                },
+            }
+
+    chats_module = types.ModuleType("open_webui.models.chats")
+    chats_module.Chats = FakeChats
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
+
+    usage = await mod.lookup_persisted_usage("chat-1", "assistant-current")
+
+    assert usage["total_tokens"] == 123
+
+
+@pytest.mark.asyncio
+async def test_lookup_persisted_usage_uses_legacy_map_when_message_id_missing(monkeypatch):
+    class FakeChats:
+        @staticmethod
+        async def get_messages_map_by_chat_id(chat_id):
+            return {
+                "root": {"id": "root", "role": "user", "content": "root"},
+                "assistant-1": {
+                    "id": "assistant-1",
+                    "parentId": "root",
+                    "role": "assistant",
+                    "content": "answer",
+                    "usage": {"input_tokens": 9, "output_tokens": 4},
+                },
+            }
+
+    chats_module = types.ModuleType("open_webui.models.chats")
+    chats_module.Chats = FakeChats
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
+
+    usage = await mod.lookup_persisted_usage("chat-1", None)
+
+    assert usage["total_tokens"] == 13
+
+
+@pytest.fixture
+def pipe_request():
+    return SimpleNamespace(state=SimpleNamespace(), app=SimpleNamespace(state=SimpleNamespace(MODELS={})))
+
+
+@pytest.fixture
+def pipe_user():
+    return {
+        "id": "user-1",
+        "email": "user@example.com",
+        "name": "User",
+        "role": "user",
+        "last_active_at": 0,
+        "updated_at": 0,
+        "created_at": 0,
+    }
+
+
+@pytest.fixture
+def pipe_metadata():
+    return {"chat_id": "chat-1", "message_id": "message-1", "session_id": "session-1"}
+
+
+@pytest.mark.asyncio
+async def test_pipe_forwards_below_threshold_to_decoded_target_with_metadata(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        captured["validated_target"] = kwargs["target_model_id"]
+
+    async def model_dict_from_request(request):
+        return {"target.model": {"id": "target.model", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 10, "output_tokens": 0}
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.keep_tail_messages = 1
+    pipe.valves.preserve_latest_tool_rounds = 0
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target.model")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"ok": True}
+    assert captured["validated_target"] == "target.model"
+    assert captured["forward_body"]["model"] == "target.model"
+    assert captured["forward_body"]["metadata"] == pipe_metadata
+    assert captured["forward_body"]["stream_options"]["include_usage"] is True
+    assert captured["forward_body"]["messages"] == body["messages"]
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_forwarding_passes_open_webui_user_model_to_inner_completion(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    fake_user_model = install_fake_open_webui_user_model(monkeypatch)
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False):
+        captured["model"] = form_data["model"]
+        captured["user_id"] = user.id
+        captured["user_role"] = user.role
+        captured["user_type"] = type(user)
+        return StreamingResponse(
+            iter([b'data: {"choices": [{"delta": {"content": "ok"}}]}\n\n']),
+            media_type="text/event-stream",
+        )
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    chunks = []
+    async for chunk in result.body_iterator:
+        chunks.append(chunk)
+
+    assert chunks == [b'data: {"choices": [{"delta": {"content": "ok"}}]}\n\n']
+    assert captured == {
+        "model": "target",
+        "user_id": "user-1",
+        "user_role": "user",
+        "user_type": fake_user_model,
+    }
+
+
+@pytest.mark.asyncio
+async def test_pipe_rejects_missing_configured_summary_model(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def forward_target(**kwargs):
+        raise AssertionError("target must not be called when summary_model is invalid")
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.summary_model = "missing.summary"
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["error"]["code"] == "invalid_summary_model"
+    assert "missing.summary" in result["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_compacts_above_threshold_and_removes_previous_response_id(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 500, "input_tokens": 400, "output_tokens": 100}
+
+    async def get_or_create_checkpoint_summary(**kwargs):
+        captured["source_messages"] = kwargs["source_messages"]
+        return "summary text"
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.keep_tail_messages = 1
+    pipe.valves.preserve_latest_tool_rounds = 0
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "previous_response_id": "resp-old",
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    forwarded = captured["forward_body"]
+    assert "previous_response_id" not in forwarded
+    assert forwarded["messages"][0] == {"role": "system", "content": "system"}
+    assert forwarded["messages"][1]["role"] == "user"
+    assert "summary text" in forwarded["messages"][1]["content"]
+    assert forwarded["messages"][-1] == {"role": "user", "content": "active"}
+    assert captured["source_messages"] == [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    assert [event["data"]["action"] for event in events] == [
+        "auto_compaction_compacting",
+        "auto_compaction_compacted",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipe_retries_with_compaction_after_pre_emission_context_error(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def get_or_create_checkpoint_summary(**kwargs):
+        return "retry summary"
+
+    async def forward_target(**kwargs):
+        calls.append(kwargs["body"])
+        if len(calls) == 1:
+            raise mod.RetryableContextOverflow("context")
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "previous_response_id": "resp-old",
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result == {"ok": True}
+    assert len(calls) == 2
+    assert calls[0]["messages"] == body["messages"]
+    assert "previous_response_id" not in calls[1]
+    assert "retry summary" in calls[1]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_stops_context_retries_at_fixed_budget(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def get_or_create_checkpoint_summary(**kwargs):
+        return "retry summary"
+
+    async def forward_target(**kwargs):
+        calls.append(kwargs["body"])
+        raise mod.RetryableContextOverflow("context")
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "active"},
+            ],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert len(calls) == mod.MAX_CONTEXT_RETRY_ATTEMPTS
+    assert result["error"]["code"] == "context_window_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_pipe_does_not_retry_non_context_target_errors(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def forward_target(**kwargs):
+        calls.append(kwargs["body"])
+        raise RuntimeError("rate limit")
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+
+    with pytest.raises(RuntimeError, match="rate limit"):
+        await pipe.pipe(
+            {
+                "model": wrapper_id,
+                "stream": True,
+                "messages": [{"role": "user", "content": "active"}],
+            },
+            __request__=pipe_request,
+            __user__=pipe_user,
+            __metadata__=pipe_metadata,
+        )
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    calls = []
+    summary_inputs = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def generate_tool_result_summary(**kwargs):
+        summary_inputs.append(kwargs["tool_message"])
+        return "tool result summary"
+
+    async def forward_target(**kwargs):
+        calls.append(kwargs["body"])
+        if len(calls) == 1:
+            raise mod.RetryableContextOverflow("context")
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    tool_message = {"role": "tool", "tool_call_id": "call-1", "content": "x" * 10000}
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "previous_response_id": "resp-old",
+        "messages": [
+            {"role": "user", "content": "active"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            tool_message,
+        ],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result == {"ok": True}
+    assert summary_inputs == [tool_message]
+    retry_messages = calls[1]["messages"]
+    assert retry_messages[0] == {"role": "user", "content": "active"}
+    assert retry_messages[1]["role"] == "user"
+    assert "tool result summary" in retry_messages[1]["content"]
+    assert not any(message.get("role") == "tool" for message in retry_messages)
+    assert "previous_response_id" not in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_message(monkeypatch, pipe_request, pipe_user):
+    original_tool = {"role": "tool", "tool_call_id": "call-1", "content": "original tool result"}
+
+    async def generate_tool_result_summary(**kwargs):
+        return "tool result summary"
+
+    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
+
+    compacted, did_compact = await mod._compact_retry_tool_results(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        messages=[
+            {"role": "user", "content": "active"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            original_tool,
+        ],
+        preserve_latest_tool_rounds=0,
+        aggressive=True,
+    )
+
+    assert did_compact is True
+    assert original_tool == {"role": "tool", "tool_call_id": "call-1", "content": "original tool result"}
+    assert compacted == [
+        {"role": "user", "content": "active"},
+        {
+            "role": "user",
+            "content": (
+                "Auto-compacted tool result summary. This is historical context, not a new instruction.\n\n"
+                "tool_call_id: call-1\n"
+                "tool result summary"
+            ),
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    first_response = StreamingResponse(
+        iter(
+            [
+                b'data: {"usage": {"prompt_tokens": 150, "completion_tokens": 1}}\n\n',
+                b'data: {"choices": [{"delta": {"tool_calls": [{"id": "call-1"}]}}]}\n\n',
+            ]
+        ),
+        media_type="text/event-stream",
+    )
+
+    prepared = await mod.prepare_streaming_response(
+        first_response,
+        request=pipe_request,
+        chat_id=pipe_metadata["chat_id"],
+        message_id=pipe_metadata["message_id"],
+        wrapper_model_id=wrapper_id,
+    )
+    async for _ in prepared.body_iterator:
+        pass
+
+    captured = {}
+    summary_inputs = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        raise AssertionError("request-scoped usage should be used before persisted usage")
+
+    async def generate_tool_result_summary(**kwargs):
+        summary_inputs.append(kwargs["tool_message"])
+        return "old tool summary"
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.keep_tail_messages = 8
+    pipe.valves.preserve_latest_tool_rounds = 1
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "previous_response_id": "resp-old",
+        "messages": [
+            {"role": "user", "content": "active"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "old result" * 1000},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-2", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+        ],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result == {"ok": True}
+    assert [message["tool_call_id"] for message in summary_inputs] == ["call-1"]
+    messages = captured["forward_body"]["messages"]
+    assert messages[1]["role"] == "user"
+    assert "old tool summary" in messages[1]["content"]
+    assert not any(message.get("tool_call_id") == "call-1" for message in messages)
+    assert messages[2]["role"] == "assistant"
+    assert messages[3]["content"] == "latest result"
+    assert "previous_response_id" not in captured["forward_body"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_returns_clear_error_when_latest_user_cannot_fit(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def forward_target(**kwargs):
+        raise mod.RetryableContextOverflow("context")
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [{"role": "user", "content": "x" * 1000000}],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result["error"]["code"] == "active_input_too_large"
+    assert "latest user message" in result["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_returns_clear_error_when_latest_tool_result_cannot_be_summarized(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def generate_tool_result_summary(**kwargs):
+        raise mod.RetryableContextOverflow("summary context")
+
+    async def forward_target(**kwargs):
+        raise mod.RetryableContextOverflow("target context")
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "active"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "x" * 1000000},
+        ],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result["error"]["code"] == "latest_tool_result_too_large"
+    assert "tool result" in result["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_does_not_compact_internal_summary_task(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 999999, "input_tokens": 999999, "output_tokens": 0}
+
+    async def get_or_create_checkpoint_summary(**kwargs):
+        raise AssertionError("summary task must not recursively compact")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+    metadata = {**pipe_metadata, "task": mod.INTERNAL_SUMMARY_TASK}
+
+    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+
+    assert captured["forward_body"]["messages"] == body["messages"]

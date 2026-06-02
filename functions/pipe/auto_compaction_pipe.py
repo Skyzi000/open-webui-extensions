@@ -1,0 +1,2446 @@
+"""
+title: Auto Compaction Pipe
+author: Skyzi000
+author_url: https://github.com/Skyzi000/open-webui-extensions
+description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
+version: 0.1.0
+license: MIT
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import fnmatch
+import hashlib
+import json
+import time
+from contextlib import suppress
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
+
+from fastapi import HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Index,
+    Integer,
+    JSON,
+    MetaData,
+    Table,
+    Text,
+    UniqueConstraint,
+    insert,
+    select,
+    update,
+)
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+
+
+PIPE_FUNCTION_ID = "auto_compact"
+CHECKPOINT_NAMESPACE = "skyzi000.open_webui_extensions.auto_compaction_pipe"
+CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_TABLE_NAME = "skyzi000_owui_ext_autocompact_checkpoint_v1"
+CHECKPOINT_LOOKUP_UQ = "skyzi000_owui_ext_accp_v1_lookup_uq"
+CHECKPOINT_PREFIX_IDX = "skyzi000_owui_ext_accp_v1_prefix_idx"
+CHECKPOINT_RECENT_IDX = "skyzi000_owui_ext_accp_v1_recent_idx"
+REQUEST_STATE_SCHEMA_READY_KEY = "_auto_compact_checkpoint_schema_ready_v1"
+INTERNAL_SUMMARY_TASK = "auto_compaction_summary"
+TEMP_CHAT_PREFIXES = ("local:", "channel:")
+SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
+SOURCE_HASH_FAMILY = "canonical-json-v1"
+PROFILE_HASH_FAMILY = "checkpoint-profile-v1"
+MAX_CONTEXT_RETRY_ATTEMPTS = 2
+
+try:
+    from open_webui.internal.db import DATABASE_SCHEMA as OPEN_WEBUI_DATABASE_SCHEMA
+except Exception:
+    OPEN_WEBUI_DATABASE_SCHEMA = None
+
+_CHECKPOINT_METADATA = MetaData(schema=OPEN_WEBUI_DATABASE_SCHEMA)
+CHECKPOINT_TABLE = Table(
+    CHECKPOINT_TABLE_NAME,
+    _CHECKPOINT_METADATA,
+    Column("id", Text, primary_key=True),
+    Column("namespace", Text, nullable=False),
+    Column("schema_version", Integer, nullable=False),
+    Column("user_id", Text, nullable=False),
+    Column("chat_id", Text, nullable=False),
+    Column("pipe_model_id", Text, nullable=False),
+    Column("profile_hash", Text, nullable=False),
+    Column("source_message_count", Integer, nullable=False),
+    Column("source_hash", Text, nullable=False),
+    Column("summary_text", Text, nullable=False),
+    Column("summary_meta", JSON, nullable=False),
+    Column("state", Text, nullable=False),
+    Column("parent_checkpoint_id", Text, nullable=True),
+    Column("created_at", BigInteger, nullable=False),
+    Column("updated_at", BigInteger, nullable=False),
+    Column("last_used_at", BigInteger, nullable=False),
+    UniqueConstraint(
+        "namespace",
+        "user_id",
+        "chat_id",
+        "pipe_model_id",
+        "profile_hash",
+        "source_hash",
+        name=CHECKPOINT_LOOKUP_UQ,
+    ),
+    Index(
+        CHECKPOINT_PREFIX_IDX,
+        "namespace",
+        "user_id",
+        "chat_id",
+        "pipe_model_id",
+        "profile_hash",
+        "source_message_count",
+    ),
+    Index(CHECKPOINT_RECENT_IDX, "namespace", "user_id", "chat_id", "last_used_at"),
+)
+
+_CHECKPOINT_SCHEMA_READY = False
+_GENERATION_LOCKS: dict[tuple[str, str, str, str, str, str], asyncio.Lock] = {}
+
+
+def get_generation_lock(key: tuple[str, str, str, str, str, str]) -> asyncio.Lock:
+    return _GENERATION_LOCKS.setdefault(key, asyncio.Lock())
+
+
+def release_generation_lock(key: tuple[str, str, str, str, str, str], lock: asyncio.Lock) -> None:
+    waiters = getattr(lock, "_waiters", None)
+    has_waiters = bool(waiters)
+    if not lock.locked() and not has_waiters and _GENERATION_LOCKS.get(key) is lock:
+        _GENERATION_LOCKS.pop(key, None)
+
+
+@dataclass(frozen=True)
+class WrapperIdentity:
+    pipe_model_id: str
+    target_model_suffix: str
+    target_model_id: str
+
+
+@dataclass(frozen=True)
+class TargetModelContract:
+    id: str
+    name: str
+    meta: dict[str, Any]
+    wrapper_params: dict[str, Any]
+    access_grants: list[dict[str, Any]]
+    owner_user_id: str | None
+
+
+@dataclass(frozen=True)
+class MessageCut:
+    preserved_system_message: dict[str, Any] | None
+    summarization_prefix: list[dict[str, Any]]
+    tail_messages: list[dict[str, Any]]
+    source_message_count: int
+
+
+@dataclass(frozen=True)
+class RetryToolResultCut:
+    active_user_message: dict[str, Any]
+    tool_round_messages: list[dict[str, Any]]
+    tool_messages_to_summarize: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ToolResultCompactionCut:
+    active_user_message: dict[str, Any]
+    tool_round_messages: list[dict[str, Any]]
+    tool_messages_to_summarize: list[dict[str, Any]]
+
+
+class RetryableContextOverflow(Exception):
+    """Raised only before any user-visible target output has been emitted."""
+
+
+class UnsupportedCompactionInput(Exception):
+    """Raised when v1 cannot safely compact without rewriting active input."""
+
+    def __init__(self, message: str, *, code: str = "unsafe_compaction_input"):
+        super().__init__(message)
+        self.code = code
+
+
+class ParentCheckpointExtensionFailed(Exception):
+    """Raised when a verified parent checkpoint exists but extension summarization fails."""
+
+    def __init__(self, parent: dict[str, Any], original: Exception):
+        super().__init__(str(original))
+        self.parent = parent
+        self.original = original
+
+
+def _json_hash(payload: Any) -> str:
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def encode_target_model_id(target_model_id: str) -> str:
+    if not isinstance(target_model_id, str) or not target_model_id:
+        raise ValueError("target_model_id must be a non-empty string")
+    return target_model_id
+
+
+def build_wrapper_model_id(pipe_model_id: str, target_model_id: str) -> str:
+    return f"{pipe_model_id}.{encode_target_model_id(target_model_id)}"
+
+
+def decode_wrapper_model_id(wrapper_model_id: str, *, expected_pipe_id: str = PIPE_FUNCTION_ID) -> WrapperIdentity:
+    if not isinstance(wrapper_model_id, str) or "." not in wrapper_model_id:
+        raise ValueError("Malformed wrapper id: expected '<pipe_id>.<target_model_id>'")
+    pipe_model_id, target_model_id = wrapper_model_id.split(".", 1)
+    if expected_pipe_id and pipe_model_id != expected_pipe_id:
+        raise ValueError(f"Unexpected wrapper pipe id: expected {expected_pipe_id!r}, got {pipe_model_id!r}")
+    if not target_model_id:
+        raise ValueError("Malformed wrapper id: missing target model id")
+    return WrapperIdentity(
+        pipe_model_id=pipe_model_id,
+        target_model_suffix=target_model_id,
+        target_model_id=target_model_id,
+    )
+
+
+def is_generated_wrapper_model_id(model_id: Any, *, pipe_model_id: str = PIPE_FUNCTION_ID) -> bool:
+    return isinstance(model_id, str) and model_id.startswith(f"{pipe_model_id}.")
+
+
+_TOP_LEVEL_MESSAGE_DROP_KEYS = {
+    "id",
+    "parentId",
+    "childrenIds",
+    "timestamp",
+    "created_at",
+    "updated_at",
+    "usage",
+    "info",
+    "done",
+    "status",
+    "statusHistory",
+    "status_history",
+    "error",
+}
+_TRANSIENT_NESTED_KEYS = {
+    "signed_url",
+    "download_url",
+    "preview_url",
+    "thumbnail_url",
+    "path",
+    "tmp_path",
+    "temp_id",
+    "upload_id",
+    "blob_url",
+}
+_STABLE_MESSAGE_KEYS = {
+    "role",
+    "content",
+    "name",
+    "tool_call_id",
+    "tool_calls",
+    "function_call",
+    "files",
+    "sources",
+}
+
+
+def _canonicalize_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key in _TRANSIENT_NESTED_KEYS:
+                continue
+            item = _canonicalize_value(value[key])
+            if item in (None, {}, []):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        return [_canonicalize_value(item) for item in value if _canonicalize_value(item) not in (None, {}, [])]
+    return value
+
+
+def canonicalize_message_for_source_hash(message: dict[str, Any]) -> dict[str, Any]:
+    canonical: dict[str, Any] = {}
+    for key in sorted(message.keys()):
+        if key in _TOP_LEVEL_MESSAGE_DROP_KEYS:
+            continue
+        if key not in _STABLE_MESSAGE_KEYS:
+            continue
+        value = _canonicalize_value(message[key])
+        if value in (None, {}, []):
+            continue
+        canonical[key] = value
+    canonical.setdefault("role", message.get("role", "assistant"))
+    canonical.setdefault("content", "")
+    return canonical
+
+
+def canonicalize_messages_for_source_hash(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [canonicalize_message_for_source_hash(message) for message in messages if isinstance(message, dict)]
+
+
+def compute_source_hash(messages: list[dict[str, Any]]) -> str:
+    return _json_hash(
+        {
+            "family": SOURCE_HASH_FAMILY,
+            "messages": canonicalize_messages_for_source_hash(messages),
+        }
+    )
+
+
+def compute_prefix_hashes(messages: list[dict[str, Any]]) -> dict[int, str]:
+    return {count: compute_source_hash(messages[:count]) for count in range(1, len(messages) + 1)}
+
+
+def compute_profile_hash(
+    *,
+    schema_family: str = CHECKPOINT_TABLE_NAME,
+    summary_format_family: str = SUMMARY_FORMAT_FAMILY,
+    source_hash_family: str = SOURCE_HASH_FAMILY,
+    **_: Any,
+) -> str:
+    return _json_hash(
+        {
+            "profile": PROFILE_HASH_FAMILY,
+            "schema_family": schema_family,
+            "summary_format_family": summary_format_family,
+            "source_hash_family": source_hash_family,
+        }
+    )
+
+
+def _first_system_index(messages: list[dict[str, Any]]) -> int | None:
+    for index, message in enumerate(messages):
+        if message.get("role") == "system":
+            return index
+    return None
+
+
+def _tool_call_ids(message: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for call in tool_calls:
+            if isinstance(call, dict) and isinstance(call.get("id"), str):
+                ids.add(call["id"])
+    return ids
+
+
+def _assistant_tool_call_ids(messages: Iterable[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for message in messages:
+        if message.get("role") == "assistant":
+            ids.update(_tool_call_ids(message))
+    return ids
+
+
+def _expand_start_for_tool_pairs(messages: list[dict[str, Any]], start: int) -> int:
+    start = max(0, min(start, len(messages)))
+    changed = True
+    while changed and start > 0:
+        changed = False
+        tail = messages[start:]
+
+        if tail and tail[0].get("role") == "tool":
+            call_id = tail[0].get("tool_call_id")
+            for index in range(start - 1, -1, -1):
+                if call_id in _tool_call_ids(messages[index]):
+                    start = index
+                    changed = True
+                    break
+            if changed:
+                continue
+
+        tail_tool_ids = {
+            message.get("tool_call_id")
+            for message in tail
+            if message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str)
+        }
+        tail_assistant_ids = _assistant_tool_call_ids(tail)
+        missing_ids = tail_tool_ids - tail_assistant_ids
+        for index in range(start - 1, -1, -1):
+            if _tool_call_ids(messages[index]) & missing_ids:
+                start = index
+                changed = True
+                break
+    return start
+
+
+def _latest_complete_tool_round_start(messages: list[dict[str, Any]], *, preserve_count: int = 1) -> int | None:
+    if preserve_count <= 0:
+        return None
+    starts: list[int] = []
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") != "assistant":
+            continue
+        ids = _tool_call_ids(message)
+        if not ids:
+            continue
+        seen: set[str] = set()
+        for following in messages[index + 1 :]:
+            if following.get("role") != "tool":
+                if seen:
+                    break
+                continue
+            call_id = following.get("tool_call_id")
+            if isinstance(call_id, str) and call_id in ids:
+                seen.add(call_id)
+            if ids <= seen:
+                starts.append(index)
+                if len(starts) >= preserve_count:
+                    return starts[-1]
+                break
+    return starts[-1] if starts else None
+
+
+def _remove_orphan_tool_messages(tail: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    assistant_ids = _assistant_tool_call_ids(tail)
+    cleaned: list[dict[str, Any]] = []
+    for message in tail:
+        if message.get("role") == "tool" and message.get("tool_call_id") not in assistant_ids:
+            continue
+        cleaned.append(message)
+    while cleaned and cleaned[0].get("role") == "tool":
+        cleaned.pop(0)
+    return cleaned
+
+
+def select_safe_message_cut(
+    messages: list[dict[str, Any]],
+    *,
+    keep_tail_messages: int,
+    preserve_latest_tool_rounds: int,
+    aggressive: bool = False,
+) -> MessageCut:
+    if not messages:
+        return MessageCut(None, [], [], 0)
+
+    source_messages = [copy.deepcopy(message) for message in messages]
+    system_index = _first_system_index(source_messages)
+    preserved_system = copy.deepcopy(source_messages[system_index]) if system_index is not None else None
+    working = [message for index, message in enumerate(source_messages) if index != system_index]
+
+    if not working:
+        return MessageCut(preserved_system, [], [], 0)
+
+    latest_user_index = next(
+        (index for index in range(len(working) - 1, -1, -1) if working[index].get("role") == "user"),
+        len(working) - 1,
+    )
+    base_start = min(max(0, len(working) - max(1, keep_tail_messages)), latest_user_index)
+
+    if preserve_latest_tool_rounds > 0 and not aggressive:
+        round_start = _latest_complete_tool_round_start(
+            working,
+            preserve_count=max(1, int(preserve_latest_tool_rounds or 0)),
+        )
+        if round_start is not None:
+            base_start = min(base_start, round_start)
+
+    if not aggressive:
+        base_start = _expand_start_for_tool_pairs(working, base_start)
+
+    tail = _remove_orphan_tool_messages(copy.deepcopy(working[base_start:]))
+    if not any(message.get("role") == "user" for message in tail):
+        tail = [copy.deepcopy(working[latest_user_index])]
+
+    # The summarized prefix is based on the original boundary. Orphan tool
+    # cleanup affects only the retained tail; it does not make tool output a
+    # stable lookup key.
+    prefix = copy.deepcopy(working[:base_start])
+    return MessageCut(
+        preserved_system_message=preserved_system,
+        summarization_prefix=prefix,
+        tail_messages=tail,
+        source_message_count=len(prefix),
+    )
+
+
+def select_retry_tool_result_cut(messages: list[dict[str, Any]]) -> RetryToolResultCut | None:
+    cut = select_tool_result_compaction_cut(messages, preserve_latest_tool_rounds=0, aggressive=True)
+    if cut is None:
+        return None
+    return RetryToolResultCut(
+        active_user_message=cut.active_user_message,
+        tool_round_messages=cut.tool_round_messages,
+        tool_messages_to_summarize=cut.tool_messages_to_summarize,
+    )
+
+
+def select_tool_result_compaction_cut(
+    messages: list[dict[str, Any]],
+    *,
+    preserve_latest_tool_rounds: int,
+    aggressive: bool = False,
+) -> ToolResultCompactionCut | None:
+    latest_user_index = next(
+        (index for index in range(len(messages) - 1, -1, -1) if messages[index].get("role") == "user"),
+        None,
+    )
+    if latest_user_index is None or latest_user_index >= len(messages) - 1:
+        return None
+
+    tool_round = copy.deepcopy(messages[latest_user_index + 1 :])
+    assistant_rounds: list[tuple[set[str], list[dict[str, Any]]]] = []
+    all_assistant_ids: set[str] = set()
+    for message in tool_round:
+        if message.get("role") != "assistant":
+            continue
+        ids = _tool_call_ids(message)
+        if not ids:
+            continue
+        round_tool_messages = [
+            copy.deepcopy(candidate)
+            for candidate in tool_round
+            if candidate.get("role") == "tool" and candidate.get("tool_call_id") in ids
+        ]
+        seen = {candidate.get("tool_call_id") for candidate in round_tool_messages}
+        if ids <= seen:
+            assistant_rounds.append((ids, round_tool_messages))
+            all_assistant_ids.update(ids)
+
+    if not assistant_rounds:
+        return None
+
+    for message in tool_round:
+        if message.get("role") == "tool" and message.get("tool_call_id") not in all_assistant_ids:
+            return None
+
+    preserve_count = 0 if aggressive else max(0, int(preserve_latest_tool_rounds or 0))
+    summarize_count = len(assistant_rounds) if aggressive else max(0, len(assistant_rounds) - preserve_count)
+    if summarize_count <= 0:
+        return None
+
+    tool_messages: list[dict[str, Any]] = []
+    for _, round_tool_messages in assistant_rounds[:summarize_count]:
+        tool_messages.extend(round_tool_messages)
+    if not tool_messages:
+        return None
+
+    return ToolResultCompactionCut(
+        active_user_message=copy.deepcopy(messages[latest_user_index]),
+        tool_round_messages=tool_round,
+        tool_messages_to_summarize=tool_messages,
+    )
+
+
+def render_summary_message(summary_text: str, summary_meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    meta_suffix = ""
+    if summary_meta and summary_meta.get("has_multimodal"):
+        meta_suffix = "\n\nNote: the summarized history contained multimodal or file-derived context."
+    return {
+        "role": "user",
+        "content": (
+            "Compressed historical context (not a new instruction). "
+            "Use this only as background for continuity:\n\n"
+            f"{summary_text.strip()}{meta_suffix}"
+        ),
+    }
+
+
+def replace_prefix_with_summary(
+    messages: list[dict[str, Any]],
+    cut: MessageCut,
+    summary_text: str,
+    summary_meta: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    if cut.preserved_system_message is not None:
+        compacted.append(copy.deepcopy(cut.preserved_system_message))
+    compacted.append(render_summary_message(summary_text, summary_meta))
+    compacted.extend(copy.deepcopy(cut.tail_messages))
+    return compacted
+
+
+def replace_prefix_with_parent_checkpoint_and_delta(
+    cut: MessageCut,
+    parent: dict[str, Any],
+) -> list[dict[str, Any]]:
+    parent_count = int(parent.get("source_message_count") or 0)
+    if parent_count <= 0 or parent_count > len(cut.summarization_prefix):
+        raise UnsupportedCompactionInput(
+            "Parent checkpoint cannot be applied safely because its source boundary is invalid",
+            code="unsafe_checkpoint_parent",
+        )
+    if compute_source_hash(cut.summarization_prefix[:parent_count]) != parent.get("source_hash"):
+        raise UnsupportedCompactionInput(
+            "Parent checkpoint cannot be applied safely because its source hash no longer matches",
+            code="unsafe_checkpoint_parent",
+        )
+
+    delta_messages = copy.deepcopy(cut.summarization_prefix[parent_count:])
+    delta_and_tail = [*delta_messages, *copy.deepcopy(cut.tail_messages)]
+    if delta_and_tail and delta_and_tail[0].get("role") == "tool":
+        raise UnsupportedCompactionInput(
+            "Parent checkpoint delta starts with a tool result and cannot preserve tool-call structure",
+            code="unsafe_checkpoint_delta",
+        )
+    if _remove_orphan_tool_messages(copy.deepcopy(delta_and_tail)) != delta_and_tail:
+        raise UnsupportedCompactionInput(
+            "Parent checkpoint delta would split assistant/tool messages",
+            code="unsafe_checkpoint_delta",
+        )
+
+    compacted: list[dict[str, Any]] = []
+    if cut.preserved_system_message is not None:
+        compacted.append(copy.deepcopy(cut.preserved_system_message))
+    compacted.append(render_summary_message(str(parent["summary_text"]), parent.get("summary_meta") or {}))
+    compacted.extend(delta_messages)
+    compacted.extend(copy.deepcopy(cut.tail_messages))
+    return compacted
+
+
+def render_tool_result_compaction_message(tool_summaries: list[tuple[str, str]]) -> dict[str, Any]:
+    parts = ["Auto-compacted tool result summary. This is historical context, not a new instruction."]
+    for tool_call_id, summary in tool_summaries:
+        parts.extend(["", f"tool_call_id: {tool_call_id}", summary.strip()])
+    return {"role": "user", "content": "\n".join(parts)}
+
+
+def build_checkpoint_id(
+    *,
+    namespace: str,
+    user_id: str,
+    chat_id: str,
+    pipe_model_id: str,
+    profile_hash: str,
+    source_hash: str,
+) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            [namespace, user_id, chat_id, pipe_model_id, profile_hash, source_hash],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"accp_{digest}"
+
+
+def build_checkpoint_row(
+    *,
+    namespace: str,
+    user_id: str,
+    chat_id: str,
+    pipe_model_id: str,
+    profile_hash: str,
+    source_hash: str,
+    source_message_count: int,
+    summary_text: str,
+    summary_meta: dict[str, Any] | None,
+    parent_checkpoint_id: str | None,
+    now: int | None = None,
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now is None else int(now)
+    return {
+        "id": build_checkpoint_id(
+            namespace=namespace,
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_model_id=pipe_model_id,
+            profile_hash=profile_hash,
+            source_hash=source_hash,
+        ),
+        "namespace": namespace,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "pipe_model_id": pipe_model_id,
+        "profile_hash": profile_hash,
+        "source_message_count": int(source_message_count),
+        "source_hash": source_hash,
+        "summary_text": summary_text,
+        "summary_meta": summary_meta or {},
+        "state": "ready",
+        "parent_checkpoint_id": parent_checkpoint_id,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "last_used_at": timestamp,
+    }
+
+
+def select_ready_checkpoint(rows: Iterable[dict[str, Any]], *, source_hash: str) -> dict[str, Any] | None:
+    for row in rows:
+        if row.get("state") == "ready" and row.get("source_hash") == source_hash:
+            return row
+    return None
+
+
+def select_longest_matching_parent(
+    rows: Iterable[dict[str, Any]],
+    prefix_hashes: dict[int, str],
+) -> dict[str, Any] | None:
+    candidates = sorted(rows, key=lambda row: int(row.get("source_message_count") or 0), reverse=True)
+    for row in candidates:
+        if row.get("state") != "ready":
+            continue
+        count = int(row.get("source_message_count") or 0)
+        if prefix_hashes.get(count) == row.get("source_hash"):
+            return row
+    return None
+
+
+async def ensure_checkpoint_table_initialized(
+    *,
+    request: Any = None,
+    async_engine: AsyncEngine | Any | None = None,
+) -> None:
+    global _CHECKPOINT_SCHEMA_READY
+
+    state = getattr(request, "state", None)
+    if state is not None and getattr(state, REQUEST_STATE_SCHEMA_READY_KEY, False):
+        return
+    if _CHECKPOINT_SCHEMA_READY:
+        if state is not None:
+            setattr(state, REQUEST_STATE_SCHEMA_READY_KEY, True)
+        return
+
+    if async_engine is None:
+        from open_webui.internal.db import async_engine as open_webui_async_engine
+
+        async_engine = open_webui_async_engine
+
+    async with async_engine.begin() as conn:
+        await conn.run_sync(lambda sync_conn: CHECKPOINT_TABLE.create(sync_conn, checkfirst=True))
+
+    _CHECKPOINT_SCHEMA_READY = True
+    if state is not None:
+        setattr(state, REQUEST_STATE_SCHEMA_READY_KEY, True)
+
+
+class CheckpointStore:
+    def __init__(self, *, db: AsyncSession | None = None):
+        self.db = db
+
+    async def _context(self):
+        if self.db is not None:
+            class ExistingSessionContext:
+                async def __aenter__(self_nonlocal):
+                    return self.db
+
+                async def __aexit__(self_nonlocal, exc_type, exc, tb):
+                    return False
+
+            return ExistingSessionContext()
+
+        from open_webui.internal.db import get_async_db
+
+        return get_async_db()
+
+    async def lookup_ready(
+        self,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_model_id: str,
+        profile_hash: str,
+        source_hash: str,
+    ) -> dict[str, Any] | None:
+        async with await self._context() as db:
+            result = await db.execute(
+                select(CHECKPOINT_TABLE).where(
+                    CHECKPOINT_TABLE.c.namespace == namespace,
+                    CHECKPOINT_TABLE.c.user_id == user_id,
+                    CHECKPOINT_TABLE.c.chat_id == chat_id,
+                    CHECKPOINT_TABLE.c.pipe_model_id == pipe_model_id,
+                    CHECKPOINT_TABLE.c.profile_hash == profile_hash,
+                    CHECKPOINT_TABLE.c.source_hash == source_hash,
+                    CHECKPOINT_TABLE.c.state == "ready",
+                )
+            )
+            row = result.mappings().first()
+            return dict(row) if row else None
+
+    async def find_longest_parent(
+        self,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_model_id: str,
+        profile_hash: str,
+        prefix_hashes: dict[int, str],
+    ) -> dict[str, Any] | None:
+        if not prefix_hashes:
+            return None
+        async with await self._context() as db:
+            result = await db.execute(
+                select(CHECKPOINT_TABLE)
+                .where(
+                    CHECKPOINT_TABLE.c.namespace == namespace,
+                    CHECKPOINT_TABLE.c.user_id == user_id,
+                    CHECKPOINT_TABLE.c.chat_id == chat_id,
+                    CHECKPOINT_TABLE.c.pipe_model_id == pipe_model_id,
+                    CHECKPOINT_TABLE.c.profile_hash == profile_hash,
+                    CHECKPOINT_TABLE.c.state == "ready",
+                    CHECKPOINT_TABLE.c.source_message_count.in_(list(prefix_hashes.keys())),
+                )
+                .order_by(CHECKPOINT_TABLE.c.source_message_count.desc())
+            )
+            rows = [dict(row) for row in result.mappings().all()]
+            return select_longest_matching_parent(rows, prefix_hashes)
+
+    async def insert_ready(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        async with await self._context() as db:
+            try:
+                await db.execute(insert(CHECKPOINT_TABLE).values(**row))
+                await db.commit()
+                return row
+            except IntegrityError:
+                await db.rollback()
+                return await self.lookup_ready(
+                    namespace=row["namespace"],
+                    user_id=row["user_id"],
+                    chat_id=row["chat_id"],
+                    pipe_model_id=row["pipe_model_id"],
+                    profile_hash=row["profile_hash"],
+                    source_hash=row["source_hash"],
+                )
+
+    async def touch(self, checkpoint_id: str, *, now: int | None = None) -> bool:
+        timestamp = int(time.time()) if now is None else int(now)
+        async with await self._context() as db:
+            try:
+                await db.execute(
+                    update(CHECKPOINT_TABLE)
+                    .where(CHECKPOINT_TABLE.c.id == checkpoint_id)
+                    .values(last_used_at=timestamp, updated_at=timestamp)
+                )
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                return False
+
+
+def _split_patterns(text: str) -> list[str]:
+    return [part.strip() for part in str(text or "").replace("\n", ",").split(",") if part.strip()]
+
+
+def _matches_any_pattern(model: dict[str, Any], patterns: list[str]) -> bool:
+    model_id = str(model.get("id") or "")
+    name = str(model.get("name") or "")
+    return any(fnmatch.fnmatchcase(model_id, pattern) or fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+def _is_arena_model(model: dict[str, Any]) -> bool:
+    return bool(model.get("arena")) or model.get("owned_by") == "arena"
+
+
+def _model_id(model: dict[str, Any]) -> str | None:
+    model_id = model.get("id")
+    return model_id if isinstance(model_id, str) and model_id else None
+
+
+def filter_target_models(models: Iterable[dict[str, Any]], valves: Any, *, pipe_model_id: str = PIPE_FUNCTION_ID):
+    include_patterns = _split_patterns(getattr(valves, "include_model_patterns", ""))
+    exclude_patterns = _split_patterns(getattr(valves, "exclude_model_patterns", ""))
+    seen: set[str] = set()
+    targets: list[dict[str, Any]] = []
+
+    for raw_model in models:
+        if not isinstance(raw_model, dict):
+            continue
+        model = copy.deepcopy(raw_model)
+        model_id = _model_id(model)
+        if model_id is None or model_id in seen:
+            continue
+        if is_generated_wrapper_model_id(model_id, pipe_model_id=pipe_model_id):
+            continue
+        if _is_arena_model(model):
+            continue
+        if include_patterns and not _matches_any_pattern(model, include_patterns):
+            continue
+        if exclude_patterns and _matches_any_pattern(model, exclude_patterns):
+            continue
+        seen.add(model_id)
+        targets.append(model)
+    return targets
+
+
+def _grant_to_dict(grant: Any) -> dict[str, Any] | None:
+    if isinstance(grant, BaseModel):
+        grant = grant.model_dump()
+    elif not isinstance(grant, dict):
+        grant = {
+            "id": getattr(grant, "id", None),
+            "principal_type": getattr(grant, "principal_type", None),
+            "principal_id": getattr(grant, "principal_id", None),
+            "permission": getattr(grant, "permission", None),
+        }
+    principal_type = grant.get("principal_type")
+    principal_id = grant.get("principal_id")
+    permission = grant.get("permission")
+    if principal_type not in ("user", "group") or permission not in ("read", "write"):
+        return None
+    if not isinstance(principal_id, str) or not principal_id:
+        return None
+    out = {
+        "principal_type": principal_type,
+        "principal_id": principal_id,
+        "permission": permission,
+    }
+    if isinstance(grant.get("id"), str) and grant["id"]:
+        out["id"] = grant["id"]
+    return out
+
+
+def _dump_model_value(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump()
+    if isinstance(value, dict):
+        return copy.deepcopy(value)
+    if isinstance(value, list):
+        return copy.deepcopy(value)
+    if hasattr(value, "__dict__"):
+        return {key: _dump_model_value(item) for key, item in vars(value).items() if not key.startswith("_")}
+    return value
+
+
+def _payload_dict(value: Any) -> dict[str, Any]:
+    dumped = _dump_model_value(value)
+    return dumped if isinstance(dumped, dict) else {}
+
+
+def _target_app_info_payload(target_model: dict[str, Any]) -> dict[str, Any]:
+    return _payload_dict(target_model.get("info"))
+
+
+def _target_record_payload(target_model_info: Any | None) -> dict[str, Any]:
+    return _payload_dict(target_model_info)
+
+
+def _payload_meta(payload: dict[str, Any]) -> dict[str, Any]:
+    meta = _dump_model_value(payload.get("meta"))
+    return copy.deepcopy(meta) if isinstance(meta, dict) else {}
+
+
+def _payload_params(payload: dict[str, Any]) -> dict[str, Any]:
+    params = _dump_model_value(payload.get("params"))
+    return copy.deepcopy(params) if isinstance(params, dict) else {}
+
+
+def build_wrapper_core_params(target_params: dict[str, Any]) -> dict[str, Any]:
+    wrapper_params: dict[str, Any] = {"stream_response": True}
+    for key in ("function_calling", "stream_delta_chunk_size", "reasoning_tags"):
+        if key in target_params and target_params[key] is not None:
+            wrapper_params[key] = copy.deepcopy(target_params[key])
+    return wrapper_params
+
+
+def _normalize_access_grants(grants: Any) -> list[dict[str, Any]]:
+    if not isinstance(grants, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for grant in grants:
+        normalized = _grant_to_dict(grant)
+        if normalized is not None:
+            out.append(normalized)
+    return out
+
+
+def _payload_access_grants(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+    if "access_grants" in payload:
+        return _normalize_access_grants(payload.get("access_grants"))
+    meta = payload.get("meta")
+    if isinstance(meta, dict) and "access_grants" in meta:
+        return _normalize_access_grants(meta.get("access_grants"))
+    return None
+
+
+def _payload_owner_user_id(payload: dict[str, Any]) -> str | None:
+    user_id = payload.get("user_id")
+    return user_id if isinstance(user_id, str) and user_id else None
+
+
+def build_target_model_contract(target_model: dict[str, Any], target_model_info: Any | None = None) -> TargetModelContract:
+    target_id = str(target_model["id"])
+    app_info = _target_app_info_payload(target_model)
+    record_info = _target_record_payload(target_model_info)
+
+    meta = _payload_meta(app_info) or _payload_meta(record_info)
+    top_level_meta = _dump_model_value(target_model.get("meta"))
+    if not meta and isinstance(top_level_meta, dict):
+        meta = copy.deepcopy(top_level_meta)
+
+    target_params = _payload_params(record_info) or _payload_params(app_info)
+    top_level_params = _dump_model_value(target_model.get("params"))
+    if not target_params and isinstance(top_level_params, dict):
+        target_params = copy.deepcopy(top_level_params)
+
+    grants = None
+    if record_info:
+        grants = _payload_access_grants(record_info)
+    if grants is None:
+        grants = _payload_access_grants(app_info)
+    if grants is None:
+        grants = _normalize_access_grants(target_model.get("access_grants"))
+
+    owner_user_id = _payload_owner_user_id(record_info) or _payload_owner_user_id(app_info)
+    user_id = target_model.get("user_id")
+    if owner_user_id is None and isinstance(user_id, str) and user_id:
+        owner_user_id = user_id
+
+    return TargetModelContract(
+        id=target_id,
+        name=str(target_model.get("name") or target_id),
+        meta=meta,
+        wrapper_params=build_wrapper_core_params(target_params),
+        access_grants=grants,
+        owner_user_id=owner_user_id,
+    )
+
+
+def build_wrapper_model_form(
+    *,
+    pipe_model_id: str,
+    function_owner_user_id: str,
+    target_model: dict[str, Any],
+    target_model_info: Any | None = None,
+    valves: Any,
+) -> dict[str, Any]:
+    target = build_target_model_contract(target_model, target_model_info)
+    target_id = target.id
+    wrapper_id = build_wrapper_model_id(pipe_model_id, target_id)
+    prefix = str(getattr(valves, "model_name_prefix", "Compact: "))
+    access_grants = copy.deepcopy(target.access_grants)
+    target_owner = target.owner_user_id
+    if target_owner and target_owner != function_owner_user_id:
+        owner_read = {
+            "principal_type": "user",
+            "principal_id": target_owner,
+            "permission": "read",
+        }
+        if not any(
+            grant.get("principal_type") == "user"
+            and grant.get("principal_id") == target_owner
+            and grant.get("permission") == "read"
+            for grant in access_grants
+        ):
+            access_grants.append(owner_read)
+    meta = copy.deepcopy(target.meta)
+    meta["description"] = f"Auto-compacting wrapper for {target_id}"
+    meta["auto_compaction"] = {
+        "pipe_model_id": pipe_model_id,
+        "target_model_id": target_id,
+    }
+    return {
+        "id": wrapper_id,
+        "user_id": function_owner_user_id,
+        "base_model_id": None,
+        "name": f"{prefix}{target.name}",
+        "params": copy.deepcopy(target.wrapper_params),
+        "meta": meta,
+        "access_grants": access_grants,
+        "is_active": True,
+    }
+
+
+def _record_field(record: Any, field: str) -> Any:
+    if isinstance(record, dict):
+        return record.get(field)
+    return getattr(record, field, None)
+
+
+def _grant_signature(grant: Any) -> tuple[str, str, str] | None:
+    grant_dict = _grant_to_dict(grant)
+    if grant_dict is None:
+        return None
+    return (
+        str(grant_dict.get("principal_type") or ""),
+        str(grant_dict.get("principal_id") or ""),
+        str(grant_dict.get("permission") or ""),
+    )
+
+
+def _grant_signatures(grants: Any) -> list[tuple[str, str, str]]:
+    if not isinstance(grants, list):
+        return []
+    signatures = [_grant_signature(grant) for grant in grants]
+    return sorted(signature for signature in signatures if signature is not None)
+
+
+def _wrapper_model_record_matches_form(existing: Any, model_form: Any) -> bool:
+    for field in ("id", "base_model_id", "name", "is_active"):
+        if _record_field(existing, field) != getattr(model_form, field, None):
+            return False
+    if _dump_model_value(_record_field(existing, "params")) != _dump_model_value(getattr(model_form, "params", {})):
+        return False
+    if _dump_model_value(_record_field(existing, "meta")) != _dump_model_value(getattr(model_form, "meta", {})):
+        return False
+    return _grant_signatures(_record_field(existing, "access_grants")) == _grant_signatures(
+        getattr(model_form, "access_grants", [])
+    )
+
+
+async def sync_wrapper_model_records(
+    *,
+    pipe_model_id: str,
+    target_models: list[dict[str, Any]],
+    valves: Any,
+) -> None:
+    try:
+        from open_webui.models.functions import Functions
+        from open_webui.models.models import ModelForm, ModelMeta, ModelParams, Models
+    except Exception:
+        return
+
+    function = await Functions.get_function_by_id(pipe_model_id)
+    owner_user_id = getattr(function, "user_id", None)
+    if not owner_user_id:
+        return
+
+    for target_model in target_models:
+        try:
+            target_model_info = None
+            target_id = _model_id(target_model)
+            if target_id:
+                with suppress(Exception):
+                    target_model_info = await Models.get_model_by_id(target_id)
+            form_payload = build_wrapper_model_form(
+                pipe_model_id=pipe_model_id,
+                function_owner_user_id=owner_user_id,
+                target_model=target_model,
+                target_model_info=target_model_info,
+                valves=valves,
+            )
+            model_form = ModelForm(
+                id=form_payload["id"],
+                base_model_id=None,
+                name=form_payload["name"],
+                params=ModelParams(**form_payload["params"]),
+                meta=ModelMeta(**form_payload["meta"]),
+                access_grants=form_payload["access_grants"],
+                is_active=True,
+            )
+            existing = await Models.get_model_by_id(form_payload["id"])
+            if existing:
+                if not _wrapper_model_record_matches_form(existing, model_form):
+                    await Models.update_model_by_id(form_payload["id"], model_form)
+            else:
+                await Models.insert_new_model(model_form, user_id=owner_user_id)
+        except Exception:
+            continue
+
+
+def _iter_cache_models_from_state(state: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for attr in ("MODELS", "BASE_MODELS", "OPENAI_MODELS", "OLLAMA_MODELS"):
+        value = getattr(state, attr, None)
+        if isinstance(value, dict):
+            out.extend(item for item in value.values() if isinstance(item, dict))
+        elif isinstance(value, list):
+            out.extend(item for item in value if isinstance(item, dict))
+    return out
+
+
+def validate_summary_model_id(configured_summary_model: str, target_model_id: str, models: dict[str, Any]) -> str:
+    configured = (configured_summary_model or "").strip()
+    summary_model = configured or target_model_id
+    model = models.get(summary_model) if isinstance(models, dict) else None
+    if model is None:
+        if configured:
+            raise ValueError(f"Configured summary_model was not found: {summary_model}")
+        raise ValueError(f"Target model was not found for summary generation: {summary_model}")
+    if isinstance(model, dict) and _is_arena_model(model):
+        raise ValueError("Configured summary_model cannot be an arena model")
+    return summary_model
+
+
+def coerce_open_webui_user(user: Any) -> Any:
+    if user is None:
+        return None
+    if all(hasattr(user, attr) for attr in ("id", "role", "name")):
+        return user
+    if isinstance(user, dict):
+        try:
+            from open_webui.models.users import UserModel
+
+            return UserModel(**user)
+        except Exception:
+            return SimpleNamespace(**user)
+    return user
+
+
+def _normalize_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from open_webui.utils.response import normalize_usage
+
+        return normalize_usage(usage)
+    except Exception:
+        if not usage:
+            return {}
+        input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        output_tokens = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        total_tokens = usage.get("total_tokens") or input_tokens + output_tokens
+        result = dict(usage)
+        result["input_tokens"] = int(input_tokens)
+        result["output_tokens"] = int(output_tokens)
+        result["total_tokens"] = int(total_tokens)
+        return result
+
+
+def extract_usage_from_stream_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage")
+    if not usage and isinstance(payload.get("response"), dict):
+        usage = payload["response"].get("usage")
+    if not usage and isinstance(payload.get("data"), dict):
+        usage = payload["data"].get("usage")
+    if isinstance(usage, dict) and usage:
+        return _normalize_usage(usage)
+    return None
+
+
+def usage_state_key(chat_id: str | None, message_id: str | None, wrapper_model_id: str | None) -> str:
+    digest = hashlib.sha256(
+        json.dumps([chat_id or "", message_id or "", wrapper_model_id or ""], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"_auto_compact_usage_{digest}"
+
+
+def store_request_scoped_usage(
+    *,
+    request: Any,
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str | None,
+    usage: dict[str, Any],
+) -> None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    setattr(state, usage_state_key(chat_id, message_id, wrapper_model_id), _normalize_usage(usage))
+
+
+def get_request_scoped_usage(
+    *,
+    request: Any,
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str | None,
+) -> dict[str, Any] | None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    usage = getattr(state, usage_state_key(chat_id, message_id, wrapper_model_id), None)
+    if isinstance(usage, dict) and usage:
+        return _normalize_usage(usage)
+    return None
+
+
+def choose_usage_signal(
+    *,
+    request: Any,
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str | None,
+    persisted_usage: dict[str, Any] | None,
+    messages: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    usage = get_request_scoped_usage(
+        request=request,
+        chat_id=chat_id,
+        message_id=message_id,
+        wrapper_model_id=wrapper_model_id,
+    )
+    if usage:
+        return usage
+    if isinstance(persisted_usage, dict) and persisted_usage:
+        return _normalize_usage(persisted_usage)
+    for message in reversed(messages or []):
+        if not isinstance(message, dict):
+            continue
+        usage = message.get("usage") or (message.get("info") or {}).get("usage")
+        if isinstance(usage, dict) and usage:
+            return _normalize_usage(usage)
+    return None
+
+
+async def lookup_persisted_usage(chat_id: str | None, message_id: str | None) -> dict[str, Any] | None:
+    if not chat_id:
+        return None
+    try:
+        from open_webui.models.chats import Chats
+        from open_webui.utils.misc import get_message_list
+
+        messages_map = await Chats.get_messages_map_by_chat_id(chat_id)
+        if not isinstance(messages_map, dict) or not messages_map:
+            return None
+        branch: list[dict[str, Any]]
+        if message_id and message_id in messages_map:
+            branch = get_message_list(messages_map, message_id)
+        else:
+            branch = list(messages_map.values())
+        for message in reversed(branch):
+            usage = message.get("usage") or (message.get("info") or {}).get("usage")
+            if isinstance(usage, dict) and usage:
+                return _normalize_usage(usage)
+    except Exception:
+        return None
+    return None
+
+
+def inject_stream_usage_options(body: dict[str, Any], *, force_include_usage: bool = True) -> dict[str, Any]:
+    if not force_include_usage or body.get("stream") is not True:
+        return body
+    stream_options = body.get("stream_options")
+    if not isinstance(stream_options, dict):
+        stream_options = {}
+    if stream_options.get("include_usage") is True:
+        return body
+    copied = copy.deepcopy(body)
+    copied["stream_options"] = {**stream_options, "include_usage": True}
+    return copied
+
+
+def _response_body_text(response: Response) -> str:
+    body = getattr(response, "body", b"")
+    if isinstance(body, bytes):
+        return body.decode("utf-8", errors="replace")
+    return str(body)
+
+
+def _json_from_response(response: Response) -> Any:
+    text = _response_body_text(response)
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def _sse_data_chunk(data: str) -> str:
+    return f"data: {data}\n\n"
+
+
+def _response_to_sse_chunk(response: Response) -> str:
+    text = _response_body_text(response)
+    if isinstance(response, JSONResponse):
+        return _sse_data_chunk(text)
+    parsed = _json_from_response(response)
+    if isinstance(parsed, (dict, list)):
+        return _sse_data_chunk(json.dumps(parsed, ensure_ascii=False))
+    return _sse_data_chunk(
+        json.dumps(
+            {"error": {"code": "provider_error", "message": text}},
+            ensure_ascii=False,
+        )
+    )
+
+
+def _coerce_stream_chunk(chunk: Any) -> bytes | str:
+    if isinstance(chunk, (bytes, str)):
+        return chunk
+    if isinstance(chunk, (dict, list)):
+        return _sse_data_chunk(json.dumps(chunk, ensure_ascii=False))
+    return str(chunk)
+
+
+def _iter_error_structures(value: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(value, dict):
+        if isinstance(value.get("error"), dict):
+            yield value["error"]
+        yield value
+        detail = value.get("detail")
+        if isinstance(detail, dict):
+            yield from _iter_error_structures(detail)
+    elif isinstance(value, HTTPException):
+        yield from _iter_error_structures(value.detail)
+
+
+def _structured_error_strings(value: Any) -> tuple[list[str], list[str], int | None]:
+    status: int | None = None
+    codes: list[str] = []
+    messages: list[str] = []
+
+    if isinstance(value, HTTPException):
+        status = value.status_code
+        value = value.detail
+    elif isinstance(value, BaseException):
+        messages.append(str(value))
+        return codes, messages, 400
+    elif isinstance(value, Response):
+        status = value.status_code
+        value = _json_from_response(value)
+
+    if isinstance(value, str):
+        messages.append(value)
+        return codes, messages, status
+
+    for error in _iter_error_structures(value):
+        for key in ("code", "type", "param"):
+            item = error.get(key)
+            if isinstance(item, str):
+                codes.append(item)
+        for key in ("message", "detail"):
+            item = error.get(key)
+            if isinstance(item, str):
+                messages.append(item)
+            elif isinstance(item, dict):
+                nested = item.get("message") or item.get("detail")
+                if isinstance(nested, str):
+                    messages.append(nested)
+
+    return codes, messages, status
+
+
+_CONTEXT_CODE_PATTERNS = (
+    "context_length_exceeded",
+    "context_window_exceeded",
+    "max_context_length",
+    "maximum_context_length",
+    "input_too_long",
+    "prompt_too_long",
+    "request_too_large",
+)
+_NEGATIVE_ERROR_PATTERNS = (
+    "rate limit",
+    "rate-limit",
+    "quota",
+    "token-per-minute",
+    "tokens per minute",
+    "tpm",
+    "insufficient_quota",
+    "authentication",
+    "permission",
+)
+_CONTEXT_MESSAGE_PATTERNS = (
+    "maximum context length",
+    "max context length",
+    "context length exceeded",
+    "context window",
+    "prompt is too long",
+    "prompt too long",
+    "input is too long",
+    "input too long",
+    "too many input tokens",
+    "request too large",
+)
+
+
+def is_retryable_context_error(value: Any, *, status_code: int | None = None) -> bool:
+    codes, messages, inferred_status = _structured_error_strings(value)
+    status = status_code if status_code is not None else inferred_status
+
+    joined_codes = " ".join(codes).lower()
+    joined_messages = " ".join(messages).lower()
+    if any(pattern in joined_codes for pattern in _NEGATIVE_ERROR_PATTERNS):
+        return False
+    if any(pattern in joined_codes for pattern in _CONTEXT_CODE_PATTERNS):
+        return True
+    if any(pattern in joined_messages for pattern in _NEGATIVE_ERROR_PATTERNS):
+        return False
+    if status not in (400, 413, 422):
+        return False
+    return any(pattern in joined_messages for pattern in _CONTEXT_MESSAGE_PATTERNS)
+
+
+def extract_sse_json_events(chunk: bytes | str) -> list[dict[str, Any]]:
+    text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+    events: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:") :].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    return events
+
+
+def first_chunk_is_retryable_context_error(chunk: bytes | str) -> bool:
+    events = extract_sse_json_events(chunk)
+    return bool(events and events[0].get("error") and is_retryable_context_error(events[0], status_code=400))
+
+
+def chunk_has_user_visible_output(chunk: bytes | str) -> bool:
+    for payload in extract_sse_json_events(chunk):
+        if payload.get("error"):
+            continue
+        if payload.get("type") in {
+            "response.output_text.delta",
+            "response.reasoning_text.delta",
+            "response.function_call_arguments.delta",
+        }:
+            return True
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            delta = choices[0].get("delta") or {}
+            if any(delta.get(key) for key in ("content", "reasoning_content", "tool_calls")):
+                return True
+    return False
+
+
+class RequestStateSnapshot:
+    def __init__(self, request: Any):
+        self.request = request
+        self.state = getattr(request, "state", None)
+        self.had_bypass = False
+        self.previous_bypass = None
+        self.had_metadata = False
+        self.previous_metadata = None
+
+    def apply_bypass(self, value: bool = True) -> None:
+        if self.state is None:
+            return
+        self.had_bypass = hasattr(self.state, "bypass_filter")
+        self.previous_bypass = getattr(self.state, "bypass_filter", None)
+        self.had_metadata = hasattr(self.state, "metadata")
+        self.previous_metadata = copy.deepcopy(getattr(self.state, "metadata", None))
+        setattr(self.state, "bypass_filter", value)
+
+    def apply_metadata(self, metadata: dict[str, Any]) -> None:
+        if self.state is None:
+            return
+        if not self.had_metadata:
+            self.had_metadata = hasattr(self.state, "metadata")
+            self.previous_metadata = copy.deepcopy(getattr(self.state, "metadata", None))
+        setattr(self.state, "metadata", copy.deepcopy(metadata))
+
+    def restore(self) -> None:
+        if self.state is None:
+            return
+        if self.had_bypass:
+            setattr(self.state, "bypass_filter", self.previous_bypass)
+        else:
+            with suppress(Exception):
+                delattr(self.state, "bypass_filter")
+        if self.had_metadata:
+            setattr(self.state, "metadata", copy.deepcopy(self.previous_metadata))
+        else:
+            with suppress(Exception):
+                delattr(self.state, "metadata")
+
+
+async def _close_stream_response(response: StreamingResponse) -> None:
+    body_iterator = getattr(response, "body_iterator", None)
+    aclose = getattr(body_iterator, "aclose", None)
+    if callable(aclose):
+        with suppress(Exception):
+            await aclose()
+    background = getattr(response, "background", None)
+    if background is not None:
+        with suppress(Exception):
+            await background()
+
+
+async def prepare_streaming_response(
+    response: Any,
+    *,
+    request: Any,
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str | None,
+    restore: Callable[[], None] | None = None,
+) -> StreamingResponse:
+    if isinstance(response, dict):
+        if response.get("error") and is_retryable_context_error(response, status_code=400):
+            if restore:
+                restore()
+            raise RetryableContextOverflow(str(response.get("error")))
+        if restore:
+            restore()
+        return StreamingResponse(iter([f"data: {json.dumps(response)}\n\n"]), media_type="text/event-stream")
+
+    if isinstance(response, (JSONResponse, PlainTextResponse)):
+        if is_retryable_context_error(response):
+            if restore:
+                restore()
+            raise RetryableContextOverflow(_response_body_text(response))
+        if restore:
+            restore()
+        return StreamingResponse(iter([_response_to_sse_chunk(response)]), media_type="text/event-stream")
+
+    if not isinstance(response, StreamingResponse):
+        if restore:
+            restore()
+        return StreamingResponse(iter([f"data: {json.dumps(response)}\n\n"]), media_type="text/event-stream")
+
+    iterator = response.body_iterator.__aiter__()
+    buffered_chunks: list[bytes | str] = []
+    try:
+        while True:
+            chunk = _coerce_stream_chunk(await iterator.__anext__())
+            events = extract_sse_json_events(chunk)
+            for payload in events:
+                usage = extract_usage_from_stream_payload(payload)
+                if usage:
+                    store_request_scoped_usage(
+                        request=request,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        wrapper_model_id=wrapper_model_id,
+                        usage=usage,
+                    )
+            buffered_chunks.append(chunk)
+            if events:
+                first_payload = events[0]
+                if first_payload.get("error") and is_retryable_context_error(first_payload, status_code=400):
+                    await _close_stream_response(response)
+                    if restore:
+                        restore()
+                    raise RetryableContextOverflow("Target model reported a context-window error before output")
+                break
+    except StopAsyncIteration:
+        if restore:
+            restore()
+        await _close_stream_response(response)
+        return StreamingResponse(iter(buffered_chunks), media_type="text/event-stream")
+    except Exception as exc:
+        if restore:
+            restore()
+        await _close_stream_response(response)
+        if is_retryable_context_error(exc):
+            raise RetryableContextOverflow(str(exc)) from exc
+        raise
+
+    async def stream() -> AsyncIterator[bytes | str]:
+        emitted_visible = False
+        try:
+            for buffered_chunk in buffered_chunks:
+                emitted_visible = emitted_visible or chunk_has_user_visible_output(buffered_chunk)
+                yield buffered_chunk
+
+            async for raw_chunk in iterator:
+                chunk = _coerce_stream_chunk(raw_chunk)
+                for payload in extract_sse_json_events(chunk):
+                    usage = extract_usage_from_stream_payload(payload)
+                    if usage:
+                        store_request_scoped_usage(
+                            request=request,
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            wrapper_model_id=wrapper_model_id,
+                            usage=usage,
+                        )
+                emitted_visible = emitted_visible or chunk_has_user_visible_output(chunk)
+                yield chunk
+        finally:
+            if restore:
+                restore()
+            await _close_stream_response(response)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+def _messages_have_multimodal(messages: list[dict[str, Any]]) -> bool:
+    for message in messages:
+        if message.get("files"):
+            return True
+        content = message.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") not in (None, "text"):
+                    return True
+    return False
+
+
+def _chat_id_supported(chat_id: str | None) -> bool:
+    return isinstance(chat_id, str) and bool(chat_id) and not chat_id.startswith(TEMP_CHAT_PREFIXES)
+
+
+def _usage_total(usage: dict[str, Any] | None) -> int | None:
+    if not usage:
+        return None
+    total = usage.get("total_tokens")
+    if isinstance(total, bool):
+        return None
+    if isinstance(total, (int, float)):
+        return int(total)
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if isinstance(input_tokens, (int, float)) and isinstance(output_tokens, (int, float)):
+        return int(input_tokens + output_tokens)
+    return None
+
+
+def _context_exhaustion_error_response(
+    messages: Any,
+    *,
+    keep_tail_messages: int,
+    preserve_latest_tool_rounds: int,
+) -> dict[str, Any]:
+    if isinstance(messages, list):
+        cut = select_safe_message_cut(
+            messages,
+            keep_tail_messages=max(1, min(int(keep_tail_messages or 1), 1)),
+            preserve_latest_tool_rounds=0,
+            aggressive=True,
+        )
+        tool_cut = select_tool_result_compaction_cut(
+            messages,
+            preserve_latest_tool_rounds=preserve_latest_tool_rounds,
+            aggressive=True,
+        )
+        latest_user = next((message for message in reversed(messages) if message.get("role") == "user"), None)
+        if latest_user is not None and not cut.summarization_prefix and tool_cut is None:
+            return _error_response(
+                "Target model context window was exceeded after all safe compaction options were exhausted; "
+                "the latest user message must remain raw and appears too large to send safely",
+                code="active_input_too_large",
+            )
+    return _error_response(
+        "Target model context window was exceeded before output, and no safe retry path remains",
+        code="context_window_exceeded",
+    )
+
+
+def _error_response(message: str, *, code: str = "auto_compaction_error") -> dict[str, Any]:
+    return {"error": {"code": code, "message": message}}
+
+
+async def emit_compaction_status(
+    event_emitter: Callable[[Any], Awaitable[None]] | None,
+    *,
+    action: str,
+    description: str,
+    done: bool = False,
+    error: bool = False,
+    **extra: Any,
+) -> None:
+    if event_emitter is None:
+        return
+    data = {
+        "action": f"auto_compaction_{action}",
+        "description": description,
+        "done": done,
+    }
+    if error:
+        data["error"] = True
+    data.update({key: value for key, value in extra.items() if value is not None})
+    try:
+        await event_emitter({"type": "status", "data": data})
+    except Exception:
+        return
+
+
+async def extract_text_from_completion_response(response: Any) -> str:
+    if isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        choices = response.get("choices")
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message") or {}
+            for key in ("content", "reasoning_content"):
+                value = message.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        for key in ("content", "text", "summary"):
+            value = response.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if isinstance(response, StreamingResponse):
+        parts: list[str] = []
+        async for chunk in response.body_iterator:
+            events = extract_sse_json_events(chunk)
+            if events:
+                for payload in events:
+                    choices = payload.get("choices")
+                    if isinstance(choices, list) and choices:
+                        delta = choices[0].get("delta") or {}
+                        content = delta.get("content") or delta.get("reasoning_content")
+                        if isinstance(content, str):
+                            parts.append(content)
+                    if payload.get("type") == "response.output_text.delta":
+                        delta = payload.get("delta")
+                        if isinstance(delta, str):
+                            parts.append(delta)
+                continue
+            if isinstance(chunk, bytes):
+                parts.append(chunk.decode("utf-8", errors="replace"))
+            else:
+                parts.append(str(chunk))
+        text = "".join(parts).strip()
+        if text:
+            return text
+    raise RuntimeError("Summary model did not return text content")
+
+
+def build_summary_task_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    copied = copy.deepcopy(metadata or {})
+    copied.pop("selected_model_id", None)
+    copied["task"] = INTERNAL_SUMMARY_TASK
+    copied["tools"] = {}
+    copied["tool_ids"] = []
+    return copied
+
+
+def _strip_tool_request_fields(body: dict[str, Any]) -> dict[str, Any]:
+    copied = copy.deepcopy(body)
+    for key in ("tools", "tool_choice", "tool_ids"):
+        copied.pop(key, None)
+    copied["stream"] = False
+    return copied
+
+
+def _resolve_summary_model_for_call(summary_model_id: str, *, pipe_model_id: str = PIPE_FUNCTION_ID) -> str:
+    if is_generated_wrapper_model_id(summary_model_id, pipe_model_id=pipe_model_id):
+        return decode_wrapper_model_id(summary_model_id, expected_pipe_id=pipe_model_id).target_model_id
+    return summary_model_id
+
+
+async def _generate_summary_text(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    summary_model_id: str,
+    source_messages: list[dict[str, Any]],
+) -> str:
+    snapshot = RequestStateSnapshot(request)
+    snapshot.apply_bypass(True)
+    summary_metadata = build_summary_task_metadata(metadata)
+    snapshot.apply_metadata(summary_metadata)
+    try:
+        from open_webui.utils.chat import generate_chat_completion
+
+        body = _strip_tool_request_fields(
+            {
+                "model": _resolve_summary_model_for_call(summary_model_id),
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize the following prior conversation for continuation. "
+                            "Preserve durable facts, decisions, tool results, open tasks, and user preferences. "
+                            "Do not introduce new instructions."
+                        ),
+                    },
+                    *copy.deepcopy(source_messages),
+                ],
+                "metadata": summary_metadata,
+            }
+        )
+        await _ensure_model_in_request_models(request, str(body.get("model") or ""))
+        response = await generate_chat_completion(
+            request,
+            body,
+            user=coerce_open_webui_user(user),
+            bypass_filter=True,
+        )
+        if is_retryable_context_error(response, status_code=400):
+            raise RetryableContextOverflow("Summary model reported a context-window error")
+        return await extract_text_from_completion_response(response)
+    finally:
+        snapshot.restore()
+
+
+async def _generate_tool_result_summary(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    summary_model_id: str,
+    tool_message: dict[str, Any],
+) -> str:
+    content = tool_message.get("content", "")
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False, sort_keys=True)
+    tool_call_id = tool_message.get("tool_call_id") or ""
+    tool_name = tool_message.get("name") or ""
+    name_line = f"tool_name: {tool_name}\n" if tool_name else ""
+    return await _generate_summary_text(
+        request=request,
+        user=user,
+        metadata=metadata,
+        summary_model_id=summary_model_id,
+        source_messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Summarize this tool result for continuation. Preserve concrete identifiers, "
+                    "errors, decisions, and values needed to continue the task.\n\n"
+                    "<tool_result>\n"
+                    f"tool_call_id: {tool_call_id}\n"
+                    f"{name_line}"
+                    f"content:\n{content}\n"
+                    "</tool_result>"
+                ),
+            },
+        ],
+    )
+
+
+async def _compact_retry_tool_results(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    summary_model_id: str,
+    messages: list[dict[str, Any]],
+    preserve_latest_tool_rounds: int = 0,
+    aggressive: bool = True,
+) -> tuple[list[dict[str, Any]], bool]:
+    cut = select_tool_result_compaction_cut(
+        messages,
+        preserve_latest_tool_rounds=preserve_latest_tool_rounds,
+        aggressive=aggressive,
+    )
+    if cut is None:
+        return messages, False
+
+    target_tool_ids = {
+        message.get("tool_call_id")
+        for message in cut.tool_messages_to_summarize
+        if isinstance(message.get("tool_call_id"), str)
+    }
+    summaries_by_tool_id: dict[str, str] = {}
+    for message in cut.tool_messages_to_summarize:
+        tool_call_id = message.get("tool_call_id")
+        if not isinstance(tool_call_id, str):
+            continue
+        try:
+            summary = await _generate_tool_result_summary(
+                request=request,
+                user=user,
+                metadata=metadata,
+                summary_model_id=summary_model_id,
+                tool_message=copy.deepcopy(message),
+            )
+        except Exception as exc:
+            if isinstance(exc, RetryableContextOverflow) or is_retryable_context_error(exc):
+                raise UnsupportedCompactionInput(
+                    "A tool result exceeds the summary model context window and cannot be safely compacted",
+                    code="latest_tool_result_too_large",
+                ) from exc
+            raise
+        summaries_by_tool_id[tool_call_id] = summary
+
+    compacted: list[dict[str, Any]] = []
+    did_compact = False
+    for message in copy.deepcopy(messages):
+        if message.get("role") == "assistant":
+            ids = _tool_call_ids(message)
+            targeted_ids = ids & target_tool_ids
+            if targeted_ids:
+                if not ids <= target_tool_ids:
+                    raise UnsupportedCompactionInput(
+                        "Cannot compact a partial assistant/tool round safely",
+                        code="unsafe_tool_round_compaction",
+                    )
+                compacted.append(
+                    render_tool_result_compaction_message(
+                        [
+                            (tool_call_id, summaries_by_tool_id[tool_call_id])
+                            for tool_call_id in sorted(targeted_ids)
+                            if tool_call_id in summaries_by_tool_id
+                        ]
+                    )
+                )
+                did_compact = True
+                continue
+        if message.get("role") == "tool" and message.get("tool_call_id") in target_tool_ids:
+            did_compact = True
+            continue
+        compacted.append(message)
+    return compacted, did_compact
+
+
+async def _get_or_create_checkpoint_summary(
+    *,
+    request: Any,
+    user_id: str,
+    chat_id: str,
+    pipe_model_id: str,
+    source_messages: list[dict[str, Any]],
+    summary_meta: dict[str, Any],
+    summary_factory: Callable[[dict[str, Any] | None], Awaitable[str]],
+) -> str:
+    profile_hash = compute_profile_hash()
+    source_hash = compute_source_hash(source_messages)
+    lock_key = (CHECKPOINT_NAMESPACE, user_id, chat_id, pipe_model_id, profile_hash, source_hash)
+    lock = get_generation_lock(lock_key)
+
+    try:
+        async with lock:
+            try:
+                await ensure_checkpoint_table_initialized(request=request)
+                store = CheckpointStore()
+            except Exception:
+                return await summary_factory(None)
+
+            existing = await store.lookup_ready(
+                namespace=CHECKPOINT_NAMESPACE,
+                user_id=user_id,
+                chat_id=chat_id,
+                pipe_model_id=pipe_model_id,
+                profile_hash=profile_hash,
+                source_hash=source_hash,
+            )
+            if existing:
+                with suppress(Exception):
+                    await store.touch(existing["id"])
+                return str(existing["summary_text"])
+
+            parent = await store.find_longest_parent(
+                namespace=CHECKPOINT_NAMESPACE,
+                user_id=user_id,
+                chat_id=chat_id,
+                pipe_model_id=pipe_model_id,
+                profile_hash=profile_hash,
+                prefix_hashes=compute_prefix_hashes(source_messages),
+            )
+            try:
+                summary_text = await summary_factory(parent)
+            except Exception as exc:
+                if parent:
+                    raise ParentCheckpointExtensionFailed(parent, exc) from exc
+                raise
+            row = build_checkpoint_row(
+                namespace=CHECKPOINT_NAMESPACE,
+                user_id=user_id,
+                chat_id=chat_id,
+                pipe_model_id=pipe_model_id,
+                profile_hash=profile_hash,
+                source_hash=source_hash,
+                source_message_count=len(source_messages),
+                summary_text=summary_text,
+                summary_meta=summary_meta,
+                parent_checkpoint_id=parent.get("id") if parent else None,
+            )
+            try:
+                inserted = await store.insert_ready(row)
+            except Exception:
+                return summary_text
+            if inserted:
+                return str(inserted["summary_text"])
+            return summary_text
+    finally:
+        release_generation_lock(lock_key, lock)
+
+
+async def _model_dict_from_request(request: Any) -> dict[str, Any]:
+    state = getattr(getattr(request, "app", None), "state", None)
+    if state is None:
+        return {}
+    models: dict[str, Any] = {}
+    for model in _iter_cache_models_from_state(state):
+        model_id = _model_id(model)
+        if model_id is not None and model_id not in models:
+            models[model_id] = model
+    return models
+
+
+async def _ensure_model_in_request_models(request: Any, model_id: str) -> dict[str, Any] | None:
+    models = await _model_dict_from_request(request)
+    model = models.get(model_id)
+    if model is None:
+        return None
+
+    state = getattr(getattr(request, "app", None), "state", None)
+    request_models = getattr(state, "MODELS", None)
+    if isinstance(request_models, dict) and model_id not in request_models:
+        request_models[model_id] = copy.deepcopy(model)
+    return model
+
+
+def _should_bypass_target_access_check(user: Any) -> bool:
+    try:
+        from open_webui.env import BYPASS_MODEL_ACCESS_CONTROL
+
+        if BYPASS_MODEL_ACCESS_CONTROL:
+            return True
+    except Exception:
+        pass
+
+    if getattr(user, "role", None) != "admin":
+        return False
+
+    try:
+        from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
+
+        return bool(BYPASS_ADMIN_ACCESS_CONTROL)
+    except Exception:
+        return False
+
+
+async def _validate_target_access(
+    *,
+    target_model_id: str,
+    request: Any,
+    user: Any,
+) -> None:
+    models = await _model_dict_from_request(request)
+    model = models.get(target_model_id)
+    if model is None or _is_arena_model(model) or is_generated_wrapper_model_id(target_model_id):
+        raise HTTPException(status_code=403, detail="Model not found")
+
+    user_model = coerce_open_webui_user(user)
+    if _should_bypass_target_access_check(user_model):
+        return
+
+    try:
+        from open_webui.utils.models import check_model_access
+
+        await check_model_access(user_model, model)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail="Model not found") from exc
+
+
+async def _forward_streaming_target(
+    *,
+    request: Any,
+    user: Any,
+    body: dict[str, Any],
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str,
+) -> StreamingResponse:
+    snapshot = RequestStateSnapshot(request)
+    snapshot.apply_bypass(True)
+    try:
+        from open_webui.utils.chat import generate_chat_completion
+
+        await _ensure_model_in_request_models(request, str(body.get("model") or ""))
+        response = await generate_chat_completion(
+            request,
+            body,
+            user=coerce_open_webui_user(user),
+            bypass_filter=True,
+        )
+    except Exception as exc:
+        snapshot.restore()
+        if is_retryable_context_error(exc):
+            raise RetryableContextOverflow(str(exc)) from exc
+        raise
+
+    return await prepare_streaming_response(
+        response,
+        request=request,
+        chat_id=chat_id,
+        message_id=message_id,
+        wrapper_model_id=wrapper_model_id,
+        restore=snapshot.restore,
+    )
+
+
+async def _compact_body(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_model_id: str,
+    target_model_id: str,
+    summary_model_id: str,
+    keep_tail_messages: int,
+    preserve_latest_tool_rounds: int,
+    aggressive: bool,
+) -> tuple[dict[str, Any], bool]:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 2:
+        return body, False
+
+    cut = select_safe_message_cut(
+        messages,
+        keep_tail_messages=max(1, keep_tail_messages if not aggressive else min(keep_tail_messages, 1)),
+        preserve_latest_tool_rounds=0 if aggressive else preserve_latest_tool_rounds,
+        aggressive=aggressive,
+    )
+    if not cut.summarization_prefix:
+        compacted_messages, did_compact_tools = await _compact_retry_tool_results(
+            request=request,
+            user=user,
+            metadata=metadata,
+            summary_model_id=summary_model_id,
+            messages=messages,
+            preserve_latest_tool_rounds=0 if aggressive else preserve_latest_tool_rounds,
+            aggressive=aggressive,
+        )
+        if did_compact_tools:
+            compacted = copy.deepcopy(body)
+            compacted["messages"] = compacted_messages
+            compacted.pop("previous_response_id", None)
+            return compacted, True
+        return body, False
+
+    latest_user = next((m for m in reversed(cut.tail_messages) if m.get("role") == "user"), None)
+    if latest_user is None:
+        raise UnsupportedCompactionInput("Cannot compact safely without retaining the active latest user message")
+
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
+    if not user_id or not _chat_id_supported(chat_id):
+        return body, False
+
+    summary_meta = {"has_multimodal": _messages_have_multimodal(cut.summarization_prefix)}
+
+    async def summary_factory(parent: dict[str, Any] | None) -> str:
+        if parent:
+            parent_count = int(parent.get("source_message_count") or 0)
+            source = [
+                render_summary_message(str(parent["summary_text"]), parent.get("summary_meta") or {}),
+                *cut.summarization_prefix[parent_count:],
+            ]
+        else:
+            source = cut.summarization_prefix
+        return await _generate_summary_text(
+            request=request,
+            user=user,
+            metadata=metadata,
+            summary_model_id=summary_model_id,
+            source_messages=source,
+        )
+
+    compacted = copy.deepcopy(body)
+    try:
+        summary_text = await _get_or_create_checkpoint_summary(
+            request=request,
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_model_id=pipe_model_id,
+            source_messages=cut.summarization_prefix,
+            summary_meta=summary_meta,
+            summary_factory=summary_factory,
+        )
+        compacted["messages"] = replace_prefix_with_summary(messages, cut, summary_text, summary_meta)
+    except ParentCheckpointExtensionFailed as exc:
+        compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(cut, exc.parent)
+    compacted["messages"], _ = await _compact_retry_tool_results(
+        request=request,
+        user=user,
+        metadata=metadata,
+        summary_model_id=summary_model_id,
+        messages=compacted["messages"],
+        preserve_latest_tool_rounds=0 if aggressive else preserve_latest_tool_rounds,
+        aggressive=aggressive,
+    )
+    compacted.pop("previous_response_id", None)
+    return compacted, True
+
+
+class Pipe:
+    class Valves(BaseModel):
+        model_name_prefix: str = Field(
+            default="Compact: ",
+            description="Display prefix for generated compact wrapper models.",
+        )
+        include_model_patterns: str = Field(
+            default="",
+            description="Comma-separated shell-style patterns matched against target model id and display name.",
+        )
+        exclude_model_patterns: str = Field(
+            default="",
+            description="Comma-separated shell-style patterns matched against target model id and display name.",
+        )
+        summary_model: str = Field(
+            default="",
+            description="Optional admin-selected Open WebUI model for summarization. Empty means use the decoded target model.",
+        )
+        trigger_total_tokens: int = Field(
+            default=100000,
+            ge=1,
+            description="Provider-reported total token threshold that starts compaction.",
+        )
+        force_include_usage: bool = Field(
+            default=True,
+            description="Set stream_options.include_usage=true on copied streaming target requests when supported.",
+        )
+        keep_tail_messages: int = Field(
+            default=6,
+            ge=1,
+            description="Minimum number of recent raw messages to keep after compaction.",
+        )
+        preserve_latest_tool_rounds: int = Field(
+            default=1,
+            ge=0,
+            description="Minimum number of complete recent assistant/tool rounds to keep after normal compaction.",
+        )
+        pass
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    async def pipes(self) -> list[dict[str, str]]:
+        try:
+            from open_webui.main import app
+
+            state = app.state
+        except Exception:
+            return []
+
+        targets = filter_target_models(_iter_cache_models_from_state(state), self.valves)
+        await sync_wrapper_model_records(pipe_model_id=PIPE_FUNCTION_ID, target_models=targets, valves=self.valves)
+
+        entries: list[dict[str, str]] = []
+        prefix = str(self.valves.model_name_prefix or "")
+        for target in targets:
+            target_id = str(target["id"])
+            target_name = str(target.get("name") or target_id)
+            entries.append({"id": encode_target_model_id(target_id), "name": f"{prefix}{target_name}"})
+        return entries
+
+    async def pipe(
+        self,
+        body: dict[str, Any],
+        __request__: Any = None,
+        __user__: dict[str, Any] | None = None,
+        __metadata__: dict[str, Any] | None = None,
+        __event_emitter__: Callable[[Any], Awaitable[None]] | None = None,
+        __tools__: dict[str, Any] | None = None,
+    ) -> Any:
+        if not isinstance(body, dict):
+            return _error_response("Request body must be an object", code="invalid_request")
+        if body.get("stream") is not True:
+            return _error_response("Auto Compaction Pipe v1 supports streaming chat requests only", code="unsupported_mode")
+        if __request__ is None:
+            return _error_response("Open WebUI request context is required", code="missing_request")
+
+        selected_wrapper_id = str(body.get("model") or "")
+        try:
+            identity = decode_wrapper_model_id(selected_wrapper_id, expected_pipe_id=PIPE_FUNCTION_ID)
+        except ValueError as exc:
+            return _error_response(str(exc), code="invalid_wrapper_id")
+
+        user = __user__ or {}
+        metadata = copy.deepcopy(__metadata__ or {})
+        chat_id = metadata.get("chat_id")
+        message_id = metadata.get("message_id") or metadata.get("user_message_id")
+
+        try:
+            await _validate_target_access(target_model_id=identity.target_model_id, request=__request__, user=user)
+        except Exception:
+            return _error_response("Model not found", code="model_access_denied")
+
+        models = await _model_dict_from_request(__request__)
+        try:
+            summary_model_id = validate_summary_model_id(self.valves.summary_model, identity.target_model_id, models)
+        except ValueError as exc:
+            return _error_response(str(exc), code="invalid_summary_model")
+
+        inner = copy.deepcopy(body)
+        inner["model"] = identity.target_model_id
+        inner["metadata"] = copy.deepcopy(metadata)
+        if self.valves.force_include_usage:
+            inner = inject_stream_usage_options(inner, force_include_usage=True)
+
+        is_summary_task = metadata.get("task") == INTERNAL_SUMMARY_TASK
+        supported_context = _chat_id_supported(chat_id) and not is_summary_task
+
+        request_usage = get_request_scoped_usage(
+            request=__request__,
+            chat_id=str(chat_id) if chat_id else None,
+            message_id=str(message_id) if message_id else None,
+            wrapper_model_id=selected_wrapper_id,
+        )
+        persisted_usage = None
+        if request_usage is None:
+            persisted_usage = await lookup_persisted_usage(
+                str(chat_id) if chat_id else None,
+                str(message_id) if message_id else None,
+            )
+        usage = choose_usage_signal(
+            request=__request__,
+            chat_id=str(chat_id) if chat_id else None,
+            message_id=str(message_id) if message_id else None,
+            wrapper_model_id=selected_wrapper_id,
+            persisted_usage=persisted_usage or request_usage,
+            messages=inner.get("messages") if isinstance(inner.get("messages"), list) else [],
+        )
+        total_tokens = _usage_total(usage)
+        should_compact = supported_context and total_tokens is not None and total_tokens >= self.valves.trigger_total_tokens
+
+        attempt = 0
+        compacted_once = False
+        while attempt < MAX_CONTEXT_RETRY_ATTEMPTS:
+            attempt += 1
+            candidate = copy.deepcopy(inner)
+            if should_compact or compacted_once:
+                try:
+                    await emit_compaction_status(
+                        __event_emitter__,
+                        action="compacting",
+                        description="Compacting chat history before forwarding to the target model",
+                        done=False,
+                    )
+                    candidate, compacted = await _compact_body(
+                        request=__request__,
+                        user=user,
+                        metadata=metadata,
+                        body=candidate,
+                        pipe_model_id=identity.pipe_model_id,
+                        target_model_id=identity.target_model_id,
+                        summary_model_id=summary_model_id,
+                        keep_tail_messages=self.valves.keep_tail_messages,
+                        preserve_latest_tool_rounds=self.valves.preserve_latest_tool_rounds,
+                        aggressive=compacted_once,
+                    )
+                    compacted_once = compacted_once or compacted
+                    if compacted:
+                        await emit_compaction_status(
+                            __event_emitter__,
+                            action="compacted",
+                            description="Compacted chat history is ready for the target model",
+                            done=True,
+                        )
+                except UnsupportedCompactionInput as exc:
+                    await emit_compaction_status(
+                        __event_emitter__,
+                        action="failed",
+                        description=str(exc),
+                        done=True,
+                        error=True,
+                    )
+                    return _error_response(str(exc), code=exc.code)
+                except Exception as exc:
+                    await emit_compaction_status(
+                        __event_emitter__,
+                        action="failed",
+                        description=f"Failed to compact chat history: {exc}",
+                        done=True,
+                        error=True,
+                    )
+                    return _error_response(f"Failed to compact chat history: {exc}", code="summary_failed")
+
+            try:
+                return await _forward_streaming_target(
+                    request=__request__,
+                    user=user,
+                    body=candidate,
+                    chat_id=str(chat_id) if chat_id else None,
+                    message_id=str(message_id) if message_id else None,
+                    wrapper_model_id=selected_wrapper_id,
+                )
+            except RetryableContextOverflow:
+                if not supported_context or attempt >= MAX_CONTEXT_RETRY_ATTEMPTS:
+                    error_response = _context_exhaustion_error_response(
+                        candidate.get("messages"),
+                        keep_tail_messages=self.valves.keep_tail_messages,
+                        preserve_latest_tool_rounds=self.valves.preserve_latest_tool_rounds,
+                    )
+                    await emit_compaction_status(
+                        __event_emitter__,
+                        action="failed",
+                        description=error_response["error"]["message"],
+                        done=True,
+                        error=True,
+                    )
+                    return error_response
+                await emit_compaction_status(
+                    __event_emitter__,
+                    action="retry",
+                    description="Target context window was exceeded before output; compacting and retrying",
+                    done=False,
+                )
+                should_compact = True
+                compacted_once = True
+                continue
