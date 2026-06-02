@@ -1627,6 +1627,138 @@ async def test_sub_agent_load_tools_includes_direct_tool_servers(monkeypatch, du
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("module_name", "module"),
+    [
+        ("sub_agent", sub_agent),
+        ("parallel_tools", parallel_tools),
+        ("multi_model_council", multi_model_council),
+        ("magi_decision_support", magi_decision_support),
+        ("llm_review", llm_review),
+    ],
+)
+async def test_direct_tool_servers_dropped_by_core_are_not_restored_from_request_body(
+    module_name, module, dummy_request
+):
+    async def fake_request_body():
+        return json.dumps(
+            {
+                "tool_servers": [
+                    {
+                        "url": "https://denied-direct.example.com",
+                        "specs": [
+                            {
+                                "name": "denied_direct",
+                                "parameters": {"properties": {"query": {"type": "string"}}},
+                            }
+                        ],
+                    }
+                ]
+            }
+        ).encode()
+
+    setattr(dummy_request, "body", fake_request_body)
+
+    resolved = await module.resolve_direct_tool_servers_from_request_and_metadata(
+        request=dummy_request,
+        metadata={"tool_servers": None},
+        debug=True,
+    )
+
+    assert resolved == [], module_name
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_mcp_resolution_uses_core_tool_server_headers(
+    monkeypatch, dummy_request
+):
+    from types import ModuleType
+
+    import open_webui
+    import open_webui.utils.tools as ow_tools
+
+    header_calls = []
+    connect_calls = []
+
+    async def fake_build_tool_server_headers(
+        connection, request, user, server_id="", metadata=None, extra_params=None
+    ):
+        header_calls.append(
+            {
+                "connection": connection,
+                "server_id": server_id,
+                "metadata": metadata,
+                "extra_params": extra_params,
+            }
+        )
+        return {"X-Resolved": "yes"}, {"session": "cookie"}
+
+    class FakeMCPClient:
+        async def connect(self, url, headers=None):
+            connect_calls.append({"url": url, "headers": headers})
+
+        async def list_tool_specs(self):
+            return [{"name": "lookup", "parameters": {"properties": {}}}]
+
+    utils_package = open_webui.utils
+    fake_misc_module = ModuleType("open_webui.utils.misc")
+    fake_misc_module.is_string_allowed = lambda value, allowlist: True
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", fake_misc_module)
+    monkeypatch.setattr(utils_package, "misc", fake_misc_module, raising=False)
+
+    fake_mcp_package = ModuleType("open_webui.utils.mcp")
+    fake_mcp_client_module = ModuleType("open_webui.utils.mcp.client")
+    fake_mcp_client_module.MCPClient = FakeMCPClient
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp", fake_mcp_package)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp.client", fake_mcp_client_module)
+    monkeypatch.setattr(utils_package, "mcp", fake_mcp_package, raising=False)
+
+    monkeypatch.setattr(
+        ow_tools,
+        "build_tool_server_headers",
+        fake_build_tool_server_headers,
+        raising=False,
+    )
+
+    dummy_request.app.state.config.TOOL_SERVER_CONNECTIONS = [
+        {
+            "type": "mcp",
+            "url": "https://mcp.example.com",
+            "auth_type": "oauth_2.1",
+            "info": {"id": "docs"},
+            "config": {"enable": True},
+            "headers": {"X-Template": "{{USER_EMAIL}}"},
+        }
+    ]
+    metadata = {"chat_id": "chat-1", "message_id": "msg-1"}
+    extra_params = {"__metadata__": metadata, "__oauth_token__": {"access_token": "system"}}
+    user = SimpleNamespace(id="u1", email="u1@example.com", role="user")
+
+    tools_dict, clients = await sub_agent.resolve_mcp_tools(
+        request=dummy_request,
+        user=user,
+        mcp_tool_ids=["server:mcp:docs"],
+        extra_params=extra_params,
+        metadata=metadata,
+        debug=True,
+    )
+
+    assert header_calls == [
+        {
+            "connection": dummy_request.app.state.config.TOOL_SERVER_CONNECTIONS[0],
+            "server_id": "docs",
+            "metadata": metadata,
+            "extra_params": extra_params,
+        }
+    ]
+    assert connect_calls == [
+        {"url": "https://mcp.example.com", "headers": {"X-Resolved": "yes"}}
+    ]
+    assert "docs_lookup" in tools_dict
+    assert "docs" in clients
+
+
+@pytest.mark.asyncio
 async def test_sub_agent_load_tools_collects_direct_tool_server_system_prompts(
     monkeypatch, dummy_request
 ):
@@ -2130,3 +2262,9 @@ def test_citation_tools_include_view_file(module_name, module):
 @pytest.mark.parametrize(("module_name", "module"), BUILTIN_KNOWLEDGE_MODULES)
 def test_builtin_knowledge_category_includes_list_knowledge(module_name, module):
     assert "list_knowledge" in module.BUILTIN_TOOL_CATEGORIES["knowledge"], module_name
+
+
+@pytest.mark.parametrize(("module_name", "module"), BUILTIN_KNOWLEDGE_MODULES)
+@pytest.mark.parametrize("tool_name", ["grep_knowledge_files", "kb_exec"])
+def test_builtin_knowledge_category_includes_v096_knowledge_tools(module_name, module, tool_name):
+    assert tool_name in module.BUILTIN_TOOL_CATEGORIES["knowledge"], module_name

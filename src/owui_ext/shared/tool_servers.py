@@ -1,19 +1,19 @@
 """Direct-tool-server payload helpers shared across owui_ext tool plugins.
 
 Open WebUI sends ``tool_servers`` (the user's MCP / direct-tool-server
-config) through a request body field, ``metadata.tool_servers``, and
-sometimes through a nested ``metadata`` block in the body. The plugins
-in this repo all need the same handful of operations:
+config) through ``metadata.tool_servers`` after core-level feature and
+permission gates, and older paths may still expose it in the request
+body. The plugins in this repo all need the same handful of operations:
 
 - coerce raw payloads into a list of dict copies,
-- read the body once and prefer it over metadata,
+- trust ``metadata.tool_servers`` when core supplied it and read the
+  request body only as a legacy fallback,
 - expand ``specs`` into the per-name dict that core middleware expects,
 - collect non-empty system prompts from the loaded servers.
 
-``resolve_terminal_id_from_request_and_metadata`` follows the same
-"prefer the request body over metadata" pattern for the
-``terminal_id`` field that selects the user's terminal binding, so it
-lives in this module too.
+``resolve_terminal_id_from_request_and_metadata`` still prefers the
+request body over metadata for the ``terminal_id`` field that selects
+the user's terminal binding, so it lives in this module too.
 
 The implementations were byte-identical across plugins (modulo a log
 prefix and ``list`` vs ``typing.List`` annotations); this module owns
@@ -66,10 +66,11 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
     metadata: Optional[dict],
     debug: bool = False,
 ) -> list[dict]:
-    """Resolve direct tool servers from request.body() first, then metadata."""
-    metadata_servers = normalize_direct_tool_servers(
-        (metadata or {}).get("tool_servers") if isinstance(metadata, dict) else None
-    )
+    """Resolve direct tool servers using core-gated metadata as source of truth."""
+    metadata_has_tool_servers = isinstance(metadata, dict) and "tool_servers" in metadata
+    if metadata_has_tool_servers:
+        return normalize_direct_tool_servers(metadata.get("tool_servers"))
+
     request_servers: list[dict] = []
     if request is not None:
         request_body = getattr(request, "body", None)
@@ -91,13 +92,8 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
             except Exception:
                 request_servers = []
     if request_servers:
-        if debug and metadata_servers and len(metadata_servers) != len(request_servers):
-            _tool_servers_log.warning(
-                "tool_servers mismatch between request body and metadata; "
-                "using request body tool_servers"
-            )
         return request_servers
-    return metadata_servers
+    return []
 
 
 def build_direct_tools_dict(
