@@ -299,6 +299,35 @@ class TestOutletEarlyReturns:
         assert result is mock_body
         assert len(filter_instance._background_tasks) == 0
 
+    @pytest.mark.asyncio
+    async def test_channel_chat_starts_background(
+        self, filter_instance, mock_event_emitter, mock_user, mock_body
+    ):
+        """Open WebUI 0.9.5 channel requests should still store Graphiti memory."""
+        channel_metadata = {"chat_id": "channel:abc123", "message_id": "msg-1"}
+        background_started = asyncio.Event()
+        background_release = asyncio.Event()
+
+        async def blocking_save(**kwargs):
+            background_started.set()
+            await background_release.wait()
+
+        with patch.object(filter_instance, "_save_memory_background", new=blocking_save):
+            result = await filter_instance.outlet(
+                body=mock_body,
+                __event_emitter__=mock_event_emitter,
+                __user__=mock_user,
+                __metadata__=channel_metadata,
+            )
+
+            await background_started.wait()
+
+            assert result is mock_body
+            assert len(filter_instance._background_tasks) == 1
+
+            background_release.set()
+            await asyncio.gather(*filter_instance._background_tasks)
+
 
 class TestSaveMemoryBackgroundErrorHandling:
     """Tests for _save_memory_background() error isolation."""

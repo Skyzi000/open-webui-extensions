@@ -25,6 +25,8 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "query_knowledge_bases",
         "search_knowledge_files",
         "query_knowledge_files",
+        "grep_knowledge_files",
+        "kb_exec",
         "view_file",
         "view_knowledge_file",
     },

@@ -8,6 +8,7 @@ rest of the suite can still import the real modules.
 """
 
 import importlib
+import json
 import sys
 import types
 
@@ -48,14 +49,46 @@ def install_open_webui_tool_stubs(monkeypatch):
         get_updated_tool_function=lambda function, extra_params: function,
         get_tools=_noop_get_tools,
         get_builtin_tools=lambda request, extra_params, **kw: {},
+        has_tool_server_access=lambda user, connection, user_group_ids=None: True,
         get_terminal_tools=None,
     )
     monkeypatch.setitem(sys.modules, "open_webui.utils.tools", tools_module)
     monkeypatch.setattr(utils_package, "tools", tools_module, raising=False)
 
+    # Unit tests in tests/tools/ should not depend on a real Open WebUI DB or
+    # access-control configuration. Real helper-path compatibility is checked by
+    # tests/test_open_webui_imports.py.
+    access_control_module = _build_module(
+        "open_webui.utils.access_control",
+        has_connection_access=lambda user, connection, user_group_ids=None: True,
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.utils.access_control", access_control_module)
+    monkeypatch.setattr(utils_package, "access_control", access_control_module, raising=False)
+
+    async def _process_tool_result(
+        request,
+        tool_function_name,
+        tool_result,
+        tool_type,
+        direct_tool=False,
+        metadata=None,
+        user=None,
+    ):
+        if isinstance(tool_result, tuple):
+            tool_result = tool_result[0] if tool_result else ""
+        elif direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
+            tool_result = tool_result[0]
+
+        if isinstance(tool_result, (dict, list)):
+            tool_result = json.dumps(tool_result, indent=2, ensure_ascii=False)
+        elif tool_result is not None and not isinstance(tool_result, str):
+            tool_result = str(tool_result)
+
+        return tool_result, [], []
+
     middleware_module = _build_module(
         "open_webui.utils.middleware",
-        process_tool_result=None,
+        process_tool_result=_process_tool_result,
         get_citation_source_from_tool_result=lambda *a, **kw: [],
         get_file_url_from_base64=None,
     )

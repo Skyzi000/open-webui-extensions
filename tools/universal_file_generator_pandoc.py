@@ -1,7 +1,7 @@
 """
 title: Universal File Generator (Pandoc Edition)
 author: Skyzi000 & Claude
-version: 0.20.5-pandoc
+version: 0.20.6-pandoc
 requirements: fastapi, pandas, openpyxl, reportlab, weasyprint, beautifulsoup4, requests, markdown, pyzipper
 description: |
   Universal file generation tool using Pandoc for superior document conversion.
@@ -95,6 +95,30 @@ except ImportError:
     PYZIPPER_AVAILABLE = False
 
 PDF_AVAILABLE = WEASYPRINT_AVAILABLE or REPORTLAB_AVAILABLE
+
+
+def _http_allow_redirects() -> bool:
+    return os.environ.get('AIOHTTP_CLIENT_ALLOW_REDIRECTS', 'False').lower() == 'true'
+
+
+def _raise_for_zip_download_error(url: str, archive_path: str, response) -> None:
+    """Reject failed ZIP URL downloads before creating incomplete archives."""
+    status_code = getattr(response, "status_code", None)
+    if status_code == 200:
+        return
+
+    if isinstance(status_code, int) and 300 <= status_code < 400 and not _http_allow_redirects():
+        guidance = (
+            "Redirect responses are not followed; provide the final direct "
+            "download URL that returns HTTP 200 without redirects."
+        )
+    else:
+        guidance = "Provide a URL that returns HTTP 200 without redirects."
+
+    raise RuntimeError(
+        f"Failed to download ZIP entry '{archive_path}' from {url}: "
+        f"HTTP {status_code}. {guidance}"
+    )
 
 
 class FileGeneratorPandoc:
@@ -589,11 +613,11 @@ class FileGeneratorPandoc:
                     if content.startswith(('http://', 'https://')):
                         # Download URL
                         try:
-                            response = requests.get(content, timeout=10)
-                            if response.status_code == 200:
-                                zf.writestr(filename, response.content)
+                            response = requests.get(content, timeout=10, allow_redirects=_http_allow_redirects())
                         except Exception as e:
                             raise RuntimeError(f"Failed to download URL {content}: {str(e)}")
+                        _raise_for_zip_download_error(content, filename, response)
+                        zf.writestr(filename, response.content)
                     else:
                         # Check if filename suggests binary format that needs conversion
                         file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
@@ -646,11 +670,11 @@ class FileGeneratorPandoc:
                     elif 'url' in item:
                         # Download from URL
                         try:
-                            response = requests.get(item['url'], timeout=10)
-                            if response.status_code == 200:
-                                zf.writestr(path, response.content)
+                            response = requests.get(item['url'], timeout=10, allow_redirects=_http_allow_redirects())
                         except Exception as e:
                             raise RuntimeError(f"Failed to download URL {item['url']}: {str(e)}")
+                        _raise_for_zip_download_error(item['url'], path, response)
+                        zf.writestr(path, response.content)
 
     def list_supported_formats(
         self,
@@ -860,7 +884,14 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
                     "reqtype": "fileupload",
                     "time": "1h"  # 1 hour retention
                 }
-                response = requests.post(service["url"], files=files, data=data, headers=headers, timeout=15)
+                response = requests.post(
+                    service["url"],
+                    files=files,
+                    data=data,
+                    headers=headers,
+                    timeout=15,
+                    allow_redirects=_http_allow_redirects(),
+                )
             elif service["method"] == "put":
                 # transfer.sh style
                 # Add Content-Type header for proper file type detection
@@ -877,7 +908,13 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
                     error_info = f"{service['name']}: No upload URL configured"
                     errors.append(error_info)
                     continue
-                response = requests.put(upload_url, data=file_content, headers=headers_with_content_type, timeout=15)
+                response = requests.put(
+                    upload_url,
+                    data=file_content,
+                    headers=headers_with_content_type,
+                    timeout=15,
+                    allow_redirects=_http_allow_redirects(),
+                )
             else:
                 # file.io and 0x0.st style (multipart form)
                 # Determine proper MIME type for file
@@ -893,7 +930,14 @@ def _upload_file(file_content: bytes, filename: str, file_type: str, file_size: 
                 if service["name"] == "0x0.st":
                     data["secret"] = ""
                 
-                response = requests.post(service["url"], files=files, data=data, headers=headers, timeout=15)
+                response = requests.post(
+                    service["url"],
+                    files=files,
+                    data=data,
+                    headers=headers,
+                    timeout=15,
+                    allow_redirects=_http_allow_redirects(),
+                )
             
             if response.status_code == 200:
                 download_url = ""

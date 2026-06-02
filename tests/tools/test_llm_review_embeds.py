@@ -365,6 +365,25 @@ async def test_init_rich_without_chat_id_skips_db_read(fake_chats) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("chat_id", ["local:abc123", "channel:abc123"])
+async def test_init_rich_skips_non_regular_chat_db_read(fake_chats, chat_id) -> None:
+    called = {"count": 0}
+
+    def fail_get(chat_id, message_id):
+        called["count"] += 1
+        raise AssertionError("should not read Chats for local/channel chat IDs")
+
+    fake_chats.get_message_by_id_and_message_id = staticmethod(fail_get)
+
+    ee, raw = await _make_initialized_emitter(chat_id=chat_id)
+
+    assert called["count"] == 0
+    assert ee._preserved_embeds == []
+    live_events = [e for e in raw.events if e["type"] == "chat:message:embeds"]
+    assert live_events == []
+
+
+@pytest.mark.asyncio
 async def test_init_rich_db_read_failure_does_not_break_init(fake_chats) -> None:
     """If the DB call raises (unusual setup, permissions, etc.), init
     must keep going — pre-existing embed restoration is best-effort."""

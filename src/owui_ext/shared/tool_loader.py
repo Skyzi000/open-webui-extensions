@@ -1,10 +1,10 @@
-"""Canonical agent-tools loader shared by ``llm_review`` / ``sub_agent`` /
-``multi_model_council``.
+"""Canonical tool loader shared by ``parallel_tools`` / ``llm_review`` /
+``sub_agent`` / ``multi_model_council``.
 
-All three plugins need to assemble the ``tools_dict`` that their
-spawned agent loop will hand to ``get_updated_tool_function`` — and
-they all need the same five tool sources merged in the same priority
-order:
+These plugins need to assemble the ``tools_dict`` that their spawned
+agent loop or batch executor will hand to ``get_updated_tool_function``
+— and they all need the same five tool sources merged in the same
+priority order:
 
 1. **Regular tools** loaded by ``open_webui.utils.tools.get_tools()``
    (filtering out ``builtin:`` and ``server:mcp:`` IDs first because
@@ -26,9 +26,9 @@ Caller responsibilities (kept outside this helper):
 
 - Parse ``AVAILABLE_TOOL_IDS`` / ``EXCLUDED_TOOL_IDS`` valves into the
   ``tool_id_list`` / ``excluded_tool_ids`` arguments.
-- Add the plugin's own tool ID to ``excluded_tool_ids`` to prevent the
-  agent loop from recursing into the plugin that spawned it.
-- After the agent loop ends, call
+- Add the plugin's own tool ID to ``excluded_tool_ids`` when the
+  loaded tool set could otherwise invoke the same plugin recursively.
+- After the caller is done using the loaded tools, call
   ``shared.mcp_tools.cleanup_mcp_clients`` on the returned
   ``mcp_clients`` mapping so MCP connections don't leak.
 
@@ -68,12 +68,12 @@ async def build_tools_dict(
     resolved_terminal_id=None,
     resolved_direct_tool_servers=None,
 ):
-    """Assemble the agent-loop tools_dict from regular, MCP, terminal,
-    direct, and builtin sources.
+    """Assemble a tools_dict from regular, MCP, terminal, direct, and
+    builtin sources.
 
     Returns ``(tools_dict, mcp_clients)``. Caller must call
-    ``shared.mcp_tools.cleanup_mcp_clients(mcp_clients)`` once the
-    agent loop is done so MCP connections don't leak. ``mcp_clients``
+    ``shared.mcp_tools.cleanup_mcp_clients(mcp_clients)`` once tool
+    execution is done so MCP connections don't leak. ``mcp_clients``
     is empty when no ``server:mcp:`` tool IDs are present.
 
     ``resolved_terminal_id`` / ``resolved_direct_tool_servers`` are
