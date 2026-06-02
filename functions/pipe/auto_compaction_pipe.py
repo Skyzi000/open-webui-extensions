@@ -1849,10 +1849,15 @@ def _chat_completion_message_response(
     message: str,
     *,
     usage: dict[str, Any] | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    finish_reason: str | None = None,
 ) -> dict[str, Any]:
     from open_webui.utils.misc import openai_chat_completion_message_template
 
-    return openai_chat_completion_message_template(model_id, message, usage=usage)
+    response = openai_chat_completion_message_template(model_id, message, tool_calls=tool_calls, usage=usage)
+    if finish_reason is not None:
+        response["choices"][0]["finish_reason"] = finish_reason
+    return response
 
 
 def _completion_error_message(value: Any) -> str:
@@ -1879,6 +1884,49 @@ def _chunk_is_sse_done_only(chunk: bytes | str) -> bool:
         if line[len("data:") :].strip() != "[DONE]":
             return False
     return True
+
+
+def _merge_stream_tool_call_delta(tool_calls: list[dict[str, Any]], delta_tool_call: dict[str, Any]) -> None:
+    tool_call_index = delta_tool_call.get("index")
+    current_tool_call = None
+    if tool_call_index is not None:
+        current_tool_call = next(
+            (tool_call for tool_call in tool_calls if tool_call.get("index") == tool_call_index),
+            None,
+        )
+
+    if current_tool_call is None:
+        current_tool_call = copy.deepcopy(delta_tool_call)
+        function = current_tool_call.get("function")
+        if not isinstance(function, dict):
+            function = {}
+            current_tool_call["function"] = function
+        function.setdefault("name", "")
+        function.setdefault("arguments", "")
+        tool_calls.append(current_tool_call)
+        return
+
+    for key in ("id", "type"):
+        value = delta_tool_call.get(key)
+        if value:
+            current_tool_call[key] = value
+
+    function_delta = delta_tool_call.get("function")
+    if not isinstance(function_delta, dict):
+        return
+
+    function = current_tool_call.setdefault("function", {})
+    if not isinstance(function, dict):
+        function = {}
+        current_tool_call["function"] = function
+
+    name = function_delta.get("name")
+    if isinstance(name, str) and name:
+        function["name"] = name
+
+    arguments = function_delta.get("arguments")
+    if isinstance(arguments, str):
+        function["arguments"] = str(function.get("arguments") or "") + arguments
 
 
 async def emit_compaction_status(
@@ -2344,6 +2392,8 @@ async def _coerce_non_streaming_completion_response(response: Any, *, model_id: 
     if isinstance(response, StreamingResponse):
         parts: list[str] = []
         usage: dict[str, Any] | None = None
+        tool_calls: list[dict[str, Any]] = []
+        finish_reason: str | None = None
         provider_error: dict[str, Any] | None = None
         try:
             async for raw_chunk in response.body_iterator:
@@ -2366,12 +2416,19 @@ async def _coerce_non_streaming_completion_response(response: Any, *, model_id: 
                     choices = payload.get("choices")
                     if isinstance(choices, list) and choices:
                         choice = choices[0]
+                        if isinstance(choice.get("finish_reason"), str):
+                            finish_reason = choice["finish_reason"]
                         message = choice.get("message") or {}
                         delta = choice.get("delta") or {}
                         for container in (message, delta):
                             content = container.get("content") or container.get("reasoning_content")
                             if isinstance(content, str):
                                 parts.append(content)
+                            container_tool_calls = container.get("tool_calls")
+                            if isinstance(container_tool_calls, list):
+                                for tool_call in container_tool_calls:
+                                    if isinstance(tool_call, dict):
+                                        _merge_stream_tool_call_delta(tool_calls, tool_call)
                     if payload.get("type") == "response.output_text.delta":
                         delta = payload.get("delta")
                         if isinstance(delta, str):
@@ -2380,7 +2437,13 @@ async def _coerce_non_streaming_completion_response(response: Any, *, model_id: 
             await _close_stream_response(response)
         if provider_error is not None:
             return provider_error
-        return _chat_completion_message_response(model_id, "".join(parts).strip(), usage=usage)
+        return _chat_completion_message_response(
+            model_id,
+            "".join(parts).strip(),
+            usage=usage,
+            tool_calls=tool_calls or None,
+            finish_reason=finish_reason,
+        )
 
     if isinstance(response, (JSONResponse, PlainTextResponse, Response)):
         if is_retryable_context_error(response):

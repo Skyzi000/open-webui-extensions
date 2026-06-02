@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import asyncio
+import json
 import sys
 import types
 
@@ -1841,6 +1842,64 @@ async def test_non_streaming_stream_response_skips_done_chunk():
     result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
 
     assert result["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_stream_response_preserves_tool_calls():
+    chunks = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "search", "arguments": '{"query":'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": '"open webui"}'},
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    ]
+    response = StreamingResponse(
+        iter([f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks]),
+        media_type="text/event-stream",
+    )
+
+    result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
+
+    choice = result["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"query":"open webui"}'},
+            }
+        ],
+    }
 
 
 @pytest.mark.asyncio
