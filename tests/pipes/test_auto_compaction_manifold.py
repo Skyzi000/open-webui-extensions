@@ -749,7 +749,7 @@ async def test_forward_target_injects_resolved_base_model_into_request_models(mo
     pipe_request.app.state.BASE_MODELS = [target_model]
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False):
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
         captured["has_target"] = form_data["model"] in request.app.state.MODELS
         captured["target_model"] = request.app.state.MODELS.get(form_data["model"])
         return StreamingResponse(
@@ -773,6 +773,47 @@ async def test_forward_target_injects_resolved_base_model_into_request_models(mo
         pass
 
     assert captured == {"has_target": True, "target_model": target_model}
+
+
+@pytest.mark.asyncio
+async def test_forward_target_preserves_core_bypass_system_prompt_state(monkeypatch, pipe_request, pipe_user):
+    pipe_request.app.state.MODELS = {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+    pipe_request.state.bypass_system_prompt = True
+    captured = {}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        request.state.bypass_filter = bypass_filter
+        request.state.bypass_system_prompt = bypass_system_prompt
+        captured["bypass_filter"] = bypass_filter
+        captured["bypass_system_prompt"] = bypass_system_prompt
+        captured["state_bypass_system_prompt"] = getattr(request.state, "bypass_system_prompt", None)
+        return StreamingResponse(
+            iter([b'data: {"choices": [{"delta": {"content": "ok"}}]}\n\n']),
+            media_type="text/event-stream",
+        )
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    response = await mod._forward_streaming_target(
+        request=pipe_request,
+        user=pipe_user,
+        body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id=mod.build_wrapper_model_id("auto_compact", "target"),
+    )
+    async for _ in response.body_iterator:
+        pass
+
+    assert captured == {
+        "bypass_filter": True,
+        "bypass_system_prompt": True,
+        "state_bypass_system_prompt": True,
+    }
+    assert pipe_request.state.bypass_system_prompt is True
+    assert not hasattr(pipe_request.state, "bypass_filter")
 
 
 def test_summary_model_validation_allows_pipe_backed_and_rejects_arena():
@@ -1113,22 +1154,63 @@ async def test_streaming_forwarder_closes_inner_stream_after_visible_output_earl
     assert background_ran is True
 
 
-def test_request_state_snapshot_restores_bypass_and_metadata():
+def test_request_state_proxy_isolates_bypass_and_metadata():
     request = SimpleNamespace(
         state=SimpleNamespace(
             bypass_filter=False,
+            bypass_system_prompt=True,
             metadata={"selected_model_id": "arena-a", "chat_id": "chat-1"},
         )
     )
 
-    snapshot = mod.RequestStateSnapshot(request)
-    snapshot.apply_bypass(True)
-    request.state.metadata.pop("selected_model_id")
-    request.state.metadata["new"] = "value"
-    snapshot.restore()
+    proxy = mod.RequestStateProxy(
+        request,
+        bypass_filter=True,
+        bypass_system_prompt=False,
+        metadata={"task": mod.INTERNAL_SUMMARY_TASK},
+    )
+    proxy.state.metadata["new"] = "value"
+    proxy.state.bypass_system_prompt = False
 
     assert request.state.bypass_filter is False
+    assert request.state.bypass_system_prompt is True
     assert request.state.metadata == {"selected_model_id": "arena-a", "chat_id": "chat-1"}
+    assert proxy.state.bypass_filter is True
+    assert proxy.state.bypass_system_prompt is False
+    assert proxy.state.metadata == {"task": mod.INTERNAL_SUMMARY_TASK, "new": "value"}
+
+
+def test_request_state_proxy_does_not_add_flags_to_original_request():
+    request = SimpleNamespace(state=SimpleNamespace())
+
+    proxy = mod.RequestStateProxy(request, bypass_filter=True, bypass_system_prompt=True)
+
+    assert not hasattr(request.state, "bypass_filter")
+    assert not hasattr(request.state, "bypass_system_prompt")
+    assert proxy.state.bypass_filter is True
+    assert proxy.state.bypass_system_prompt is True
+
+
+@pytest.mark.asyncio
+async def test_request_state_proxy_handles_unpickleable_metadata_without_mutating_original():
+    future = asyncio.get_running_loop().create_future()
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            metadata={
+                "chat_id": "chat-1",
+                "tools": {"tool": {"future": future}},
+            }
+        )
+    )
+
+    proxy = mod.RequestStateProxy(request, bypass_filter=True)
+
+    proxy.state.metadata["chat_id"] = "summary-chat"
+    proxy.state.metadata["tools"]["tool"]["name"] = "Tool"
+
+    assert request.state.metadata["chat_id"] == "chat-1"
+    assert "name" not in request.state.metadata["tools"]["tool"]
+    assert proxy.state.metadata["tools"]["tool"]["future"] is future
 
 
 def test_summary_task_metadata_removes_tool_and_arena_state():
@@ -1149,12 +1231,34 @@ def test_summary_task_metadata_removes_tool_and_arena_state():
 
 
 @pytest.mark.asyncio
+async def test_summary_task_metadata_drops_unpickleable_core_values():
+    future = asyncio.get_running_loop().create_future()
+    metadata = {
+        "chat_id": "chat-1",
+        "params": {"function_calling": "native"},
+        "mcp_clients": {"server": future},
+    }
+
+    summary_metadata = mod.build_summary_task_metadata(metadata)
+
+    assert summary_metadata["chat_id"] == "chat-1"
+    assert summary_metadata["params"] == {"function_calling": "native"}
+    assert "mcp_clients" not in summary_metadata
+    assert summary_metadata["task"] == mod.INTERNAL_SUMMARY_TASK
+    assert summary_metadata["tools"] == {}
+    assert summary_metadata["tool_ids"] == []
+
+
+@pytest.mark.asyncio
 async def test_summary_generation_overrides_request_state_metadata(monkeypatch, pipe_request, pipe_user):
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False):
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        request.state.bypass_filter = bypass_filter
+        request.state.bypass_system_prompt = bypass_system_prompt
         captured["state_metadata"] = dict(request.state.metadata)
         captured["form_metadata"] = dict(form_data["metadata"])
+        captured["bypass_system_prompt"] = bypass_system_prompt
         return {"choices": [{"message": {"content": "summary"}}]}
 
     chat_module = types.ModuleType("open_webui.utils.chat")
@@ -1162,6 +1266,7 @@ async def test_summary_generation_overrides_request_state_metadata(monkeypatch, 
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
 
     pipe_request.state.metadata = {"selected_model_id": "arena-a", "tools": {"bad": {}}, "tool_ids": ["bad"]}
+    pipe_request.state.bypass_system_prompt = True
 
     result = await mod._generate_summary_text(
         request=pipe_request,
@@ -1177,18 +1282,21 @@ async def test_summary_generation_overrides_request_state_metadata(monkeypatch, 
     assert captured["state_metadata"]["tool_ids"] == []
     assert "selected_model_id" not in captured["state_metadata"]
     assert captured["form_metadata"] == captured["state_metadata"]
+    assert captured["bypass_system_prompt"] is False
     assert pipe_request.state.metadata == {
         "selected_model_id": "arena-a",
         "tools": {"bad": {}},
         "tool_ids": ["bad"],
     }
+    assert pipe_request.state.bypass_system_prompt is True
+    assert not hasattr(pipe_request.state, "bypass_filter")
 
 
 @pytest.mark.asyncio
 async def test_summary_generation_decodes_own_wrapper_summary_model(monkeypatch, pipe_request, pipe_user):
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False):
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
         captured["model"] = form_data["model"]
         captured["stream"] = form_data["stream"]
         captured["metadata"] = dict(form_data["metadata"])
@@ -1223,7 +1331,7 @@ async def test_summary_generation_passes_open_webui_user_model_to_inner_completi
     fake_user_model = install_fake_open_webui_user_model(monkeypatch)
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False):
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
         captured["user_id"] = user.id
         captured["user_role"] = user.role
         captured["user_type"] = type(user)
@@ -1424,6 +1532,54 @@ async def test_pipe_forwards_below_threshold_to_decoded_target_with_metadata(mon
 
 
 @pytest.mark.asyncio
+async def test_pipe_forwards_metadata_with_unpickleable_core_values(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    future = asyncio.get_running_loop().create_future()
+    metadata = {
+        **pipe_metadata,
+        "params": {"function_calling": "native"},
+        "tools": {"tool": {"future": future}},
+    }
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10}
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=metadata,
+    )
+
+    assert result == {"ok": True}
+    assert captured["forward_body"]["metadata"]["tools"]["tool"]["future"] is future
+    assert metadata["chat_id"] == "chat-1"
+
+
+@pytest.mark.asyncio
 async def test_pipe_forwarding_passes_open_webui_user_model_to_inner_completion(
     monkeypatch,
     pipe_request,
@@ -1442,7 +1598,7 @@ async def test_pipe_forwarding_passes_open_webui_user_model_to_inner_completion(
     async def lookup_persisted_usage(chat_id, message_id):
         return {"total_tokens": 10}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False):
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
         captured["model"] = form_data["model"]
         captured["user_id"] = user.id
         captured["user_role"] = user.role

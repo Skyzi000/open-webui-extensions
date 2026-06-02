@@ -1337,6 +1337,99 @@ async def lookup_persisted_usage(chat_id: str | None, message_id: str | None) ->
     return None
 
 
+_METADATA_VALUE_DROPPED = object()
+
+
+def _copy_metadata_value(value: Any, *, drop_uncloneable: bool, memo: dict[int, Any] | None = None) -> Any:
+    if memo is None:
+        memo = {}
+
+    if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in memo:
+            return memo[value_id]
+
+        copied: dict[Any, Any] = {}
+        memo[value_id] = copied
+        for key, item in value.items():
+            try:
+                copied_key = copy.deepcopy(key)
+            except Exception:
+                if drop_uncloneable:
+                    continue
+                copied_key = key
+
+            copied_item = _copy_metadata_value(item, drop_uncloneable=drop_uncloneable, memo=memo)
+            if copied_item is _METADATA_VALUE_DROPPED:
+                continue
+            copied[copied_key] = copied_item
+
+        if drop_uncloneable and value and not copied:
+            return _METADATA_VALUE_DROPPED
+        return copied
+
+    if isinstance(value, list):
+        value_id = id(value)
+        if value_id in memo:
+            return memo[value_id]
+
+        copied_list: list[Any] = []
+        memo[value_id] = copied_list
+        for item in value:
+            copied_item = _copy_metadata_value(item, drop_uncloneable=drop_uncloneable, memo=memo)
+            if copied_item is not _METADATA_VALUE_DROPPED:
+                copied_list.append(copied_item)
+
+        if drop_uncloneable and value and not copied_list:
+            return _METADATA_VALUE_DROPPED
+        return copied_list
+
+    if isinstance(value, tuple):
+        copied_items = []
+        for item in value:
+            copied_item = _copy_metadata_value(item, drop_uncloneable=drop_uncloneable, memo=memo)
+            if copied_item is not _METADATA_VALUE_DROPPED:
+                copied_items.append(copied_item)
+        if drop_uncloneable and value and not copied_items:
+            return _METADATA_VALUE_DROPPED
+        return tuple(copied_items)
+
+    if isinstance(value, (set, frozenset)):
+        copied_items = []
+        for item in value:
+            copied_item = _copy_metadata_value(item, drop_uncloneable=drop_uncloneable, memo=memo)
+            if copied_item is not _METADATA_VALUE_DROPPED:
+                copied_items.append(copied_item)
+        if drop_uncloneable and value and not copied_items:
+            return _METADATA_VALUE_DROPPED
+        try:
+            return type(value)(copied_items)
+        except TypeError:
+            return _METADATA_VALUE_DROPPED if drop_uncloneable else value
+
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return _METADATA_VALUE_DROPPED if drop_uncloneable else value
+
+
+def _copy_metadata_preserving_references(metadata: Any) -> dict[str, Any]:
+    copied = _copy_metadata_value(metadata or {}, drop_uncloneable=False)
+    return copied if isinstance(copied, dict) else {}
+
+
+def _copy_summary_task_metadata(metadata: Any) -> dict[str, Any]:
+    copied = _copy_metadata_value(metadata or {}, drop_uncloneable=True)
+    return copied if isinstance(copied, dict) else {}
+
+
+def _copy_body_preserving_metadata(body: dict[str, Any]) -> dict[str, Any]:
+    copied = copy.deepcopy({key: value for key, value in body.items() if key != "metadata"})
+    if "metadata" in body:
+        copied["metadata"] = _copy_metadata_preserving_references(body.get("metadata"))
+    return copied
+
+
 def inject_stream_usage_options(body: dict[str, Any], *, force_include_usage: bool = True) -> dict[str, Any]:
     if not force_include_usage or body.get("stream") is not True:
         return body
@@ -1345,7 +1438,7 @@ def inject_stream_usage_options(body: dict[str, Any], *, force_include_usage: bo
         stream_options = {}
     if stream_options.get("include_usage") is True:
         return body
-    copied = copy.deepcopy(body)
+    copied = _copy_body_preserving_metadata(body)
     copied["stream_options"] = {**stream_options, "include_usage": True}
     return copied
 
@@ -1533,45 +1626,45 @@ def chunk_has_user_visible_output(chunk: bytes | str) -> bool:
     return False
 
 
-class RequestStateSnapshot:
-    def __init__(self, request: Any):
-        self.request = request
-        self.state = getattr(request, "state", None)
-        self.had_bypass = False
-        self.previous_bypass = None
-        self.had_metadata = False
-        self.previous_metadata = None
+def _request_bypass_system_prompt(request: Any) -> bool:
+    state = getattr(request, "state", None)
+    return bool(getattr(state, "bypass_system_prompt", False))
 
-    def apply_bypass(self, value: bool = True) -> None:
-        if self.state is None:
-            return
-        self.had_bypass = hasattr(self.state, "bypass_filter")
-        self.previous_bypass = getattr(self.state, "bypass_filter", None)
-        self.had_metadata = hasattr(self.state, "metadata")
-        self.previous_metadata = copy.deepcopy(getattr(self.state, "metadata", None))
-        setattr(self.state, "bypass_filter", value)
 
-    def apply_metadata(self, metadata: dict[str, Any]) -> None:
-        if self.state is None:
-            return
-        if not self.had_metadata:
-            self.had_metadata = hasattr(self.state, "metadata")
-            self.previous_metadata = copy.deepcopy(getattr(self.state, "metadata", None))
-        setattr(self.state, "metadata", copy.deepcopy(metadata))
+def _iter_request_state_items(state: Any) -> Iterable[tuple[str, Any]]:
+    if state is None:
+        return ()
+    raw_state = getattr(state, "_state", None)
+    if isinstance(raw_state, dict):
+        return tuple(raw_state.items())
+    try:
+        return tuple(vars(state).items())
+    except TypeError:
+        return ()
 
-    def restore(self) -> None:
-        if self.state is None:
-            return
-        if self.had_bypass:
-            setattr(self.state, "bypass_filter", self.previous_bypass)
-        else:
-            with suppress(Exception):
-                delattr(self.state, "bypass_filter")
-        if self.had_metadata:
-            setattr(self.state, "metadata", copy.deepcopy(self.previous_metadata))
-        else:
-            with suppress(Exception):
-                delattr(self.state, "metadata")
+
+def _copy_state_value(key: str, value: Any) -> Any:
+    if key == "metadata":
+        return _copy_metadata_preserving_references(value)
+    return value
+
+
+def _build_request_state(base_state: Any, overrides: dict[str, Any]) -> SimpleNamespace:
+    state = SimpleNamespace()
+    for key, value in _iter_request_state_items(base_state):
+        setattr(state, key, _copy_state_value(key, value))
+    for key, value in overrides.items():
+        setattr(state, key, _copy_state_value(key, value))
+    return state
+
+
+class RequestStateProxy:
+    def __init__(self, request: Any, **state_overrides: Any):
+        object.__setattr__(self, "_request", request)
+        object.__setattr__(self, "state", _build_request_state(getattr(request, "state", None), state_overrides))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._request, name)
 
 
 async def _close_stream_response(response: StreamingResponse) -> None:
@@ -1819,8 +1912,9 @@ async def extract_text_from_completion_response(response: Any) -> str:
 
 
 def build_summary_task_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
-    copied = copy.deepcopy(metadata or {})
+    copied = _copy_summary_task_metadata(metadata or {})
     copied.pop("selected_model_id", None)
+    copied.pop("mcp_clients", None)
     copied["task"] = INTERNAL_SUMMARY_TASK
     copied["tools"] = {}
     copied["tool_ids"] = []
@@ -1828,7 +1922,7 @@ def build_summary_task_metadata(metadata: dict[str, Any] | None) -> dict[str, An
 
 
 def _strip_tool_request_fields(body: dict[str, Any]) -> dict[str, Any]:
-    copied = copy.deepcopy(body)
+    copied = _copy_body_preserving_metadata(body)
     for key in ("tools", "tool_choice", "tool_ids"):
         copied.pop(key, None)
     copied["stream"] = False
@@ -1849,42 +1943,43 @@ async def _generate_summary_text(
     summary_model_id: str,
     source_messages: list[dict[str, Any]],
 ) -> str:
-    snapshot = RequestStateSnapshot(request)
-    snapshot.apply_bypass(True)
     summary_metadata = build_summary_task_metadata(metadata)
-    snapshot.apply_metadata(summary_metadata)
-    try:
-        from open_webui.utils.chat import generate_chat_completion
+    inner_request = RequestStateProxy(
+        request,
+        bypass_filter=True,
+        bypass_system_prompt=False,
+        metadata=summary_metadata,
+    )
+    from open_webui.utils.chat import generate_chat_completion
 
-        body = _strip_tool_request_fields(
-            {
-                "model": _resolve_summary_model_for_call(summary_model_id),
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Summarize the following prior conversation for continuation. "
-                            "Preserve durable facts, decisions, tool results, open tasks, and user preferences. "
-                            "Do not introduce new instructions."
-                        ),
-                    },
-                    *copy.deepcopy(source_messages),
-                ],
-                "metadata": summary_metadata,
-            }
-        )
-        await _ensure_model_in_request_models(request, str(body.get("model") or ""))
-        response = await generate_chat_completion(
-            request,
-            body,
-            user=coerce_open_webui_user(user),
-            bypass_filter=True,
-        )
-        if is_retryable_context_error(response, status_code=400):
-            raise RetryableContextOverflow("Summary model reported a context-window error")
-        return await extract_text_from_completion_response(response)
-    finally:
-        snapshot.restore()
+    body = _strip_tool_request_fields(
+        {
+            "model": _resolve_summary_model_for_call(summary_model_id),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Summarize the following prior conversation for continuation. "
+                        "Preserve durable facts, decisions, tool results, open tasks, and user preferences. "
+                        "Do not introduce new instructions."
+                    ),
+                },
+                *copy.deepcopy(source_messages),
+            ],
+            "metadata": summary_metadata,
+        }
+    )
+    await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
+    response = await generate_chat_completion(
+        inner_request,
+        body,
+        user=coerce_open_webui_user(user),
+        bypass_filter=True,
+        bypass_system_prompt=False,
+    )
+    if is_retryable_context_error(response, status_code=400):
+        raise RetryableContextOverflow("Summary model reported a context-window error")
+    return await extract_text_from_completion_response(response)
 
 
 async def _generate_tool_result_summary(
@@ -2163,20 +2258,24 @@ async def _forward_streaming_target(
     message_id: str | None,
     wrapper_model_id: str,
 ) -> StreamingResponse:
-    snapshot = RequestStateSnapshot(request)
-    snapshot.apply_bypass(True)
+    bypass_system_prompt = _request_bypass_system_prompt(request)
+    inner_request = RequestStateProxy(
+        request,
+        bypass_filter=True,
+        bypass_system_prompt=bypass_system_prompt,
+    )
     try:
         from open_webui.utils.chat import generate_chat_completion
 
-        await _ensure_model_in_request_models(request, str(body.get("model") or ""))
+        await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
         response = await generate_chat_completion(
-            request,
+            inner_request,
             body,
             user=coerce_open_webui_user(user),
             bypass_filter=True,
+            bypass_system_prompt=bypass_system_prompt,
         )
     except Exception as exc:
-        snapshot.restore()
         if is_retryable_context_error(exc):
             raise RetryableContextOverflow(str(exc)) from exc
         raise
@@ -2187,7 +2286,6 @@ async def _forward_streaming_target(
         chat_id=chat_id,
         message_id=message_id,
         wrapper_model_id=wrapper_model_id,
-        restore=snapshot.restore,
     )
 
 
@@ -2225,7 +2323,7 @@ async def _compact_body(
             aggressive=aggressive,
         )
         if did_compact_tools:
-            compacted = copy.deepcopy(body)
+            compacted = _copy_body_preserving_metadata(body)
             compacted["messages"] = compacted_messages
             compacted.pop("previous_response_id", None)
             return compacted, True
@@ -2259,7 +2357,7 @@ async def _compact_body(
             source_messages=source,
         )
 
-    compacted = copy.deepcopy(body)
+    compacted = _copy_body_preserving_metadata(body)
     try:
         summary_text = await _get_or_create_checkpoint_summary(
             request=request,
@@ -2370,7 +2468,7 @@ class Pipe:
             return _error_response(str(exc), code="invalid_wrapper_id")
 
         user = __user__ or {}
-        metadata = copy.deepcopy(__metadata__ or {})
+        metadata = _copy_metadata_preserving_references(__metadata__ or {})
         chat_id = metadata.get("chat_id")
         message_id = metadata.get("message_id") or metadata.get("user_message_id")
 
@@ -2385,9 +2483,9 @@ class Pipe:
         except ValueError as exc:
             return _error_response(str(exc), code="invalid_summary_model")
 
-        inner = copy.deepcopy(body)
+        inner = _copy_body_preserving_metadata(body)
         inner["model"] = identity.target_model_id
-        inner["metadata"] = copy.deepcopy(metadata)
+        inner["metadata"] = _copy_metadata_preserving_references(metadata)
         if self.valves.force_include_usage:
             inner = inject_stream_usage_options(inner, force_include_usage=True)
 
@@ -2421,7 +2519,7 @@ class Pipe:
         compacted_once = False
         while attempt < MAX_CONTEXT_RETRY_ATTEMPTS:
             attempt += 1
-            candidate = copy.deepcopy(inner)
+            candidate = _copy_body_preserving_metadata(inner)
             if should_compact or compacted_once:
                 try:
                     await emit_compaction_status(
