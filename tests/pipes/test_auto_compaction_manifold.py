@@ -41,6 +41,20 @@ def test_target_filter_excludes_own_wrappers_and_arena_but_allows_other_pipes():
     assert [m["id"] for m in targets] == ["gpt-4.1", "other_pipe.child"]
 
 
+def test_target_filter_excludes_presets_based_on_own_wrappers():
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "gpt-4.1")
+    models = [
+        {"id": "gpt-4.1", "name": "GPT"},
+        {"id": "compact-preset", "name": "Compact Preset", "info": {"base_model_id": wrapper_id}},
+        {"id": "top-level-compact-preset", "name": "Compact Preset 2", "base_model_id": wrapper_id},
+        {"id": "normal-preset", "name": "Normal Preset", "info": {"base_model_id": "gpt-4.1"}},
+    ]
+
+    targets = mod.filter_target_models(models, mod.Pipe.Valves())
+
+    assert [m["id"] for m in targets] == ["gpt-4.1", "normal-preset"]
+
+
 def test_include_exclude_patterns_match_id_and_name_and_deduplicate_targets():
     valves = mod.Pipe.Valves(
         include_model_patterns="*gpt*,Anthropic*",
@@ -576,6 +590,24 @@ async def test_target_access_uses_core_chat_model_dict_access_check(monkeypatch,
     assert captured == {"user_type": fake_user_model, "user_id": "user-1", "model": target_model}
 
 
+def test_iter_cache_models_reads_redisdict_like_values():
+    class FakeRedisDict:
+        def __init__(self, values):
+            self._values = values
+
+        def values(self):
+            return list(self._values)
+
+    state = SimpleNamespace(
+        MODELS=FakeRedisDict([{"id": "redis-target", "name": "Redis Target"}, "not-a-model"]),
+        BASE_MODELS=[],
+        OPENAI_MODELS={},
+        OLLAMA_MODELS={},
+    )
+
+    assert [model["id"] for model in mod._iter_cache_models_from_state(state)] == ["redis-target"]
+
+
 @pytest.mark.asyncio
 async def test_target_access_bypasses_core_access_check_for_admin_when_admin_bypass_enabled(
     monkeypatch,
@@ -607,21 +639,63 @@ async def test_target_access_checks_admin_when_admin_bypass_disabled(monkeypatch
     admin_user = {**pipe_user, "role": "admin"}
     captured = {}
 
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "target"
+            return SimpleNamespace(id="target")
+
     async def check_model_access(user, model, db=None):
         captured["user_type"] = type(user)
         captured["user_role"] = user.role
         captured["model"] = model
 
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
     utils_models_module = types.ModuleType("open_webui.utils.models")
     utils_models_module.check_model_access = check_model_access
     config_module = types.ModuleType("open_webui.config")
     config_module.BYPASS_ADMIN_ACCESS_CONTROL = False
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.config", config_module)
 
     await mod._validate_target_access(target_model_id="target", request=pipe_request, user=admin_user)
 
     assert captured == {"user_type": fake_user_model, "user_role": "admin", "model": target_model}
+
+
+@pytest.mark.asyncio
+async def test_target_access_allows_admin_raw_provider_target_without_model_record(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    target_model = {"id": "raw-target", "name": "Raw Target", "owned_by": "openai"}
+    pipe_request.app.state.MODELS = {"raw-target": target_model}
+    admin_user = {**pipe_user, "role": "admin"}
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "raw-target"
+            return None
+
+    async def check_model_access(user, model, db=None):
+        raise AssertionError("admin raw provider target should not require a DB Model access check")
+
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    config_module = types.ModuleType("open_webui.config")
+    config_module.BYPASS_ADMIN_ACCESS_CONTROL = False
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.config", config_module)
+
+    await mod._validate_target_access(target_model_id="raw-target", request=pipe_request, user=admin_user)
 
 
 @pytest.mark.asyncio

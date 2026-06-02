@@ -839,6 +839,33 @@ def _model_id(model: dict[str, Any]) -> str | None:
     return model_id if isinstance(model_id, str) and model_id else None
 
 
+def _model_base_model_id(model: dict[str, Any]) -> str | None:
+    base_model_id = model.get("base_model_id")
+    if isinstance(base_model_id, str) and base_model_id:
+        return base_model_id
+
+    info = model.get("info")
+    if isinstance(info, BaseModel):
+        info = info.model_dump()
+    elif not isinstance(info, dict):
+        model_dump = getattr(info, "model_dump", None)
+        if callable(model_dump):
+            with suppress(Exception):
+                info = model_dump()
+        elif hasattr(info, "__dict__"):
+            info = vars(info)
+
+    if isinstance(info, dict):
+        base_model_id = info.get("base_model_id")
+        if isinstance(base_model_id, str) and base_model_id:
+            return base_model_id
+    return None
+
+
+def _is_based_on_generated_wrapper(model: dict[str, Any], *, pipe_model_id: str = PIPE_FUNCTION_ID) -> bool:
+    return is_generated_wrapper_model_id(_model_base_model_id(model), pipe_model_id=pipe_model_id)
+
+
 def filter_target_models(models: Iterable[dict[str, Any]], valves: Any, *, pipe_model_id: str = PIPE_FUNCTION_ID):
     include_patterns = _split_patterns(getattr(valves, "include_model_patterns", ""))
     exclude_patterns = _split_patterns(getattr(valves, "exclude_model_patterns", ""))
@@ -853,6 +880,8 @@ def filter_target_models(models: Iterable[dict[str, Any]], valves: Any, *, pipe_
         if model_id is None or model_id in seen:
             continue
         if is_generated_wrapper_model_id(model_id, pipe_model_id=pipe_model_id):
+            continue
+        if _is_based_on_generated_wrapper(model, pipe_model_id=pipe_model_id):
             continue
         if _is_arena_model(model):
             continue
@@ -1133,14 +1162,30 @@ async def sync_wrapper_model_records(
             continue
 
 
+def _iter_model_cache_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        return value.values()
+    if isinstance(value, list):
+        return value
+
+    values = getattr(value, "values", None)
+    if callable(values):
+        with suppress(Exception):
+            cache_values = values()
+            if cache_values is not None:
+                return cache_values
+    return ()
+
+
 def _iter_cache_models_from_state(state: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for attr in ("MODELS", "BASE_MODELS", "OPENAI_MODELS", "OLLAMA_MODELS"):
         value = getattr(state, attr, None)
-        if isinstance(value, dict):
-            out.extend(item for item in value.values() if isinstance(item, dict))
-        elif isinstance(value, list):
-            out.extend(item for item in value if isinstance(item, dict))
+        try:
+            iterator = iter(_iter_model_cache_values(value))
+        except TypeError:
+            continue
+        out.extend(item for item in iterator if isinstance(item, dict))
     return out
 
 
@@ -2046,8 +2091,9 @@ async def _ensure_model_in_request_models(request: Any, model_id: str) -> dict[s
 
     state = getattr(getattr(request, "app", None), "state", None)
     request_models = getattr(state, "MODELS", None)
-    if isinstance(request_models, dict) and model_id not in request_models:
-        request_models[model_id] = copy.deepcopy(model)
+    with suppress(Exception):
+        if request_models is not None and model_id not in request_models:
+            request_models[model_id] = copy.deepcopy(model)
     return model
 
 
@@ -2071,6 +2117,15 @@ def _should_bypass_target_access_check(user: Any) -> bool:
         return False
 
 
+async def _target_has_db_model_record(target_model_id: str) -> bool:
+    try:
+        from open_webui.models.models import Models
+
+        return await Models.get_model_by_id(target_model_id) is not None
+    except Exception:
+        return True
+
+
 async def _validate_target_access(
     *,
     target_model_id: str,
@@ -2084,6 +2139,9 @@ async def _validate_target_access(
 
     user_model = coerce_open_webui_user(user)
     if _should_bypass_target_access_check(user_model):
+        return
+
+    if getattr(user_model, "role", None) == "admin" and not await _target_has_db_model_record(target_model_id):
         return
 
     try:
