@@ -1844,6 +1844,43 @@ def _error_response(message: str, *, code: str = "auto_compaction_error") -> dic
     return {"error": {"code": code, "message": message}}
 
 
+def _chat_completion_message_response(
+    model_id: str,
+    message: str,
+    *,
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from open_webui.utils.misc import openai_chat_completion_message_template
+
+    return openai_chat_completion_message_template(model_id, message, usage=usage)
+
+
+def _completion_error_message(value: Any) -> str:
+    codes, messages, _ = _structured_error_strings(value)
+    if messages:
+        return messages[0]
+    if codes:
+        return codes[0]
+    if isinstance(value, Response):
+        return _response_body_text(value)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _chunk_is_sse_done_only(chunk: bytes | str) -> bool:
+    text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+    meaningful_lines = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith(":")]
+    if not meaningful_lines:
+        return False
+    for line in meaningful_lines:
+        if not line.startswith("data:"):
+            return False
+        if line[len("data:") :].strip() != "[DONE]":
+            return False
+    return True
+
+
 async def emit_compaction_status(
     event_emitter: Callable[[Any], Awaitable[None]] | None,
     *,
@@ -2249,15 +2286,12 @@ async def _validate_target_access(
         raise HTTPException(status_code=403, detail="Model not found") from exc
 
 
-async def _forward_streaming_target(
+async def _call_target_completion(
     *,
     request: Any,
     user: Any,
     body: dict[str, Any],
-    chat_id: str | None,
-    message_id: str | None,
-    wrapper_model_id: str,
-) -> StreamingResponse:
+) -> Any:
     bypass_system_prompt = _request_bypass_system_prompt(request)
     inner_request = RequestStateProxy(
         request,
@@ -2275,11 +2309,23 @@ async def _forward_streaming_target(
             bypass_filter=True,
             bypass_system_prompt=bypass_system_prompt,
         )
+        return response
     except Exception as exc:
         if is_retryable_context_error(exc):
             raise RetryableContextOverflow(str(exc)) from exc
         raise
 
+
+async def _forward_streaming_target(
+    *,
+    request: Any,
+    user: Any,
+    body: dict[str, Any],
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str,
+) -> StreamingResponse:
+    response = await _call_target_completion(request=request, user=user, body=body)
     return await prepare_streaming_response(
         response,
         request=request,
@@ -2287,6 +2333,87 @@ async def _forward_streaming_target(
         message_id=message_id,
         wrapper_model_id=wrapper_model_id,
     )
+
+
+async def _coerce_non_streaming_completion_response(response: Any, *, model_id: str) -> dict[str, Any]:
+    if isinstance(response, dict):
+        if response.get("error") and is_retryable_context_error(response, status_code=400):
+            raise RetryableContextOverflow(str(response.get("error")))
+        return response
+
+    if isinstance(response, StreamingResponse):
+        parts: list[str] = []
+        usage: dict[str, Any] | None = None
+        provider_error: dict[str, Any] | None = None
+        try:
+            async for raw_chunk in response.body_iterator:
+                chunk = _coerce_stream_chunk(raw_chunk)
+                events = extract_sse_json_events(chunk)
+                if not events:
+                    if _chunk_is_sse_done_only(chunk):
+                        continue
+                    parts.append(chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk))
+                    continue
+                for payload in events:
+                    if payload.get("error"):
+                        if is_retryable_context_error(payload, status_code=400):
+                            raise RetryableContextOverflow(str(payload.get("error")))
+                        provider_error = _error_response(_completion_error_message(payload), code="provider_error")
+                        continue
+                    chunk_usage = extract_usage_from_stream_payload(payload)
+                    if chunk_usage:
+                        usage = chunk_usage
+                    choices = payload.get("choices")
+                    if isinstance(choices, list) and choices:
+                        choice = choices[0]
+                        message = choice.get("message") or {}
+                        delta = choice.get("delta") or {}
+                        for container in (message, delta):
+                            content = container.get("content") or container.get("reasoning_content")
+                            if isinstance(content, str):
+                                parts.append(content)
+                    if payload.get("type") == "response.output_text.delta":
+                        delta = payload.get("delta")
+                        if isinstance(delta, str):
+                            parts.append(delta)
+        finally:
+            await _close_stream_response(response)
+        if provider_error is not None:
+            return provider_error
+        return _chat_completion_message_response(model_id, "".join(parts).strip(), usage=usage)
+
+    if isinstance(response, (JSONResponse, PlainTextResponse, Response)):
+        if is_retryable_context_error(response):
+            raise RetryableContextOverflow(_response_body_text(response))
+        parsed = _json_from_response(response)
+        if response.status_code >= 400:
+            return _error_response(_completion_error_message(parsed), code="provider_error")
+        if isinstance(parsed, dict) and not parsed.get("error"):
+            return parsed
+        return _error_response(_completion_error_message(parsed), code="provider_error")
+
+    if isinstance(response, BaseModel):
+        dumped = response.model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+
+    if isinstance(response, str):
+        return _chat_completion_message_response(model_id, response)
+
+    return _error_response(
+        f"Unsupported target response type: {type(response).__name__}",
+        code="unsupported_target_response",
+    )
+
+
+async def _forward_non_streaming_target(
+    *,
+    request: Any,
+    user: Any,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    response = await _call_target_completion(request=request, user=user, body=body)
+    return await _coerce_non_streaming_completion_response(response, model_id=str(body.get("model") or ""))
 
 
 async def _compact_body(
@@ -2456,11 +2583,10 @@ class Pipe:
     ) -> Any:
         if not isinstance(body, dict):
             return _error_response("Request body must be an object", code="invalid_request")
-        if body.get("stream") is not True:
-            return _error_response("Auto Compaction Pipe v1 supports streaming chat requests only", code="unsupported_mode")
         if __request__ is None:
             return _error_response("Open WebUI request context is required", code="missing_request")
 
+        is_streaming = body.get("stream") is True
         selected_wrapper_id = str(body.get("model") or "")
         try:
             identity = decode_wrapper_model_id(selected_wrapper_id, expected_pipe_id=PIPE_FUNCTION_ID)
@@ -2486,7 +2612,7 @@ class Pipe:
         inner = _copy_body_preserving_metadata(body)
         inner["model"] = identity.target_model_id
         inner["metadata"] = _copy_metadata_preserving_references(metadata)
-        if self.valves.force_include_usage:
+        if is_streaming and self.valves.force_include_usage:
             inner = inject_stream_usage_options(inner, force_include_usage=True)
 
         is_summary_task = metadata.get("task") == INTERNAL_SUMMARY_TASK
@@ -2568,13 +2694,19 @@ class Pipe:
                     return _error_response(f"Failed to compact chat history: {exc}", code="summary_failed")
 
             try:
-                return await _forward_streaming_target(
+                if is_streaming:
+                    return await _forward_streaming_target(
+                        request=__request__,
+                        user=user,
+                        body=candidate,
+                        chat_id=str(chat_id) if chat_id else None,
+                        message_id=str(message_id) if message_id else None,
+                        wrapper_model_id=selected_wrapper_id,
+                    )
+                return await _forward_non_streaming_target(
                     request=__request__,
                     user=user,
                     body=candidate,
-                    chat_id=str(chat_id) if chat_id else None,
-                    message_id=str(message_id) if message_id else None,
-                    wrapper_model_id=selected_wrapper_id,
                 )
             except RetryableContextOverflow:
                 if not supported_context or attempt >= MAX_CONTEXT_RETRY_ATTEMPTS:

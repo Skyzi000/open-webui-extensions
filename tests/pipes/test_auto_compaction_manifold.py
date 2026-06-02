@@ -1644,6 +1644,227 @@ async def test_pipe_forwarding_passes_open_webui_user_model_to_inner_completion(
 
 
 @pytest.mark.asyncio
+async def test_pipe_non_streaming_forwards_to_decoded_target_completion(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    fake_user_model = install_fake_open_webui_user_model(monkeypatch)
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        captured["validated_target"] = kwargs["target_model_id"]
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["request_state"] = request.state
+        captured["form_data"] = form_data
+        captured["user"] = user
+        captured["bypass_filter"] = bypass_filter
+        captured["bypass_system_prompt"] = bypass_system_prompt
+        return {
+            "id": "chatcmpl-target",
+            "object": "chat.completion",
+            "model": form_data["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert captured["validated_target"] == "target"
+    assert captured["form_data"]["model"] == "target"
+    assert captured["form_data"]["stream"] is False
+    assert captured["form_data"]["metadata"] == pipe_metadata
+    assert "stream_options" not in captured["form_data"]
+    assert captured["user"].id == "user-1"
+    assert type(captured["user"]) is fake_user_model
+    assert captured["request_state"].bypass_filter is True
+    assert captured["bypass_filter"] is True
+
+
+@pytest.mark.asyncio
+async def test_pipe_non_streaming_retries_with_compaction_after_context_error(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def get_or_create_checkpoint_summary(**kwargs):
+        return "retry summary"
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        calls.append(copy_body(form_data))
+        if len(calls) == 1:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "maximum context length exceeded",
+                    }
+                },
+            )
+        return {
+            "id": "chatcmpl-target",
+            "object": "chat.completion",
+            "model": form_data["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    def copy_body(body):
+        return {
+            key: value
+            for key, value in body.items()
+            if key != "metadata"
+        } | {"metadata": body.get("metadata")}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+
+    pipe = mod.Pipe()
+    pipe.valves.keep_tail_messages = 1
+    pipe.valves.preserve_latest_tool_rounds = 0
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "previous_response_id": "resp-old",
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert len(calls) == 2
+    assert calls[0]["messages"] == body["messages"]
+    assert "previous_response_id" not in calls[1]
+    assert "retry summary" in calls[1]["messages"][0]["content"]
+
+
+def test_chat_completion_response_requires_core_template(monkeypatch):
+    misc_module = types.ModuleType("open_webui.utils.misc")
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", misc_module)
+
+    with pytest.raises(ImportError):
+        mod._chat_completion_message_response("target", "content")
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_stream_response_error_stays_error_dict():
+    response = StreamingResponse(
+        iter(
+            [
+                b'data: {"error": {"code": "rate_limit_exceeded", "message": "rate limited"}}\n\n',
+            ]
+        ),
+        media_type="text/event-stream",
+    )
+
+    result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
+
+    assert result == {"error": {"code": "provider_error", "message": "rate limited"}}
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_stream_response_skips_done_chunk():
+    response = StreamingResponse(
+        iter(
+            [
+                b'data: {"choices": [{"delta": {"content": "ok"}}]}\n\n',
+                b"data: [DONE]\n\n",
+            ]
+        ),
+        media_type="text/event-stream",
+    )
+
+    result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_http_error_response_stays_error_dict_without_error_shape():
+    response = JSONResponse(status_code=429, content={"message": "rate limited"})
+
+    result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
+
+    assert result == {"error": {"code": "provider_error", "message": "rate limited"}}
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_unknown_response_type_stays_error_dict():
+    result = await mod._coerce_non_streaming_completion_response(object(), model_id="target")
+
+    assert result == {
+        "error": {
+            "code": "unsupported_target_response",
+            "message": "Unsupported target response type: object",
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_pipe_rejects_missing_configured_summary_model(monkeypatch, pipe_request, pipe_user, pipe_metadata):
     async def validate_target_access(**kwargs):
         return None
