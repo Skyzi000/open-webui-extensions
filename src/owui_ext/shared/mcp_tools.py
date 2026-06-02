@@ -83,7 +83,16 @@ async def _build_mcp_headers_with_core(
         )
     )
     headers = result[0] if isinstance(result, tuple) else result
-    return dict(headers) if isinstance(headers, dict) else {}
+    if not isinstance(headers, dict):
+        # Only a missing helper is a legacy Open WebUI compatibility case.
+        # Once the core helper exists, exceptions or contract violations point
+        # to a v0.9.6+ auth/header bug that should fail visibly instead of
+        # being masked by the older hand-built header path.
+        raise TypeError(
+            "open_webui.utils.tools.build_tool_server_headers() returned "
+            f"non-dict headers: {type(headers).__name__}"
+        )
+    return dict(headers)
 
 
 async def _build_mcp_headers_legacy(

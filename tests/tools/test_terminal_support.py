@@ -1759,6 +1759,74 @@ async def test_sub_agent_mcp_resolution_uses_core_tool_server_headers(
 
 
 @pytest.mark.asyncio
+async def test_sub_agent_mcp_resolution_rejects_invalid_core_tool_server_headers(
+    monkeypatch, dummy_request
+):
+    from types import ModuleType
+
+    import open_webui
+    import open_webui.utils.tools as ow_tools
+
+    connect_calls = []
+
+    async def fake_build_tool_server_headers(
+        connection, request, user, server_id="", metadata=None, extra_params=None
+    ):
+        return None, {"session": "cookie"}
+
+    class FakeMCPClient:
+        async def connect(self, url, headers=None):
+            connect_calls.append({"url": url, "headers": headers})
+
+        async def list_tool_specs(self):
+            return [{"name": "lookup", "parameters": {"properties": {}}}]
+
+    utils_package = open_webui.utils
+    fake_misc_module = ModuleType("open_webui.utils.misc")
+    fake_misc_module.is_string_allowed = lambda value, allowlist: True
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", fake_misc_module)
+    monkeypatch.setattr(utils_package, "misc", fake_misc_module, raising=False)
+
+    fake_mcp_package = ModuleType("open_webui.utils.mcp")
+    fake_mcp_client_module = ModuleType("open_webui.utils.mcp.client")
+    fake_mcp_client_module.MCPClient = FakeMCPClient
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp", fake_mcp_package)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp.client", fake_mcp_client_module)
+    monkeypatch.setattr(utils_package, "mcp", fake_mcp_package, raising=False)
+
+    monkeypatch.setattr(
+        ow_tools,
+        "build_tool_server_headers",
+        fake_build_tool_server_headers,
+        raising=False,
+    )
+
+    dummy_request.app.state.config.TOOL_SERVER_CONNECTIONS = [
+        {
+            "type": "mcp",
+            "url": "https://mcp.example.com",
+            "auth_type": "bearer",
+            "key": "legacy-token",
+            "info": {"id": "docs"},
+            "config": {"enable": True},
+        }
+    ]
+
+    tools_dict, clients = await sub_agent.resolve_mcp_tools(
+        request=dummy_request,
+        user=SimpleNamespace(id="u1", email="u1@example.com", role="user"),
+        mcp_tool_ids=["server:mcp:docs"],
+        extra_params={},
+        metadata={},
+        debug=True,
+    )
+
+    assert tools_dict == {}
+    assert clients == {}
+    assert connect_calls == []
+
+
+@pytest.mark.asyncio
 async def test_sub_agent_load_tools_collects_direct_tool_server_system_prompts(
     monkeypatch, dummy_request
 ):
