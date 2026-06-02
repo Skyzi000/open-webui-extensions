@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.0
+version: 0.2.1
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -412,6 +412,113 @@ async def _emit_warning_notification(
         _mcp_tools_log.debug(f"Error emitting MCP warning notification: {exc}")
 
 
+async def _build_mcp_headers_with_core(
+    *,
+    connection: dict,
+    request: Request,
+    user: Any,
+    server_id: str,
+    metadata: dict,
+    extra_params: dict,
+) -> Optional[dict[str, Any]]:
+    try:
+        from open_webui.utils.tools import build_tool_server_headers
+    except ImportError:
+        return None
+
+    result = await _mcp_maybe_await(
+        build_tool_server_headers(
+            connection,
+            request,
+            user,
+            server_id=server_id,
+            metadata=metadata,
+            extra_params=extra_params,
+        )
+    )
+    headers = result[0] if isinstance(result, tuple) else result
+    if not isinstance(headers, dict):
+        # Only a missing helper is a legacy Open WebUI compatibility case.
+        # Once the core helper exists, exceptions or contract violations point
+        # to a v0.9.6+ auth/header bug that should fail visibly instead of
+        # being masked by the older hand-built header path.
+        raise TypeError(
+            "open_webui.utils.tools.build_tool_server_headers() returned "
+            f"non-dict headers: {type(headers).__name__}"
+        )
+    return dict(headers)
+
+
+async def _build_mcp_headers_legacy(
+    *,
+    connection: dict,
+    request: Request,
+    user: Any,
+    server_id: str,
+    metadata: dict,
+    extra_params: dict,
+) -> dict[str, Any]:
+    from open_webui.utils.headers import include_user_info_headers
+    from open_webui.env import ENABLE_FORWARD_USER_INFO_HEADERS
+
+    try:
+        from open_webui.env import (
+            FORWARD_SESSION_INFO_HEADER_CHAT_ID,
+            FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
+        )
+    except ImportError:
+        FORWARD_SESSION_INFO_HEADER_CHAT_ID = None
+        FORWARD_SESSION_INFO_HEADER_MESSAGE_ID = None
+
+    auth_type = connection.get("auth_type", "")
+    headers: dict[str, Any] = {}
+    if auth_type == "bearer":
+        headers["Authorization"] = f'Bearer {connection.get("key", "")}'
+    elif auth_type == "none":
+        pass
+    elif auth_type == "session":
+        token = getattr(getattr(request.state, "token", None), "credentials", "")
+        headers["Authorization"] = f"Bearer {token}"
+    elif auth_type == "system_oauth":
+        oauth_token = extra_params.get("__oauth_token__", None)
+        if oauth_token:
+            headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
+    elif auth_type in ("oauth_2.1", "oauth_2.1_static"):
+        # Open WebUI core (utils/middleware.py) looks up OAuth tokens under
+        # the colon-trailing segment of ``server_id`` so that ``host:port``
+        # style ids resolve to the key the UI stored. Mirror that for the
+        # lookup only -- keep the full ``server_id`` for the ``mcp_clients``
+        # cache key, otherwise two servers sharing a trailing segment would
+        # collide and the earlier client would be overwritten without cleanup.
+        try:
+            splits = server_id.split(":")
+            oauth_lookup_id = splits[-1] if len(splits) > 1 else server_id
+
+            oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
+                user.id, f"mcp:{oauth_lookup_id}"
+            )
+
+            if oauth_token:
+                headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
+        except Exception as e:
+            _mcp_tools_log.error(
+                f"Error getting OAuth token for MCP server {server_id}: {e}"
+            )
+
+    connection_headers = connection.get("headers", None)
+    if connection_headers and isinstance(connection_headers, dict):
+        headers.update(connection_headers)
+
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+        headers = include_user_info_headers(headers, user)
+        if FORWARD_SESSION_INFO_HEADER_CHAT_ID and metadata.get("chat_id"):
+            headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata["chat_id"]
+        if FORWARD_SESSION_INFO_HEADER_MESSAGE_ID and metadata.get("message_id"):
+            headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID] = metadata["message_id"]
+
+    return headers
+
+
 async def resolve_mcp_tools(
     request: Request,
     user: Any,
@@ -439,8 +546,6 @@ async def resolve_mcp_tools(
         return {}, {}
 
     from open_webui.utils.misc import is_string_allowed
-    from open_webui.utils.headers import include_user_info_headers
-    from open_webui.env import ENABLE_FORWARD_USER_INFO_HEADERS
 
     try:
         from open_webui.utils.access_control import has_connection_access
@@ -448,15 +553,6 @@ async def resolve_mcp_tools(
         from open_webui.utils.tools import (
             has_tool_server_access as has_connection_access,
         )
-
-    try:
-        from open_webui.env import (
-            FORWARD_SESSION_INFO_HEADER_CHAT_ID,
-            FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
-        )
-    except ImportError:
-        FORWARD_SESSION_INFO_HEADER_CHAT_ID = None
-        FORWARD_SESSION_INFO_HEADER_MESSAGE_ID = None
 
     event_emitter = (extra_params or {}).get("__event_emitter__")
 
@@ -526,54 +622,23 @@ async def resolve_mcp_tools(
                 await emit_warning(f"Access denied to MCP server '{server_id}'")
                 continue
 
-            auth_type = mcp_server_connection.get("auth_type", "")
-            headers: dict[str, Any] = {}
-            if auth_type == "bearer":
-                headers["Authorization"] = f'Bearer {mcp_server_connection.get("key", "")}'
-            elif auth_type == "none":
-                pass
-            elif auth_type == "session":
-                token = getattr(getattr(request.state, "token", None), "credentials", "")
-                headers["Authorization"] = f"Bearer {token}"
-            elif auth_type == "system_oauth":
-                oauth_token = extra_params.get("__oauth_token__", None)
-                if oauth_token:
-                    headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
-            elif auth_type in ("oauth_2.1", "oauth_2.1_static"):
-                # Open WebUI core (utils/middleware.py) looks up OAuth
-                # tokens under the colon-trailing segment of ``server_id``
-                # so that ``host:port`` style ids resolve to the key the
-                # UI stored. Mirror that for the lookup only -- keep the
-                # full ``server_id`` for the ``mcp_clients`` cache key,
-                # otherwise two servers sharing a trailing segment (e.g.
-                # ``alpha:443`` and ``beta:443``) would collide on
-                # ``mcp_clients[443]`` and the earlier client would be
-                # overwritten without being added to the cleanup set.
-                try:
-                    splits = server_id.split(":")
-                    oauth_lookup_id = splits[-1] if len(splits) > 1 else server_id
-
-                    oauth_token = await request.app.state.oauth_client_manager.get_oauth_token(
-                        user.id, f"mcp:{oauth_lookup_id}"
-                    )
-
-                    if oauth_token:
-                        headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
-                except Exception as e:
-                    _mcp_tools_log.error(
-                        f"Error getting OAuth token for MCP server {server_id}: {e}"
-                    )
-
-            connection_headers = mcp_server_connection.get("headers", None)
-            if connection_headers and isinstance(connection_headers, dict):
-                headers.update(connection_headers)
-
-            if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-                headers = include_user_info_headers(headers, user)
-                if FORWARD_SESSION_INFO_HEADER_CHAT_ID and metadata.get("chat_id"):
-                    headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata["chat_id"]
-                if FORWARD_SESSION_INFO_HEADER_MESSAGE_ID and metadata.get("message_id"):
-                    headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID] = metadata["message_id"]
+            headers = await _build_mcp_headers_with_core(
+                connection=mcp_server_connection,
+                request=request,
+                user=user,
+                server_id=server_id,
+                metadata=metadata,
+                extra_params=extra_params,
+            )
+            if headers is None:
+                headers = await _build_mcp_headers_legacy(
+                    connection=mcp_server_connection,
+                    request=request,
+                    user=user,
+                    server_id=server_id,
+                    metadata=metadata,
+                    extra_params=extra_params,
+                )
 
             function_name_filter_list = mcp_server_connection.get("config", {}).get(
                 "function_name_filter_list", ""
@@ -686,6 +751,8 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "query_knowledge_bases",
         "search_knowledge_files",
         "query_knowledge_files",
+        "grep_knowledge_files",
+        "kb_exec",
         "view_file",
         "view_knowledge_file",
     },
@@ -834,10 +901,11 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
     metadata: Optional[dict],
     debug: bool = False,
 ) -> list[dict]:
-    """Resolve direct tool servers from request.body() first, then metadata."""
-    metadata_servers = normalize_direct_tool_servers(
-        (metadata or {}).get("tool_servers") if isinstance(metadata, dict) else None
-    )
+    """Resolve direct tool servers using core-gated metadata as source of truth."""
+    metadata_has_tool_servers = isinstance(metadata, dict) and "tool_servers" in metadata
+    if metadata_has_tool_servers:
+        return normalize_direct_tool_servers(metadata.get("tool_servers"))
+
     request_servers: list[dict] = []
     if request is not None:
         request_body = getattr(request, "body", None)
@@ -859,13 +927,8 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
             except Exception:
                 request_servers = []
     if request_servers:
-        if debug and metadata_servers and len(metadata_servers) != len(request_servers):
-            _tool_servers_log.warning(
-                "tool_servers mismatch between request body and metadata; "
-                "using request body tool_servers"
-            )
         return request_servers
-    return metadata_servers
+    return []
 
 
 def build_direct_tools_dict(
