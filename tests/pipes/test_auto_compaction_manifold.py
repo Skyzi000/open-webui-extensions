@@ -1386,7 +1386,7 @@ async def test_summary_generation_passes_open_webui_user_model_to_inner_completi
 
 
 @pytest.mark.asyncio
-async def test_tool_history_compaction_summarizes_full_history_and_keeps_latest_user_raw(
+async def test_tool_history_compaction_summarizes_before_latest_tool_round_and_preserves_tool_messages(
     monkeypatch,
     pipe_request,
     pipe_user,
@@ -1431,20 +1431,27 @@ async def test_tool_history_compaction_summarizes_full_history_and_keeps_latest_
         "user",
         "assistant",
         "user",
-        "assistant",
-        "tool",
     ]
-    assert captured["source_messages"][-1] == original_tool
     assert compacted[0] == {"role": "system", "content": "system prompt"}
     assert compacted[1]["role"] == "user"
     assert "<auto_compaction_context>" in compacted[1]["content"]
     assert "combined summary" in compacted[1]["content"]
-    assert compacted[2] == {"role": "user", "content": "active request"}
-    assert not any(message.get("role") == "tool" for message in compacted)
+    assert compacted[2] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"q":"alpha"}'},
+            }
+        ],
+    }
+    assert compacted[3] == original_tool
 
 
 @pytest.mark.asyncio
-async def test_tool_history_compaction_passes_multiple_tool_rounds_as_source_messages(
+async def test_tool_history_compaction_summarizes_all_but_latest_sequential_tool_round(
     monkeypatch,
     pipe_request,
     pipe_user,
@@ -1463,19 +1470,17 @@ async def test_tool_history_compaction_passes_multiple_tool_rounds_as_source_mes
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {"name": "search", "arguments": '{"q":"alpha"}'},
-                },
-                {
-                    "id": "call-2",
-                    "type": "function",
-                    "function": {"name": "fetch", "arguments": '{"url":"https://example.test"}'},
-                },
+                {"id": "call-1", "type": "function", "function": {"name": "search", "arguments": '{"q":"alpha"}'}}
             ],
         },
         {"role": "tool", "tool_call_id": "call-1", "content": {"value": 42}},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call-2", "type": "function", "function": {"name": "fetch", "arguments": '{"url":"https://example.test"}'}}
+            ],
+        },
         {"role": "tool", "tool_call_id": "call-2", "content": "fetched body"},
     ]
 
@@ -1488,10 +1493,9 @@ async def test_tool_history_compaction_passes_multiple_tool_rounds_as_source_mes
     )
 
     assert did_compact is True
-    assert captured["source_messages"] == messages
+    assert captured["source_messages"] == messages[:3]
     assert "combined summary" in compacted[0]["content"]
-    assert compacted[1] == {"role": "user", "content": "active request"}
-    assert not any(message.get("role") == "tool" for message in compacted)
+    assert compacted[1:] == messages[3:]
 
 
 @pytest.mark.asyncio
@@ -2340,15 +2344,16 @@ async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exce
     assert [message["role"] for message in summary_inputs[0]] == [
         "user",
         "user",
-        "assistant",
-        "tool",
     ]
     assert "existing summary" in summary_inputs[0][0]["content"]
-    assert summary_inputs[0][-1] == tool_message
     messages = captured["forward_body"]["messages"]
     assert "combined active summary" in messages[0]["content"]
-    assert messages[1] == {"role": "user", "content": "active"}
-    assert not any(message.get("role") == "tool" for message in messages)
+    assert messages[1] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call-1", "type": "function"}],
+    }
+    assert messages[2] == tool_message
     assert events == []
 
 
@@ -2460,15 +2465,16 @@ async def test_pipe_compacts_active_tool_result_when_normal_checkpoint_exact_hit
     assert [message["role"] for message in summary_inputs[0]] == [
         "user",
         "user",
-        "assistant",
-        "tool",
     ]
     assert "existing summary" in summary_inputs[0][0]["content"]
-    assert summary_inputs[0][-1] == tool_message
     messages = captured["forward_body"]["messages"]
     assert "combined active summary" in messages[0]["content"]
-    assert messages[1] == {"role": "user", "content": "active"}
-    assert not any(message.get("role") == "tool" for message in messages)
+    assert messages[1] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call-1", "type": "function"}],
+    }
+    assert messages[2] == tool_message
     assert events == []
 
 
@@ -2662,11 +2668,10 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
 
     assert result == {"ok": True}
     assert len(summary_inputs) == 1
-    assert summary_inputs[0] == body["messages"]
+    assert summary_inputs[0] == [{"role": "user", "content": "active"}]
     retry_messages = calls[1]["messages"]
     assert "combined retry summary" in retry_messages[0]["content"]
-    assert retry_messages[1] == {"role": "user", "content": "active"}
-    assert not any(message.get("role") == "tool" for message in retry_messages)
+    assert retry_messages[1:] == body["messages"][1:]
     assert "previous_response_id" not in calls[1]
 
 
@@ -2708,7 +2713,12 @@ async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_me
                 "</auto_compaction_context>"
             ),
         },
-        {"role": "user", "content": "active"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        original_tool,
     ]
 
 
@@ -2793,14 +2803,14 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
 
     assert result == {"ok": True}
     assert len(summary_inputs) == 1
-    assert summary_inputs[0] == body["messages"]
+    assert summary_inputs[0] == body["messages"][:3]
     messages = captured["forward_body"]["messages"]
-    assert messages[1]["role"] == "user"
+    assert messages[1:] == body["messages"][3:]
     summary_text = "\n".join(message.get("content", "") for message in messages if message.get("role") == "user")
     assert "combined old tool summary" in summary_text
     assert "<auto_compaction_context>" in summary_text
     assert not any(message.get("tool_call_id") == "call-1" for message in messages)
-    assert not any(message.get("tool_call_id") == "call-2" for message in messages)
+    assert any(message.get("tool_call_id") == "call-2" for message in messages)
     assert "previous_response_id" not in captured["forward_body"]
 
 

@@ -134,7 +134,7 @@ def test_summary_insertion_without_historical_user_messages_omits_excerpt_sectio
     assert compacted[1:] == [{"role": "user", "content": "active"}]
 
 
-def test_tool_loop_compaction_summarizes_every_complete_round():
+def test_tool_loop_compaction_retains_only_latest_complete_round_raw():
     messages = [
         {"role": "user", "content": "active request"},
         {
@@ -154,8 +154,55 @@ def test_tool_loop_compaction_summarizes_every_complete_round():
     cut = mod.select_tool_result_compaction_cut(messages)
 
     assert cut is not None
-    assert cut.active_user_message == {"role": "user", "content": "active request"}
-    assert [message["tool_call_id"] for message in cut.tool_messages_to_summarize] == ["call-1", "call-2"]
+    assert cut.summarization_prefix == [
+        {"role": "user", "content": "active request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search"}}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+    ]
+    assert cut.tail_messages == [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function", "function": {"name": "fetch"}}],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+    ]
+
+
+def test_tool_loop_compaction_keeps_latest_parallel_tool_call_round_intact():
+    latest_assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "call-2", "type": "function", "function": {"name": "fetch"}},
+            {"id": "call-3", "type": "function", "function": {"name": "read"}},
+        ],
+    }
+    latest_tools = [
+        {"role": "tool", "tool_call_id": "call-2", "content": "fetch result"},
+        {"role": "tool", "tool_call_id": "call-3", "content": "read result"},
+    ]
+    messages = [
+        {"role": "user", "content": "active request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search"}}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+        latest_assistant,
+        *latest_tools,
+    ]
+
+    cut = mod.select_tool_result_compaction_cut(messages)
+
+    assert cut is not None
+    assert cut.summarization_prefix == messages[:3]
+    assert cut.tail_messages == [latest_assistant, *latest_tools]
 
 
 def test_tool_loop_compaction_rejects_orphan_tool_messages():

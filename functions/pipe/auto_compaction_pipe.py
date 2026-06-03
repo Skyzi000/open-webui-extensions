@@ -166,16 +166,18 @@ class MessageCut:
 
 @dataclass(frozen=True)
 class RetryToolResultCut:
-    active_user_message: dict[str, Any]
-    tool_round_messages: list[dict[str, Any]]
-    tool_messages_to_summarize: list[dict[str, Any]]
+    preserved_system_message: dict[str, Any] | None
+    summarization_prefix: list[dict[str, Any]]
+    tail_messages: list[dict[str, Any]]
+    source_message_count: int
 
 
 @dataclass(frozen=True)
 class ToolResultCompactionCut:
-    active_user_message: dict[str, Any]
-    tool_round_messages: list[dict[str, Any]]
-    tool_messages_to_summarize: list[dict[str, Any]]
+    preserved_system_message: dict[str, Any] | None
+    summarization_prefix: list[dict[str, Any]]
+    tail_messages: list[dict[str, Any]]
+    source_message_count: int
 
 
 class RetryableContextOverflow(Exception):
@@ -627,58 +629,76 @@ def select_retry_tool_result_cut(messages: list[dict[str, Any]]) -> RetryToolRes
     if cut is None:
         return None
     return RetryToolResultCut(
-        active_user_message=cut.active_user_message,
-        tool_round_messages=cut.tool_round_messages,
-        tool_messages_to_summarize=cut.tool_messages_to_summarize,
+        preserved_system_message=copy.deepcopy(cut.preserved_system_message),
+        summarization_prefix=copy.deepcopy(cut.summarization_prefix),
+        tail_messages=copy.deepcopy(cut.tail_messages),
+        source_message_count=cut.source_message_count,
     )
 
 
 def select_tool_result_compaction_cut(
     messages: list[dict[str, Any]],
 ) -> ToolResultCompactionCut | None:
+    source_messages = [copy.deepcopy(message) for message in messages]
+    system_index = _first_system_index(source_messages)
+    preserved_system = copy.deepcopy(source_messages[system_index]) if system_index is not None else None
+    working = [message for index, message in enumerate(source_messages) if index != system_index]
+
     latest_user_index = next(
-        (index for index in range(len(messages) - 1, -1, -1) if messages[index].get("role") == "user"),
+        (index for index in range(len(working) - 1, -1, -1) if working[index].get("role") == "user"),
         None,
     )
-    if latest_user_index is None or latest_user_index >= len(messages) - 1:
+    if latest_user_index is None or latest_user_index >= len(working) - 1:
         return None
 
-    tool_round = copy.deepcopy(messages[latest_user_index + 1 :])
-    assistant_rounds: list[tuple[set[str], list[dict[str, Any]]]] = []
+    tool_loop_start = latest_user_index + 1
+    tool_loop_messages = working[tool_loop_start:]
+    complete_rounds: list[tuple[int, int, set[str]]] = []
     all_assistant_ids: set[str] = set()
-    for message in tool_round:
+    for relative_index, message in enumerate(tool_loop_messages):
         if message.get("role") != "assistant":
             continue
         ids = _tool_call_ids(message)
         if not ids:
             continue
-        round_tool_messages = [
-            copy.deepcopy(candidate)
-            for candidate in tool_round
+        round_tool_indices = [
+            tool_loop_start + candidate_relative_index
+            for candidate_relative_index, candidate in enumerate(tool_loop_messages)
             if candidate.get("role") == "tool" and candidate.get("tool_call_id") in ids
         ]
-        seen = {candidate.get("tool_call_id") for candidate in round_tool_messages}
+        seen = {working[index].get("tool_call_id") for index in round_tool_indices}
         if ids <= seen:
-            assistant_rounds.append((ids, round_tool_messages))
+            round_start = tool_loop_start + relative_index
+            round_end = max(round_tool_indices) + 1
+            complete_rounds.append((round_start, round_end, ids))
             all_assistant_ids.update(ids)
 
-    if not assistant_rounds:
+    if not complete_rounds:
         return None
 
-    for message in tool_round:
+    for message in tool_loop_messages:
         if message.get("role") == "tool" and message.get("tool_call_id") not in all_assistant_ids:
             return None
 
-    tool_messages: list[dict[str, Any]] = []
-    for _, round_tool_messages in assistant_rounds:
-        tool_messages.extend(round_tool_messages)
-    if not tool_messages:
+    latest_round_start, _, _ = complete_rounds[-1]
+    summarization_prefix = copy.deepcopy(working[:latest_round_start])
+    tail_messages = copy.deepcopy(working[latest_round_start:])
+    if not summarization_prefix or not tail_messages:
+        return None
+
+    tail_assistant_ids = _assistant_tool_call_ids(tail_messages)
+    for message in tail_messages:
+        if message.get("role") == "tool" and message.get("tool_call_id") not in tail_assistant_ids:
+            return None
+
+    if not any(message.get("role") == "tool" for message in tail_messages):
         return None
 
     return ToolResultCompactionCut(
-        active_user_message=copy.deepcopy(messages[latest_user_index]),
-        tool_round_messages=tool_round,
-        tool_messages_to_summarize=tool_messages,
+        preserved_system_message=preserved_system,
+        summarization_prefix=summarization_prefix,
+        tail_messages=tail_messages,
+        source_message_count=len(summarization_prefix),
     )
 
 
@@ -2312,11 +2332,6 @@ async def _generate_summary_text(
     return await extract_text_from_completion_response(response)
 
 
-def _messages_without_first_system(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    system_index = _first_system_index(messages)
-    return [copy.deepcopy(message) for index, message in enumerate(messages) if index != system_index]
-
-
 async def _compact_retry_tool_results(
     *,
     request: Any,
@@ -2329,7 +2344,7 @@ async def _compact_retry_tool_results(
     if cut is None:
         return messages, False
 
-    source_messages = _messages_without_first_system(messages)
+    source_messages = copy.deepcopy(cut.summarization_prefix)
     try:
         summary = await _generate_summary_text(
             request=request,
@@ -2347,16 +2362,15 @@ async def _compact_retry_tool_results(
         raise
 
     compacted: list[dict[str, Any]] = []
-    system_index = _first_system_index(messages)
-    if system_index is not None:
-        compacted.append(copy.deepcopy(messages[system_index]))
+    if cut.preserved_system_message is not None:
+        compacted.append(copy.deepcopy(cut.preserved_system_message))
     compacted.append(
         render_summary_message(
             summary,
             {"has_multimodal": _messages_have_multimodal(source_messages)},
         )
     )
-    compacted.append(copy.deepcopy(cut.active_user_message))
+    compacted.extend(copy.deepcopy(cut.tail_messages))
     return compacted, True
 
 
