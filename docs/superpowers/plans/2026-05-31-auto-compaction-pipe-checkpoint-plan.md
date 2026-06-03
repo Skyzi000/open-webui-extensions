@@ -23,7 +23,7 @@ This Pipe exists to prevent long-running chats from stopping because the accumul
 - Checkpoints are durable continuation state, not disposable optimization cache.
 - Existing ready checkpoints must remain readable and extendable across ordinary implementation, prompt, summary model, target model, and cut-policy changes whenever the stored summary format can still be consumed.
 - A request that is at or above the compaction threshold must prefer exact checkpoint reuse, rolling checkpoint extension, or a usable parent checkpoint over raw direct forwarding, because raw direct forwarding is likely to reproduce the context-window failure this Pipe exists to avoid.
-- Provider context-window errors are compaction signals, not terminal failures. When the first attempt overflows, the Pipe must compact more aggressively and retry instead of surfacing the error whenever no target content has already been emitted.
+- Provider context-window errors are compaction signals, not terminal failures. When the first attempt overflows, the Pipe must compact with the same latest-user boundary and retry instead of surfacing the error whenever no target content has already been emitted.
 - Automatic checkpoint expiry, pruning, or prompt-version invalidation violates the v1 objective because it can make an otherwise continuable long chat impossible to continue.
 - External provider failures and provider errors that cannot be classified as context overflow remain explicit v1 risks, not reasons to weaken the continuation requirement.
 
@@ -88,8 +88,8 @@ Define the complete v1 Valve surface in the Pipe. Do not add additional Valves d
 - `summary_model`: optional admin-selected Open WebUI model for summarization; empty means use the selected target model. Pipe-backed summary models are allowed. Arena models are not valid summary models.
 - `trigger_total_tokens`: global provider-usage threshold for starting compaction.
 - `force_include_usage`: when enabled, the copied inner streaming target request must ask OpenAI-compatible providers to include usage chunks. Disable only for providers that reject this request option.
-- `keep_tail_messages`: minimum number of recent messages to keep after compaction.
-- `preserve_latest_tool_rounds`: minimum number of complete recent assistant/tool rounds to keep.
+- `historical_message_excerpt_bytes`: maximum UTF-8 bytes retained from the middle-truncated text of each historical user message inserted alongside the AI-generated summary.
+- `historical_message_excerpt_count`: maximum number of recent historical user messages inserted as middle-truncated excerpts. The Pipe selects the most recent historical user messages before the latest user message, then renders those selected excerpts in chronological order. `0` disables mechanical historical excerpts.
 
 ## Compaction Trigger Strategy
 
@@ -134,7 +134,7 @@ Context-overflow retry requirements:
 - After the first non-error event, or after any target content, reasoning delta, or tool-call delta has been yielded, streaming error chunks must be captured for status/diagnostics but must not trigger an internal retry in v1.
 - If any target content, reasoning delta, or tool-call delta has already been emitted to the client, the Pipe must not silently restart that call; it should surface the error and status because the response is no longer cleanly retryable.
 - A retry must remove provider state such as `previous_response_id` when compaction changes the message payload.
-- Retry compaction may be more aggressive than normal threshold compaction. It may reduce retained-tail requirements and compact oversized recent tool results when keeping them raw would reproduce the context overflow, but it must preserve valid chat/tool message structure and enough semantic content to continue the user task.
+- Compaction always uses the same boundary: the first system message is preserved separately, every message before the latest user message is summarized, and the latest user message remains raw. Tool-call/result rounds after that latest user message are never retained as `assistant`/`tool` protocol messages after compaction; they are replaced by user-role tool-result summary messages.
 - Retry compaction must not silently summarize or replace the active latest user message. If the latest user message itself is too large to send raw after all safe compaction options are exhausted, the Pipe must fail clearly instead of rewriting the user's request.
 - If the summary model itself returns a context-window error while summarizing a large prefix or tool result, the Pipe must retry summarization by extending from an existing parent checkpoint when available. Dynamic adaptive summary splitting is out of v1 scope. If the latest tool result alone exceeds the summary model's capacity, the Pipe must return a clear error instead of inventing a lossy split strategy.
 
@@ -161,7 +161,7 @@ Required checkpoint columns:
 - `schema_version`
 - `user_id`
 - `chat_id`
-- `pipe_model_id`
+- `pipe_function_id`
 - `profile_hash`
 - `source_message_count`
 - `source_hash`
@@ -178,7 +178,7 @@ Required unique lookup key:
 - `namespace`
 - `user_id`
 - `chat_id`
-- `pipe_model_id`
+- `pipe_function_id`
 - `profile_hash`
 - `source_hash`
 
@@ -192,11 +192,11 @@ Required unique lookup key:
 
 `summary_model` affects only generation on a checkpoint miss. Once a checkpoint is ready, changing `summary_model` or changing the prompt used for future summaries must not invalidate that `summary_text`. If a future implementation introduces a truly incompatible summary format, it should add a legacy reader or a new table/schema version rather than casually changing the v1 `profile_hash` and breaking continuation of existing long chats.
 
-`pipe_model_id` in checkpoint keys means the base Pipe function id before the manifold suffix, not the full selected wrapper id. The target model suffix must not indirectly scope checkpoint reuse.
+`pipe_function_id` in checkpoint keys means the base Pipe function id before the manifold suffix, not the full selected wrapper id. The target model suffix must not indirectly scope checkpoint reuse.
 
-`source_hash` must be computed from a canonical JSON serialization of the exact stable prefix being summarized. Canonicalization must avoid transient values such as signed URLs, volatile file metadata, generated temporary ids, and provider-specific decoration that is not semantically part of the conversation. If an active multimodal/file reference cannot be canonicalized safely, keep that message in the retained tail or skip compaction.
+`source_hash` must be computed from a canonical JSON serialization of the exact stable prefix being summarized. Canonicalization must avoid transient values such as signed URLs, volatile file metadata, generated temporary ids, and provider-specific decoration that is not semantically part of the conversation. If an active multimodal/file reference cannot be canonicalized safely, keep it with the latest user turn or skip compaction.
 
-Parent checkpoint selection must be exact, not approximate. To extend a checkpoint, the Pipe must choose the longest ready checkpoint in the same namespace, user, chat, Pipe id, and profile whose `source_hash` matches a canonical prefix of the current summarization prefix. `source_message_count` may be used to order candidates, but it must not be trusted without `source_hash` validation. `parent_checkpoint_id` is nullable for base checkpoints and is set when a newly inserted checkpoint is derived from an existing checkpoint.
+Parent checkpoint selection must be exact, not approximate. To extend a checkpoint, the Pipe must choose the longest ready checkpoint in the same namespace, user, chat, Pipe Function id, and profile whose `source_hash` matches a canonical prefix of the current summarization prefix. `source_message_count` may be used to order candidates, but it must not be trusted without `source_hash` validation. `parent_checkpoint_id` is nullable for base checkpoints and is set when a newly inserted checkpoint is derived from an existing checkpoint.
 
 Do not store message ids or output indexes in v1. They are not needed for the planned lookup key or rolling checkpoint extension.
 
@@ -204,7 +204,7 @@ Do not store message ids or output indexes in v1. They are not needed for the pl
 
 1. Pipe receives `body`, `__metadata__`, `__request__`, and `__user__`.
 2. Pipe deep-copies `body` into an inner request payload.
-3. Pipe resolves `pipe_model_id` and `target_model` by stripping the selected manifold wrapper prefix from original `body["model"]`.
+3. Pipe resolves `pipe_function_id` and `target_model` by stripping the selected manifold wrapper prefix from original `body["model"]`.
 4. Pipe rejects malformed wrapper ids, unknown target models, this Pipe's own generated wrapper models, arena models, and target models the current user may not access.
 5. Pipe restores forwarded metadata from `__metadata__`.
 6. Pipe sets only the copied inner payload model to `target_model`.
@@ -223,26 +223,26 @@ Do not store message ids or output indexes in v1. They are not needed for the pl
 19. On miss, Pipe searches for the longest exact parent checkpoint that represents a canonical prefix of the desired summarization prefix.
 20. If a parent checkpoint exists, Pipe calls the summary model with the parent summary as compressed historical context plus only the delta messages after the parent prefix.
 21. Summary calls must be marked with summary-task metadata, must not request tools, must preserve and restore request-scoped bypass state, and may target a Pipe-backed summary model as long as the summary task cannot recursively compact itself.
-22. If no parent checkpoint exists, Pipe calls the summary model with the raw summarization prefix and lets the normal compaction failure behavior handle summary-context overflow.
+22. If no parent checkpoint exists, Pipe calls the summary model with the raw summarization prefix and lets the compaction failure behavior handle summary-context overflow.
 23. Pipe inserts the checkpoint for the full desired prefix. If it was derived from a parent checkpoint, the row records that parent checkpoint id. If a concurrent insert wins elsewhere, Pipe fetches and uses the existing ready checkpoint.
-24. Pipe replaces the old prefix with the preserved system message, a compact user-role summary message, and retained tail messages.
+24. Pipe replaces the old prefix with the preserved system message, a compact user-role summary message containing both AI summary text and chronological middle-truncated historical user excerpts, and the raw latest user message.
 25. Pipe removes `previous_response_id` only when compaction was applied.
 26. Pipe forwards the compacted copied payload to the target model with scoped request-state restoration and wraps any streaming response for usage and context-error capture.
-27. If a wrapped target call fails with a retryable context-window error before any target output is emitted, Pipe compacts more aggressively and retries within the fixed retry budget.
+27. If a wrapped target call fails with a retryable context-window error before any target output is emitted, Pipe compacts with the same latest-user boundary and retries within the fixed retry budget.
 28. If retry compaction succeeds, Pipe returns the retried streaming response as the user-visible response and stores any reusable checkpoint state created along the way.
 
 ## Message Compaction Rules
 
 - Preserve the first system message unchanged.
 - Insert the summary as a `role: "user"` message immediately after the first system message, or at index 0 when there is no system message.
-- The summary message must state that it is compressed historical context and not a new instruction.
+- The summary message must be XML-tag structured under `<auto_compaction_context>`, with the AI-generated checkpoint summary inside `<checkpoint_summary>` and mechanical historical user excerpts inside `<historical_user_messages>`.
+- Arbitrary summary, excerpt, and tool-result-summary text must be wrapped in CDATA sections, escaping `]]>` by splitting CDATA sections.
+- The summary message must state inside an `<instruction>` tag that it is compressed historical context and not a new instruction.
 - Do not include the preserved first system message in the summarization prefix.
-- Do not start the retained tail with a tool message.
-- Do not retain an assistant tool-call message without its corresponding tool results.
-- Do not retain tool result messages without the corresponding earlier assistant tool call.
-- Normal compaction must retain the latest user message as a raw message.
-- Normal compaction must retain at least the latest complete assistant/tool round as raw messages.
-- Context-error retry may override normal raw retention for historical tail messages and oversized tool results when those messages are themselves too large, but the active latest user message must remain raw. If that latest user message is the reason the request cannot fit, the Pipe must return a clear error rather than silently rewriting it.
+- The latest user message must remain raw.
+- Historical user messages in the summarized prefix must also appear as chronological middle-truncated excerpts inside the summary message, bounded by `historical_message_excerpt_bytes` per message and `historical_message_excerpt_count` total messages.
+- Do not retain tool result messages as `role: "tool"` after compaction. Complete assistant/tool rounds after the latest user message must be replaced by user-role `<auto_compacted_tool_results>` summary messages.
+- If the latest user message itself is the reason the request cannot fit after all safe compaction options are exhausted, the Pipe must return a clear error rather than silently rewriting it.
 - Treat multimodal content conservatively. If summarized history contains images or file-derived content, record that fact in summary metadata and keep recent active image references in the tail.
 
 ## Files To Create
@@ -279,7 +279,7 @@ Do not start with builder integration unless the single-file proof works.
 - [ ] Write tests that prove profile hashes change only when hard checkpoint compatibility boundaries change.
 - [ ] Write tests that prove profile hashes do not change for summary prompt wording, target model, summary model, wrapper suffix, or cut-policy changes.
 - [ ] Write tests that prove target model ids with special characters round-trip through manifold wrapper ids.
-- [ ] Write tests that prove selected wrapper ids split into the Pipe id and decoded target model id.
+- [ ] Write tests that prove selected wrapper ids split into the Pipe Function id and decoded target model id.
 - [ ] Run the checkpoint test file and confirm it fails before implementation.
 - [ ] Implement only the primitives needed to satisfy these tests.
 - [ ] Run the checkpoint test file and confirm it passes.
@@ -305,11 +305,11 @@ Do not start with builder integration unless the single-file proof works.
 - Modify: `functions/pipe/auto_compaction_pipe.py`
 - Create: `tests/pipes/test_auto_compaction_messages.py`
 
-- [ ] Add tests that verify the retained tail never starts with a tool message.
+- [ ] Add tests that verify compaction keeps the latest user message raw and does not retain tool-role messages.
 - [ ] Add tests that verify assistant tool calls and corresponding tool results are not split.
 - [ ] Add tests that verify orphan tool result messages are not retained.
-- [ ] Add tests that verify the latest user message remains in the retained tail.
-- [ ] Add tests that verify at least the latest complete assistant/tool round is retained.
+- [ ] Add tests that verify historical user messages are inserted as chronological middle-truncated excerpts.
+- [ ] Add tests that verify complete assistant/tool rounds after the latest user message are replaced by user-role summary messages.
 - [ ] Implement the safe-cut selector.
 - [ ] Run message tests.
 
@@ -323,7 +323,7 @@ Do not start with builder integration unless the single-file proof works.
 - [ ] Add tests that verify the first system message is preserved unchanged.
 - [ ] Add tests that verify the summary is inserted only as a user-role historical context message.
 - [ ] Add tests that verify no system message is created or modified for summary insertion.
-- [ ] Add tests that verify the retained tail is appended unchanged after the summary message.
+- [ ] Add tests that verify the latest user message is appended unchanged after the summary message.
 - [ ] Implement summary rendering and prefix replacement.
 - [ ] Run message tests.
 
@@ -426,7 +426,7 @@ Do not start with builder integration unless the single-file proof works.
 - [ ] Add tests that verify retry stops at a fixed internal retry budget and does not retry non-context errors.
 - [ ] Add tests that verify raw direct forwarding is limited to cases where compaction is not required or no safer checkpoint-based continuation path exists.
 - [ ] Add tests that verify fallback forwarding still captures stream usage.
-- [ ] Implement conservative context-window error detection, pre-emission aggressive compact-and-retry behavior, failure handling, and status emission without treating checkpoints as optional cache.
+- [ ] Implement conservative context-window error detection, pre-emission compact-and-retry behavior, failure handling, and status emission without treating checkpoints as optional cache.
 - [ ] Run all Pipe tests and compile the Pipe file.
 
 ## Task 9: Manual Open WebUI Verification
@@ -481,8 +481,8 @@ Do not start with builder integration unless the single-file proof works.
 - **Retry after partial output:** Once target output has been emitted to the client, an internal retry would duplicate or corrupt the stream. Mitigation: retry only before user-visible output begins, do not fully buffer normal streams, and surface streaming errors that arrive after body iteration has started.
 - **Oversized active input:** The latest user message or latest tool result can itself exceed available context or summary-model capacity. Mitigation: never rewrite the active user request silently; compact oversized tool results only when the summary model can safely process them, and return a clear error otherwise.
 - **Summary authority:** Putting user/tool history into a system message can elevate historical text. Mitigation: never modify system messages; always inject summaries as user-role historical context.
-- **Rolling summary drift:** Repeatedly extending summaries can accumulate omissions or distortions. Mitigation: use the longest exact parent checkpoint, include only verified delta messages after that parent, preserve recent tail and tool rounds, and keep the summary output contract backward compatible.
-- **Summary quality:** Bad summaries can degrade answer quality. Mitigation: preserve recent tail and tool rounds, keep summary compatibility stable for existing checkpoints, reuse existing ready checkpoints across target/summary model changes, and make compaction threshold conservative by default.
+- **Rolling summary drift:** Repeatedly extending summaries can accumulate omissions or distortions. Mitigation: use the longest exact parent checkpoint, include only verified delta messages after that parent, include bounded chronological middle-truncated historical user excerpts, and keep the summary output contract backward compatible.
+- **Summary quality:** Bad summaries can degrade answer quality. Mitigation: include bounded historical user excerpts alongside the AI summary, keep summary compatibility stable for existing checkpoints, reuse existing ready checkpoints across target/summary model changes, and make compaction threshold conservative by default.
 - **Table lifecycle:** Extension-owned tables will not be managed by Open WebUI migrations. Mitigation: version table names and never destructively migrate in place.
 - **Privacy:** Summaries may contain sensitive data. Mitigation: do not store raw prefixes and document that summaries are persisted in the same DB as chat data.
 - **DB growth:** Checkpoints accumulate outside Open WebUI migrations. Mitigation: store only summaries and compact metadata in v1, keep the table versioned, and defer explicit admin cleanup/export policy until there is real usage data. Do not prune automatically in v1 because doing so can break continuation of long chats.
@@ -506,7 +506,7 @@ Ship a single-file Pipe with:
 - request-scoped stream usage capture for native tool-loop recursion
 - read-only persisted usage lookup for later turns
 - conservative context-window error classification and pre-emission compact-and-retry behavior
-- aggressive retry compaction for oversized recent tool results
+- tool-result summary replacement for complete assistant/tool rounds after the latest user message
 - conservative safe-cut logic
 - user-role summary injection only
 - backward-compatible summary consumption

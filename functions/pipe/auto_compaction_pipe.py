@@ -13,6 +13,7 @@ import asyncio
 import copy
 import fnmatch
 import hashlib
+import html
 import json
 import time
 from contextlib import suppress
@@ -55,6 +56,8 @@ SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
 SOURCE_HASH_FAMILY = "canonical-json-v1"
 PROFILE_HASH_FAMILY = "checkpoint-profile-v1"
 MAX_CONTEXT_RETRY_ATTEMPTS = 2
+DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES = 512
+DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT = 32
 
 try:
     from open_webui.internal.db import DATABASE_SCHEMA as OPEN_WEBUI_DATABASE_SCHEMA
@@ -70,7 +73,7 @@ CHECKPOINT_TABLE = Table(
     Column("schema_version", Integer, nullable=False),
     Column("user_id", Text, nullable=False),
     Column("chat_id", Text, nullable=False),
-    Column("pipe_model_id", Text, nullable=False),
+    Column("pipe_function_id", Text, nullable=False),
     Column("profile_hash", Text, nullable=False),
     Column("source_message_count", Integer, nullable=False),
     Column("source_hash", Text, nullable=False),
@@ -85,7 +88,7 @@ CHECKPOINT_TABLE = Table(
         "namespace",
         "user_id",
         "chat_id",
-        "pipe_model_id",
+        "pipe_function_id",
         "profile_hash",
         "source_hash",
         name=CHECKPOINT_LOOKUP_UQ,
@@ -95,7 +98,7 @@ CHECKPOINT_TABLE = Table(
         "namespace",
         "user_id",
         "chat_id",
-        "pipe_model_id",
+        "pipe_function_id",
         "profile_hash",
         "source_message_count",
     ),
@@ -119,9 +122,15 @@ def release_generation_lock(key: tuple[str, str, str, str, str, str], lock: asyn
 
 @dataclass(frozen=True)
 class WrapperIdentity:
-    pipe_model_id: str
+    pipe_function_id: str
     target_model_suffix: str
     target_model_id: str
+
+
+@dataclass(frozen=True)
+class ReusableCheckpointMatch:
+    kind: str
+    source_message_count: int
 
 
 @dataclass(frozen=True)
@@ -188,27 +197,27 @@ def encode_target_model_id(target_model_id: str) -> str:
     return target_model_id
 
 
-def build_wrapper_model_id(pipe_model_id: str, target_model_id: str) -> str:
-    return f"{pipe_model_id}.{encode_target_model_id(target_model_id)}"
+def build_wrapper_model_id(pipe_function_id: str, target_model_id: str) -> str:
+    return f"{pipe_function_id}.{encode_target_model_id(target_model_id)}"
 
 
-def decode_wrapper_model_id(wrapper_model_id: str, *, expected_pipe_id: str = PIPE_FUNCTION_ID) -> WrapperIdentity:
+def decode_wrapper_model_id(wrapper_model_id: str, *, expected_pipe_function_id: str = PIPE_FUNCTION_ID) -> WrapperIdentity:
     if not isinstance(wrapper_model_id, str) or "." not in wrapper_model_id:
-        raise ValueError("Malformed wrapper id: expected '<pipe_id>.<target_model_id>'")
-    pipe_model_id, target_model_id = wrapper_model_id.split(".", 1)
-    if expected_pipe_id and pipe_model_id != expected_pipe_id:
-        raise ValueError(f"Unexpected wrapper pipe id: expected {expected_pipe_id!r}, got {pipe_model_id!r}")
+        raise ValueError("Malformed wrapper id: expected '<pipe_function_id>.<target_model_id>'")
+    pipe_function_id, target_model_id = wrapper_model_id.split(".", 1)
+    if expected_pipe_function_id and pipe_function_id != expected_pipe_function_id:
+        raise ValueError(f"Unexpected wrapper pipe function id: expected {expected_pipe_function_id!r}, got {pipe_function_id!r}")
     if not target_model_id:
         raise ValueError("Malformed wrapper id: missing target model id")
     return WrapperIdentity(
-        pipe_model_id=pipe_model_id,
+        pipe_function_id=pipe_function_id,
         target_model_suffix=target_model_id,
         target_model_id=target_model_id,
     )
 
 
-def is_generated_wrapper_model_id(model_id: Any, *, pipe_model_id: str = PIPE_FUNCTION_ID) -> bool:
-    return isinstance(model_id, str) and model_id.startswith(f"{pipe_model_id}.")
+def is_generated_wrapper_model_id(model_id: Any, *, pipe_function_id: str = PIPE_FUNCTION_ID) -> bool:
+    return isinstance(model_id, str) and model_id.startswith(f"{pipe_function_id}.")
 
 
 _TOP_LEVEL_MESSAGE_DROP_KEYS = {
@@ -557,66 +566,6 @@ def _assistant_tool_call_ids(messages: Iterable[dict[str, Any]]) -> set[str]:
     return ids
 
 
-def _expand_start_for_tool_pairs(messages: list[dict[str, Any]], start: int) -> int:
-    start = max(0, min(start, len(messages)))
-    changed = True
-    while changed and start > 0:
-        changed = False
-        tail = messages[start:]
-
-        if tail and tail[0].get("role") == "tool":
-            call_id = tail[0].get("tool_call_id")
-            for index in range(start - 1, -1, -1):
-                if call_id in _tool_call_ids(messages[index]):
-                    start = index
-                    changed = True
-                    break
-            if changed:
-                continue
-
-        tail_tool_ids = {
-            message.get("tool_call_id")
-            for message in tail
-            if message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str)
-        }
-        tail_assistant_ids = _assistant_tool_call_ids(tail)
-        missing_ids = tail_tool_ids - tail_assistant_ids
-        for index in range(start - 1, -1, -1):
-            if _tool_call_ids(messages[index]) & missing_ids:
-                start = index
-                changed = True
-                break
-    return start
-
-
-def _latest_complete_tool_round_start(messages: list[dict[str, Any]], *, preserve_count: int = 1) -> int | None:
-    if preserve_count <= 0:
-        return None
-    starts: list[int] = []
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if message.get("role") != "assistant":
-            continue
-        ids = _tool_call_ids(message)
-        if not ids:
-            continue
-        seen: set[str] = set()
-        for following in messages[index + 1 :]:
-            if following.get("role") != "tool":
-                if seen:
-                    break
-                continue
-            call_id = following.get("tool_call_id")
-            if isinstance(call_id, str) and call_id in ids:
-                seen.add(call_id)
-            if ids <= seen:
-                starts.append(index)
-                if len(starts) >= preserve_count:
-                    return starts[-1]
-                break
-    return starts[-1] if starts else None
-
-
 def _remove_orphan_tool_messages(tail: list[dict[str, Any]]) -> list[dict[str, Any]]:
     assistant_ids = _assistant_tool_call_ids(tail)
     cleaned: list[dict[str, Any]] = []
@@ -631,10 +580,6 @@ def _remove_orphan_tool_messages(tail: list[dict[str, Any]]) -> list[dict[str, A
 
 def select_safe_message_cut(
     messages: list[dict[str, Any]],
-    *,
-    keep_tail_messages: int,
-    preserve_latest_tool_rounds: int,
-    aggressive: bool = False,
 ) -> MessageCut:
     if not messages:
         return MessageCut(None, [], [], 0)
@@ -651,27 +596,11 @@ def select_safe_message_cut(
         (index for index in range(len(working) - 1, -1, -1) if working[index].get("role") == "user"),
         len(working) - 1,
     )
-    base_start = min(max(0, len(working) - max(1, keep_tail_messages)), latest_user_index)
-
-    if preserve_latest_tool_rounds > 0 and not aggressive:
-        round_start = _latest_complete_tool_round_start(
-            working,
-            preserve_count=max(1, int(preserve_latest_tool_rounds or 0)),
-        )
-        if round_start is not None:
-            base_start = min(base_start, round_start)
-
-    if not aggressive:
-        base_start = _expand_start_for_tool_pairs(working, base_start)
-
-    tail = _remove_orphan_tool_messages(copy.deepcopy(working[base_start:]))
+    tail = copy.deepcopy(working[latest_user_index:])
     if not any(message.get("role") == "user" for message in tail):
         tail = [copy.deepcopy(working[latest_user_index])]
 
-    # The summarized prefix is based on the original boundary. Orphan tool
-    # cleanup affects only the retained tail; it does not make tool output a
-    # stable lookup key.
-    prefix = copy.deepcopy(working[:base_start])
+    prefix = copy.deepcopy(working[:latest_user_index])
     return MessageCut(
         preserved_system_message=preserved_system,
         summarization_prefix=prefix,
@@ -681,7 +610,7 @@ def select_safe_message_cut(
 
 
 def select_retry_tool_result_cut(messages: list[dict[str, Any]]) -> RetryToolResultCut | None:
-    cut = select_tool_result_compaction_cut(messages, preserve_latest_tool_rounds=0, aggressive=True)
+    cut = select_tool_result_compaction_cut(messages)
     if cut is None:
         return None
     return RetryToolResultCut(
@@ -693,9 +622,6 @@ def select_retry_tool_result_cut(messages: list[dict[str, Any]]) -> RetryToolRes
 
 def select_tool_result_compaction_cut(
     messages: list[dict[str, Any]],
-    *,
-    preserve_latest_tool_rounds: int,
-    aggressive: bool = False,
 ) -> ToolResultCompactionCut | None:
     latest_user_index = next(
         (index for index in range(len(messages) - 1, -1, -1) if messages[index].get("role") == "user"),
@@ -730,13 +656,8 @@ def select_tool_result_compaction_cut(
         if message.get("role") == "tool" and message.get("tool_call_id") not in all_assistant_ids:
             return None
 
-    preserve_count = 0 if aggressive else max(0, int(preserve_latest_tool_rounds or 0))
-    summarize_count = len(assistant_rounds) if aggressive else max(0, len(assistant_rounds) - preserve_count)
-    if summarize_count <= 0:
-        return None
-
     tool_messages: list[dict[str, Any]] = []
-    for _, round_tool_messages in assistant_rounds[:summarize_count]:
+    for _, round_tool_messages in assistant_rounds:
         tool_messages.extend(round_tool_messages)
     if not tool_messages:
         return None
@@ -748,16 +669,111 @@ def select_tool_result_compaction_cut(
     )
 
 
-def render_summary_message(summary_text: str, summary_meta: dict[str, Any] | None = None) -> dict[str, Any]:
-    meta_suffix = ""
+def _message_content_as_excerpt_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, sort_keys=True)
+
+
+def truncate_text_middle_by_utf8_bytes(text: str, max_bytes: int) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    budget = max(0, int(max_bytes or 0))
+    encoded = text.encode("utf-8")
+    if len(encoded) <= budget:
+        return text
+    if budget <= 0:
+        return ""
+
+    marker = "...[middle omitted]..."
+    marker_bytes = marker.encode("utf-8")
+    if budget <= len(marker_bytes):
+        return marker_bytes[:budget].decode("utf-8", errors="ignore")
+
+    remaining = budget - len(marker_bytes)
+    prefix_budget = remaining // 2
+    suffix_budget = remaining - prefix_budget
+    prefix = encoded[:prefix_budget].decode("utf-8", errors="ignore")
+    suffix = encoded[-suffix_budget:].decode("utf-8", errors="ignore") if suffix_budget > 0 else ""
+    result = f"{prefix}{marker}{suffix}"
+    while len(result.encode("utf-8")) > budget and suffix:
+        suffix = suffix[1:]
+        result = f"{prefix}{marker}{suffix}"
+    return result
+
+
+def _xml_attr(value: Any) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _xml_cdata(value: Any) -> str:
+    text = str(value)
+    return "<![CDATA[" + text.replace("]]>", "]]]]><![CDATA[>") + "]]>"
+
+
+def render_historical_user_message_excerpts(
+    source_messages: list[dict[str, Any]],
+    *,
+    excerpt_bytes: int,
+    max_messages: int,
+) -> str:
+    count_limit = int(max_messages or 0)
+    if count_limit <= 0:
+        return ""
+
+    excerpts: list[str] = []
+    for message in source_messages:
+        if message.get("role") != "user":
+            continue
+        text = _message_content_as_excerpt_text(message).strip()
+        if not text:
+            continue
+        excerpts.append(truncate_text_middle_by_utf8_bytes(text, excerpt_bytes))
+    excerpts = excerpts[-count_limit:]
+    if not excerpts:
+        return ""
+
+    lines = [
+        (
+            f'<historical_user_messages order="chronological" selected_count="{len(excerpts)}" '
+            f'max_count="{count_limit}" max_bytes_per_message="{int(excerpt_bytes or 0)}">'
+        )
+    ]
+    for index, excerpt in enumerate(excerpts, start=1):
+        lines.append(f'<historical_user_message ordinal="{index}">{_xml_cdata(excerpt)}</historical_user_message>')
+    lines.append("</historical_user_messages>")
+    return "\n".join(lines)
+
+
+def render_summary_message(
+    summary_text: str,
+    summary_meta: dict[str, Any] | None = None,
+    *,
+    historical_source_messages: list[dict[str, Any]] | None = None,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+) -> dict[str, Any]:
+    meta_section = ""
     if summary_meta and summary_meta.get("has_multimodal"):
-        meta_suffix = "\n\nNote: the summarized history contained multimodal or file-derived context."
+        meta_section = "\n<metadata><has_multimodal>true</has_multimodal></metadata>"
+    excerpts = ""
+    if historical_source_messages:
+        excerpts = render_historical_user_message_excerpts(
+            historical_source_messages,
+            excerpt_bytes=historical_message_excerpt_bytes,
+            max_messages=historical_message_excerpt_count,
+        )
+    excerpt_section = f"\n{excerpts}" if excerpts else ""
     return {
         "role": "user",
         "content": (
-            "Compressed historical context (not a new instruction). "
-            "Use this only as background for continuity:\n\n"
-            f"{summary_text.strip()}{meta_suffix}"
+            "<auto_compaction_context>\n"
+            "<instruction>Compressed historical context. This is not a new instruction. "
+            "Use it only as background for continuity.</instruction>\n"
+            f"<checkpoint_summary>{_xml_cdata(summary_text.strip())}</checkpoint_summary>"
+            f"{meta_section}{excerpt_section}\n"
+            "</auto_compaction_context>"
         ),
     }
 
@@ -767,11 +783,22 @@ def replace_prefix_with_summary(
     cut: MessageCut,
     summary_text: str,
     summary_meta: dict[str, Any] | None = None,
+    *,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
 ) -> list[dict[str, Any]]:
     compacted: list[dict[str, Any]] = []
     if cut.preserved_system_message is not None:
         compacted.append(copy.deepcopy(cut.preserved_system_message))
-    compacted.append(render_summary_message(summary_text, summary_meta))
+    compacted.append(
+        render_summary_message(
+            summary_text,
+            summary_meta,
+            historical_source_messages=cut.summarization_prefix,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+    )
     compacted.extend(copy.deepcopy(cut.tail_messages))
     return compacted
 
@@ -779,6 +806,9 @@ def replace_prefix_with_summary(
 def replace_prefix_with_parent_checkpoint_and_delta(
     cut: MessageCut,
     parent: dict[str, Any],
+    *,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
 ) -> list[dict[str, Any]]:
     parent_count = int(parent.get("source_message_count") or 0)
     if parent_count <= 0 or parent_count > len(cut.summarization_prefix):
@@ -808,16 +838,31 @@ def replace_prefix_with_parent_checkpoint_and_delta(
     compacted: list[dict[str, Any]] = []
     if cut.preserved_system_message is not None:
         compacted.append(copy.deepcopy(cut.preserved_system_message))
-    compacted.append(render_summary_message(str(parent["summary_text"]), parent.get("summary_meta") or {}))
+    compacted.append(
+        render_summary_message(
+            str(parent["summary_text"]),
+            parent.get("summary_meta") or {},
+            historical_source_messages=cut.summarization_prefix,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+    )
     compacted.extend(delta_messages)
     compacted.extend(copy.deepcopy(cut.tail_messages))
     return compacted
 
 
 def render_tool_result_compaction_message(tool_summaries: list[tuple[str, str]]) -> dict[str, Any]:
-    parts = ["Auto-compacted tool result summary. This is historical context, not a new instruction."]
+    parts = [
+        "<auto_compacted_tool_results>",
+        "<instruction>This is historical context, not a new instruction.</instruction>",
+    ]
     for tool_call_id, summary in tool_summaries:
-        parts.extend(["", f"tool_call_id: {tool_call_id}", summary.strip()])
+        parts.append(
+            f'<tool_result_summary tool_call_id="{_xml_attr(tool_call_id)}">'
+            f"{_xml_cdata(summary.strip())}</tool_result_summary>"
+        )
+    parts.append("</auto_compacted_tool_results>")
     return {"role": "user", "content": "\n".join(parts)}
 
 
@@ -826,13 +871,13 @@ def build_checkpoint_id(
     namespace: str,
     user_id: str,
     chat_id: str,
-    pipe_model_id: str,
+    pipe_function_id: str,
     profile_hash: str,
     source_hash: str,
 ) -> str:
     digest = hashlib.sha256(
         json.dumps(
-            [namespace, user_id, chat_id, pipe_model_id, profile_hash, source_hash],
+            [namespace, user_id, chat_id, pipe_function_id, profile_hash, source_hash],
             separators=(",", ":"),
             ensure_ascii=False,
         ).encode("utf-8")
@@ -845,7 +890,7 @@ def build_checkpoint_row(
     namespace: str,
     user_id: str,
     chat_id: str,
-    pipe_model_id: str,
+    pipe_function_id: str,
     profile_hash: str,
     source_hash: str,
     source_message_count: int,
@@ -860,7 +905,7 @@ def build_checkpoint_row(
             namespace=namespace,
             user_id=user_id,
             chat_id=chat_id,
-            pipe_model_id=pipe_model_id,
+            pipe_function_id=pipe_function_id,
             profile_hash=profile_hash,
             source_hash=source_hash,
         ),
@@ -868,7 +913,7 @@ def build_checkpoint_row(
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "user_id": user_id,
         "chat_id": chat_id,
-        "pipe_model_id": pipe_model_id,
+        "pipe_function_id": pipe_function_id,
         "profile_hash": profile_hash,
         "source_message_count": int(source_message_count),
         "source_hash": source_hash,
@@ -956,7 +1001,7 @@ class CheckpointStore:
         namespace: str,
         user_id: str,
         chat_id: str,
-        pipe_model_id: str,
+        pipe_function_id: str,
         profile_hash: str,
         source_hash: str,
     ) -> dict[str, Any] | None:
@@ -966,7 +1011,7 @@ class CheckpointStore:
                     CHECKPOINT_TABLE.c.namespace == namespace,
                     CHECKPOINT_TABLE.c.user_id == user_id,
                     CHECKPOINT_TABLE.c.chat_id == chat_id,
-                    CHECKPOINT_TABLE.c.pipe_model_id == pipe_model_id,
+                    CHECKPOINT_TABLE.c.pipe_function_id == pipe_function_id,
                     CHECKPOINT_TABLE.c.profile_hash == profile_hash,
                     CHECKPOINT_TABLE.c.source_hash == source_hash,
                     CHECKPOINT_TABLE.c.state == "ready",
@@ -981,7 +1026,7 @@ class CheckpointStore:
         namespace: str,
         user_id: str,
         chat_id: str,
-        pipe_model_id: str,
+        pipe_function_id: str,
         profile_hash: str,
         prefix_hashes: dict[int, str],
     ) -> dict[str, Any] | None:
@@ -994,7 +1039,7 @@ class CheckpointStore:
                     CHECKPOINT_TABLE.c.namespace == namespace,
                     CHECKPOINT_TABLE.c.user_id == user_id,
                     CHECKPOINT_TABLE.c.chat_id == chat_id,
-                    CHECKPOINT_TABLE.c.pipe_model_id == pipe_model_id,
+                    CHECKPOINT_TABLE.c.pipe_function_id == pipe_function_id,
                     CHECKPOINT_TABLE.c.profile_hash == profile_hash,
                     CHECKPOINT_TABLE.c.state == "ready",
                     CHECKPOINT_TABLE.c.source_message_count.in_(list(prefix_hashes.keys())),
@@ -1016,7 +1061,7 @@ class CheckpointStore:
                     namespace=row["namespace"],
                     user_id=row["user_id"],
                     chat_id=row["chat_id"],
-                    pipe_model_id=row["pipe_model_id"],
+                    pipe_function_id=row["pipe_function_id"],
                     profile_hash=row["profile_hash"],
                     source_hash=row["source_hash"],
                 )
@@ -1079,11 +1124,11 @@ def _model_base_model_id(model: dict[str, Any]) -> str | None:
     return None
 
 
-def _is_based_on_generated_wrapper(model: dict[str, Any], *, pipe_model_id: str = PIPE_FUNCTION_ID) -> bool:
-    return is_generated_wrapper_model_id(_model_base_model_id(model), pipe_model_id=pipe_model_id)
+def _is_based_on_generated_wrapper(model: dict[str, Any], *, pipe_function_id: str = PIPE_FUNCTION_ID) -> bool:
+    return is_generated_wrapper_model_id(_model_base_model_id(model), pipe_function_id=pipe_function_id)
 
 
-def filter_target_models(models: Iterable[dict[str, Any]], valves: Any, *, pipe_model_id: str = PIPE_FUNCTION_ID):
+def filter_target_models(models: Iterable[dict[str, Any]], valves: Any, *, pipe_function_id: str = PIPE_FUNCTION_ID):
     include_patterns = _split_patterns(getattr(valves, "include_model_patterns", ""))
     exclude_patterns = _split_patterns(getattr(valves, "exclude_model_patterns", ""))
     seen: set[str] = set()
@@ -1096,9 +1141,9 @@ def filter_target_models(models: Iterable[dict[str, Any]], valves: Any, *, pipe_
         model_id = _model_id(model)
         if model_id is None or model_id in seen:
             continue
-        if is_generated_wrapper_model_id(model_id, pipe_model_id=pipe_model_id):
+        if is_generated_wrapper_model_id(model_id, pipe_function_id=pipe_function_id):
             continue
-        if _is_based_on_generated_wrapper(model, pipe_model_id=pipe_model_id):
+        if _is_based_on_generated_wrapper(model, pipe_function_id=pipe_function_id):
             continue
         if _is_arena_model(model):
             continue
@@ -1249,7 +1294,7 @@ def build_target_model_contract(target_model: dict[str, Any], target_model_info:
 
 def build_wrapper_model_form(
     *,
-    pipe_model_id: str,
+    pipe_function_id: str,
     function_owner_user_id: str,
     target_model: dict[str, Any],
     target_model_info: Any | None = None,
@@ -1257,7 +1302,7 @@ def build_wrapper_model_form(
 ) -> dict[str, Any]:
     target = build_target_model_contract(target_model, target_model_info)
     target_id = target.id
-    wrapper_id = build_wrapper_model_id(pipe_model_id, target_id)
+    wrapper_id = build_wrapper_model_id(pipe_function_id, target_id)
     prefix = str(getattr(valves, "model_name_prefix", "Compact: "))
     access_grants = copy.deepcopy(target.access_grants)
     target_owner = target.owner_user_id
@@ -1277,7 +1322,7 @@ def build_wrapper_model_form(
     meta = copy.deepcopy(target.meta)
     meta["description"] = f"Auto-compacting wrapper for {target_id}"
     meta["auto_compaction"] = {
-        "pipe_model_id": pipe_model_id,
+        "pipe_function_id": pipe_function_id,
         "target_model_id": target_id,
     }
     return {
@@ -1331,7 +1376,7 @@ def _wrapper_model_record_matches_form(existing: Any, model_form: Any) -> bool:
 
 async def sync_wrapper_model_records(
     *,
-    pipe_model_id: str,
+    pipe_function_id: str,
     target_models: list[dict[str, Any]],
     valves: Any,
 ) -> None:
@@ -1341,7 +1386,7 @@ async def sync_wrapper_model_records(
     except Exception:
         return
 
-    function = await Functions.get_function_by_id(pipe_model_id)
+    function = await Functions.get_function_by_id(pipe_function_id)
     owner_user_id = getattr(function, "user_id", None)
     if not owner_user_id:
         return
@@ -1354,7 +1399,7 @@ async def sync_wrapper_model_records(
                 with suppress(Exception):
                     target_model_info = await Models.get_model_by_id(target_id)
             form_payload = build_wrapper_model_form(
-                pipe_model_id=pipe_model_id,
+                pipe_function_id=pipe_function_id,
                 function_owner_user_id=owner_user_id,
                 target_model=target_model,
                 target_model_info=target_model_info,
@@ -2028,22 +2073,10 @@ def _usage_total(usage: dict[str, Any] | None) -> int | None:
 
 def _context_exhaustion_error_response(
     messages: Any,
-    *,
-    keep_tail_messages: int,
-    preserve_latest_tool_rounds: int,
 ) -> dict[str, Any]:
     if isinstance(messages, list):
-        cut = select_safe_message_cut(
-            messages,
-            keep_tail_messages=max(1, min(int(keep_tail_messages or 1), 1)),
-            preserve_latest_tool_rounds=0,
-            aggressive=True,
-        )
-        tool_cut = select_tool_result_compaction_cut(
-            messages,
-            preserve_latest_tool_rounds=preserve_latest_tool_rounds,
-            aggressive=True,
-        )
+        cut = select_safe_message_cut(messages)
+        tool_cut = select_tool_result_compaction_cut(messages)
         latest_user = next((message for message in reversed(messages) if message.get("role") == "user"), None)
         if latest_user is not None and not cut.summarization_prefix and tool_cut is None:
             return _error_response(
@@ -2231,9 +2264,9 @@ def _strip_tool_request_fields(body: dict[str, Any]) -> dict[str, Any]:
     return copied
 
 
-def _resolve_summary_model_for_call(summary_model_id: str, *, pipe_model_id: str = PIPE_FUNCTION_ID) -> str:
-    if is_generated_wrapper_model_id(summary_model_id, pipe_model_id=pipe_model_id):
-        return decode_wrapper_model_id(summary_model_id, expected_pipe_id=pipe_model_id).target_model_id
+def _resolve_summary_model_for_call(summary_model_id: str, *, pipe_function_id: str = PIPE_FUNCTION_ID) -> str:
+    if is_generated_wrapper_model_id(summary_model_id, pipe_function_id=pipe_function_id):
+        return decode_wrapper_model_id(summary_model_id, expected_pipe_function_id=pipe_function_id).target_model_id
     return summary_model_id
 
 
@@ -2327,14 +2360,8 @@ async def _compact_retry_tool_results(
     metadata: dict[str, Any],
     summary_model_id: str,
     messages: list[dict[str, Any]],
-    preserve_latest_tool_rounds: int = 0,
-    aggressive: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
-    cut = select_tool_result_compaction_cut(
-        messages,
-        preserve_latest_tool_rounds=preserve_latest_tool_rounds,
-        aggressive=aggressive,
-    )
+    cut = select_tool_result_compaction_cut(messages)
     if cut is None:
         return messages, False
 
@@ -2400,14 +2427,14 @@ async def _get_or_create_checkpoint_summary(
     request: Any,
     user_id: str,
     chat_id: str,
-    pipe_model_id: str,
+    pipe_function_id: str,
     source_messages: list[dict[str, Any]],
     summary_meta: dict[str, Any],
     summary_factory: Callable[[dict[str, Any] | None], Awaitable[str]],
 ) -> str:
     profile_hash = compute_profile_hash()
     source_hash = compute_source_hash(source_messages)
-    lock_key = (CHECKPOINT_NAMESPACE, user_id, chat_id, pipe_model_id, profile_hash, source_hash)
+    lock_key = (CHECKPOINT_NAMESPACE, user_id, chat_id, pipe_function_id, profile_hash, source_hash)
     lock = get_generation_lock(lock_key)
 
     try:
@@ -2422,7 +2449,7 @@ async def _get_or_create_checkpoint_summary(
                 namespace=CHECKPOINT_NAMESPACE,
                 user_id=user_id,
                 chat_id=chat_id,
-                pipe_model_id=pipe_model_id,
+                pipe_function_id=pipe_function_id,
                 profile_hash=profile_hash,
                 source_hash=source_hash,
             )
@@ -2435,7 +2462,7 @@ async def _get_or_create_checkpoint_summary(
                 namespace=CHECKPOINT_NAMESPACE,
                 user_id=user_id,
                 chat_id=chat_id,
-                pipe_model_id=pipe_model_id,
+                pipe_function_id=pipe_function_id,
                 profile_hash=profile_hash,
                 prefix_hashes=compute_prefix_hashes(source_messages),
             )
@@ -2449,7 +2476,7 @@ async def _get_or_create_checkpoint_summary(
                 namespace=CHECKPOINT_NAMESPACE,
                 user_id=user_id,
                 chat_id=chat_id,
-                pipe_model_id=pipe_model_id,
+                pipe_function_id=pipe_function_id,
                 profile_hash=profile_hash,
                 source_hash=source_hash,
                 source_message_count=len(source_messages),
@@ -2466,6 +2493,62 @@ async def _get_or_create_checkpoint_summary(
             return summary_text
     finally:
         release_generation_lock(lock_key, lock)
+
+
+async def _body_reusable_checkpoint_match(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    include_parent: bool,
+) -> ReusableCheckpointMatch | None:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 2:
+        return None
+
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
+    if not user_id or not _chat_id_supported(chat_id):
+        return None
+
+    profile_hash = compute_profile_hash()
+    cut = select_safe_message_cut(messages)
+    if not cut.summarization_prefix:
+        return None
+
+    try:
+        await ensure_checkpoint_table_initialized(request=request)
+        store = CheckpointStore()
+        source_hash = compute_source_hash(cut.summarization_prefix)
+        existing = await store.lookup_ready(
+            namespace=CHECKPOINT_NAMESPACE,
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_function_id=pipe_function_id,
+            profile_hash=profile_hash,
+            source_hash=source_hash,
+        )
+        if existing:
+            return ReusableCheckpointMatch(kind="exact", source_message_count=cut.source_message_count)
+        if include_parent:
+            parent = await store.find_longest_parent(
+                namespace=CHECKPOINT_NAMESPACE,
+                user_id=user_id,
+                chat_id=chat_id,
+                pipe_function_id=pipe_function_id,
+                profile_hash=profile_hash,
+                prefix_hashes=compute_prefix_hashes(cut.summarization_prefix),
+            )
+            if parent is not None:
+                return ReusableCheckpointMatch(
+                    kind="parent",
+                    source_message_count=int(parent.get("source_message_count") or 0),
+                )
+    except Exception:
+        return None
+    return None
 
 
 async def _model_dict_from_request(request: Any) -> dict[str, Any]:
@@ -2702,23 +2785,17 @@ async def _compact_body(
     user: Any,
     metadata: dict[str, Any],
     body: dict[str, Any],
-    pipe_model_id: str,
+    pipe_function_id: str,
     target_model_id: str,
     summary_model_id: str,
-    keep_tail_messages: int,
-    preserve_latest_tool_rounds: int,
-    aggressive: bool,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
 ) -> tuple[dict[str, Any], bool]:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
         return body, False
 
-    cut = select_safe_message_cut(
-        messages,
-        keep_tail_messages=max(1, keep_tail_messages if not aggressive else min(keep_tail_messages, 1)),
-        preserve_latest_tool_rounds=0 if aggressive else preserve_latest_tool_rounds,
-        aggressive=aggressive,
-    )
+    cut = select_safe_message_cut(messages)
     if not cut.summarization_prefix:
         compacted_messages, did_compact_tools = await _compact_retry_tool_results(
             request=request,
@@ -2726,8 +2803,6 @@ async def _compact_body(
             metadata=metadata,
             summary_model_id=summary_model_id,
             messages=messages,
-            preserve_latest_tool_rounds=0 if aggressive else preserve_latest_tool_rounds,
-            aggressive=aggressive,
         )
         if did_compact_tools:
             compacted = _copy_body_preserving_metadata(body)
@@ -2771,22 +2846,32 @@ async def _compact_body(
             request=request,
             user_id=user_id,
             chat_id=chat_id,
-            pipe_model_id=pipe_model_id,
+            pipe_function_id=pipe_function_id,
             source_messages=cut.summarization_prefix,
             summary_meta=summary_meta,
             summary_factory=summary_factory,
         )
-        compacted["messages"] = replace_prefix_with_summary(messages, cut, summary_text, summary_meta)
+        compacted["messages"] = replace_prefix_with_summary(
+            messages,
+            cut,
+            summary_text,
+            summary_meta,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
     except ParentCheckpointExtensionFailed as exc:
-        compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(cut, exc.parent)
+        compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
+            cut,
+            exc.parent,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
     compacted["messages"], _ = await _compact_retry_tool_results(
         request=request,
         user=user,
         metadata=metadata,
         summary_model_id=summary_model_id,
         messages=compacted["messages"],
-        preserve_latest_tool_rounds=0 if aggressive else preserve_latest_tool_rounds,
-        aggressive=aggressive,
     )
     compacted.pop("previous_response_id", None)
     return compacted, True
@@ -2819,15 +2904,15 @@ class Pipe:
             default=True,
             description="Set stream_options.include_usage=true on copied streaming target requests when supported.",
         )
-        keep_tail_messages: int = Field(
-            default=6,
+        historical_message_excerpt_bytes: int = Field(
+            default=DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
             ge=1,
-            description="Minimum number of recent raw messages to keep after compaction.",
+            description="Maximum UTF-8 bytes retained from the middle-truncated text of each historical user message.",
         )
-        preserve_latest_tool_rounds: int = Field(
-            default=1,
+        historical_message_excerpt_count: int = Field(
+            default=DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
             ge=0,
-            description="Minimum number of complete recent assistant/tool rounds to keep after normal compaction.",
+            description="Maximum number of recent historical user messages inserted as middle-truncated excerpts. Set 0 to disable excerpts.",
         )
         pass
 
@@ -2843,7 +2928,7 @@ class Pipe:
             return []
 
         targets = filter_target_models(_iter_cache_models_from_state(state), self.valves)
-        await sync_wrapper_model_records(pipe_model_id=PIPE_FUNCTION_ID, target_models=targets, valves=self.valves)
+        await sync_wrapper_model_records(pipe_function_id=PIPE_FUNCTION_ID, target_models=targets, valves=self.valves)
 
         entries: list[dict[str, str]] = []
         prefix = str(self.valves.model_name_prefix or "")
@@ -2870,7 +2955,7 @@ class Pipe:
         is_streaming = body.get("stream") is True
         selected_wrapper_id = str(body.get("model") or "")
         try:
-            identity = decode_wrapper_model_id(selected_wrapper_id, expected_pipe_id=PIPE_FUNCTION_ID)
+            identity = decode_wrapper_model_id(selected_wrapper_id, expected_pipe_function_id=PIPE_FUNCTION_ID)
         except ValueError as exc:
             return _error_response(str(exc), code="invalid_wrapper_id")
 
@@ -2920,7 +3005,20 @@ class Pipe:
             messages=inner.get("messages") if isinstance(inner.get("messages"), list) else [],
         )
         total_tokens = _usage_total(usage)
-        should_compact = supported_context and total_tokens is not None and total_tokens >= self.valves.trigger_total_tokens
+        usage_should_compact = (
+            supported_context and total_tokens is not None and total_tokens >= self.valves.trigger_total_tokens
+        )
+        reusable_checkpoint_match = None
+        if supported_context:
+            reusable_checkpoint_match = await _body_reusable_checkpoint_match(
+                request=__request__,
+                user=user,
+                metadata=metadata,
+                body=inner,
+                pipe_function_id=identity.pipe_function_id,
+                include_parent=usage_should_compact,
+            )
+        should_compact = usage_should_compact or reusable_checkpoint_match is not None
 
         attempt = 0
         compacted_once = False
@@ -2929,26 +3027,30 @@ class Pipe:
             candidate = _copy_body_preserving_metadata(inner)
             if should_compact or compacted_once:
                 try:
-                    await emit_compaction_status(
-                        __event_emitter__,
-                        action="compacting",
-                        description="Compacting chat history before forwarding to the target model",
-                        done=False,
+                    emit_progress_status = compacted_once or (
+                        usage_should_compact
+                        and (reusable_checkpoint_match is None or reusable_checkpoint_match.kind != "exact")
                     )
+                    if emit_progress_status:
+                        await emit_compaction_status(
+                            __event_emitter__,
+                            action="compacting",
+                            description="Compacting chat history before forwarding to the target model",
+                            done=False,
+                        )
                     candidate, compacted = await _compact_body(
                         request=__request__,
                         user=user,
                         metadata=metadata,
                         body=candidate,
-                        pipe_model_id=identity.pipe_model_id,
+                        pipe_function_id=identity.pipe_function_id,
                         target_model_id=identity.target_model_id,
                         summary_model_id=summary_model_id,
-                        keep_tail_messages=self.valves.keep_tail_messages,
-                        preserve_latest_tool_rounds=self.valves.preserve_latest_tool_rounds,
-                        aggressive=compacted_once,
+                        historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                        historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                     )
                     compacted_once = compacted_once or compacted
-                    if compacted:
+                    if compacted and emit_progress_status:
                         await emit_compaction_status(
                             __event_emitter__,
                             action="compacted",
@@ -2993,8 +3095,6 @@ class Pipe:
                 if not supported_context or attempt >= MAX_CONTEXT_RETRY_ATTEMPTS:
                     error_response = _context_exhaustion_error_response(
                         candidate.get("messages"),
-                        keep_tail_messages=self.valves.keep_tail_messages,
-                        preserve_latest_tool_rounds=self.valves.preserve_latest_tool_rounds,
                     )
                     await emit_compaction_status(
                         __event_emitter__,

@@ -5,159 +5,136 @@ from copy import deepcopy
 from functions.pipe import auto_compaction_pipe as mod
 
 
-def test_safe_cut_tail_never_starts_with_tool_message():
-    messages = [
-        {"role": "user", "content": "start"},
-        {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function"}], "content": ""},
-        {"role": "tool", "tool_call_id": "call-1", "content": "tool result"},
-        {"role": "user", "content": "continue"},
-    ]
-
-    cut = mod.select_safe_message_cut(messages, keep_tail_messages=2, preserve_latest_tool_rounds=1)
-
-    assert cut.tail_messages[0]["role"] != "tool"
-    assert cut.tail_messages[0]["role"] == "assistant"
-
-
-def test_safe_cut_does_not_split_assistant_tool_call_from_results():
-    assistant = {
-        "role": "assistant",
-        "content": "",
-        "tool_calls": [
-            {"id": "call-a", "type": "function"},
-            {"id": "call-b", "type": "function"},
-        ],
-    }
-    messages = [
-        {"role": "user", "content": "start"},
-        assistant,
-        {"role": "tool", "tool_call_id": "call-a", "content": "a"},
-        {"role": "tool", "tool_call_id": "call-b", "content": "b"},
-        {"role": "user", "content": "next"},
-    ]
-
-    cut = mod.select_safe_message_cut(messages, keep_tail_messages=2, preserve_latest_tool_rounds=1)
-
-    assert assistant in cut.tail_messages
-    assert {"role": "tool", "tool_call_id": "call-a", "content": "a"} in cut.tail_messages
-    assert {"role": "tool", "tool_call_id": "call-b", "content": "b"} in cut.tail_messages
-
-
-def test_safe_cut_drops_orphan_tool_result_messages_from_tail():
-    messages = [
-        {"role": "user", "content": "start"},
-        {"role": "tool", "tool_call_id": "missing", "content": "orphan"},
-        {"role": "user", "content": "latest"},
-    ]
-
-    cut = mod.select_safe_message_cut(messages, keep_tail_messages=3, preserve_latest_tool_rounds=1)
-
-    assert {"role": "tool", "tool_call_id": "missing", "content": "orphan"} not in cut.tail_messages
-    assert cut.tail_messages[-1] == {"role": "user", "content": "latest"}
-
-
-def test_safe_cut_keeps_latest_user_message_raw():
-    messages = [
-        {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "old answer"},
-        {"role": "user", "content": "active request"},
-    ]
-
-    cut = mod.select_safe_message_cut(messages, keep_tail_messages=1, preserve_latest_tool_rounds=0)
-
-    assert cut.tail_messages[-1] == {"role": "user", "content": "active request"}
-
-
-def test_summary_insertion_preserves_system_and_appends_tail_unchanged():
+def test_safe_cut_keeps_only_latest_user_and_following_active_turn_raw():
     messages = [
         {"role": "system", "content": "system stays"},
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
-        {"role": "user", "content": "active"},
-    ]
-    original = deepcopy(messages)
-    cut = mod.select_safe_message_cut(messages, keep_tail_messages=1, preserve_latest_tool_rounds=0)
-
-    compacted = mod.replace_prefix_with_summary(messages, cut, "Old discussion summary.")
-
-    assert messages == original
-    assert compacted[0] == {"role": "system", "content": "system stays"}
-    assert compacted[1]["role"] == "user"
-    assert "compressed historical context" in compacted[1]["content"].lower()
-    assert "not a new instruction" in compacted[1]["content"].lower()
-    assert compacted[2:] == cut.tail_messages
-    assert all(m["role"] != "system" for m in compacted[1:])
-
-
-def test_summary_insertion_without_system_places_summary_first():
-    messages = [
-        {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "old answer"},
-        {"role": "user", "content": "active"},
-    ]
-    cut = mod.select_safe_message_cut(messages, keep_tail_messages=1, preserve_latest_tool_rounds=0)
-
-    compacted = mod.replace_prefix_with_summary(messages, cut, "Summary")
-
-    assert compacted[0]["role"] == "user"
-    assert compacted[0]["content"].endswith("Summary")
-    assert compacted[1:] == cut.tail_messages
-
-
-def test_preserved_system_message_is_excluded_from_summarization_prefix():
-    messages = [
-        {"role": "system", "content": "policy"},
-        {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "old answer"},
-        {"role": "user", "content": "active"},
-    ]
-
-    cut = mod.select_safe_message_cut(messages, keep_tail_messages=1, preserve_latest_tool_rounds=0)
-
-    assert cut.preserved_system_message == {"role": "system", "content": "policy"}
-    assert {"role": "system", "content": "policy"} not in cut.summarization_prefix
-
-
-def test_retry_cut_can_compact_oversized_historical_tool_result_but_not_latest_user():
-    messages = [
-        {"role": "user", "content": "start"},
-        {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function"}], "content": ""},
-        {"role": "tool", "tool_call_id": "call-1", "content": "x" * 10_000},
-        {"role": "user", "content": "active request"},
-    ]
-
-    cut = mod.select_safe_message_cut(
-        messages,
-        keep_tail_messages=1,
-        preserve_latest_tool_rounds=0,
-        aggressive=True,
-    )
-
-    assert cut.tail_messages == [{"role": "user", "content": "active request"}]
-    assert messages[-1] in cut.tail_messages
-
-
-def test_retry_tool_loop_cut_keeps_active_user_and_tool_structure():
-    messages = [
         {"role": "user", "content": "active request"},
         {
             "role": "assistant",
             "content": "",
-            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search"}}],
+            "tool_calls": [{"id": "call-1", "type": "function"}],
         },
-        {"role": "tool", "tool_call_id": "call-1", "content": "x" * 10000},
+        {"role": "tool", "tool_call_id": "call-1", "content": "tool result"},
     ]
 
-    cut = mod.select_retry_tool_result_cut(messages)
+    cut = mod.select_safe_message_cut(messages)
 
-    assert cut is not None
-    assert cut.active_user_message == {"role": "user", "content": "active request"}
-    assert cut.tool_round_messages[0]["role"] == "assistant"
-    assert cut.tool_round_messages[1]["role"] == "tool"
-    assert cut.tool_messages_to_summarize == [messages[2]]
+    assert cut.preserved_system_message == {"role": "system", "content": "system stays"}
+    assert cut.summarization_prefix == [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    assert cut.tail_messages == [
+        {"role": "user", "content": "active request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "tool result"},
+    ]
 
 
-def test_tool_loop_compaction_preserves_latest_round_and_summarizes_older_results():
+def test_safe_cut_keeps_latest_user_raw_when_no_following_tool_round():
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active request"},
+    ]
+
+    cut = mod.select_safe_message_cut(messages)
+
+    assert cut.summarization_prefix == [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    assert cut.tail_messages == [{"role": "user", "content": "active request"}]
+
+
+def test_summary_insertion_preserves_system_and_adds_chronological_user_excerpts():
+    long_user = "first " + ("x" * 200) + " last"
+    messages = [
+        {"role": "system", "content": "system stays"},
+        {"role": "user", "content": long_user},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "short user"},
+        {"role": "assistant", "content": "short answer"},
+        {"role": "user", "content": "active"},
+    ]
+    original = deepcopy(messages)
+    cut = mod.select_safe_message_cut(messages)
+
+    compacted = mod.replace_prefix_with_summary(
+        messages,
+        cut,
+        "Old discussion summary.",
+        historical_message_excerpt_bytes=40,
+        historical_message_excerpt_count=16,
+    )
+
+    assert messages == original
+    assert compacted[0] == {"role": "system", "content": "system stays"}
+    summary_message = compacted[1]
+    assert summary_message["role"] == "user"
+    assert "<auto_compaction_context>" in summary_message["content"]
+    assert "<checkpoint_summary><![CDATA[Old discussion summary.]]></checkpoint_summary>" in summary_message["content"]
+    assert "<historical_user_messages" in summary_message["content"]
+    assert '<historical_user_message ordinal="1"><![CDATA[first ' in summary_message["content"]
+    assert "middle omitted" in summary_message["content"]
+    assert " last" in summary_message["content"]
+    assert '<historical_user_message ordinal="2"><![CDATA[short user]]></historical_user_message>' in summary_message["content"]
+    assert compacted[2:] == [{"role": "user", "content": "active"}]
+    assert all(m["role"] != "system" for m in compacted[1:])
+
+
+def test_summary_insertion_limits_historical_user_excerpts_to_recent_count():
+    messages = [
+        {"role": "user", "content": "oldest"},
+        {"role": "assistant", "content": "oldest answer"},
+        {"role": "user", "content": "middle"},
+        {"role": "assistant", "content": "middle answer"},
+        {"role": "user", "content": "newest historical"},
+        {"role": "assistant", "content": "newest answer"},
+        {"role": "user", "content": "active"},
+    ]
+    cut = mod.select_safe_message_cut(messages)
+
+    compacted = mod.replace_prefix_with_summary(
+        messages,
+        cut,
+        "Summary",
+        historical_message_excerpt_bytes=128,
+        historical_message_excerpt_count=2,
+    )
+
+    content = compacted[0]["content"]
+    assert "oldest" not in content
+    assert '<historical_user_message ordinal="1"><![CDATA[middle]]></historical_user_message>' in content
+    assert (
+        '<historical_user_message ordinal="2"><![CDATA[newest historical]]></historical_user_message>'
+        in content
+    )
+    assert content.index('ordinal="1"') < content.index('ordinal="2"')
+
+
+def test_summary_insertion_without_historical_user_messages_omits_excerpt_section():
+    messages = [
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    cut = mod.select_safe_message_cut(messages)
+
+    compacted = mod.replace_prefix_with_summary(messages, cut, "Summary")
+
+    assert compacted[0]["role"] == "user"
+    assert "Summary" in compacted[0]["content"]
+    assert "<historical_user_messages" not in compacted[0]["content"]
+    assert compacted[1:] == [{"role": "user", "content": "active"}]
+
+
+def test_tool_loop_compaction_summarizes_every_complete_round():
     messages = [
         {"role": "user", "content": "active request"},
         {
@@ -174,93 +151,56 @@ def test_tool_loop_compaction_preserves_latest_round_and_summarizes_older_result
         {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
     ]
 
-    cut = mod.select_tool_result_compaction_cut(
-        messages,
-        preserve_latest_tool_rounds=1,
-        aggressive=False,
-    )
+    cut = mod.select_tool_result_compaction_cut(messages)
 
     assert cut is not None
     assert cut.active_user_message == {"role": "user", "content": "active request"}
-    assert [message["tool_call_id"] for message in cut.tool_messages_to_summarize] == ["call-1"]
+    assert [message["tool_call_id"] for message in cut.tool_messages_to_summarize] == ["call-1", "call-2"]
 
 
-def test_safe_cut_preserves_requested_number_of_latest_tool_rounds():
-    messages = [
-        {"role": "user", "content": "initial request"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search"}}],
-        },
-        {"role": "tool", "tool_call_id": "call-1", "content": "first result"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "call-2", "type": "function", "function": {"name": "fetch"}}],
-        },
-        {"role": "tool", "tool_call_id": "call-2", "content": "second result"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "call-3", "type": "function", "function": {"name": "read"}}],
-        },
-        {"role": "tool", "tool_call_id": "call-3", "content": "third result"},
-        {"role": "user", "content": "latest request"},
-    ]
-
-    cut = mod.select_safe_message_cut(
-        messages,
-        keep_tail_messages=1,
-        preserve_latest_tool_rounds=2,
-    )
-
-    assert [message.get("tool_call_id") for message in cut.tail_messages if message.get("role") == "tool"] == [
-        "call-2",
-        "call-3",
-    ]
-    assert cut.tail_messages[0]["role"] == "assistant"
-    assert cut.tail_messages[0]["tool_calls"][0]["id"] == "call-2"
-    assert cut.tail_messages[-1] == {"role": "user", "content": "latest request"}
-
-
-def test_tool_loop_compaction_returns_none_when_only_latest_round_must_remain_raw():
+def test_tool_loop_compaction_rejects_orphan_tool_messages():
     messages = [
         {"role": "user", "content": "active request"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search"}}],
-        },
-        {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
+        {"role": "tool", "tool_call_id": "missing", "content": "orphan"},
     ]
 
-    assert (
-        mod.select_tool_result_compaction_cut(
-            messages,
-            preserve_latest_tool_rounds=1,
-            aggressive=False,
-        )
-        is None
+    assert mod.select_tool_result_compaction_cut(messages) is None
+
+
+def test_utf8_middle_truncation_respects_byte_budget():
+    text = "先頭" + ("中" * 100) + "末尾"
+
+    truncated = mod.truncate_text_middle_by_utf8_bytes(text, 48)
+
+    assert len(truncated.encode("utf-8")) <= 48
+    assert truncated.startswith("先頭")
+    assert truncated.endswith("末尾")
+    assert "middle omitted" in truncated
+
+
+def test_xml_cdata_sections_escape_cdata_terminators():
+    message = mod.render_summary_message(
+        "summary ]]> tail",
+        historical_source_messages=[{"role": "user", "content": "user ]]> tail"}],
     )
 
+    assert "<checkpoint_summary><![CDATA[summary ]]]]><![CDATA[> tail]]></checkpoint_summary>" in message["content"]
+    assert "<![CDATA[user ]]]]><![CDATA[> tail]]>" in message["content"]
 
-def test_aggressive_tool_loop_compaction_can_summarize_latest_round():
+
+def test_historical_user_excerpt_count_zero_disables_excerpt_section():
     messages = [
-        {"role": "user", "content": "active request"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search"}}],
-        },
-        {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
     ]
+    cut = mod.select_safe_message_cut(messages)
 
-    cut = mod.select_tool_result_compaction_cut(
+    compacted = mod.replace_prefix_with_summary(
         messages,
-        preserve_latest_tool_rounds=1,
-        aggressive=True,
+        cut,
+        "Summary",
+        historical_message_excerpt_count=0,
     )
 
-    assert cut is not None
-    assert [message["tool_call_id"] for message in cut.tool_messages_to_summarize] == ["call-1"]
+    assert "<historical_user_messages" not in compacted[0]["content"]

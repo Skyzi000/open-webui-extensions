@@ -237,14 +237,16 @@ def test_profile_hash_only_uses_hard_compatibility_boundaries():
         summary_model="gpt-4.1-mini",
         wrapper_suffix="abc",
         summary_prompt="old prompt",
-        keep_tail_messages=8,
+        historical_message_excerpt_bytes=256,
+        historical_message_excerpt_count=16,
     )
     ordinary_changes = mod.compute_profile_hash(
         target_model="claude-sonnet",
         summary_model="pipe.summary",
         wrapper_suffix="xyz",
         summary_prompt="new prompt",
-        keep_tail_messages=32,
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=64,
     )
     hard_change = mod.compute_profile_hash(summary_format_family="compact-user-summary-v2")
 
@@ -264,17 +266,17 @@ def test_wrapper_ids_round_trip_special_target_model_ids():
         wrapper_id = mod.build_wrapper_model_id("auto_compact", target)
         assert wrapper_id == f"auto_compact.{target}"
         assert wrapper_id.startswith("auto_compact.")
-        decoded = mod.decode_wrapper_model_id(wrapper_id, expected_pipe_id="auto_compact")
-        assert decoded.pipe_model_id == "auto_compact"
+        decoded = mod.decode_wrapper_model_id(wrapper_id, expected_pipe_function_id="auto_compact")
+        assert decoded.pipe_function_id == "auto_compact"
         assert decoded.target_model_id == target
 
 
 def test_decode_rejects_malformed_or_wrong_pipe_wrapper_ids():
     with pytest.raises(ValueError, match="wrapper"):
-        mod.decode_wrapper_model_id("not-a-wrapper", expected_pipe_id="auto_compact")
+        mod.decode_wrapper_model_id("not-a-wrapper", expected_pipe_function_id="auto_compact")
 
     with pytest.raises(ValueError, match="pipe"):
-        mod.decode_wrapper_model_id("other_pipe.gpt", expected_pipe_id="auto_compact")
+        mod.decode_wrapper_model_id("other_pipe.gpt", expected_pipe_function_id="auto_compact")
 
 
 def test_checkpoint_table_contract_names_and_columns():
@@ -295,7 +297,7 @@ def test_checkpoint_table_contract_names_and_columns():
         "schema_version",
         "user_id",
         "chat_id",
-        "pipe_model_id",
+        "pipe_function_id",
         "profile_hash",
         "source_message_count",
         "source_hash",
@@ -307,6 +309,33 @@ def test_checkpoint_table_contract_names_and_columns():
         "updated_at",
         "last_used_at",
     }
+
+
+def test_checkpoint_lookup_indexes_partition_by_pipe_function_id_not_selected_wrapper_id():
+    table = mod.CHECKPOINT_TABLE
+    lookup = next(
+        constraint
+        for constraint in table.constraints
+        if constraint.name == "skyzi000_owui_ext_accp_v1_lookup_uq"
+    )
+    prefix = next(idx for idx in table.indexes if idx.name == "skyzi000_owui_ext_accp_v1_prefix_idx")
+
+    assert [column.name for column in lookup.columns] == [
+        "namespace",
+        "user_id",
+        "chat_id",
+        "pipe_function_id",
+        "profile_hash",
+        "source_hash",
+    ]
+    assert [column.name for column in prefix.columns] == [
+        "namespace",
+        "user_id",
+        "chat_id",
+        "pipe_function_id",
+        "profile_hash",
+        "source_message_count",
+    ]
 
 
 @pytest.mark.asyncio
@@ -379,7 +408,7 @@ def test_checkpoint_row_uses_stable_identity_and_contract_fields():
         namespace=mod.CHECKPOINT_NAMESPACE,
         user_id="user-1",
         chat_id="chat-1",
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         profile_hash="profile",
         source_hash="source",
         source_message_count=12,
@@ -392,7 +421,7 @@ def test_checkpoint_row_uses_stable_identity_and_contract_fields():
         namespace=mod.CHECKPOINT_NAMESPACE,
         user_id="user-1",
         chat_id="chat-1",
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         profile_hash="profile",
         source_hash="source",
         source_message_count=12,
@@ -409,7 +438,7 @@ def test_checkpoint_row_uses_stable_identity_and_contract_fields():
         "schema_version": 1,
         "user_id": "user-1",
         "chat_id": "chat-1",
-        "pipe_model_id": "auto_compact",
+        "pipe_function_id": "auto_compact",
         "profile_hash": "profile",
         "source_message_count": 12,
         "source_hash": "source",
@@ -421,6 +450,51 @@ def test_checkpoint_row_uses_stable_identity_and_contract_fields():
         "updated_at": 123,
         "last_used_at": 123,
     }
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_store_queries_filter_by_pipe_function_id():
+    from sqlalchemy.dialects import sqlite
+
+    statements = []
+
+    class FakeMappings:
+        def first(self):
+            return None
+
+        def all(self):
+            return []
+
+    class FakeResult:
+        def mappings(self):
+            return FakeMappings()
+
+    class FakeDb:
+        async def execute(self, statement):
+            statements.append(str(statement.compile(dialect=sqlite.dialect())))
+            return FakeResult()
+
+    store = mod.CheckpointStore(db=FakeDb())
+
+    await store.lookup_ready(
+        namespace="auto_compact",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+    )
+    await store.find_longest_parent(
+        namespace="auto_compact",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        prefix_hashes={1: "source"},
+    )
+
+    assert statements
+    assert all("pipe_function_id =" in statement for statement in statements)
 
 
 def test_parent_checkpoint_selection_requires_exact_source_hash():
@@ -479,7 +553,7 @@ async def test_checkpoint_exact_hit_uses_ready_summary_without_calling_summary_f
         request=None,
         user_id="user-1",
         chat_id="chat-1",
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         source_messages=[{"role": "user", "content": "old"}],
         summary_meta={},
         summary_factory=summary_factory,
@@ -518,7 +592,7 @@ async def test_checkpoint_exact_hit_survives_last_used_update_failure(monkeypatc
         request=None,
         user_id="user-1",
         chat_id="chat-1",
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         source_messages=[{"role": "user", "content": "old"}],
         summary_meta={},
         summary_factory=summary_factory,
@@ -555,7 +629,7 @@ async def test_checkpoint_summary_returns_generated_summary_when_insert_fails(mo
         request=None,
         user_id="user-1",
         chat_id="chat-1",
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         source_messages=[{"role": "user", "content": "old"}],
         summary_meta={},
         summary_factory=summary_factory,
@@ -574,7 +648,7 @@ async def test_checkpoint_store_concurrent_insert_conflict_returns_existing_read
         "namespace": "auto_compact",
         "user_id": "user-1",
         "chat_id": "chat-1",
-        "pipe_model_id": "auto_compact",
+        "pipe_function_id": "auto_compact",
         "profile_hash": "profile",
         "source_hash": "source",
         "state": "ready",
@@ -614,7 +688,7 @@ async def test_checkpoint_store_concurrent_insert_conflict_returns_existing_read
         "namespace": "auto_compact",
         "user_id": "user-1",
         "chat_id": "chat-1",
-        "pipe_model_id": "auto_compact",
+        "pipe_function_id": "auto_compact",
         "profile_hash": "profile",
         "source_hash": "source",
         "state": "ready",
@@ -666,7 +740,7 @@ async def test_checkpoint_miss_generates_summary_and_stores_ready_row(monkeypatc
         request=None,
         user_id="user-1",
         chat_id="chat-1",
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         source_messages=source_messages,
         summary_meta={"has_multimodal": False},
         summary_factory=summary_factory,
@@ -723,7 +797,7 @@ async def test_checkpoint_extension_uses_parent_summary_and_stores_lineage(monke
         request=None,
         user_id="user-1",
         chat_id="chat-1",
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         source_messages=source_messages,
         summary_meta={"has_multimodal": False},
         summary_factory=summary_factory,
@@ -792,16 +866,15 @@ async def test_compact_body_extends_from_parent_summary_plus_delta(monkeypatch):
         user={"id": "user-1"},
         metadata={"chat_id": "chat-1"},
         body=body,
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         target_model_id="target",
         summary_model_id="target",
-        keep_tail_messages=1,
-        preserve_latest_tool_rounds=0,
-        aggressive=False,
+        historical_message_excerpt_bytes=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+        historical_message_excerpt_count=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
     )
 
     assert did_compact is True
-    assert captured["source_messages"][0]["content"].endswith("parent summary")
+    assert "<checkpoint_summary><![CDATA[parent summary]]></checkpoint_summary>" in captured["source_messages"][0]["content"]
     assert captured["source_messages"][1:] == [
         {"role": "user", "content": "delta"},
         {"role": "assistant", "content": "delta answer"},
@@ -871,12 +944,11 @@ async def test_compact_body_uses_canonical_checkpoint_source_for_summary(monkeyp
         user={"id": "user-1"},
         metadata={"chat_id": "chat-1"},
         body=body,
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         target_model_id="target",
         summary_model_id="target",
-        keep_tail_messages=1,
-        preserve_latest_tool_rounds=0,
-        aggressive=False,
+        historical_message_excerpt_bytes=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+        historical_message_excerpt_count=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
     )
 
     assert did_compact is True
@@ -928,7 +1000,7 @@ async def test_checkpoint_reuse_survives_target_and_summary_model_changes(monkey
         request=None,
         user_id="user-1",
         chat_id="chat-1",
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         source_messages=source_messages,
         summary_meta={},
         summary_factory=summary_factory,
@@ -937,7 +1009,7 @@ async def test_checkpoint_reuse_survives_target_and_summary_model_changes(monkey
         request=None,
         user_id="user-1",
         chat_id="chat-1",
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         source_messages=source_messages,
         summary_meta={"summary_model": "changed", "target_model": "changed"},
         summary_factory=summary_factory,
@@ -986,7 +1058,7 @@ async def test_parent_checkpoint_failure_does_not_resubmit_raw_prefix(monkeypatc
             request=None,
             user_id="user-1",
             chat_id="chat-1",
-            pipe_model_id="auto_compact",
+            pipe_function_id="auto_compact",
             source_messages=[
                 {"role": "user", "content": "old"},
                 {"role": "assistant", "content": "new"},
@@ -1054,12 +1126,11 @@ async def test_compact_body_uses_parent_checkpoint_delta_when_extension_summary_
         user={"id": "user-1"},
         metadata={"chat_id": "chat-1"},
         body=body,
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         target_model_id="target",
         summary_model_id="target",
-        keep_tail_messages=1,
-        preserve_latest_tool_rounds=0,
-        aggressive=False,
+        historical_message_excerpt_bytes=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+        historical_message_excerpt_count=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
     )
 
     assert did_compact is True

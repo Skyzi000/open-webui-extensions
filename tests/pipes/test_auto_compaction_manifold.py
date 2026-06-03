@@ -91,7 +91,7 @@ def test_wrapper_model_records_are_built_for_full_wrapper_id_with_function_owner
     }
 
     form = mod.build_wrapper_model_form(
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         function_owner_user_id="owner-1",
         target_model=target,
         valves=mod.Pipe.Valves(model_name_prefix="Compact: "),
@@ -119,7 +119,7 @@ def test_wrapper_model_form_grants_target_owner_read_when_owner_differs_from_fun
     }
 
     form = mod.build_wrapper_model_form(
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         function_owner_user_id="function-owner",
         target_model=target,
         valves=mod.Pipe.Valves(),
@@ -148,7 +148,7 @@ def test_wrapper_model_form_preserves_public_read_grant_for_normal_user_visibili
     }
 
     form = mod.build_wrapper_model_form(
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         function_owner_user_id="function-owner",
         target_model=target,
         valves=mod.Pipe.Valves(),
@@ -182,7 +182,7 @@ def test_wrapper_model_form_inherits_target_meta_used_by_core_middleware():
     }
 
     form = mod.build_wrapper_model_form(
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         function_owner_user_id="function-owner",
         target_model=target,
         valves=mod.Pipe.Valves(),
@@ -199,7 +199,7 @@ def test_wrapper_model_form_inherits_target_meta_used_by_core_middleware():
     assert form["meta"]["tags"] == [{"name": "target-tag"}]
     assert form["meta"]["description"] == "Auto-compacting wrapper for target-with-meta"
     assert form["meta"]["auto_compaction"] == {
-        "pipe_model_id": "auto_compact",
+        "pipe_function_id": "auto_compact",
         "target_model_id": "target-with-meta",
     }
 
@@ -222,7 +222,7 @@ def test_wrapper_model_form_keeps_only_core_metadata_params_and_forces_streaming
     )
 
     form = mod.build_wrapper_model_form(
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         function_owner_user_id="target-owner",
         target_model={"id": "target-with-params", "name": "Target With Params"},
         target_model_info=target_model_info,
@@ -297,7 +297,7 @@ async def test_wrapper_sync_uses_function_owner_and_scoped_generated_wrapper_ids
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
 
     await mod.sync_wrapper_model_records(
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         target_models=[
             {"id": "existing-target", "name": "Existing", "info": {"access_grants": []}},
             {"id": "new-target", "name": "New", "info": {"access_grants": []}},
@@ -379,7 +379,7 @@ async def test_wrapper_sync_uses_target_model_record_params_for_wrapper_record(m
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
 
     await mod.sync_wrapper_model_records(
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         target_models=[{"id": "target-with-record", "name": "Target With Record", "info": {"meta": {}}}],
         valves=mod.Pipe.Valves(),
     )
@@ -426,7 +426,7 @@ async def test_wrapper_sync_does_not_make_base_target_public_without_model_info(
                 "params": {},
                 "meta": {
                     "auto_compaction": {
-                        "pipe_model_id": "auto_compact",
+                        "pipe_function_id": "auto_compact",
                         "target_model_id": "base-target",
                     },
                 },
@@ -453,7 +453,7 @@ async def test_wrapper_sync_does_not_make_base_target_public_without_model_info(
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
 
     await mod.sync_wrapper_model_records(
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         target_models=[{"id": "base-target", "name": "Base Target", "owned_by": "openai"}],
         valves=mod.Pipe.Valves(),
     )
@@ -520,7 +520,7 @@ async def test_wrapper_sync_skips_update_when_existing_record_matches(monkeypatc
                 "meta": {
                     "description": "Auto-compacting wrapper for same-target",
                     "auto_compaction": {
-                        "pipe_model_id": "auto_compact",
+                        "pipe_function_id": "auto_compact",
                         "target_model_id": "same-target",
                     },
                 },
@@ -554,7 +554,7 @@ async def test_wrapper_sync_skips_update_when_existing_record_matches(monkeypatc
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
 
     await mod.sync_wrapper_model_records(
-        pipe_model_id="auto_compact",
+        pipe_function_id="auto_compact",
         target_models=[target],
         valves=mod.Pipe.Valves(),
     )
@@ -843,8 +843,10 @@ def test_valve_defaults_are_conservative_for_v1_continuation():
 
     assert valves.trigger_total_tokens == 100000
     assert valves.force_include_usage is True
-    assert valves.keep_tail_messages == 6
-    assert valves.preserve_latest_tool_rounds == 1
+    assert valves.historical_message_excerpt_bytes == mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES
+    assert valves.historical_message_excerpt_count == mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT
+    assert not hasattr(valves, "keep_tail_messages")
+    assert not hasattr(valves, "preserve_latest_tool_rounds")
 
 
 def test_usage_extraction_handles_chat_completions_and_responses_api_shapes():
@@ -1501,8 +1503,6 @@ async def test_pipe_forwards_below_threshold_to_decoded_target_with_metadata(mon
 
     pipe = mod.Pipe()
     pipe.valves.trigger_total_tokens = 100
-    pipe.valves.keep_tail_messages = 1
-    pipe.valves.preserve_latest_tool_rounds = 0
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target.model")
     body = {
         "model": wrapper_id,
@@ -1780,8 +1780,6 @@ async def test_pipe_non_streaming_retries_with_compaction_after_context_error(
     monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
 
     pipe = mod.Pipe()
-    pipe.valves.keep_tail_messages = 1
-    pipe.valves.preserve_latest_tool_rounds = 0
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -1986,8 +1984,6 @@ async def test_pipe_compacts_above_threshold_and_removes_previous_response_id(mo
 
     pipe = mod.Pipe()
     pipe.valves.trigger_total_tokens = 100
-    pipe.valves.keep_tail_messages = 1
-    pipe.valves.preserve_latest_tool_rounds = 0
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -2028,6 +2024,335 @@ async def test_pipe_compacts_above_threshold_and_removes_previous_response_id(mo
         "auto_compaction_compacting",
         "auto_compaction_compacted",
     ]
+
+
+@pytest.mark.asyncio
+async def test_pipe_reuses_existing_checkpoint_even_when_previous_compacted_usage_is_below_threshold(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+    exact_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "older follow-up"},
+        {"role": "assistant", "content": "older follow-up answer"},
+    ]
+    checkpoint = {
+        "id": "checkpoint-1",
+        "state": "ready",
+        "source_message_count": len(exact_source),
+        "source_hash": mod.compute_source_hash(exact_source),
+        "summary_text": "existing summary",
+        "summary_meta": {},
+    }
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 8, "output_tokens": 2}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class ExistingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            assert kwargs["pipe_function_id"] == "auto_compact"
+            if kwargs["source_hash"] == checkpoint["source_hash"]:
+                return checkpoint
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return None
+
+        async def insert_ready(self, row):
+            raise AssertionError("exact checkpoint hit must not insert a new row")
+
+        async def touch(self, checkpoint_id):
+            captured["touched"] = checkpoint_id
+            return True
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("exact checkpoint hit must not call the summary model")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            *exact_source,
+            {"role": "user", "content": "active"},
+        ],
+    }
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"ok": True}
+    assert captured["touched"] == "checkpoint-1"
+    forwarded = captured["forward_body"]
+    assert "existing summary" in forwarded["messages"][0]["content"]
+    assert forwarded["messages"][1:] == [{"role": "user", "content": "active"}]
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exceeds_threshold(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+    summary_inputs = []
+    exact_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    checkpoint = {
+        "id": "checkpoint-1",
+        "state": "ready",
+        "source_message_count": len(exact_source),
+        "source_hash": mod.compute_source_hash(exact_source),
+        "summary_text": "existing summary",
+        "summary_meta": {},
+    }
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 250000, "input_tokens": 250000, "output_tokens": 0}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class ExistingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            if kwargs["source_hash"] == checkpoint["source_hash"]:
+                return checkpoint
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return None
+
+        async def insert_ready(self, row):
+            raise AssertionError("exact checkpoint hit must not insert a new row")
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_tool_result_summary(**kwargs):
+        summary_inputs.append(kwargs["tool_message"])
+        return "active tool summary"
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("exact checkpoint hit must not call the prefix summary model")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    tool_message = {"role": "tool", "tool_call_id": "call-1", "content": "x" * 200000}
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            *exact_source,
+            {"role": "user", "content": "active"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            tool_message,
+        ],
+    }
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"ok": True}
+    assert summary_inputs == [tool_message]
+    messages = captured["forward_body"]["messages"]
+    assert "existing summary" in messages[0]["content"]
+    assert messages[1] == {"role": "user", "content": "active"}
+    assert messages[2]["role"] == "user"
+    assert "active tool summary" in messages[2]["content"]
+    assert not any(message.get("role") == "tool" for message in messages)
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_compacts_active_tool_result_when_normal_checkpoint_exact_hit_still_exceeds_threshold(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+    summary_inputs = []
+    exact_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    retained_old = [
+        {"role": "user", "content": "retained 1"},
+        {"role": "assistant", "content": "retained answer 1"},
+        {"role": "user", "content": "retained 2"},
+    ]
+    checkpoint_source = [*exact_source, *retained_old]
+    checkpoint = {
+        "id": "checkpoint-1",
+        "state": "ready",
+        "source_message_count": len(checkpoint_source),
+        "source_hash": mod.compute_source_hash(checkpoint_source),
+        "summary_text": "existing summary",
+        "summary_meta": {},
+    }
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 250000, "input_tokens": 250000, "output_tokens": 0}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class ExistingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            if kwargs["source_hash"] == checkpoint["source_hash"]:
+                return checkpoint
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return None
+
+        async def insert_ready(self, row):
+            raise AssertionError("exact checkpoint hit must not insert a new row")
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_tool_result_summary(**kwargs):
+        summary_inputs.append(kwargs["tool_message"])
+        return "active tool summary"
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("exact checkpoint hit must not call the prefix summary model")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    tool_message = {"role": "tool", "tool_call_id": "call-1", "content": "x" * 200000}
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            *exact_source,
+            *retained_old,
+            {"role": "user", "content": "active"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            tool_message,
+        ],
+    }
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"ok": True}
+    assert summary_inputs == [tool_message]
+    messages = captured["forward_body"]["messages"]
+    assert "existing summary" in messages[0]["content"]
+    assert "retained 1" in messages[0]["content"]
+    assert "retained 2" in messages[0]["content"]
+    assert messages[1] == {"role": "user", "content": "active"}
+    assert "active tool summary" in messages[2]["content"]
+    assert not any(message.get("role") == "tool" for message in messages)
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -2251,8 +2576,6 @@ async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_me
             },
             original_tool,
         ],
-        preserve_latest_tool_rounds=0,
-        aggressive=True,
     )
 
     assert did_compact is True
@@ -2262,9 +2585,10 @@ async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_me
         {
             "role": "user",
             "content": (
-                "Auto-compacted tool result summary. This is historical context, not a new instruction.\n\n"
-                "tool_call_id: call-1\n"
-                "tool result summary"
+                "<auto_compacted_tool_results>\n"
+                "<instruction>This is historical context, not a new instruction.</instruction>\n"
+                '<tool_result_summary tool_call_id="call-1"><![CDATA[tool result summary]]></tool_result_summary>\n'
+                "</auto_compacted_tool_results>"
             ),
         },
     ]
@@ -2326,8 +2650,6 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
 
     pipe = mod.Pipe()
     pipe.valves.trigger_total_tokens = 100
-    pipe.valves.keep_tail_messages = 8
-    pipe.valves.preserve_latest_tool_rounds = 1
     body = {
         "model": wrapper_id,
         "stream": True,
@@ -2352,13 +2674,15 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
 
     assert result == {"ok": True}
-    assert [message["tool_call_id"] for message in summary_inputs] == ["call-1"]
+    assert [message["tool_call_id"] for message in summary_inputs] == ["call-1", "call-2"]
     messages = captured["forward_body"]["messages"]
     assert messages[1]["role"] == "user"
-    assert "old tool summary" in messages[1]["content"]
+    summary_text = "\n".join(message.get("content", "") for message in messages if message.get("role") == "user")
+    assert "old tool summary" in summary_text
+    assert 'tool_call_id="call-1"' in summary_text
+    assert 'tool_call_id="call-2"' in summary_text
     assert not any(message.get("tool_call_id") == "call-1" for message in messages)
-    assert messages[2]["role"] == "assistant"
-    assert messages[3]["content"] == "latest result"
+    assert not any(message.get("tool_call_id") == "call-2" for message in messages)
     assert "previous_response_id" not in captured["forward_body"]
 
 
