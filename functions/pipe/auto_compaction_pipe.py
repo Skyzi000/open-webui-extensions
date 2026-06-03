@@ -226,16 +226,70 @@ _TOP_LEVEL_MESSAGE_DROP_KEYS = {
     "status_history",
     "error",
 }
-_TRANSIENT_NESTED_KEYS = {
-    "signed_url",
-    "download_url",
-    "preview_url",
-    "thumbnail_url",
-    "path",
-    "tmp_path",
-    "temp_id",
-    "upload_id",
+_STABLE_FILE_ATTACHMENT_KEYS = {
+    "collection_name",
+    "collection_names",
+    "content",
+    "content_type",
+    "context",
+    "docs",
+    "file",
+    "id",
+    "legacy",
+    "name",
+    "queries",
+    "type",
+    "url",
+    "urls",
+}
+_STABLE_EMBEDDED_FILE_KEYS = {
+    "collection_name",
+    "collection_names",
+    "content_type",
+    "context",
+    "data",
+    "file_hash",
+    "file_id",
+    "filename",
+    "hash",
+    "id",
+    "legacy",
+    "meta",
+    "metadata",
+    "mime_type",
+    "name",
+    "type",
+    "url",
+}
+_STABLE_FILE_DATA_KEYS = {
+    "content",
+    "metadata",
+}
+_FILE_METADATA_TRANSIENT_KEYS = {
     "blob_url",
+    "created_at",
+    "download_url",
+    "error",
+    "headers",
+    "itemId",
+    "item_id",
+    "path",
+    "preview_url",
+    "size",
+    "signed_url",
+    "status",
+    "temp_id",
+    "thumbnail_url",
+    "tmp_path",
+    "updated_at",
+    "upload_id",
+}
+_TRANSIENT_SOURCE_KEYS = {
+    "distances",
+}
+_FILE_CONTENT_PART_TYPES = {
+    "file",
+    "input_file",
 }
 _STABLE_MESSAGE_KEYS = {
     "role",
@@ -249,20 +303,183 @@ _STABLE_MESSAGE_KEYS = {
 }
 
 
-def _canonicalize_value(value: Any) -> Any:
+def _is_empty_canonical_value(value: Any) -> bool:
+    return value in (None, {}, [])
+
+
+def _canonicalize_general_value(value: Any) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for key in sorted(value.keys()):
-            if key in _TRANSIENT_NESTED_KEYS:
-                continue
-            item = _canonicalize_value(value[key])
-            if item in (None, {}, []):
+            item = _canonicalize_general_value(value[key])
+            if _is_empty_canonical_value(item):
                 continue
             out[key] = item
         return out
     if isinstance(value, list):
-        return [_canonicalize_value(item) for item in value if _canonicalize_value(item) not in (None, {}, [])]
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_general_value(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
     return value
+
+
+def _canonicalize_file_metadata_map(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key in _FILE_METADATA_TRANSIENT_KEYS:
+                continue
+            item = _canonicalize_file_metadata_map(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_file_metadata_map(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return value
+
+
+def _canonicalize_file_data_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key not in _STABLE_FILE_DATA_KEYS:
+                continue
+            item = _canonicalize_file_metadata_map(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    return _canonicalize_file_metadata_map(value)
+
+
+def _canonicalize_embedded_file_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key not in _STABLE_EMBEDDED_FILE_KEYS:
+                continue
+            if key == "data":
+                item = _canonicalize_file_data_value(value[key])
+            elif key in {"meta", "metadata"}:
+                item = _canonicalize_file_metadata_map(value[key])
+            else:
+                item = _canonicalize_general_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_embedded_file_value(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return _canonicalize_general_value(value)
+
+
+def _canonicalize_file_attachment_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key not in _STABLE_FILE_ATTACHMENT_KEYS:
+                continue
+            if key == "file":
+                item = _canonicalize_embedded_file_value(value[key])
+            else:
+                item = _canonicalize_general_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_file_attachment_value(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return _canonicalize_general_value(value)
+
+
+def _is_file_content_part(value: dict[str, Any]) -> bool:
+    part_type = value.get("type")
+    return isinstance(part_type, str) and part_type in _FILE_CONTENT_PART_TYPES and "file" in value
+
+
+def _canonicalize_content_part(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        is_file_part = _is_file_content_part(value)
+        for key in sorted(value.keys()):
+            if is_file_part and key == "file":
+                item = _canonicalize_embedded_file_value(value[key])
+            else:
+                item = _canonicalize_general_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    return _canonicalize_general_value(value)
+
+
+def _canonicalize_content_value(value: Any) -> Any:
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_content_part(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return _canonicalize_content_part(value)
+
+
+def _canonicalize_files_value(value: Any) -> Any:
+    return _canonicalize_file_attachment_value(value)
+
+
+def _canonicalize_source_value(value: Any, *, source_root: bool = False) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if source_root and key in _TRANSIENT_SOURCE_KEYS:
+                continue
+            item = _canonicalize_general_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    return _canonicalize_general_value(value)
+
+
+def _canonicalize_sources_value(value: Any) -> Any:
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_source_value(item, source_root=True)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return _canonicalize_source_value(value, source_root=True)
+
+
+def _canonicalize_message_value(key: str, value: Any) -> Any:
+    if key == "content":
+        return _canonicalize_content_value(value)
+    if key == "files":
+        return _canonicalize_files_value(value)
+    if key == "sources":
+        return _canonicalize_sources_value(value)
+    return _canonicalize_general_value(value)
 
 
 def canonicalize_message_for_source_hash(message: dict[str, Any]) -> dict[str, Any]:
@@ -272,8 +489,8 @@ def canonicalize_message_for_source_hash(message: dict[str, Any]) -> dict[str, A
             continue
         if key not in _STABLE_MESSAGE_KEYS:
             continue
-        value = _canonicalize_value(message[key])
-        if value in (None, {}, []):
+        value = _canonicalize_message_value(key, message[key])
+        if _is_empty_canonical_value(value):
             continue
         canonical[key] = value
     canonical.setdefault("role", message.get("role", "assistant"))
@@ -2529,16 +2746,17 @@ async def _compact_body(
         return body, False
 
     summary_meta = {"has_multimodal": _messages_have_multimodal(cut.summarization_prefix)}
+    checkpoint_source_prefix = canonicalize_messages_for_source_hash(cut.summarization_prefix)
 
     async def summary_factory(parent: dict[str, Any] | None) -> str:
         if parent:
             parent_count = int(parent.get("source_message_count") or 0)
             source = [
                 render_summary_message(str(parent["summary_text"]), parent.get("summary_meta") or {}),
-                *cut.summarization_prefix[parent_count:],
+                *checkpoint_source_prefix[parent_count:],
             ]
         else:
-            source = cut.summarization_prefix
+            source = checkpoint_source_prefix
         return await _generate_summary_text(
             request=request,
             user=user,

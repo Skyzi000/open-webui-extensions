@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -30,7 +31,7 @@ def test_source_hash_is_deterministic_for_equivalent_canonical_payloads():
     assert mod.compute_source_hash(left) == mod.compute_source_hash(right)
 
 
-def test_source_hash_ignores_transient_file_and_multimodal_metadata():
+def test_source_hash_ignores_core_file_upload_transients():
     stable = {
         "role": "user",
         "content": [
@@ -47,48 +48,135 @@ def test_source_hash_ignores_transient_file_and_multimodal_metadata():
         ],
         "files": [
             {
-                "id": "file-1",
-                "name": "report.pdf",
-                "signed_url": "https://signed.example/a?token=old",
-                "path": "/tmp/a",
-                "sha256": "abc123",
-            }
-        ],
-    }
-    changed_transient = {
-        **stable,
-        "content": [
-            {"type": "text", "text": "inspect this file"},
-            {
                 "type": "file",
+                "id": "file-1",
+                "url": "file-1",
+                "name": "report.pdf",
+                "collection_name": "knowledge",
+                "content_type": "application/pdf",
+                "size": 12345,
+                "status": "uploaded",
+                "error": "",
+                "itemId": "ui-item-a",
                 "file": {
                     "id": "file-1",
-                    "name": "report.pdf",
-                    "signed_url": "https://signed.example/a?token=new",
-                    "metadata": {"upload_id": "tmp-b", "sha256": "abc123"},
+                    "user_id": "user-1",
+                    "hash": "abc123",
+                    "filename": "report.pdf",
+                    "path": "/var/lib/open-webui/uploads/a/report.pdf",
+                    "data": {"content": "extracted text", "status": "pending"},
+                    "meta": {
+                        "name": "report.pdf",
+                        "content_type": "application/pdf",
+                        "collection_name": "knowledge",
+                        "data": {"upload_id": "tmp-a"},
+                    },
+                    "created_at": 100,
+                    "updated_at": 100,
                 },
-            },
-        ],
-        "files": [
-            {
-                "id": "file-1",
-                "name": "report.pdf",
-                "signed_url": "https://signed.example/a?token=new",
-                "path": "/tmp/b",
-                "sha256": "abc123",
             }
         ],
     }
-    changed_semantic = {
-        **stable,
-        "content": [
-            {"type": "text", "text": "inspect this other file"},
-            stable["content"][1],
-        ],
-    }
+    changed_transient = copy.deepcopy(stable)
+    changed_transient["content"][1]["file"]["signed_url"] = "https://signed.example/a?token=new"
+    changed_transient["content"][1]["file"]["metadata"]["upload_id"] = "tmp-b"
+    changed_transient["files"][0]["status"] = "processing"
+    changed_transient["files"][0]["error"] = "temporary warning"
+    changed_transient["files"][0]["itemId"] = "ui-item-b"
+    changed_transient["files"][0]["size"] = 99999
+    changed_transient["files"][0]["progress"] = {"phase": "extracting", "percent": 50}
+    changed_transient["files"][0]["file"]["path"] = "/var/lib/open-webui/uploads/b/report.pdf"
+    changed_transient["files"][0]["file"]["data"]["status"] = "done"
+    changed_transient["files"][0]["file"]["meta"]["data"]["upload_id"] = "tmp-b"
+    changed_transient["files"][0]["file"]["created_at"] = 200
+    changed_transient["files"][0]["file"]["updated_at"] = 200
+    changed_semantic = copy.deepcopy(stable)
+    changed_semantic["files"][0]["file"]["hash"] = "def456"
 
     assert mod.compute_source_hash([stable]) == mod.compute_source_hash([changed_transient])
     assert mod.compute_source_hash([stable]) != mod.compute_source_hash([changed_semantic])
+
+
+def test_source_hash_preserves_file_metadata_used_for_source_context():
+    first = {
+        "role": "user",
+        "content": "Use attached page",
+        "files": [
+            {
+                "type": "text",
+                "name": "https://example.com/a",
+                "url": "https://example.com/a",
+                "context": "full",
+                "file": {
+                    "data": {"content": "same text"},
+                    "meta": {"name": "page", "source": "https://example.com/a"},
+                },
+            }
+        ],
+    }
+    second = copy.deepcopy(first)
+    second["files"][0]["file"]["meta"]["source"] = "https://example.com/b"
+
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([second])
+
+
+def test_source_hash_preserves_web_search_attachment_urls_and_queries():
+    first = {
+        "role": "user",
+        "content": "Search the web",
+        "files": [
+            {
+                "collection_name": "web-search-collection",
+                "name": "open webui auto compaction",
+                "type": "web_search",
+                "urls": ["https://example.com/old"],
+                "queries": ["open webui auto compaction"],
+                "status": "uploaded",
+            }
+        ],
+    }
+    changed_url = copy.deepcopy(first)
+    changed_url["files"][0]["urls"] = ["https://example.com/new"]
+    changed_query = copy.deepcopy(first)
+    changed_query["files"][0]["queries"] = ["open webui checkpoint compaction"]
+
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([changed_url])
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([changed_query])
+    assert "status" not in mod.canonicalize_messages_for_source_hash([first])[0]["files"][0]
+
+
+def test_source_hash_preserves_non_file_content_file_paths():
+    first = {
+        "role": "user",
+        "content": [{"type": "profile", "file": {"path": "/workspace/a.txt", "name": "same"}}],
+    }
+    second = copy.deepcopy(first)
+    second["content"][0]["file"]["path"] = "/workspace/b.txt"
+
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([second])
+
+
+def test_source_hash_preserves_semantic_paths_outside_file_metadata():
+    first = {
+        "role": "assistant",
+        "content": [{"type": "input", "path": "/workspace/a.txt"}],
+        "function_call": {"name": "read_file", "arguments": {"path": "/workspace/a.txt"}},
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": {"path": "/workspace/a.txt"}},
+            }
+        ],
+        "sources": [{"source": {"id": "doc-1", "name": "docs", "path": "docs/a.md"}}],
+    }
+    second = copy.deepcopy(first)
+    second["content"][0]["path"] = "/workspace/b.txt"
+    second["function_call"] = {"name": "read_file", "arguments": {"path": "/workspace/b.txt"}}
+    second["tool_calls"][0]["function"]["arguments"]["path"] = "/workspace/b.txt"
+    second["sources"][0]["source"]["path"] = "docs/b.md"
+
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([second])
 
 
 def test_source_hash_preserves_semantic_urls():
@@ -104,6 +192,43 @@ def test_source_hash_preserves_semantic_urls():
     }
 
     assert mod.compute_source_hash([first]) != mod.compute_source_hash([second])
+
+
+def test_source_hash_preserves_semantic_download_urls_outside_file_metadata():
+    first = {
+        "role": "user",
+        "content": "Use this reference URL",
+        "sources": [{"source": {"name": "docs", "download_url": "https://example.com/a"}}],
+    }
+    second = {
+        "role": "user",
+        "content": "Use this reference URL",
+        "sources": [{"source": {"name": "docs", "download_url": "https://example.com/b"}}],
+    }
+
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([second])
+
+
+def test_source_hash_ignores_retrieval_source_scores():
+    stable = {
+        "role": "assistant",
+        "content": "answer",
+        "sources": [
+            {
+                "source": {"id": "doc-1", "name": "docs", "type": "file"},
+                "document": ["same chunk"],
+                "metadata": [{"source": "docs/a.md"}],
+                "distances": [0.1],
+            }
+        ],
+    }
+    changed_score = copy.deepcopy(stable)
+    changed_score["sources"][0]["distances"] = [0.9]
+    changed_document = copy.deepcopy(stable)
+    changed_document["sources"][0]["document"] = ["different chunk"]
+
+    assert mod.compute_source_hash([stable]) == mod.compute_source_hash([changed_score])
+    assert mod.compute_source_hash([stable]) != mod.compute_source_hash([changed_document])
 
 
 def test_profile_hash_only_uses_hard_compatibility_boundaries():
@@ -683,6 +808,92 @@ async def test_compact_body_extends_from_parent_summary_plus_delta(monkeypatch):
     ]
     assert "extended summary" in compacted["messages"][0]["content"]
     assert compacted["messages"][-1] == {"role": "user", "content": "active"}
+
+
+@pytest.mark.asyncio
+async def test_compact_body_uses_canonical_checkpoint_source_for_summary(monkeypatch):
+    captured = {}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class EmptyStore:
+        async def lookup_ready(self, **kwargs):
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return None
+
+        async def insert_ready(self, row):
+            return row
+
+    async def generate_summary_text(**kwargs):
+        captured["source_messages"] = kwargs["source_messages"]
+        return "summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: EmptyStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    body = {
+        "model": "target",
+        "stream": True,
+        "messages": [
+            {
+                "role": "user",
+                "content": "old file",
+                "files": [
+                    {
+                        "type": "text",
+                        "name": "https://example.com/a",
+                        "url": "https://example.com/a",
+                        "status": "processing",
+                        "progress": {"phase": "extracting"},
+                        "file": {
+                            "id": "file-1",
+                            "filename": "page.txt",
+                            "path": "/var/lib/open-webui/uploads/a/page.txt",
+                            "hash": "abc123",
+                            "data": {"content": "page text", "status": "pending"},
+                            "meta": {"source": "https://example.com/a", "data": {"upload_id": "tmp-a"}},
+                            "created_at": 100,
+                        },
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    compacted, did_compact = await mod._compact_body(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_model_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        keep_tail_messages=1,
+        preserve_latest_tool_rounds=0,
+        aggressive=False,
+    )
+
+    assert did_compact is True
+    summary_file = captured["source_messages"][0]["files"][0]
+    assert summary_file == {
+        "file": {
+            "data": {"content": "page text"},
+            "filename": "page.txt",
+            "hash": "abc123",
+            "id": "file-1",
+            "meta": {"source": "https://example.com/a"},
+        },
+        "name": "https://example.com/a",
+        "type": "text",
+        "url": "https://example.com/a",
+    }
+    assert "summary" in compacted["messages"][0]["content"]
 
 
 @pytest.mark.asyncio
