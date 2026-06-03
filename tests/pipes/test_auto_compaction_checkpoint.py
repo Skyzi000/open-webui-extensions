@@ -602,7 +602,7 @@ async def test_checkpoint_exact_hit_survives_last_used_update_failure(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_summary_returns_generated_summary_when_insert_fails(monkeypatch):
+async def test_checkpoint_summary_surfaces_insert_failure(monkeypatch):
     calls = []
 
     async def noop_initialize(**kwargs):
@@ -625,17 +625,17 @@ async def test_checkpoint_summary_returns_generated_summary_when_insert_fails(mo
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: FailingInsertStore())
 
-    result = await mod._get_or_create_checkpoint_summary(
-        request=None,
-        user_id="user-1",
-        chat_id="chat-1",
-        pipe_function_id="auto_compact",
-        source_messages=[{"role": "user", "content": "old"}],
-        summary_meta={},
-        summary_factory=summary_factory,
-    )
+    with pytest.raises(RuntimeError, match="db down"):
+        await mod._get_or_create_checkpoint_summary(
+            request=None,
+            user_id="user-1",
+            chat_id="chat-1",
+            pipe_function_id="auto_compact",
+            source_messages=[{"role": "user", "content": "old"}],
+            summary_meta={},
+            summary_factory=summary_factory,
+        )
 
-    assert result == "generated summary"
     assert calls == [None]
 
 

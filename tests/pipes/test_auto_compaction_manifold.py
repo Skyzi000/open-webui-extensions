@@ -1393,17 +1393,18 @@ async def test_tool_history_compaction_summarizes_before_latest_tool_round_and_p
 ):
     captured = {}
 
-    async def generate_summary_text(**kwargs):
+    async def get_or_create_compaction_summary(**kwargs):
         captured["source_messages"] = kwargs["source_messages"]
         return "combined summary"
 
-    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
 
     original_tool = {"role": "tool", "tool_call_id": "call-1", "content": {"value": 42}}
     compacted, did_compact = await mod._compact_retry_tool_results(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
+        pipe_function_id="auto_compact",
         summary_model_id="target",
         messages=[
             {"role": "system", "content": "system prompt"},
@@ -1458,11 +1459,11 @@ async def test_tool_history_compaction_summarizes_all_but_latest_sequential_tool
 ):
     captured = {}
 
-    async def generate_summary_text(**kwargs):
+    async def get_or_create_compaction_summary(**kwargs):
         captured["source_messages"] = kwargs["source_messages"]
         return "combined summary"
 
-    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
 
     messages = [
         {"role": "user", "content": "active request"},
@@ -1488,6 +1489,7 @@ async def test_tool_history_compaction_summarizes_all_but_latest_sequential_tool
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
+        pipe_function_id="auto_compact",
         summary_model_id="target",
         messages=messages,
     )
@@ -2244,6 +2246,57 @@ async def test_pipe_reuses_existing_checkpoint_even_when_previous_compacted_usag
 
 
 @pytest.mark.asyncio
+async def test_pipe_does_not_forward_raw_history_when_checkpoint_lookup_fails(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 8, "output_tokens": 2}
+
+    async def initialize_fails(**kwargs):
+        raise RuntimeError("checkpoint db down")
+
+    async def forward_target(**kwargs):
+        raise AssertionError("raw history must not be forwarded when checkpoint lookup fails")
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "active"},
+            ],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["error"]["code"] == "checkpoint_unavailable"
+    assert "checkpoint db down" in result["error"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exceeds_threshold(
     monkeypatch,
     pipe_request,
@@ -2284,10 +2337,11 @@ async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exce
             return None
 
         async def find_longest_parent(self, **kwargs):
-            return None
+            return checkpoint
 
         async def insert_ready(self, row):
-            raise AssertionError("exact checkpoint hit must not insert a new row")
+            captured["inserted"] = row
+            return row
 
         async def touch(self, checkpoint_id):
             return True
@@ -2341,11 +2395,13 @@ async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exce
 
     assert result == {"ok": True}
     assert len(summary_inputs) == 1
-    assert [message["role"] for message in summary_inputs[0]] == [
-        "user",
-        "user",
-    ]
+    assert [message["role"] for message in summary_inputs[0]] == ["user", "user"]
     assert "existing summary" in summary_inputs[0][0]["content"]
+    assert summary_inputs[0][1] == {"role": "user", "content": "active"}
+    checkpoint_source = [*exact_source, {"role": "user", "content": "active"}]
+    assert captured["inserted"]["parent_checkpoint_id"] == "checkpoint-1"
+    assert captured["inserted"]["source_message_count"] == len(checkpoint_source)
+    assert captured["inserted"]["source_hash"] == mod.compute_source_hash(checkpoint_source)
     messages = captured["forward_body"]["messages"]
     assert "combined active summary" in messages[0]["content"]
     assert messages[1] == {
@@ -2404,10 +2460,11 @@ async def test_pipe_compacts_active_tool_result_when_normal_checkpoint_exact_hit
             return None
 
         async def find_longest_parent(self, **kwargs):
-            return None
+            return checkpoint
 
         async def insert_ready(self, row):
-            raise AssertionError("exact checkpoint hit must not insert a new row")
+            captured["inserted"] = row
+            return row
 
         async def touch(self, checkpoint_id):
             return True
@@ -2462,11 +2519,13 @@ async def test_pipe_compacts_active_tool_result_when_normal_checkpoint_exact_hit
 
     assert result == {"ok": True}
     assert len(summary_inputs) == 1
-    assert [message["role"] for message in summary_inputs[0]] == [
-        "user",
-        "user",
-    ]
+    assert [message["role"] for message in summary_inputs[0]] == ["user", "user"]
     assert "existing summary" in summary_inputs[0][0]["content"]
+    assert summary_inputs[0][1] == {"role": "user", "content": "active"}
+    checkpoint_source_with_active = [*checkpoint_source, {"role": "user", "content": "active"}]
+    assert captured["inserted"]["parent_checkpoint_id"] == "checkpoint-1"
+    assert captured["inserted"]["source_message_count"] == len(checkpoint_source_with_active)
+    assert captured["inserted"]["source_hash"] == mod.compute_source_hash(checkpoint_source_with_active)
     messages = captured["forward_body"]["messages"]
     assert "combined active summary" in messages[0]["content"]
     assert messages[1] == {
@@ -2630,7 +2689,7 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
     async def lookup_persisted_usage(chat_id, message_id):
         return None
 
-    async def generate_summary_text(**kwargs):
+    async def get_or_create_compaction_summary(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
         return "combined retry summary"
 
@@ -2643,7 +2702,7 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
-    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -2679,15 +2738,16 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
 async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_message(monkeypatch, pipe_request, pipe_user):
     original_tool = {"role": "tool", "tool_call_id": "call-1", "content": "original tool result"}
 
-    async def generate_summary_text(**kwargs):
+    async def get_or_create_compaction_summary(**kwargs):
         return "combined summary"
 
-    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
 
     compacted, did_compact = await mod._compact_retry_tool_results(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
+        pipe_function_id="auto_compact",
         summary_model_id="target",
         messages=[
             {"role": "user", "content": "active"},
@@ -2762,7 +2822,7 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     async def lookup_persisted_usage(chat_id, message_id):
         raise AssertionError("request-scoped usage should be used before persisted usage")
 
-    async def generate_summary_text(**kwargs):
+    async def get_or_create_compaction_summary(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
         return "combined old tool summary"
 
@@ -2773,7 +2833,7 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
-    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
