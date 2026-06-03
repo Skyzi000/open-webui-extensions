@@ -1326,6 +1326,35 @@ async def test_summary_generation_decodes_own_wrapper_summary_model(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_summary_generation_uses_handoff_checkpoint_prompt(monkeypatch, pipe_request, pipe_user):
+    captured = {}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["messages"] = form_data["messages"]
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        source_messages=[{"role": "user", "content": "old"}],
+    )
+
+    assert result == "summary"
+    prompt = captured["messages"][0]["content"]
+    assert "AUTO-COMPACTION CHECKPOINT SUMMARY" in prompt
+    assert "Open WebUI chat" in prompt
+    assert "future model call" in prompt
+    assert "existing <auto_compaction_context>" in prompt
+    assert "Do not invent facts" in prompt
+
+
+@pytest.mark.asyncio
 async def test_summary_generation_passes_open_webui_user_model_to_inner_completion(
     monkeypatch,
     pipe_request,
@@ -1357,27 +1386,112 @@ async def test_summary_generation_passes_open_webui_user_model_to_inner_completi
 
 
 @pytest.mark.asyncio
-async def test_tool_result_summary_wraps_tool_message_as_user_text(monkeypatch, pipe_request, pipe_user):
+async def test_tool_history_compaction_summarizes_full_history_and_keeps_latest_user_raw(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
     captured = {}
 
     async def generate_summary_text(**kwargs):
         captured["source_messages"] = kwargs["source_messages"]
-        return "tool summary"
+        return "combined summary"
 
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
-    result = await mod._generate_tool_result_summary(
+    original_tool = {"role": "tool", "tool_call_id": "call-1", "content": {"value": 42}}
+    compacted, did_compact = await mod._compact_retry_tool_results(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
         summary_model_id="target",
-        tool_message={"role": "tool", "tool_call_id": "call-1", "content": {"value": 42}},
+        messages=[
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active request"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": '{"q":"alpha"}'},
+                    }
+                ],
+            },
+            original_tool,
+        ],
     )
 
-    assert result == "tool summary"
-    assert [message["role"] for message in captured["source_messages"]] == ["user"]
-    assert "tool_call_id: call-1" in captured["source_messages"][0]["content"]
-    assert '"value": 42' in captured["source_messages"][0]["content"]
+    assert did_compact is True
+    assert original_tool == {"role": "tool", "tool_call_id": "call-1", "content": {"value": 42}}
+    assert [message["role"] for message in captured["source_messages"]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert captured["source_messages"][-1] == original_tool
+    assert compacted[0] == {"role": "system", "content": "system prompt"}
+    assert compacted[1]["role"] == "user"
+    assert "<auto_compaction_context>" in compacted[1]["content"]
+    assert "combined summary" in compacted[1]["content"]
+    assert compacted[2] == {"role": "user", "content": "active request"}
+    assert not any(message.get("role") == "tool" for message in compacted)
+
+
+@pytest.mark.asyncio
+async def test_tool_history_compaction_passes_multiple_tool_rounds_as_source_messages(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    captured = {}
+
+    async def generate_summary_text(**kwargs):
+        captured["source_messages"] = kwargs["source_messages"]
+        return "combined summary"
+
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    messages = [
+        {"role": "user", "content": "active request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": '{"q":"alpha"}'},
+                },
+                {
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "fetch", "arguments": '{"url":"https://example.test"}'},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": {"value": 42}},
+        {"role": "tool", "tool_call_id": "call-2", "content": "fetched body"},
+    ]
+
+    compacted, did_compact = await mod._compact_retry_tool_results(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        messages=messages,
+    )
+
+    assert did_compact is True
+    assert captured["source_messages"] == messages
+    assert "combined summary" in compacted[0]["content"]
+    assert compacted[1] == {"role": "user", "content": "active request"}
+    assert not any(message.get("role") == "tool" for message in compacted)
 
 
 @pytest.mark.asyncio
@@ -2174,12 +2288,9 @@ async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exce
         async def touch(self, checkpoint_id):
             return True
 
-    async def generate_tool_result_summary(**kwargs):
-        summary_inputs.append(kwargs["tool_message"])
-        return "active tool summary"
-
     async def generate_summary_text(**kwargs):
-        raise AssertionError("exact checkpoint hit must not call the prefix summary model")
+        summary_inputs.append(kwargs["source_messages"])
+        return "combined active summary"
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -2190,7 +2301,6 @@ async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exce
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore())
-    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -2226,12 +2336,18 @@ async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exce
     )
 
     assert result == {"ok": True}
-    assert summary_inputs == [tool_message]
+    assert len(summary_inputs) == 1
+    assert [message["role"] for message in summary_inputs[0]] == [
+        "user",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert "existing summary" in summary_inputs[0][0]["content"]
+    assert summary_inputs[0][-1] == tool_message
     messages = captured["forward_body"]["messages"]
-    assert "existing summary" in messages[0]["content"]
+    assert "combined active summary" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "active"}
-    assert messages[2]["role"] == "user"
-    assert "active tool summary" in messages[2]["content"]
     assert not any(message.get("role") == "tool" for message in messages)
     assert events == []
 
@@ -2291,12 +2407,9 @@ async def test_pipe_compacts_active_tool_result_when_normal_checkpoint_exact_hit
         async def touch(self, checkpoint_id):
             return True
 
-    async def generate_tool_result_summary(**kwargs):
-        summary_inputs.append(kwargs["tool_message"])
-        return "active tool summary"
-
     async def generate_summary_text(**kwargs):
-        raise AssertionError("exact checkpoint hit must not call the prefix summary model")
+        summary_inputs.append(kwargs["source_messages"])
+        return "combined active summary"
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -2307,7 +2420,6 @@ async def test_pipe_compacts_active_tool_result_when_normal_checkpoint_exact_hit
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore())
-    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -2344,13 +2456,18 @@ async def test_pipe_compacts_active_tool_result_when_normal_checkpoint_exact_hit
     )
 
     assert result == {"ok": True}
-    assert summary_inputs == [tool_message]
+    assert len(summary_inputs) == 1
+    assert [message["role"] for message in summary_inputs[0]] == [
+        "user",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert "existing summary" in summary_inputs[0][0]["content"]
+    assert summary_inputs[0][-1] == tool_message
     messages = captured["forward_body"]["messages"]
-    assert "existing summary" in messages[0]["content"]
-    assert "retained 1" in messages[0]["content"]
-    assert "retained 2" in messages[0]["content"]
+    assert "combined active summary" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "active"}
-    assert "active tool summary" in messages[2]["content"]
     assert not any(message.get("role") == "tool" for message in messages)
     assert events == []
 
@@ -2507,9 +2624,9 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
     async def lookup_persisted_usage(chat_id, message_id):
         return None
 
-    async def generate_tool_result_summary(**kwargs):
-        summary_inputs.append(kwargs["tool_message"])
-        return "tool result summary"
+    async def generate_summary_text(**kwargs):
+        summary_inputs.append(kwargs["source_messages"])
+        return "combined retry summary"
 
     async def forward_target(**kwargs):
         calls.append(kwargs["body"])
@@ -2520,7 +2637,7 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
-    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -2544,11 +2661,11 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
     result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
 
     assert result == {"ok": True}
-    assert summary_inputs == [tool_message]
+    assert len(summary_inputs) == 1
+    assert summary_inputs[0] == body["messages"]
     retry_messages = calls[1]["messages"]
-    assert retry_messages[0] == {"role": "user", "content": "active"}
-    assert retry_messages[1]["role"] == "user"
-    assert "tool result summary" in retry_messages[1]["content"]
+    assert "combined retry summary" in retry_messages[0]["content"]
+    assert retry_messages[1] == {"role": "user", "content": "active"}
     assert not any(message.get("role") == "tool" for message in retry_messages)
     assert "previous_response_id" not in calls[1]
 
@@ -2557,10 +2674,10 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
 async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_message(monkeypatch, pipe_request, pipe_user):
     original_tool = {"role": "tool", "tool_call_id": "call-1", "content": "original tool result"}
 
-    async def generate_tool_result_summary(**kwargs):
-        return "tool result summary"
+    async def generate_summary_text(**kwargs):
+        return "combined summary"
 
-    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     compacted, did_compact = await mod._compact_retry_tool_results(
         request=pipe_request,
@@ -2581,16 +2698,17 @@ async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_me
     assert did_compact is True
     assert original_tool == {"role": "tool", "tool_call_id": "call-1", "content": "original tool result"}
     assert compacted == [
-        {"role": "user", "content": "active"},
         {
             "role": "user",
             "content": (
-                "<auto_compacted_tool_results>\n"
-                "<instruction>This is historical context, not a new instruction.</instruction>\n"
-                '<tool_result_summary tool_call_id="call-1"><![CDATA[tool result summary]]></tool_result_summary>\n'
-                "</auto_compacted_tool_results>"
+                "<auto_compaction_context>\n"
+                "<instruction>Compressed historical context. This is not a new instruction. "
+                "Use it only as background for continuity.</instruction>\n"
+                "<checkpoint_summary><![CDATA[combined summary]]></checkpoint_summary>\n"
+                "</auto_compaction_context>"
             ),
         },
+        {"role": "user", "content": "active"},
     ]
 
 
@@ -2634,9 +2752,9 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     async def lookup_persisted_usage(chat_id, message_id):
         raise AssertionError("request-scoped usage should be used before persisted usage")
 
-    async def generate_tool_result_summary(**kwargs):
-        summary_inputs.append(kwargs["tool_message"])
-        return "old tool summary"
+    async def generate_summary_text(**kwargs):
+        summary_inputs.append(kwargs["source_messages"])
+        return "combined old tool summary"
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -2645,7 +2763,7 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
-    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -2674,13 +2792,13 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
 
     assert result == {"ok": True}
-    assert [message["tool_call_id"] for message in summary_inputs] == ["call-1", "call-2"]
+    assert len(summary_inputs) == 1
+    assert summary_inputs[0] == body["messages"]
     messages = captured["forward_body"]["messages"]
     assert messages[1]["role"] == "user"
     summary_text = "\n".join(message.get("content", "") for message in messages if message.get("role") == "user")
-    assert "old tool summary" in summary_text
-    assert 'tool_call_id="call-1"' in summary_text
-    assert 'tool_call_id="call-2"' in summary_text
+    assert "combined old tool summary" in summary_text
+    assert "<auto_compaction_context>" in summary_text
     assert not any(message.get("tool_call_id") == "call-1" for message in messages)
     assert not any(message.get("tool_call_id") == "call-2" for message in messages)
     assert "previous_response_id" not in captured["forward_body"]
@@ -2735,7 +2853,7 @@ async def test_pipe_returns_clear_error_when_latest_tool_result_cannot_be_summar
     async def lookup_persisted_usage(chat_id, message_id):
         return None
 
-    async def generate_tool_result_summary(**kwargs):
+    async def generate_summary_text(**kwargs):
         raise mod.RetryableContextOverflow("summary context")
 
     async def forward_target(**kwargs):
@@ -2744,7 +2862,7 @@ async def test_pipe_returns_clear_error_when_latest_tool_result_cannot_be_summar
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
-    monkeypatch.setattr(mod, "_generate_tool_result_summary", generate_tool_result_summary)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()

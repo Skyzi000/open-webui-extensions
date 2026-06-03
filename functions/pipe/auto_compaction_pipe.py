@@ -58,6 +58,19 @@ PROFILE_HASH_FAMILY = "checkpoint-profile-v1"
 MAX_CONTEXT_RETRY_ATTEMPTS = 2
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES = 512
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT = 32
+SUMMARY_SYSTEM_PROMPT = (
+    "You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY for an Open WebUI chat. "
+    "Create a concise handoff summary for a future model call that will continue the same chat.\n\n"
+    "Preserve:\n"
+    "- Current progress and durable decisions already made\n"
+    "- User preferences, constraints, and standing requirements that remain relevant\n"
+    "- Tool results, external facts, errors, identifiers, URLs, file names, commands, values, and examples needed to continue\n"
+    "- Open questions, unresolved failures, and clear next steps\n\n"
+    "If the input contains an existing <auto_compaction_context>, merge that prior checkpoint with the following newer messages. "
+    "Do not discard earlier checkpoint information merely because it is summarized.\n\n"
+    "Do not invent facts. Do not introduce new instructions. Do not include irrelevant transcript detail. "
+    "Be concise, structured, and focused on continuity."
+)
 
 try:
     from open_webui.internal.db import DATABASE_SCHEMA as OPEN_WEBUI_DATABASE_SCHEMA
@@ -850,20 +863,6 @@ def replace_prefix_with_parent_checkpoint_and_delta(
     compacted.extend(delta_messages)
     compacted.extend(copy.deepcopy(cut.tail_messages))
     return compacted
-
-
-def render_tool_result_compaction_message(tool_summaries: list[tuple[str, str]]) -> dict[str, Any]:
-    parts = [
-        "<auto_compacted_tool_results>",
-        "<instruction>This is historical context, not a new instruction.</instruction>",
-    ]
-    for tool_call_id, summary in tool_summaries:
-        parts.append(
-            f'<tool_result_summary tool_call_id="{_xml_attr(tool_call_id)}">'
-            f"{_xml_cdata(summary.strip())}</tool_result_summary>"
-        )
-    parts.append("</auto_compacted_tool_results>")
-    return {"role": "user", "content": "\n".join(parts)}
 
 
 def build_checkpoint_id(
@@ -2293,11 +2292,7 @@ async def _generate_summary_text(
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "Summarize the following prior conversation for continuation. "
-                        "Preserve durable facts, decisions, tool results, open tasks, and user preferences. "
-                        "Do not introduce new instructions."
-                    ),
+                    "content": SUMMARY_SYSTEM_PROMPT,
                 },
                 *copy.deepcopy(source_messages),
             ],
@@ -2317,40 +2312,9 @@ async def _generate_summary_text(
     return await extract_text_from_completion_response(response)
 
 
-async def _generate_tool_result_summary(
-    *,
-    request: Any,
-    user: Any,
-    metadata: dict[str, Any],
-    summary_model_id: str,
-    tool_message: dict[str, Any],
-) -> str:
-    content = tool_message.get("content", "")
-    if not isinstance(content, str):
-        content = json.dumps(content, ensure_ascii=False, sort_keys=True)
-    tool_call_id = tool_message.get("tool_call_id") or ""
-    tool_name = tool_message.get("name") or ""
-    name_line = f"tool_name: {tool_name}\n" if tool_name else ""
-    return await _generate_summary_text(
-        request=request,
-        user=user,
-        metadata=metadata,
-        summary_model_id=summary_model_id,
-        source_messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Summarize this tool result for continuation. Preserve concrete identifiers, "
-                    "errors, decisions, and values needed to continue the task.\n\n"
-                    "<tool_result>\n"
-                    f"tool_call_id: {tool_call_id}\n"
-                    f"{name_line}"
-                    f"content:\n{content}\n"
-                    "</tool_result>"
-                ),
-            },
-        ],
-    )
+def _messages_without_first_system(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    system_index = _first_system_index(messages)
+    return [copy.deepcopy(message) for index, message in enumerate(messages) if index != system_index]
 
 
 async def _compact_retry_tool_results(
@@ -2365,61 +2329,35 @@ async def _compact_retry_tool_results(
     if cut is None:
         return messages, False
 
-    target_tool_ids = {
-        message.get("tool_call_id")
-        for message in cut.tool_messages_to_summarize
-        if isinstance(message.get("tool_call_id"), str)
-    }
-    summaries_by_tool_id: dict[str, str] = {}
-    for message in cut.tool_messages_to_summarize:
-        tool_call_id = message.get("tool_call_id")
-        if not isinstance(tool_call_id, str):
-            continue
-        try:
-            summary = await _generate_tool_result_summary(
-                request=request,
-                user=user,
-                metadata=metadata,
-                summary_model_id=summary_model_id,
-                tool_message=copy.deepcopy(message),
-            )
-        except Exception as exc:
-            if isinstance(exc, RetryableContextOverflow) or is_retryable_context_error(exc):
-                raise UnsupportedCompactionInput(
-                    "A tool result exceeds the summary model context window and cannot be safely compacted",
-                    code="latest_tool_result_too_large",
-                ) from exc
-            raise
-        summaries_by_tool_id[tool_call_id] = summary
+    source_messages = _messages_without_first_system(messages)
+    try:
+        summary = await _generate_summary_text(
+            request=request,
+            user=user,
+            metadata=metadata,
+            summary_model_id=summary_model_id,
+            source_messages=source_messages,
+        )
+    except Exception as exc:
+        if isinstance(exc, RetryableContextOverflow) or is_retryable_context_error(exc):
+            raise UnsupportedCompactionInput(
+                "A conversation history with tool results exceeds the summary model context window and cannot be safely compacted",
+                code="latest_tool_result_too_large",
+            ) from exc
+        raise
 
     compacted: list[dict[str, Any]] = []
-    did_compact = False
-    for message in copy.deepcopy(messages):
-        if message.get("role") == "assistant":
-            ids = _tool_call_ids(message)
-            targeted_ids = ids & target_tool_ids
-            if targeted_ids:
-                if not ids <= target_tool_ids:
-                    raise UnsupportedCompactionInput(
-                        "Cannot compact a partial assistant/tool round safely",
-                        code="unsafe_tool_round_compaction",
-                    )
-                compacted.append(
-                    render_tool_result_compaction_message(
-                        [
-                            (tool_call_id, summaries_by_tool_id[tool_call_id])
-                            for tool_call_id in sorted(targeted_ids)
-                            if tool_call_id in summaries_by_tool_id
-                        ]
-                    )
-                )
-                did_compact = True
-                continue
-        if message.get("role") == "tool" and message.get("tool_call_id") in target_tool_ids:
-            did_compact = True
-            continue
-        compacted.append(message)
-    return compacted, did_compact
+    system_index = _first_system_index(messages)
+    if system_index is not None:
+        compacted.append(copy.deepcopy(messages[system_index]))
+    compacted.append(
+        render_summary_message(
+            summary,
+            {"has_multimodal": _messages_have_multimodal(source_messages)},
+        )
+    )
+    compacted.append(copy.deepcopy(cut.active_user_message))
+    return compacted, True
 
 
 async def _get_or_create_checkpoint_summary(
