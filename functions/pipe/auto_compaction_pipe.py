@@ -2789,7 +2789,29 @@ async def _compact_body(
         return body, False
 
     tool_cut = select_tool_result_compaction_cut(messages)
+    cut = select_safe_message_cut(messages)
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
+
     if tool_cut is not None:
+        if cut.summarization_prefix:
+            if not user_id or not _chat_id_supported(chat_id):
+                raise UnsupportedCompactionInput(
+                    "Cannot compact tool history without a durable checkpoint identity",
+                    code="checkpoint_identity_missing",
+                )
+            history_summary_meta = {"has_multimodal": _messages_have_multimodal(cut.summarization_prefix)}
+            await _get_or_create_compaction_summary(
+                request=request,
+                user=user,
+                user_id=user_id,
+                chat_id=chat_id,
+                pipe_function_id=pipe_function_id,
+                metadata=metadata,
+                summary_model_id=summary_model_id,
+                source_messages=cut.summarization_prefix,
+                summary_meta=history_summary_meta,
+            )
         compacted_messages, did_compact_tools = await _compact_retry_tool_results(
             request=request,
             user=user,
@@ -2804,7 +2826,6 @@ async def _compact_body(
             compacted.pop("previous_response_id", None)
             return compacted, True
 
-    cut = select_safe_message_cut(messages)
     if not cut.summarization_prefix:
         return body, False
 
@@ -2812,8 +2833,6 @@ async def _compact_body(
     if latest_user is None:
         raise UnsupportedCompactionInput("Cannot compact safely without retaining the active latest user message")
 
-    chat_id = str(metadata.get("chat_id") or "")
-    user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
     if not user_id or not _chat_id_supported(chat_id):
         return body, False
 

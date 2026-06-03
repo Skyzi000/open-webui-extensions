@@ -2297,6 +2297,105 @@ async def test_pipe_does_not_forward_raw_history_when_checkpoint_lookup_fails(
 
 
 @pytest.mark.asyncio
+async def test_pipe_creates_history_checkpoint_before_tool_history_checkpoint(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+    rows = []
+    summary_inputs = []
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active"}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 250000, "input_tokens": 250000, "output_tokens": 0}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class RecordingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            for row in rows:
+                if row["source_hash"] == kwargs["source_hash"]:
+                    return row
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
+
+        async def insert_ready(self, row):
+            rows.append(row)
+            return row
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_summary_text(**kwargs):
+        summary_inputs.append(kwargs["source_messages"])
+        return f"summary {len(summary_inputs)}"
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    tool_message = {"role": "tool", "tool_call_id": "call-1", "content": "x" * 200000}
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            *history,
+            active,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            tool_message,
+        ],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result == {"ok": True}
+    assert summary_inputs[0] == history
+    assert summary_inputs[1][0]["role"] == "user"
+    assert "summary 1" in summary_inputs[1][0]["content"]
+    assert summary_inputs[1][1] == active
+    assert len(rows) == 2
+    assert rows[0]["source_message_count"] == len(history)
+    assert rows[0]["parent_checkpoint_id"] is None
+    tool_source = [*history, active]
+    assert rows[1]["source_message_count"] == len(tool_source)
+    assert rows[1]["source_hash"] == mod.compute_source_hash(tool_source)
+    assert rows[1]["parent_checkpoint_id"] == rows[0]["id"]
+    messages = captured["forward_body"]["messages"]
+    assert "summary 2" in messages[0]["content"]
+    assert messages[1:] == body["messages"][3:]
+
+
+@pytest.mark.asyncio
 async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exceeds_threshold(
     monkeypatch,
     pipe_request,
@@ -2708,6 +2807,11 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     tool_message = {"role": "tool", "tool_call_id": "call-1", "content": "x" * 10000}
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
     body = {
         "model": wrapper_id,
         "stream": True,
@@ -2723,7 +2827,13 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
 
     assert result == {"ok": True}
     assert len(summary_inputs) == 1
@@ -2732,6 +2842,12 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
     assert "combined retry summary" in retry_messages[0]["content"]
     assert retry_messages[1:] == body["messages"][1:]
     assert "previous_response_id" not in calls[1]
+    assert [event["data"]["action"] for event in events] == [
+        "auto_compaction_retry",
+        "auto_compaction_compacting",
+        "auto_compaction_compacted",
+    ]
+    assert events[-1]["data"]["done"] is True
 
 
 @pytest.mark.asyncio
@@ -2838,6 +2954,11 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
 
     pipe = mod.Pipe()
     pipe.valves.trigger_total_tokens = 100
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
     body = {
         "model": wrapper_id,
         "stream": True,
@@ -2859,7 +2980,13 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
 
     assert result == {"ok": True}
     assert len(summary_inputs) == 1
@@ -2872,6 +2999,11 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     assert not any(message.get("tool_call_id") == "call-1" for message in messages)
     assert any(message.get("tool_call_id") == "call-2" for message in messages)
     assert "previous_response_id" not in captured["forward_body"]
+    assert [event["data"]["action"] for event in events] == [
+        "auto_compaction_compacting",
+        "auto_compaction_compacted",
+    ]
+    assert events[-1]["data"]["done"] is True
 
 
 @pytest.mark.asyncio
