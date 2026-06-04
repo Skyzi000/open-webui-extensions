@@ -2297,7 +2297,7 @@ async def test_pipe_does_not_forward_raw_history_when_checkpoint_lookup_fails(
 
 
 @pytest.mark.asyncio
-async def test_pipe_creates_history_checkpoint_before_tool_history_checkpoint(
+async def test_pipe_creates_tool_checkpoint_without_history_parent_when_summary_fits(
     monkeypatch,
     pipe_request,
     pipe_user,
@@ -2379,24 +2379,946 @@ async def test_pipe_creates_history_checkpoint_before_tool_history_checkpoint(
     result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
 
     assert result == {"ok": True}
-    assert summary_inputs[0] == history
-    assert summary_inputs[1][0]["role"] == "user"
-    assert "summary 1" in summary_inputs[1][0]["content"]
-    assert summary_inputs[1][1] == active
-    assert len(rows) == 2
-    assert rows[0]["source_message_count"] == len(history)
-    assert rows[0]["parent_checkpoint_id"] is None
     tool_source = [*history, active]
-    assert rows[1]["source_message_count"] == len(tool_source)
-    assert rows[1]["source_hash"] == mod.compute_source_hash(tool_source)
-    assert rows[1]["parent_checkpoint_id"] == rows[0]["id"]
+    assert summary_inputs == [tool_source]
+    assert len(rows) == 1
+    assert rows[0]["source_message_count"] == len(tool_source)
+    assert rows[0]["source_hash"] == mod.compute_source_hash(tool_source)
+    assert rows[0]["parent_checkpoint_id"] is None
     messages = captured["forward_body"]["messages"]
-    assert "summary 2" in messages[0]["content"]
+    assert "summary 1" in messages[0]["content"]
     assert messages[1:] == body["messages"][3:]
 
 
 @pytest.mark.asyncio
-async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exceeds_threshold(
+async def test_tool_loop_direct_summary_does_not_use_existing_history_parent_when_summary_fits(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    inserted = []
+    summary_inputs = []
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active"}
+    tool_source = [*history, active]
+    history_checkpoint = {
+        "id": "history-checkpoint-1",
+        "state": "ready",
+        "source_message_count": len(history),
+        "source_hash": mod.compute_source_hash(history),
+        "summary_text": "existing history summary",
+        "summary_meta": {},
+    }
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class ExistingHistoryCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            if kwargs["source_hash"] == history_checkpoint["source_hash"]:
+                return history_checkpoint
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            raise AssertionError("direct tool summary must not use an existing history parent")
+
+        async def insert_ready(self, row):
+            inserted.append(row)
+            return row
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_summary_text(**kwargs):
+        summary_inputs.append(kwargs["source_messages"])
+        return "direct tool summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingHistoryCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    body = {
+        "messages": [
+            *tool_source,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
+        ],
+    }
+
+    compacted, did_compact = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=0,
+        historical_message_excerpt_count=0,
+    )
+
+    assert did_compact is True
+    assert summary_inputs == [tool_source]
+    assert len(inserted) == 1
+    assert inserted[0]["source_hash"] == mod.compute_source_hash(tool_source)
+    assert inserted[0]["parent_checkpoint_id"] is None
+    assert "direct tool summary" in compacted["messages"][0]["content"]
+    assert compacted["messages"][1:] == body["messages"][3:]
+
+
+@pytest.mark.asyncio
+async def test_pipe_reuses_exact_tool_checkpoint_without_creating_history_checkpoint(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+    touched = []
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active"}
+    old_tool_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+    ]
+    tool_source = [*history, active, *old_tool_round]
+    checkpoint = {
+        "id": "tool-checkpoint-1",
+        "state": "ready",
+        "source_message_count": len(tool_source),
+        "source_hash": mod.compute_source_hash(tool_source),
+        "summary_text": "existing tool summary",
+        "summary_meta": {},
+    }
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 250000, "input_tokens": 250000, "output_tokens": 0}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class ExistingToolCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            if kwargs["source_hash"] == checkpoint["source_hash"]:
+                return checkpoint
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return None
+
+        async def insert_ready(self, row):
+            raise AssertionError("exact tool checkpoint hit must not insert")
+
+        async def touch(self, checkpoint_id):
+            touched.append(checkpoint_id)
+            return True
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("exact tool checkpoint hit must not call the summary model")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingToolCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    latest_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+    ]
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [*tool_source, *latest_round],
+    }
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"ok": True}
+    assert touched == ["tool-checkpoint-1"]
+    messages = captured["forward_body"]["messages"]
+    assert "existing tool summary" in messages[0]["content"]
+    assert messages[1:] == latest_round
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_reuses_exact_tool_checkpoint_even_when_usage_is_below_threshold(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+    touched = []
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active"}
+    old_tool_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+    ]
+    tool_source = [*history, active, *old_tool_round]
+    checkpoint = {
+        "id": "tool-checkpoint-1",
+        "state": "ready",
+        "source_message_count": len(tool_source),
+        "source_hash": mod.compute_source_hash(tool_source),
+        "summary_text": "existing tool summary",
+        "summary_meta": {},
+    }
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 8, "output_tokens": 2}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class ExistingToolCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            if kwargs["source_hash"] == checkpoint["source_hash"]:
+                return checkpoint
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            raise AssertionError("exact tool checkpoint reuse must not need a parent lookup")
+
+        async def insert_ready(self, row):
+            raise AssertionError("exact tool checkpoint hit must not insert")
+
+        async def touch(self, checkpoint_id):
+            touched.append(checkpoint_id)
+            return True
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("exact tool checkpoint hit must not call the summary model")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingToolCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    latest_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+    ]
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [*tool_source, *latest_round],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"ok": True}
+    assert touched == ["tool-checkpoint-1"]
+    messages = captured["forward_body"]["messages"]
+    assert "existing tool summary" in messages[0]["content"]
+    assert messages[1:] == latest_round
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_uses_history_checkpoint_for_tool_loop_when_tool_exact_is_missing_and_usage_is_below_threshold(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+    rows = []
+    summary_inputs = []
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active"}
+    history_checkpoint = {
+        "id": "history-checkpoint-1",
+        "state": "ready",
+        "source_message_count": len(history),
+        "source_hash": mod.compute_source_hash(history),
+        "summary_text": "existing history summary",
+        "summary_meta": {},
+    }
+    rows.append(history_checkpoint)
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 8, "output_tokens": 2}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class RecordingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            for row in rows:
+                if row["source_hash"] == kwargs["source_hash"]:
+                    return row
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
+
+        async def insert_ready(self, row):
+            rows.append(row)
+            return row
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_summary_text(**kwargs):
+        summary_inputs.append(kwargs["source_messages"])
+        return "tool source summary"
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    latest_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
+    ]
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [*history, active, *latest_round],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result == {"ok": True}
+    assert summary_inputs == [[*history, active]]
+    assert len(rows) == 2
+    assert rows[1]["source_hash"] == mod.compute_source_hash([*history, active])
+    assert rows[1]["parent_checkpoint_id"] is None
+    messages = captured["forward_body"]["messages"]
+    assert "tool source summary" in messages[0]["content"]
+    assert messages[1:] == latest_round
+
+
+@pytest.mark.asyncio
+async def test_pipe_falls_back_to_history_parent_when_direct_tool_summary_overflows(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+    rows = []
+    summary_inputs = []
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active"}
+    tool_source = [*history, active]
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 250000, "input_tokens": 250000, "output_tokens": 0}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class RecordingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            for row in rows:
+                if row["source_hash"] == kwargs["source_hash"]:
+                    return row
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
+
+        async def insert_ready(self, row):
+            rows.append(row)
+            return row
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_summary_text(**kwargs):
+        summary_inputs.append(kwargs["source_messages"])
+        if kwargs["source_messages"] == tool_source:
+            raise mod.RetryableContextOverflow("summary context")
+        if kwargs["source_messages"] == history:
+            return "history summary"
+        return "tool summary"
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            *tool_source,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
+        ],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result == {"ok": True}
+    assert summary_inputs[0] == tool_source
+    assert summary_inputs[1] == history
+    assert summary_inputs[2][0]["role"] == "user"
+    assert "history summary" in summary_inputs[2][0]["content"]
+    assert summary_inputs[2][1] == active
+    assert len(rows) == 2
+    assert rows[0]["source_hash"] == mod.compute_source_hash(history)
+    assert rows[1]["source_hash"] == mod.compute_source_hash(tool_source)
+    assert rows[1]["parent_checkpoint_id"] == rows[0]["id"]
+    messages = captured["forward_body"]["messages"]
+    assert "tool summary" in messages[0]["content"]
+    assert messages[1:] == body["messages"][3:]
+
+
+@pytest.mark.asyncio
+async def test_pipe_falls_back_to_history_checkpoint_when_existing_tool_parent_retry_overflows(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    rows = []
+    summary_inputs = []
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active"}
+    tool_source = [*history, active]
+    short_parent_source = history[:1]
+    short_parent = {
+        "id": "short-parent-1",
+        "state": "ready",
+        "source_message_count": len(short_parent_source),
+        "source_hash": mod.compute_source_hash(short_parent_source),
+        "summary_text": "short parent summary",
+        "summary_meta": {},
+    }
+    rows.append(short_parent)
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class RecordingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            for row in rows:
+                if row["source_hash"] == kwargs["source_hash"]:
+                    return row
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
+
+        async def insert_ready(self, row):
+            rows.append(row)
+            return row
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_summary_text(**kwargs):
+        source = kwargs["source_messages"]
+        summary_inputs.append(source)
+        if source == tool_source:
+            raise mod.RetryableContextOverflow("direct tool source overflow")
+        if source and "short parent summary" in source[0].get("content", "") and source[1:] == [history[1], active]:
+            raise mod.RetryableContextOverflow("short parent delta overflow")
+        if source and "short parent summary" in source[0].get("content", "") and source[1:] == [history[1]]:
+            return "history summary"
+        if source and "history summary" in source[0].get("content", "") and source[1:] == [active]:
+            return "tool summary"
+        raise AssertionError(f"unexpected summary input: {source!r}")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    body = {
+        "messages": [
+            *tool_source,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
+        ],
+    }
+
+    compacted, did_compact = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=0,
+        historical_message_excerpt_count=0,
+    )
+
+    assert did_compact is True
+    assert summary_inputs[0] == tool_source
+    assert "short parent summary" in summary_inputs[1][0]["content"]
+    assert summary_inputs[1][1:] == [history[1], active]
+    assert "short parent summary" in summary_inputs[2][0]["content"]
+    assert summary_inputs[2][1:] == [history[1]]
+    assert "history summary" in summary_inputs[3][0]["content"]
+    assert summary_inputs[3][1:] == [active]
+    assert len(rows) == 3
+    assert rows[1]["source_hash"] == mod.compute_source_hash(history)
+    assert rows[1]["parent_checkpoint_id"] == short_parent["id"]
+    assert rows[2]["source_hash"] == mod.compute_source_hash(tool_source)
+    assert rows[2]["parent_checkpoint_id"] == rows[1]["id"]
+    assert "tool summary" in compacted["messages"][0]["content"]
+    assert compacted["messages"][1:] == body["messages"][3:]
+
+
+@pytest.mark.asyncio
+async def test_history_fallback_does_not_reselect_failed_longer_tool_parent(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    rows = []
+    summary_inputs = []
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active"}
+    old_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+    ]
+    latest_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+    ]
+    failed_parent_source = [*history, active]
+    failed_parent = {
+        "id": "failed-parent-1",
+        "state": "ready",
+        "source_message_count": len(failed_parent_source),
+        "source_hash": mod.compute_source_hash(failed_parent_source),
+        "summary_text": "failed parent summary",
+        "summary_meta": {},
+    }
+    rows.append(failed_parent)
+    tool_source = [*failed_parent_source, *old_round]
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class RecordingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            for row in rows:
+                if row["source_hash"] == kwargs["source_hash"]:
+                    return row
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
+
+        async def insert_ready(self, row):
+            rows.append(row)
+            return row
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_summary_text(**kwargs):
+        source = kwargs["source_messages"]
+        summary_inputs.append(source)
+        if source == tool_source:
+            raise mod.RetryableContextOverflow("direct tool source overflow")
+        if source and "failed parent summary" in source[0].get("content", "") and source[1:] == old_round:
+            raise mod.RetryableContextOverflow("failed parent delta overflow")
+        if source == history:
+            return "history summary"
+        if source and "history summary" in source[0].get("content", "") and source[1:] == [active, *old_round]:
+            return "tool summary"
+        raise AssertionError(f"unexpected summary input: {source!r}")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    body = {"messages": [*tool_source, *latest_round]}
+
+    compacted, did_compact = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=0,
+        historical_message_excerpt_count=0,
+    )
+
+    assert did_compact is True
+    assert summary_inputs[0] == tool_source
+    assert "failed parent summary" in summary_inputs[1][0]["content"]
+    assert summary_inputs[1][1:] == old_round
+    assert summary_inputs[2] == history
+    assert "history summary" in summary_inputs[3][0]["content"]
+    assert summary_inputs[3][1:] == [active, *old_round]
+    assert len(rows) == 3
+    assert rows[1]["source_hash"] == mod.compute_source_hash(history)
+    assert rows[2]["source_hash"] == mod.compute_source_hash(tool_source)
+    assert rows[2]["parent_checkpoint_id"] == rows[1]["id"]
+    assert "tool summary" in compacted["messages"][0]["content"]
+    assert compacted["messages"][1:] == latest_round
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_parent_retry_does_not_swallow_non_context_error(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    rows = []
+    summary_inputs = []
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active"}
+    tool_source = [*history, active]
+    short_parent_source = history[:1]
+    rows.append(
+        {
+            "id": "short-parent-1",
+            "state": "ready",
+            "source_message_count": len(short_parent_source),
+            "source_hash": mod.compute_source_hash(short_parent_source),
+            "summary_text": "short parent summary",
+            "summary_meta": {},
+        }
+    )
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class RecordingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            for row in rows:
+                if row["source_hash"] == kwargs["source_hash"]:
+                    return row
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
+
+        async def insert_ready(self, row):
+            rows.append(row)
+            return row
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_summary_text(**kwargs):
+        source = kwargs["source_messages"]
+        summary_inputs.append(source)
+        if source == tool_source:
+            raise mod.RetryableContextOverflow("direct tool source overflow")
+        if source and "short parent summary" in source[0].get("content", "") and source[1:] == [history[1], active]:
+            raise RuntimeError("parent retry failed")
+        raise AssertionError(f"unexpected summary input: {source!r}")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    body = {
+        "messages": [
+            *tool_source,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
+        ],
+    }
+
+    with pytest.raises(mod.ParentCheckpointExtensionFailed) as exc_info:
+        await mod._compact_body(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={"chat_id": "chat-1"},
+            body=body,
+            pipe_function_id="auto_compact",
+            target_model_id="target",
+            summary_model_id="target",
+            historical_message_excerpt_bytes=0,
+            historical_message_excerpt_count=0,
+        )
+
+    assert str(exc_info.value.original) == "parent retry failed"
+    assert len(summary_inputs) == 2
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_checkpoints_extend_previous_tool_checkpoint_without_history_parent(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    rows = []
+    summary_inputs = []
+    active = {"role": "user", "content": "active"}
+    round_1 = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "result 1"},
+    ]
+    round_2 = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "result 2"},
+    ]
+    round_3 = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-3", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-3", "content": "result 3"},
+    ]
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class RecordingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            for row in rows:
+                if row["source_hash"] == kwargs["source_hash"]:
+                    return row
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
+
+        async def insert_ready(self, row):
+            rows.append(row)
+            return row
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_summary_text(**kwargs):
+        summary_inputs.append(kwargs["source_messages"])
+        if kwargs["source_messages"] == [active, *round_1, *round_2]:
+            raise mod.RetryableContextOverflow("summary context")
+        return f"summary {len(summary_inputs)}"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    metadata = {"chat_id": "chat-1"}
+    first_body = {
+        "messages": [
+            active,
+            *round_1,
+            *round_2,
+        ],
+    }
+    first_compacted, first_did_compact = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata=metadata,
+        body=first_body,
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=0,
+        historical_message_excerpt_count=0,
+    )
+    second_body = {
+        "messages": [
+            active,
+            *round_1,
+            *round_2,
+            *round_3,
+        ],
+    }
+    second_compacted, second_did_compact = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata=metadata,
+        body=second_body,
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=0,
+        historical_message_excerpt_count=0,
+    )
+
+    assert first_did_compact is True
+    assert second_did_compact is True
+    assert summary_inputs[0] == [active, *round_1]
+    assert summary_inputs[1] == [active, *round_1, *round_2]
+    assert summary_inputs[2][0]["role"] == "user"
+    assert "summary 1" in summary_inputs[2][0]["content"]
+    assert summary_inputs[2][1:] == round_2
+    assert len(rows) == 2
+    assert rows[0]["source_hash"] == mod.compute_source_hash([active, *round_1])
+    assert rows[0]["parent_checkpoint_id"] is None
+    assert rows[1]["source_hash"] == mod.compute_source_hash([active, *round_1, *round_2])
+    assert rows[1]["parent_checkpoint_id"] == rows[0]["id"]
+    assert first_compacted["messages"][1:] == round_2
+    assert second_compacted["messages"][1:] == round_3
+
+
+@pytest.mark.asyncio
+async def test_pipe_compacts_active_tool_result_directly_when_history_parent_exists_and_summary_fits(
     monkeypatch,
     pipe_request,
     pipe_user,
@@ -2494,11 +3416,9 @@ async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exce
 
     assert result == {"ok": True}
     assert len(summary_inputs) == 1
-    assert [message["role"] for message in summary_inputs[0]] == ["user", "user"]
-    assert "existing summary" in summary_inputs[0][0]["content"]
-    assert summary_inputs[0][1] == {"role": "user", "content": "active"}
+    assert summary_inputs[0] == [*exact_source, {"role": "user", "content": "active"}]
     checkpoint_source = [*exact_source, {"role": "user", "content": "active"}]
-    assert captured["inserted"]["parent_checkpoint_id"] == "checkpoint-1"
+    assert captured["inserted"]["parent_checkpoint_id"] is None
     assert captured["inserted"]["source_message_count"] == len(checkpoint_source)
     assert captured["inserted"]["source_hash"] == mod.compute_source_hash(checkpoint_source)
     messages = captured["forward_body"]["messages"]
@@ -2513,7 +3433,7 @@ async def test_pipe_compacts_active_tool_result_when_exact_checkpoint_still_exce
 
 
 @pytest.mark.asyncio
-async def test_pipe_compacts_active_tool_result_when_normal_checkpoint_exact_hit_still_exceeds_threshold(
+async def test_pipe_compacts_active_tool_result_directly_when_normal_parent_exists_and_summary_fits(
     monkeypatch,
     pipe_request,
     pipe_user,
@@ -2618,11 +3538,9 @@ async def test_pipe_compacts_active_tool_result_when_normal_checkpoint_exact_hit
 
     assert result == {"ok": True}
     assert len(summary_inputs) == 1
-    assert [message["role"] for message in summary_inputs[0]] == ["user", "user"]
-    assert "existing summary" in summary_inputs[0][0]["content"]
-    assert summary_inputs[0][1] == {"role": "user", "content": "active"}
+    assert summary_inputs[0] == [*checkpoint_source, {"role": "user", "content": "active"}]
     checkpoint_source_with_active = [*checkpoint_source, {"role": "user", "content": "active"}]
-    assert captured["inserted"]["parent_checkpoint_id"] == "checkpoint-1"
+    assert captured["inserted"]["parent_checkpoint_id"] is None
     assert captured["inserted"]["source_message_count"] == len(checkpoint_source_with_active)
     assert captured["inserted"]["source_hash"] == mod.compute_source_hash(checkpoint_source_with_active)
     messages = captured["forward_body"]["messages"]

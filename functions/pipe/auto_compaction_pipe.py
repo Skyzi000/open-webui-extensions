@@ -2340,6 +2340,8 @@ async def _compact_retry_tool_results(
     pipe_function_id: str,
     summary_model_id: str,
     messages: list[dict[str, Any]],
+    use_parent_checkpoint: bool = False,
+    parent_checkpoint: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     cut = select_tool_result_compaction_cut(messages)
     if cut is None:
@@ -2365,8 +2367,17 @@ async def _compact_retry_tool_results(
             summary_model_id=summary_model_id,
             source_messages=source_messages,
             summary_meta=summary_meta,
+            use_parent_checkpoint=use_parent_checkpoint,
+            parent_checkpoint=parent_checkpoint,
         )
     except Exception as exc:
+        if isinstance(exc, ParentCheckpointExtensionFailed) and (
+            isinstance(exc.original, RetryableContextOverflow) or is_retryable_context_error(exc.original)
+        ):
+            raise UnsupportedCompactionInput(
+                "A conversation history with tool results exceeds the summary model context window and cannot be safely compacted",
+                code="latest_tool_result_too_large",
+            ) from exc
         if isinstance(exc, RetryableContextOverflow) or is_retryable_context_error(exc):
             raise UnsupportedCompactionInput(
                 "A conversation history with tool results exceeds the summary model context window and cannot be safely compacted",
@@ -2391,6 +2402,8 @@ async def _get_or_create_checkpoint_summary(
     source_messages: list[dict[str, Any]],
     summary_meta: dict[str, Any],
     summary_factory: Callable[[dict[str, Any] | None], Awaitable[str]],
+    use_parent_checkpoint: bool = True,
+    parent_checkpoint: dict[str, Any] | None = None,
 ) -> str:
     profile_hash = compute_profile_hash()
     source_hash = compute_source_hash(source_messages)
@@ -2415,14 +2428,28 @@ async def _get_or_create_checkpoint_summary(
                     await store.touch(existing["id"])
                 return str(existing["summary_text"])
 
-            parent = await store.find_longest_parent(
-                namespace=CHECKPOINT_NAMESPACE,
-                user_id=user_id,
-                chat_id=chat_id,
-                pipe_function_id=pipe_function_id,
-                profile_hash=profile_hash,
-                prefix_hashes=compute_prefix_hashes(source_messages),
-            )
+            parent = None
+            if parent_checkpoint is not None:
+                parent_count = int(parent_checkpoint.get("source_message_count") or 0)
+                if (
+                    parent_count <= 0
+                    or parent_count > len(source_messages)
+                    or compute_source_hash(source_messages[:parent_count]) != parent_checkpoint.get("source_hash")
+                ):
+                    raise UnsupportedCompactionInput(
+                        "Parent checkpoint cannot be applied safely because its source boundary is invalid",
+                        code="unsafe_checkpoint_parent",
+                    )
+                parent = parent_checkpoint
+            elif use_parent_checkpoint:
+                parent = await store.find_longest_parent(
+                    namespace=CHECKPOINT_NAMESPACE,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    pipe_function_id=pipe_function_id,
+                    profile_hash=profile_hash,
+                    prefix_hashes=compute_prefix_hashes(source_messages),
+                )
             try:
                 summary_text = await summary_factory(parent)
             except Exception as exc:
@@ -2460,6 +2487,8 @@ async def _get_or_create_compaction_summary(
     summary_model_id: str,
     source_messages: list[dict[str, Any]],
     summary_meta: dict[str, Any],
+    use_parent_checkpoint: bool = True,
+    parent_checkpoint: dict[str, Any] | None = None,
 ) -> str:
     checkpoint_source_prefix = canonicalize_messages_for_source_hash(source_messages)
 
@@ -2488,6 +2517,46 @@ async def _get_or_create_compaction_summary(
         source_messages=source_messages,
         summary_meta=summary_meta,
         summary_factory=summary_factory,
+        use_parent_checkpoint=use_parent_checkpoint,
+        parent_checkpoint=parent_checkpoint,
+    )
+
+
+async def _lookup_ready_checkpoint_for_source(
+    *,
+    request: Any,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    source_messages: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    await ensure_checkpoint_table_initialized(request=request)
+    return await CheckpointStore().lookup_ready(
+        namespace=CHECKPOINT_NAMESPACE,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        profile_hash=compute_profile_hash(),
+        source_hash=compute_source_hash(source_messages),
+    )
+
+
+async def _lookup_longest_checkpoint_parent(
+    *,
+    request: Any,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    source_messages: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    await ensure_checkpoint_table_initialized(request=request)
+    return await CheckpointStore().find_longest_parent(
+        namespace=CHECKPOINT_NAMESPACE,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        profile_hash=compute_profile_hash(),
+        prefix_hashes=compute_prefix_hashes(source_messages),
     )
 
 
@@ -2509,13 +2578,31 @@ async def _body_reusable_checkpoint_match(
     if not user_id or not _chat_id_supported(chat_id):
         return None
 
-    profile_hash = compute_profile_hash()
+    tool_cut = select_tool_result_compaction_cut(messages)
     cut = select_safe_message_cut(messages)
+    if (tool_cut is None or not tool_cut.summarization_prefix) and not cut.summarization_prefix:
+        return None
+
+    profile_hash = compute_profile_hash()
+    await ensure_checkpoint_table_initialized(request=request)
+    store = CheckpointStore()
+
+    if tool_cut is not None and tool_cut.summarization_prefix:
+        source_hash = compute_source_hash(tool_cut.summarization_prefix)
+        existing = await store.lookup_ready(
+            namespace=CHECKPOINT_NAMESPACE,
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_function_id=pipe_function_id,
+            profile_hash=profile_hash,
+            source_hash=source_hash,
+        )
+        if existing:
+            return ReusableCheckpointMatch(kind="exact", source_message_count=tool_cut.source_message_count)
+
     if not cut.summarization_prefix:
         return None
 
-    await ensure_checkpoint_table_initialized(request=request)
-    store = CheckpointStore()
     source_hash = compute_source_hash(cut.summarization_prefix)
     existing = await store.lookup_ready(
         namespace=CHECKPOINT_NAMESPACE,
@@ -2794,12 +2881,54 @@ async def _compact_body(
     user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
 
     if tool_cut is not None:
-        if cut.summarization_prefix:
+        try:
+            compacted_messages, did_compact_tools = await _compact_retry_tool_results(
+                request=request,
+                user=user,
+                metadata=metadata,
+                pipe_function_id=pipe_function_id,
+                summary_model_id=summary_model_id,
+                messages=messages,
+                use_parent_checkpoint=False,
+            )
+        except UnsupportedCompactionInput as exc:
+            if exc.code != "latest_tool_result_too_large":
+                raise
+            if user_id and _chat_id_supported(chat_id):
+                parent = await _lookup_longest_checkpoint_parent(
+                    request=request,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    pipe_function_id=pipe_function_id,
+                    source_messages=tool_cut.summarization_prefix,
+                )
+                if parent is not None:
+                    try:
+                        compacted_messages, did_compact_tools = await _compact_retry_tool_results(
+                            request=request,
+                            user=user,
+                            metadata=metadata,
+                            pipe_function_id=pipe_function_id,
+                            summary_model_id=summary_model_id,
+                            messages=messages,
+                            use_parent_checkpoint=True,
+                        )
+                    except UnsupportedCompactionInput as parent_exc:
+                        if parent_exc.code != "latest_tool_result_too_large":
+                            raise
+                    else:
+                        if did_compact_tools:
+                            compacted = _copy_body_preserving_metadata(body)
+                            compacted["messages"] = compacted_messages
+                            compacted.pop("previous_response_id", None)
+                            return compacted, True
+            if not cut.summarization_prefix:
+                raise
             if not user_id or not _chat_id_supported(chat_id):
                 raise UnsupportedCompactionInput(
                     "Cannot compact tool history without a durable checkpoint identity",
                     code="checkpoint_identity_missing",
-                )
+                ) from exc
             history_summary_meta = {"has_multimodal": _messages_have_multimodal(cut.summarization_prefix)}
             await _get_or_create_compaction_summary(
                 request=request,
@@ -2812,14 +2941,24 @@ async def _compact_body(
                 source_messages=cut.summarization_prefix,
                 summary_meta=history_summary_meta,
             )
-        compacted_messages, did_compact_tools = await _compact_retry_tool_results(
-            request=request,
-            user=user,
-            metadata=metadata,
-            pipe_function_id=pipe_function_id,
-            summary_model_id=summary_model_id,
-            messages=messages,
-        )
+            history_checkpoint = await _lookup_ready_checkpoint_for_source(
+                request=request,
+                user_id=user_id,
+                chat_id=chat_id,
+                pipe_function_id=pipe_function_id,
+                source_messages=cut.summarization_prefix,
+            )
+            if history_checkpoint is None:
+                raise RuntimeError("History checkpoint was not available after creation")
+            compacted_messages, did_compact_tools = await _compact_retry_tool_results(
+                request=request,
+                user=user,
+                metadata=metadata,
+                pipe_function_id=pipe_function_id,
+                summary_model_id=summary_model_id,
+                messages=messages,
+                parent_checkpoint=history_checkpoint,
+            )
         if did_compact_tools:
             compacted = _copy_body_preserving_metadata(body)
             compacted["messages"] = compacted_messages
