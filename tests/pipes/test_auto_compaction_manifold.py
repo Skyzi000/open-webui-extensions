@@ -56,6 +56,43 @@ def test_target_filter_excludes_presets_based_on_own_wrappers():
     assert [m["id"] for m in targets] == ["gpt-4.1", "normal-preset"]
 
 
+def test_compaction_summary_embed_html_contains_full_escaped_summary():
+    summary = "line 1\n" + ("long summary " * 200) + "<script>alert(1)</script>"
+
+    embed_html = mod.render_compaction_summary_embed_html(summary)
+
+    assert "<details" in embed_html
+    assert "Auto-compaction checkpoint" in embed_html
+    assert "line 1" in embed_html
+    assert "long summary " * 20 in embed_html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in embed_html
+    assert "<script>alert(1)</script>" not in embed_html
+
+
+def test_extract_compaction_summary_text_decodes_cdata_boundaries():
+    summary = "before ]]> after </checkpoint_summary> literal"
+    rendered = mod.render_summary_message(summary)
+
+    assert mod.extract_compaction_summary_text_from_messages([rendered]) == summary
+
+
+def test_extract_compaction_summary_text_ignores_non_generated_tags():
+    rendered = mod.render_summary_message("generated summary")
+    messages = [
+        {
+            "role": "system",
+            "content": "<checkpoint_summary>system prompt fragment</checkpoint_summary>",
+        },
+        rendered,
+        {
+            "role": "user",
+            "content": "<checkpoint_summary>ordinary user text</checkpoint_summary>",
+        },
+    ]
+
+    assert mod.extract_compaction_summary_text_from_messages(messages) == "generated summary"
+
+
 def test_include_exclude_patterns_match_id_and_name_and_deduplicate_targets():
     valves = mod.Pipe.Valves(
         include_model_patterns="*gpt*,Anthropic*",
@@ -2140,10 +2177,18 @@ async def test_pipe_compacts_above_threshold_and_removes_previous_response_id(mo
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
     ]
-    assert [event["data"]["action"] for event in events] == [
+    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
         "auto_compaction_compacting",
         "auto_compaction_compacted",
     ]
+    embed_events = [event for event in events if event["type"] == "embeds"]
+    assert len(embed_events) == 1
+    assert embed_events[0]["data"]["replace"] is False
+    assert len(embed_events[0]["data"]["embeds"]) == 1
+    embed_html = embed_events[0]["data"]["embeds"][0]
+    assert "<details" in embed_html
+    assert "Auto-compaction checkpoint" in embed_html
+    assert "summary text" in embed_html
 
 
 @pytest.mark.asyncio
@@ -3760,12 +3805,87 @@ async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pi
     assert "combined retry summary" in retry_messages[0]["content"]
     assert retry_messages[1:] == body["messages"][1:]
     assert "previous_response_id" not in calls[1]
-    assert [event["data"]["action"] for event in events] == [
+    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
         "auto_compaction_retry",
         "auto_compaction_compacting",
         "auto_compaction_compacted",
     ]
-    assert events[-1]["data"]["done"] is True
+    status_events = [event for event in events if event["type"] == "status"]
+    assert status_events[-1]["data"]["done"] is True
+    embed_events = [event for event in events if event["type"] == "embeds"]
+    assert len(embed_events) == 1
+    assert embed_events[0]["data"]["replace"] is False
+    assert len(embed_events[0]["data"]["embeds"]) == 1
+    embed_html = embed_events[0]["data"]["embeds"][0]
+    assert "<details" in embed_html
+    assert "Auto-compaction checkpoint" in embed_html
+    assert "combined retry summary" in embed_html
+
+
+@pytest.mark.asyncio
+async def test_pipe_reemits_latest_compaction_summary_embed_on_retry_after_initial_compaction(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    calls = []
+    summaries = ["first compacted summary", "second compacted summary"]
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 500, "input_tokens": 500, "output_tokens": 0}
+
+    async def get_or_create_checkpoint_summary(**kwargs):
+        return summaries.pop(0)
+
+    async def forward_target(**kwargs):
+        calls.append(kwargs["body"])
+        if len(calls) == 1:
+            raise mod.RetryableContextOverflow("context")
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "active"},
+            ],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"ok": True}
+    assert len(calls) == 2
+    embed_events = [event for event in events if event["type"] == "embeds"]
+    assert len(embed_events) == 2
+    assert "first compacted summary" in embed_events[0]["data"]["embeds"][0]
+    assert "second compacted summary" in embed_events[1]["data"]["embeds"][0]
 
 
 @pytest.mark.asyncio
@@ -3917,11 +4037,20 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     assert not any(message.get("tool_call_id") == "call-1" for message in messages)
     assert any(message.get("tool_call_id") == "call-2" for message in messages)
     assert "previous_response_id" not in captured["forward_body"]
-    assert [event["data"]["action"] for event in events] == [
+    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
         "auto_compaction_compacting",
         "auto_compaction_compacted",
     ]
-    assert events[-1]["data"]["done"] is True
+    status_events = [event for event in events if event["type"] == "status"]
+    assert status_events[-1]["data"]["done"] is True
+    embed_events = [event for event in events if event["type"] == "embeds"]
+    assert len(embed_events) == 1
+    assert embed_events[0]["data"]["replace"] is False
+    assert len(embed_events[0]["data"]["embeds"]) == 1
+    embed_html = embed_events[0]["data"]["embeds"][0]
+    assert "<details" in embed_html
+    assert "Auto-compaction checkpoint" in embed_html
+    assert "combined old tool summary" in embed_html
 
 
 @pytest.mark.asyncio

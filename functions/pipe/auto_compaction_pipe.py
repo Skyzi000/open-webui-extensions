@@ -3,7 +3,7 @@ title: Auto Compaction Pipe
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.1.0
+version: 0.1.1
 license: MIT
 """
 
@@ -58,6 +58,7 @@ PROFILE_HASH_FAMILY = "checkpoint-profile-v1"
 MAX_CONTEXT_RETRY_ATTEMPTS = 2
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES = 512
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT = 32
+COMPACTION_SUMMARY_EMBED_MARKER = "<!--auto-compaction-summary-embed:v1-->"
 SUMMARY_SYSTEM_PROMPT = (
     "You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY for an Open WebUI chat. "
     "Create a concise handoff summary for a future model call that will continue the same chat.\n\n"
@@ -745,6 +746,12 @@ def _xml_cdata(value: Any) -> str:
     return "<![CDATA[" + text.replace("]]>", "]]]]><![CDATA[>") + "]]>"
 
 
+def _decode_xml_cdata(value: str) -> str:
+    if value.startswith("<![CDATA[") and value.endswith("]]>"):
+        return value[len("<![CDATA[") : -len("]]>")].replace("]]]]><![CDATA[>", "]]>")
+    return html.unescape(value)
+
+
 def render_historical_user_message_excerpts(
     source_messages: list[dict[str, Any]],
     *,
@@ -809,6 +816,142 @@ def render_summary_message(
             "</auto_compaction_context>"
         ),
     }
+
+
+def extract_compaction_summary_text_from_messages(messages: Any) -> str | None:
+    if not isinstance(messages, list):
+        return None
+    start_tag = "<checkpoint_summary>"
+    end_tag = "</checkpoint_summary>"
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if not _is_rendered_summary_context_message(message):
+            continue
+        content = message.get("content")
+        start = content.find(start_tag)
+        if start < 0:
+            continue
+        start += len(start_tag)
+        end = _find_xml_element_end_outside_cdata(content, start, end_tag)
+        if end < 0:
+            continue
+        summary = _decode_xml_cdata(content[start:end]).strip()
+        if summary:
+            return summary
+    return None
+
+
+def _is_rendered_summary_context_message(message: dict[str, Any]) -> bool:
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    stripped = content.strip()
+    return stripped.startswith("<auto_compaction_context>") and stripped.endswith("</auto_compaction_context>")
+
+
+def _find_xml_element_end_outside_cdata(text: str, start: int, end_tag: str) -> int:
+    pos = start
+    while pos < len(text):
+        if text.startswith("<![CDATA[", pos):
+            cdata_end = text.find("]]>", pos + len("<![CDATA["))
+            if cdata_end < 0:
+                return -1
+            pos = cdata_end + len("]]>")
+            continue
+        if text.startswith(end_tag, pos):
+            return pos
+        pos += 1
+    return -1
+
+
+def render_compaction_summary_embed_html(summary_text: str) -> str:
+    escaped_summary = html.escape(str(summary_text or "").strip(), quote=False)
+    styles = "".join(
+        [
+            "*{box-sizing:border-box}",
+            (
+                "html,body{margin:0;padding:0;background:transparent;color:#111827;"
+                "font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+                "font-size:13px;line-height:1.45}"
+            ),
+            "body{padding:2px}",
+            (
+                ".card{border:1px solid rgba(107,114,128,.35);border-radius:8px;"
+                "background:rgba(249,250,251,.92);overflow:hidden}"
+            ),
+            ".card[open]{background:#fff}",
+            (
+                "summary{display:flex;align-items:center;justify-content:space-between;gap:12px;"
+                "padding:10px 12px;cursor:pointer;user-select:none;font-weight:600;color:#111827}"
+            ),
+            "summary::-webkit-details-marker{display:none}",
+            ".title{overflow-wrap:anywhere}",
+            ".meta{font-size:12px;font-weight:500;color:#6b7280;white-space:nowrap}",
+            ".body{border-top:1px solid rgba(107,114,128,.25);padding:12px;background:rgba(255,255,255,.8)}",
+            (
+                "pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;"
+                "font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;"
+                "font-size:12px;line-height:1.5;color:#111827}"
+            ),
+            (
+                "@media (prefers-color-scheme: dark){html,body{color:#e5e7eb}"
+                ".card{border-color:rgba(156,163,175,.38);background:rgba(17,24,39,.72)}"
+                ".card[open]{background:rgba(17,24,39,.92)}summary{color:#f9fafb}"
+                ".meta{color:#9ca3af}.body{border-top-color:rgba(156,163,175,.28);"
+                "background:rgba(3,7,18,.35)}pre{color:#e5e7eb}}"
+            ),
+        ]
+    )
+    script = "".join(
+        [
+            "(function(){",
+            "function postHeight(){",
+            "var h=Math.max(document.documentElement.scrollHeight,document.body.scrollHeight,1);",
+            "parent.postMessage({type:'iframe:height',height:h},'*');",
+            "}",
+            "window.addEventListener('load',function(){setTimeout(postHeight,0);setTimeout(postHeight,50);});",
+            "document.addEventListener('toggle',function(){setTimeout(postHeight,0);setTimeout(postHeight,50);},true);",
+            "if(document.readyState!=='loading'){setTimeout(postHeight,0);}",
+            "})();",
+        ]
+    )
+    return (
+        f"{COMPACTION_SUMMARY_EMBED_MARKER}"
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<style>{styles}</style></head><body>"
+        "<details class=\"card\">"
+        "<summary>"
+        "<span class=\"title\">Auto-compaction checkpoint</span>"
+        "<span class=\"meta\">Full summary</span>"
+        "</summary>"
+        f"<div class=\"body\"><pre>{escaped_summary}</pre></div>"
+        "</details>"
+        f"<script>{script}</script></body></html>"
+    )
+
+
+async def emit_compaction_summary_embed(
+    event_emitter: Callable[[Any], Awaitable[None]] | None,
+    *,
+    summary_text: str | None,
+) -> None:
+    if event_emitter is None or not summary_text:
+        return
+    try:
+        await event_emitter(
+            {
+                "type": "embeds",
+                "data": {
+                    "embeds": [render_compaction_summary_embed_html(summary_text)],
+                    "replace": False,
+                },
+            }
+        )
+    except Exception:
+        return
 
 
 def replace_prefix_with_summary(
@@ -3194,6 +3337,11 @@ class Pipe:
                             action="compacted",
                             description="Compacted chat history is ready for the target model",
                             done=True,
+                        )
+                        summary_text = extract_compaction_summary_text_from_messages(candidate.get("messages"))
+                        await emit_compaction_summary_embed(
+                            __event_emitter__,
+                            summary_text=summary_text,
                         )
                 except UnsupportedCompactionInput as exc:
                     await emit_compaction_status(
