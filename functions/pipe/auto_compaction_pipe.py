@@ -157,6 +157,7 @@ class WrapperIdentity:
 class ReusableCheckpointMatch:
     kind: str
     source_message_count: int
+    source_kind: str = "message"
 
 
 @dataclass(frozen=True)
@@ -3044,7 +3045,6 @@ async def _compact_retry_tool_results(
     summary_model_id: str,
     base_body: dict[str, Any],
     messages: list[dict[str, Any]],
-    use_parent_checkpoint: bool = False,
     parent_checkpoint: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     cut = select_tool_result_compaction_cut(messages)
@@ -3072,7 +3072,6 @@ async def _compact_retry_tool_results(
             base_body=base_body,
             source_messages=source_messages,
             summary_meta=summary_meta,
-            use_parent_checkpoint=use_parent_checkpoint,
             parent_checkpoint=parent_checkpoint,
         )
     except Exception as exc:
@@ -3107,7 +3106,6 @@ async def _get_or_create_checkpoint_summary(
     source_messages: list[dict[str, Any]],
     summary_meta: dict[str, Any],
     summary_factory: Callable[[dict[str, Any] | None], Awaitable[str]],
-    use_parent_checkpoint: bool = True,
     parent_checkpoint: dict[str, Any] | None = None,
 ) -> str:
     profile_hash = compute_profile_hash()
@@ -3146,7 +3144,7 @@ async def _get_or_create_checkpoint_summary(
                         code="unsafe_checkpoint_parent",
                     )
                 parent = parent_checkpoint
-            elif use_parent_checkpoint:
+            else:
                 parent = await store.find_longest_parent(
                     namespace=CHECKPOINT_NAMESPACE,
                     user_id=user_id,
@@ -3193,7 +3191,6 @@ async def _get_or_create_compaction_summary(
     base_body: dict[str, Any],
     source_messages: list[dict[str, Any]],
     summary_meta: dict[str, Any],
-    use_parent_checkpoint: bool = True,
     parent_checkpoint: dict[str, Any] | None = None,
 ) -> str:
     summary_source_prefix = copy.deepcopy(source_messages)
@@ -3224,7 +3221,6 @@ async def _get_or_create_compaction_summary(
         source_messages=source_messages,
         summary_meta=summary_meta,
         summary_factory=summary_factory,
-        use_parent_checkpoint=use_parent_checkpoint,
         parent_checkpoint=parent_checkpoint,
     )
 
@@ -3248,23 +3244,38 @@ async def _lookup_ready_checkpoint_for_source(
     )
 
 
-async def _lookup_longest_checkpoint_parent(
+async def _find_reusable_checkpoint_for_source(
     *,
-    request: Any,
+    store: Any,
     user_id: str,
     chat_id: str,
     pipe_function_id: str,
+    profile_hash: str,
     source_messages: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    await ensure_checkpoint_table_initialized(request=request)
-    return await CheckpointStore().find_longest_parent(
+) -> tuple[str, dict[str, Any]] | None:
+    source_hash = compute_source_hash(source_messages)
+    existing = await store.lookup_ready(
         namespace=CHECKPOINT_NAMESPACE,
         user_id=user_id,
         chat_id=chat_id,
         pipe_function_id=pipe_function_id,
-        profile_hash=compute_profile_hash(),
+        profile_hash=profile_hash,
+        source_hash=source_hash,
+    )
+    if existing:
+        return "exact", existing
+
+    parent = await store.find_longest_parent(
+        namespace=CHECKPOINT_NAMESPACE,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        profile_hash=profile_hash,
         prefix_hashes=compute_prefix_hashes(source_messages),
     )
+    if parent is not None:
+        return "parent", parent
+    return None
 
 
 async def _body_reusable_checkpoint_match(
@@ -3274,7 +3285,6 @@ async def _body_reusable_checkpoint_match(
     metadata: dict[str, Any],
     body: dict[str, Any],
     pipe_function_id: str,
-    include_parent: bool,
 ) -> ReusableCheckpointMatch | None:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -3295,47 +3305,112 @@ async def _body_reusable_checkpoint_match(
     store = CheckpointStore()
 
     if tool_cut is not None and tool_cut.summarization_prefix:
-        source_hash = compute_source_hash(tool_cut.summarization_prefix)
-        existing = await store.lookup_ready(
-            namespace=CHECKPOINT_NAMESPACE,
+        tool_match = await _find_reusable_checkpoint_for_source(
+            store=store,
             user_id=user_id,
             chat_id=chat_id,
             pipe_function_id=pipe_function_id,
             profile_hash=profile_hash,
-            source_hash=source_hash,
+            source_messages=tool_cut.summarization_prefix,
         )
-        if existing:
-            return ReusableCheckpointMatch(kind="exact", source_message_count=tool_cut.source_message_count)
+        if tool_match is not None:
+            kind, checkpoint = tool_match
+            return ReusableCheckpointMatch(
+                kind=kind,
+                source_message_count=int(checkpoint.get("source_message_count") or tool_cut.source_message_count),
+                source_kind="tool",
+            )
 
     if not cut.summarization_prefix:
         return None
 
-    source_hash = compute_source_hash(cut.summarization_prefix)
-    existing = await store.lookup_ready(
-        namespace=CHECKPOINT_NAMESPACE,
+    message_match = await _find_reusable_checkpoint_for_source(
+        store=store,
         user_id=user_id,
         chat_id=chat_id,
         pipe_function_id=pipe_function_id,
         profile_hash=profile_hash,
-        source_hash=source_hash,
+        source_messages=cut.summarization_prefix,
     )
-    if existing:
-        return ReusableCheckpointMatch(kind="exact", source_message_count=cut.source_message_count)
-    if include_parent:
-        parent = await store.find_longest_parent(
-            namespace=CHECKPOINT_NAMESPACE,
+    if message_match is not None:
+        kind, checkpoint = message_match
+        return ReusableCheckpointMatch(
+            kind=kind,
+            source_message_count=int(checkpoint.get("source_message_count") or cut.source_message_count),
+            source_kind="message",
+        )
+    return None
+
+
+async def _compact_body_with_reusable_checkpoint(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    match: ReusableCheckpointMatch,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> tuple[dict[str, Any], bool]:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 2:
+        return body, False
+
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
+    if not user_id or not _chat_id_supported(chat_id):
+        return body, False
+
+    candidates: list[tuple[str, MessageCut | ToolResultCompactionCut, list[dict[str, Any]]]] = []
+    tool_cut = select_tool_result_compaction_cut(messages)
+    if tool_cut is not None and tool_cut.summarization_prefix and match.source_kind == "tool":
+        candidates.append(("tool", tool_cut, tool_cut.summarization_prefix))
+
+    cut = select_safe_message_cut(messages)
+    if cut.summarization_prefix and match.source_kind == "message":
+        candidates.append(("message", cut, cut.summarization_prefix))
+
+    await ensure_checkpoint_table_initialized(request=request)
+    store = CheckpointStore()
+    profile_hash = compute_profile_hash()
+
+    for _kind, candidate_cut, source_messages in candidates:
+        checkpoint_match = await _find_reusable_checkpoint_for_source(
+            store=store,
             user_id=user_id,
             chat_id=chat_id,
             pipe_function_id=pipe_function_id,
             profile_hash=profile_hash,
-            prefix_hashes=compute_prefix_hashes(cut.summarization_prefix),
+            source_messages=source_messages,
         )
-        if parent is not None:
-            return ReusableCheckpointMatch(
-                kind="parent",
-                source_message_count=int(parent.get("source_message_count") or 0),
+        if checkpoint_match is None:
+            continue
+        _, checkpoint = checkpoint_match
+
+        with suppress(Exception):
+            await store.touch(str(checkpoint["id"]))
+
+        compacted = _copy_body_preserving_metadata(body)
+        if isinstance(candidate_cut, ToolResultCompactionCut):
+            message_cut = MessageCut(
+                preserved_system_message=copy.deepcopy(candidate_cut.preserved_system_message),
+                summarization_prefix=copy.deepcopy(candidate_cut.summarization_prefix),
+                tail_messages=copy.deepcopy(candidate_cut.tail_messages),
+                source_message_count=candidate_cut.source_message_count,
             )
-    return None
+        else:
+            message_cut = candidate_cut
+        compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
+            message_cut,
+            checkpoint,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+        compacted.pop("previous_response_id", None)
+        return compacted, True
+
+    raise RuntimeError("Reusable checkpoint match disappeared before compaction")
 
 
 async def _model_dict_from_request(request: Any) -> dict[str, Any]:
@@ -3597,40 +3672,10 @@ async def _compact_body(
                 summary_model_id=summary_model_id,
                 base_body=body,
                 messages=messages,
-                use_parent_checkpoint=False,
             )
         except UnsupportedCompactionInput as exc:
             if exc.code != "latest_tool_result_too_large":
                 raise
-            if user_id and _chat_id_supported(chat_id):
-                parent = await _lookup_longest_checkpoint_parent(
-                    request=request,
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    pipe_function_id=pipe_function_id,
-                    source_messages=tool_cut.summarization_prefix,
-                )
-                if parent is not None:
-                    try:
-                        compacted_messages, did_compact_tools = await _compact_retry_tool_results(
-                            request=request,
-                            user=user,
-                            metadata=metadata,
-                            pipe_function_id=pipe_function_id,
-                            summary_model_id=summary_model_id,
-                            base_body=body,
-                            messages=messages,
-                            use_parent_checkpoint=True,
-                        )
-                    except UnsupportedCompactionInput as parent_exc:
-                        if parent_exc.code != "latest_tool_result_too_large":
-                            raise
-                    else:
-                        if did_compact_tools:
-                            compacted = _copy_body_preserving_metadata(body)
-                            compacted["messages"] = compacted_messages
-                            compacted.pop("previous_response_id", None)
-                            return compacted, True
             if not cut.summarization_prefix:
                 raise
             if not user_id or not _chat_id_supported(chat_id):
@@ -3861,7 +3906,6 @@ class Pipe:
                     metadata=metadata,
                     body=inner,
                     pipe_function_id=identity.pipe_function_id,
-                    include_parent=usage_should_compact,
                 )
             except Exception as exc:
                 return _error_response(
@@ -3869,6 +3913,11 @@ class Pipe:
                     code="checkpoint_unavailable",
                 )
         should_compact = usage_should_compact or reusable_checkpoint_match is not None
+        reusable_checkpoint_only = (
+            reusable_checkpoint_match
+            if reusable_checkpoint_match is not None and not usage_should_compact
+            else None
+        )
 
         attempt = 0
         compacted_once = False
@@ -3888,17 +3937,29 @@ class Pipe:
                             description="Compacting chat history before forwarding to the target model",
                             done=False,
                         )
-                    candidate, compacted = await _compact_body(
-                        request=__request__,
-                        user=user,
-                        metadata=metadata,
-                        body=candidate,
-                        pipe_function_id=identity.pipe_function_id,
-                        target_model_id=identity.target_model_id,
-                        summary_model_id=summary_model_id,
-                        historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
-                        historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
-                    )
+                    if reusable_checkpoint_only is not None and not compacted_once:
+                        candidate, compacted = await _compact_body_with_reusable_checkpoint(
+                            request=__request__,
+                            user=user,
+                            metadata=metadata,
+                            body=candidate,
+                            pipe_function_id=identity.pipe_function_id,
+                            match=reusable_checkpoint_only,
+                            historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                            historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                        )
+                    else:
+                        candidate, compacted = await _compact_body(
+                            request=__request__,
+                            user=user,
+                            metadata=metadata,
+                            body=candidate,
+                            pipe_function_id=identity.pipe_function_id,
+                            target_model_id=identity.target_model_id,
+                            summary_model_id=summary_model_id,
+                            historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                            historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                        )
                     compacted_once = compacted_once or compacted
                     if compacted and emit_progress_status:
                         await emit_compaction_status(
