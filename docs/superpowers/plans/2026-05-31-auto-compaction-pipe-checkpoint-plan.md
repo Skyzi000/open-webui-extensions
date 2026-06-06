@@ -22,7 +22,7 @@ This Pipe exists to prevent long-running chats from stopping because the accumul
 
 - Checkpoints are durable continuation state, not disposable optimization cache.
 - Existing ready checkpoints must remain readable and extendable across ordinary implementation, prompt, summary model, target model, and cut-policy changes whenever the stored summary format can still be consumed.
-- A request that is at or above the compaction threshold must prefer exact checkpoint reuse, rolling checkpoint extension, or a usable parent checkpoint over raw direct forwarding, because raw direct forwarding is likely to reproduce the context-window failure this Pipe exists to avoid.
+- If any ready checkpoint matches a prefix in the current chat-history chain, the Pipe must use it regardless of the provider-usage threshold. Exact checkpoint reuse, rolling checkpoint extension, or parent-checkpoint compaction is mandatory once a valid checkpoint exists; raw direct forwarding is allowed only before any applicable checkpoint exists and no compaction is otherwise required.
 - Provider context-window errors are compaction signals, not terminal failures. When the first attempt overflows, the Pipe must compact with the same latest-user boundary and retry instead of surfacing the error whenever no target content has already been emitted.
 - Automatic checkpoint expiry, pruning, or prompt-version invalidation violates the v1 objective because it can make an otherwise continuable long chat impossible to continue.
 - External provider failures and provider errors that cannot be classified as context overflow remain explicit v1 risks, not reasons to weaken the continuation requirement.
@@ -136,7 +136,7 @@ Context-overflow retry requirements:
 - A retry must remove provider state such as `previous_response_id` when compaction changes the message payload.
 - Compaction always uses the same boundary: the first system message is preserved separately, every message before the latest user message is summarized, and the latest user message remains raw. Tool-call/result rounds after that latest user message are never retained as `assistant`/`tool` protocol messages after compaction; they are replaced by user-role tool-result summary messages.
 - Retry compaction must not silently summarize or replace the active latest user message. If the latest user message itself is too large to send raw after all safe compaction options are exhausted, the Pipe must fail clearly instead of rewriting the user's request.
-- If the summary model itself returns a context-window error while summarizing a large prefix or tool result, the Pipe must retry summarization by extending from an existing parent checkpoint when available. Dynamic adaptive summary splitting is out of v1 scope. If the latest tool result alone exceeds the summary model's capacity, the Pipe must return a clear error instead of inventing a lossy split strategy.
+- Summary creation must always resolve an exact or longest matching parent checkpoint before calling the summary model. If a parent checkpoint exists, the summary model receives the parent summary plus only the delta messages after that parent, including tool-loop summaries. Dynamic adaptive summary splitting is out of v1 scope. If ordinary message summary extension fails after a verified parent checkpoint is found, the Pipe may continue the current target call with a checkpoint-derived payload containing the parent summary plus the verified raw delta and tail messages. This is not raw direct forwarding: the already summarized prefix must stay replaced by the checkpoint summary, and the Pipe must not insert a full-prefix checkpoint that was not actually generated. Tool-result compaction, unsafe deltas, and active inputs that cannot be sent safely must return a clear error instead of inventing a lossy split strategy or bypassing the checkpoint.
 
 ## Persistence Strategy
 
@@ -150,7 +150,7 @@ Use extension-owned indexes:
 - `skyzi000_owui_ext_accp_v1_prefix_idx`
 - `skyzi000_owui_ext_accp_v1_recent_idx`
 
-The table stores derived durable compaction state, not raw chat source of truth. Open WebUI chat history remains canonical, but valid checkpoints may become operationally necessary for continuing very long chats after the original prefix exceeds the summary model context window. Checkpoints must support both exact reuse and rolling extension: when a longer raw prefix needs compaction and an exact parent checkpoint exists, the Pipe must summarize from that checkpoint plus only the new delta messages after it, instead of resubmitting the already summarized raw prefix. If checkpoint storage is missing or corrupt, the Pipe should still forward without persistent reuse, while documenting that very long chats may no longer be compactable.
+The table stores derived durable compaction state, not raw chat source of truth. Open WebUI chat history remains canonical, but valid checkpoints may become operationally necessary for continuing very long chats after the original prefix exceeds the summary model context window. Checkpoints must support both exact reuse and rolling extension: whenever a current summarization prefix has an exact checkpoint or a matching parent checkpoint, the Pipe must summarize or compact from that checkpoint plus only the new delta messages after it, instead of resubmitting the already summarized raw prefix. Checkpoint storage is not an optional cache: if checkpoint lookup, initialization, validation, or required persistence fails for a durable chat context, the Pipe must fail clearly instead of silently forwarding a request that may destroy the continuation path.
 
 Use SQLAlchemy Core table metadata local to the Pipe module. Do not register a Declarative ORM class from a reloadable Pipe. Do not add foreign keys in v1.
 
@@ -212,24 +212,26 @@ Do not store message ids or output indexes in v1. They are not needed for the pl
 8. Pipe requests provider usage on copied streaming target requests when `force_include_usage` is enabled.
 9. Pipe skips compaction for unsupported contexts: no `chat_id`, temporary `local:` or `channel:` chats, and known internal tasks including its own summary task.
 10. Pipe reads provider usage from request-scoped in-flight usage first, then from Open WebUI persisted chat/message state, then from message payload usage if present.
-11. If usage is absent or below `trigger_total_tokens`, Pipe may make a first target attempt with unchanged copied messages, scoped request-state restoration, and streaming response wrapping for usage and context-error capture.
-12. If usage is at or above `trigger_total_tokens`, Pipe chooses a safe message cut point.
-13. Pipe excludes the preserved first system message from the summarization prefix.
-14. Pipe computes `source_hash` and `profile_hash`.
-15. Pipe initializes the checkpoint table idempotently.
-16. Pipe enters a per-process generation lock for the namespace/user/chat/pipe/profile/source hash.
-17. Pipe looks up an existing ready checkpoint by source hash and profile hash, independent of selected target model and summary model.
-18. On exact hit, Pipe updates `last_used_at` and reuses `summary_text`.
-19. On miss, Pipe searches for the longest exact parent checkpoint that represents a canonical prefix of the desired summarization prefix.
-20. If a parent checkpoint exists, Pipe calls the summary model with the parent summary as compressed historical context plus only the delta messages after the parent prefix.
-21. Summary calls must be marked with summary-task metadata, must not request tools, must preserve and restore request-scoped bypass state, and may target a Pipe-backed summary model as long as the summary task cannot recursively compact itself.
-22. If no parent checkpoint exists, Pipe calls the summary model with the raw summarization prefix and lets the compaction failure behavior handle summary-context overflow.
-23. Pipe inserts the checkpoint for the full desired prefix. If it was derived from a parent checkpoint, the row records that parent checkpoint id. If a concurrent insert wins elsewhere, Pipe fetches and uses the existing ready checkpoint.
-24. Pipe replaces the old prefix with the preserved system message, a compact user-role summary message containing both AI summary text and chronological middle-truncated historical user excerpts, and the raw latest user message.
-25. Pipe removes `previous_response_id` only when compaction was applied.
-26. Pipe forwards the compacted copied payload to the target model with scoped request-state restoration and wraps any streaming response for usage and context-error capture.
-27. If a wrapped target call fails with a retryable context-window error before any target output is emitted, Pipe compacts with the same latest-user boundary and retries within the fixed retry budget.
-28. If retry compaction succeeds, Pipe returns the retried streaming response as the user-visible response and stores any reusable checkpoint state created along the way.
+11. Pipe chooses the safe message cut points needed to determine whether an exact checkpoint or parent checkpoint already matches the current chain, even when usage is absent or below `trigger_total_tokens`.
+12. Pipe excludes the preserved first system message from any summarization prefix.
+13. Pipe computes `source_hash`, prefix hashes, and `profile_hash`.
+14. Pipe initializes the checkpoint table idempotently; failure to access required checkpoint state in a durable chat context is a clear error, not a raw-forward fallback.
+15. Pipe first checks for exact checkpoint reuse and then longest matching parent checkpoints for tool-loop and ordinary message cuts.
+16. If usage is absent or below threshold and no exact or parent checkpoint exists anywhere in the current cut chain, Pipe may make a first target attempt with unchanged copied messages, scoped request-state restoration, and streaming response wrapping for usage and context-error capture.
+17. If usage is absent or below threshold but an exact or parent checkpoint exists anywhere in the current cut chain, Pipe applies that checkpoint and forwards the checkpoint-derived compacted payload without creating a new summary.
+18. If usage is at or above `trigger_total_tokens`, Pipe enters a per-process generation lock for the namespace/user/chat/pipe/profile/source hash.
+19. Inside the lock, Pipe looks up an existing ready checkpoint by source hash and profile hash, independent of selected target model and summary model.
+20. On exact hit, Pipe updates `last_used_at` and reuses `summary_text`.
+21. On miss, Pipe searches for the longest exact parent checkpoint that represents a canonical prefix of the desired summarization prefix.
+22. If a parent checkpoint exists, Pipe calls the summary model with the parent summary as compressed historical context plus only the delta messages after the parent prefix.
+23. Summary calls must be marked with summary-task metadata, must not request tools, must preserve and restore request-scoped bypass state, and may target a Pipe-backed summary model as long as the summary task cannot recursively compact itself.
+24. If no parent checkpoint exists, Pipe calls the summary model with the raw summarization prefix and lets the compaction failure behavior handle summary-context overflow.
+25. Pipe inserts the checkpoint for the full desired prefix before relying on that checkpoint as durable continuation state. If it was derived from a parent checkpoint, the row records that parent checkpoint id. If a concurrent insert wins elsewhere, Pipe fetches and uses the existing ready checkpoint.
+26. Pipe replaces the old prefix with the preserved system message, a compact user-role summary message containing both AI summary text and chronological middle-truncated historical user excerpts, and the raw latest user message.
+27. Pipe removes `previous_response_id` only when compaction was applied.
+28. Pipe forwards the compacted copied payload to the target model with scoped request-state restoration and wraps any streaming response for usage and context-error capture.
+29. If a wrapped target call fails with a retryable context-window error before any target output is emitted, Pipe compacts with the same latest-user boundary and retries within the fixed retry budget.
+30. If retry compaction succeeds, Pipe returns the retried streaming response as the user-visible response and stores any reusable checkpoint state created along the way.
 
 ## Message Compaction Rules
 
@@ -369,7 +371,7 @@ Do not start with builder integration unless the single-file proof works.
 - [ ] Add tests for request-scoped usage taking precedence over persisted message usage.
 - [ ] Add tests that persisted usage lookup can read the current branch from Open WebUI's normalized `chat_message` path.
 - [ ] Add tests that persisted usage lookup handles the legacy embedded chat-history fallback when normalized rows are absent or incomplete.
-- [ ] Add tests for forwarding unchanged when usage is absent or below threshold.
+- [ ] Add tests for forwarding unchanged when usage is absent or below threshold only after verifying no exact or parent checkpoint matches the current chat-history chain.
 - [ ] Implement the complete v1 Admin Valve surface listed in this plan, without adding extra knobs.
 - [ ] Implement manifold listing from the allowed Open WebUI process-local app-state model caches, tolerating cold caches.
 - [ ] Implement wrapper Model record and access grant synchronization through existing Open WebUI APIs as generated-wrapper access-control overrides, not as Workspace/preset models.
@@ -399,13 +401,15 @@ Do not start with builder integration unless the single-file proof works.
 - [ ] Add tests that verify a checkpoint miss generates a summary and stores a ready checkpoint.
 - [ ] Add tests that verify a longer-prefix checkpoint miss uses the longest matching parent checkpoint summary plus delta messages, not the raw already-summarized prefix.
 - [ ] Add tests that verify extended checkpoints store the full new prefix hash and parent checkpoint lineage.
-- [ ] Add tests that verify summary-model context-window errors trigger parent-checkpoint extension before failing the chat.
+- [ ] Add tests that verify ordinary message summary-extension failures use the verified parent checkpoint plus safe raw delta fallback without inserting a full-prefix checkpoint.
 - [ ] Add tests that verify dynamic adaptive summary splitting is not used in v1.
 - [ ] Add tests that verify a latest tool result that alone exceeds the summary model capacity returns a clear error.
 - [ ] Add tests that verify oversized retained tool results can be compacted during context-error retry while preserving valid tool-call/result structure.
 - [ ] Add tests that verify the active latest user message is never silently summarized or replaced during retry compaction.
 - [ ] Add tests that verify an oversized active latest user message returns a clear error when it cannot be sent raw.
 - [ ] Add tests that verify checkpoint reuse survives target model and summary model changes when source hash and profile hash match.
+- [ ] Add tests that verify below-threshold requests still reuse an exact or parent checkpoint when one exists in the current chat-history chain.
+- [ ] Add tests that verify tool-loop summary creation always extends an available parent checkpoint and never exposes an opt-out path for parent checkpoint use.
 - [ ] Add tests that verify compacted requests remove `previous_response_id`.
 - [ ] Implement summary generation, checkpoint compatibility handling, exact checkpoint reuse, rolling checkpoint extension, and compacted forwarding.
 - [ ] Run all Pipe tests and compile the Pipe file.
@@ -417,15 +421,15 @@ Do not start with builder integration unless the single-file proof works.
 - Modify: `functions/pipe/auto_compaction_pipe.py`
 - Modify: `tests/pipes/test_auto_compaction_checkpoint.py`
 
-- [ ] Add tests that verify DB write failures after a summary is generated do not block using that summary for the current compacted request.
+- [ ] Add tests that verify required checkpoint storage failures fail clearly instead of forwarding without durable continuation state.
 - [ ] Add tests that verify exact checkpoint hits are still used when non-critical checkpoint update operations fail.
-- [ ] Add tests that verify summary-extension failures prefer an existing usable parent checkpoint plus safe delta over raw over-threshold direct forwarding, and return a clear error when the delta itself cannot be safely sent or summarized.
+- [ ] Add tests that verify summary-extension failures never raw-forward the full history: ordinary safe deltas may use parent-checkpoint plus raw delta fallback, while tool-result compaction and unsafe deltas return a clear error.
 - [ ] Add tests that verify missing usage permits only the first unchanged attempt and that a resulting context-window error triggers compaction and retry.
 - [ ] Add tests that verify pre-stream context-window errors and first-event SSE context errors are retried before any user-visible chunks are emitted.
 - [ ] Add tests that verify streaming error chunks observed after stream body iteration starts are surfaced and not internally retried in v1.
 - [ ] Add tests that verify retry stops at a fixed internal retry budget and does not retry non-context errors.
-- [ ] Add tests that verify raw direct forwarding is limited to cases where compaction is not required or no safer checkpoint-based continuation path exists.
-- [ ] Add tests that verify fallback forwarding still captures stream usage.
+- [ ] Add tests that verify raw direct forwarding is limited to cases where compaction is not required and no exact or parent checkpoint exists in the current chat-history chain.
+- [ ] Add tests that verify the allowed first unchanged target attempt still captures stream usage.
 - [ ] Implement conservative context-window error detection, pre-emission compact-and-retry behavior, failure handling, and status emission without treating checkpoints as optional cache.
 - [ ] Run all Pipe tests and compile the Pipe file.
 
@@ -438,7 +442,8 @@ Do not start with builder integration unless the single-file proof works.
 - [ ] Import the Pipe in Open WebUI as a Pipe Function with the Function id `auto_compact`.
 - [ ] Configure the v1 Valves listed in this plan.
 - [ ] Enable native function calling for the wrapper model or request params.
-- [ ] Verify basic below-threshold chat forwards to the decoded target model and emits no compaction status.
+- [ ] Verify a basic below-threshold chat with no applicable checkpoint forwards to the decoded target model and emits no compaction status.
+- [ ] Verify a below-threshold chat with any applicable exact or parent checkpoint uses that checkpoint before forwarding.
 - [ ] Verify manifold wrapper generation covers the expected real models without manual per-model Pipe configuration.
 - [ ] Verify a non-admin user can see and use authorized wrapper models through normal Open WebUI model filtering.
 - [ ] Verify a non-admin user cannot use a wrapper to reach a target model they cannot directly access.
@@ -454,7 +459,7 @@ Do not start with builder integration unless the single-file proof works.
 - [ ] Verify a huge tool result that causes a pre-emission target-model context-window error is compacted and retried without ending the chat.
 - [ ] Verify a first-event SSE context error is retried before any client-visible chunk is emitted.
 - [ ] Verify a streaming provider error that arrives after output has begun is surfaced rather than silently retried.
-- [ ] Verify a summary-model context-window error during compaction triggers parent-checkpoint extension when available.
+- [ ] Verify summary creation always uses an available parent checkpoint; if ordinary message extension fails, safe raw delta fallback still forwards a checkpoint-derived payload, while tool-result or unsafe-delta failures return a clear error.
 - [ ] Verify a Pipe-backed `summary_model` can be used without recursively compacting the summary task.
 - [ ] Verify `request.state.bypass_filter` does not remain changed after target or summary forwarding.
 - [ ] Verify a latest tool result that exceeds the summary model capacity returns a clear error.
@@ -482,6 +487,7 @@ Do not start with builder integration unless the single-file proof works.
 - **Oversized active input:** The latest user message or latest tool result can itself exceed available context or summary-model capacity. Mitigation: never rewrite the active user request silently; compact oversized tool results only when the summary model can safely process them, and return a clear error otherwise.
 - **Summary authority:** Putting user/tool history into a system message can elevate historical text. Mitigation: never modify system messages; always inject summaries as user-role historical context.
 - **Rolling summary drift:** Repeatedly extending summaries can accumulate omissions or distortions. Mitigation: use the longest exact parent checkpoint, include only verified delta messages after that parent, include bounded chronological middle-truncated historical user excerpts, and keep the summary output contract backward compatible.
+- **Parent-delta fallback recurrence:** If ordinary message summary extension fails but the target can accept parent summary plus raw delta, the current turn may continue without creating a new full-prefix checkpoint. Mitigation: apply this fallback only to verified safe ordinary deltas, keep the parent checkpoint as the durable boundary, remove provider state from compacted payloads, and surface target context overflow if the fallback payload cannot be sent safely.
 - **Summary quality:** Bad summaries can degrade answer quality. Mitigation: include bounded historical user excerpts alongside the AI summary, keep summary compatibility stable for existing checkpoints, reuse existing ready checkpoints across target/summary model changes, and make compaction threshold conservative by default.
 - **Table lifecycle:** Extension-owned tables will not be managed by Open WebUI migrations. Mitigation: version table names and never destructively migrate in place.
 - **Privacy:** Summaries may contain sensitive data. Mitigation: do not store raw prefixes and document that summaries are persisted in the same DB as chat data.
