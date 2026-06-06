@@ -248,7 +248,7 @@ def test_profile_hash_only_uses_hard_compatibility_boundaries():
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=64,
     )
-    hard_change = mod.compute_profile_hash(summary_format_family="compact-user-summary-v2")
+    hard_change = mod.compute_profile_hash(summary_format_family="changed-summary-format-family")
 
     assert ordinary_changes == baseline
     assert hard_change != baseline

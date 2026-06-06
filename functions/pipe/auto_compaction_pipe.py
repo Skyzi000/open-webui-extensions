@@ -10,6 +10,7 @@ license: MIT
 from __future__ import annotations
 
 import asyncio
+import codecs
 import copy
 import fnmatch
 import hashlib
@@ -883,18 +884,22 @@ def render_compaction_summary_embed_html(summary_text: str) -> str:
             ),
             "body{padding:2px}",
             (
-                ".card{border:1px solid rgba(107,114,128,.35);border-radius:8px;"
-                "background:rgba(249,250,251,.92);overflow:hidden}"
+                ".card{border:1px solid rgba(107,114,128,.35);border-radius:6px;"
+                "background:rgba(249,250,251,.92);overflow:hidden;margin:0}"
             ),
             ".card[open]{background:#fff}",
             (
                 "summary{display:flex;align-items:center;justify-content:space-between;gap:12px;"
-                "padding:10px 12px;cursor:pointer;user-select:none;font-weight:600;color:#111827}"
+                "padding:6px 10px;cursor:pointer;user-select:none;font-weight:600;color:#111827;"
+                "font-size:12.5px;line-height:1.35}"
             ),
             "summary::-webkit-details-marker{display:none}",
             ".title{overflow-wrap:anywhere}",
             ".meta{font-size:12px;font-weight:500;color:#6b7280;white-space:nowrap}",
-            ".body{border-top:1px solid rgba(107,114,128,.25);padding:12px;background:rgba(255,255,255,.8)}",
+            (
+                ".body{border-top:1px solid rgba(107,114,128,.25);padding:12px;"
+                "background:rgba(255,255,255,.8);max-height:36em;overflow:auto;scrollbar-width:thin}"
+            ),
             (
                 "pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;"
                 "font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;"
@@ -912,19 +917,22 @@ def render_compaction_summary_embed_html(summary_text: str) -> str:
     script = "".join(
         [
             "(function(){",
-            "function postHeight(){",
-            "var h=Math.max(document.documentElement.scrollHeight,document.body.scrollHeight,1);",
+            "function postHeight(){requestAnimationFrame(function(){",
+            "var b=document.body;",
+            "var h=b?b.scrollHeight:document.documentElement.scrollHeight;",
             "parent.postMessage({type:'iframe:height',height:h},'*');",
-            "}",
-            "window.addEventListener('load',function(){setTimeout(postHeight,0);setTimeout(postHeight,50);});",
-            "document.addEventListener('toggle',function(){setTimeout(postHeight,0);setTimeout(postHeight,50);},true);",
-            "if(document.readyState!=='loading'){setTimeout(postHeight,0);}",
+            "});}",
+            "postHeight();",
+            "window.addEventListener('DOMContentLoaded',postHeight);",
+            "window.addEventListener('load',postHeight);",
+            "document.addEventListener('toggle',postHeight,true);",
             "})();",
         ]
     )
     return (
         f"{COMPACTION_SUMMARY_EMBED_MARKER}"
         "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<script>parent.postMessage({type:'iframe:height',height:0},'*');</script>"
         f"<style>{styles}</style></head><body>"
         "<details class=\"card\">"
         "<summary>"
@@ -2012,18 +2020,82 @@ def is_retryable_context_error(value: Any, *, status_code: int | None = None) ->
     return any(pattern in joined_messages for pattern in _CONTEXT_MESSAGE_PATTERNS)
 
 
+class _SSEDataParser:
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._buffer = ""
+        self._data_lines: list[str] = []
+
+    def feed(self, chunk: bytes | str) -> tuple[list[str], bool]:
+        text = self._decoder.decode(chunk, final=False) if isinstance(chunk, bytes) else str(chunk)
+        self._buffer += text
+        lines = self._buffer.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._buffer = lines.pop()
+        else:
+            self._buffer = ""
+        return self._process_lines([line.rstrip("\r\n") for line in lines])
+
+    def flush(self) -> tuple[list[str], bool]:
+        lines = []
+        remaining_text = self._decoder.decode(b"", final=True)
+        if remaining_text:
+            self._buffer += remaining_text
+        if self._buffer:
+            lines.append(self._buffer)
+            self._buffer = ""
+        values, saw_data_field = self._process_lines(lines)
+        final_value = self._consume_event()
+        if final_value is not None:
+            values.append(final_value)
+        return values, saw_data_field
+
+    def _process_lines(self, lines: list[str]) -> tuple[list[str], bool]:
+        values: list[str] = []
+        saw_data_field = False
+        for line in lines:
+            if line == "":
+                value = self._consume_event()
+                if value is not None:
+                    values.append(value)
+                continue
+            if not line.startswith("data:"):
+                continue
+            saw_data_field = True
+            data = line[len("data:") :]
+            if data.startswith(" "):
+                data = data[1:]
+            self._data_lines.append(data)
+        return values, saw_data_field
+
+    def _consume_event(self) -> str | None:
+        if not self._data_lines:
+            return None
+        value = "\n".join(self._data_lines)
+        self._data_lines = []
+        if value.strip() == "[DONE]":
+            return None
+        return value
+
+
+def _parse_sse_data_values(chunk: bytes | str) -> tuple[list[str], bool]:
+    parser = _SSEDataParser()
+    values, saw_data_field = parser.feed(chunk)
+    flushed_values, flushed_saw_data_field = parser.flush()
+    values.extend(flushed_values)
+    return values, saw_data_field or flushed_saw_data_field
+
+
+def extract_sse_data_values(chunk: bytes | str) -> list[str]:
+    values, _ = _parse_sse_data_values(chunk)
+    return values
+
+
 def extract_sse_json_events(chunk: bytes | str) -> list[dict[str, Any]]:
-    text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
     events: list[dict[str, Any]] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        data = line[len("data:") :].strip()
-        if not data or data == "[DONE]":
-            continue
+    for data in extract_sse_data_values(chunk):
         try:
-            payload = json.loads(data)
+            payload = json.loads(data.strip())
         except Exception:
             continue
         if isinstance(payload, dict):
@@ -2382,6 +2454,78 @@ def _responses_output_has_tool_call(response: dict[str, Any]) -> bool:
     return False
 
 
+def _responses_output_text(response: dict[str, Any]) -> str | None:
+    output_text = response.get("output_text")
+    if isinstance(output_text, str):
+        return output_text
+    output = response.get("output")
+    if not isinstance(output, list):
+        return None
+    parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for content_item in content:
+            if not isinstance(content_item, dict) or content_item.get("type") != "output_text":
+                continue
+            text = content_item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    if not parts:
+        return None
+    return "".join(parts)
+
+
+def _stream_payload_delta_text(payload: dict[str, Any]) -> str | None:
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        delta = choices[0].get("delta") or {}
+        content = delta.get("content")
+        if isinstance(content, str):
+            return content
+    if payload.get("type") == "response.output_text.delta":
+        delta = payload.get("delta")
+        if isinstance(delta, str):
+            return delta
+    return None
+
+
+def _stream_payload_is_control_event(payload: dict[str, Any]) -> bool:
+    if "error" in payload or "usage" in payload:
+        return True
+    return payload.get("done") is True
+
+
+def _stream_payload_is_known_transport_event(payload: dict[str, Any]) -> bool:
+    payload_type = payload.get("type")
+    if isinstance(payload.get("choices"), list):
+        return True
+    if isinstance(payload_type, str) and payload_type.startswith("response."):
+        return True
+    return _stream_payload_is_control_event(payload)
+
+
+def _append_summary_sse_value(value: str, parts: list[str]) -> bool:
+    try:
+        payload = json.loads(value.strip())
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    is_known_transport_event = _stream_payload_is_known_transport_event(payload)
+    saw_tool_call = is_known_transport_event and _stream_payload_has_tool_call(payload)
+    if not is_known_transport_event:
+        return False
+    delta_text = _stream_payload_delta_text(payload)
+    if delta_text is not None:
+        parts.append(delta_text)
+    return saw_tool_call
+
+
 async def emit_compaction_status(
     event_emitter: Callable[[Any], Awaitable[None]] | None,
     *,
@@ -2408,8 +2552,6 @@ async def emit_compaction_status(
 
 
 async def extract_text_from_completion_response(response: Any, *, tools_enabled: bool = False) -> str:
-    if isinstance(response, str):
-        return response
     if isinstance(response, dict):
         if _responses_output_has_tool_call(response):
             raise _summary_tool_call_error()
@@ -2419,37 +2561,27 @@ async def extract_text_from_completion_response(response: Any, *, tools_enabled:
             if _choice_has_tool_call(choice):
                 raise _summary_tool_call_error()
             message = choice.get("message") or {}
-            for key in ("content", "reasoning_content"):
-                value = message.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-        for key in ("content", "text", "summary"):
-            value = response.get(key)
+            value = message.get("content")
             if isinstance(value, str) and value.strip():
                 return value.strip()
+        responses_text = _responses_output_text(response)
+        if responses_text and responses_text.strip():
+            return responses_text.strip()
     if isinstance(response, StreamingResponse):
         parts: list[str] = []
         saw_tool_call = False
+        sse_parser = _SSEDataParser()
+        media_type = getattr(response, "media_type", None) or response.headers.get("content-type", "")
+        is_sse_response = "text/event-stream" in media_type
+        if not is_sse_response:
+            await _close_stream_response(response)
+            raise RuntimeError("Summary model did not return a structured OpenAI-compatible response")
         async for chunk in response.body_iterator:
-            events = extract_sse_json_events(chunk)
-            if events:
-                for payload in events:
-                    saw_tool_call = saw_tool_call or _stream_payload_has_tool_call(payload)
-                    choices = payload.get("choices")
-                    if isinstance(choices, list) and choices:
-                        delta = choices[0].get("delta") or {}
-                        content = delta.get("content") or delta.get("reasoning_content")
-                        if isinstance(content, str):
-                            parts.append(content)
-                    if payload.get("type") == "response.output_text.delta":
-                        delta = payload.get("delta")
-                        if isinstance(delta, str):
-                            parts.append(delta)
-                continue
-            if isinstance(chunk, bytes):
-                parts.append(chunk.decode("utf-8", errors="replace"))
-            else:
-                parts.append(str(chunk))
+            sse_values, _ = sse_parser.feed(chunk)
+            for value in sse_values:
+                saw_tool_call = saw_tool_call or _append_summary_sse_value(value, parts)
+        for value in sse_parser.flush()[0]:
+            saw_tool_call = saw_tool_call or _append_summary_sse_value(value, parts)
         text = "".join(parts).strip()
         if saw_tool_call:
             raise _summary_tool_call_error()

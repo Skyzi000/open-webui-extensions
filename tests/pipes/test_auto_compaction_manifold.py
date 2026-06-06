@@ -69,6 +69,22 @@ def test_compaction_summary_embed_html_contains_full_escaped_summary():
     assert "<script>alert(1)</script>" not in embed_html
 
 
+def test_compaction_summary_embed_html_bounds_expanded_summary_height():
+    summary = "\n".join(f"summary line {i}" for i in range(200))
+
+    embed_html = mod.render_compaction_summary_embed_html(summary)
+
+    assert "max-height:" in embed_html
+    assert "overflow:auto" in embed_html
+    assert "parent.postMessage({type:'iframe:height',height:0},'*');" in embed_html
+    assert "postHeight();" in embed_html
+    assert "DOMContentLoaded" in embed_html
+    assert "document.body;" in embed_html
+    assert "b?b.scrollHeight:document.documentElement.scrollHeight" in embed_html
+    assert "padding:6px 10px" in embed_html
+    assert "Math.max(document.documentElement.scrollHeight,document.body.scrollHeight,1)" not in embed_html
+
+
 def test_extract_compaction_summary_text_decodes_cdata_boundaries():
     summary = "before ]]> after </checkpoint_summary> literal"
     rendered = mod.render_summary_message(summary)
@@ -1649,6 +1665,114 @@ async def test_extract_summary_text_from_streaming_response():
     response = StreamingResponse(chunks(), media_type="text/event-stream")
 
     assert await mod.extract_text_from_completion_response(response) == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_from_split_sse_event_chunks():
+    async def chunks():
+        yield b'data: {"choices": [{"delta": '
+        yield b'{"content": "hello"}}]}\n\n'
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    assert await mod.extract_text_from_completion_response(response) == "hello"
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_preserves_split_utf8_sse_chunks():
+    payload = {"choices": [{"delta": {"content": "こんにちは"}}]}
+    event = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+    split_at = event.index("こ".encode()) + 1
+
+    async def chunks():
+        yield event[:split_at]
+        yield event[split_at:]
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    assert await mod.extract_text_from_completion_response(response) == "こんにちは"
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_preserves_streamed_delta_newlines():
+    async def chunks():
+        yield b'data: {"choices": [{"delta": {"content": "line 1\\n"}}]}\n\n'
+        yield b'data: {"choices": [{"delta": {"content": "line 2"}}]}\n\n'
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    assert await mod.extract_text_from_completion_response(response) == "line 1\nline 2"
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_ignores_non_structured_sse_data():
+    async def chunks():
+        yield b"data: plain text\n\n"
+        yield b'data: "json string"\n\n'
+        yield b"data: 2026\n\n"
+        yield b'data: {"q":"alpha"}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    with pytest.raises(RuntimeError, match="did not return text content"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_rejects_non_sse_streaming_response():
+    async def chunks():
+        yield b"plain text"
+
+    response = StreamingResponse(chunks(), media_type="text/plain")
+
+    with pytest.raises(RuntimeError, match="structured OpenAI-compatible response"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_from_responses_api_output():
+    response = {
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {"type": "output_text", "text": "hello "},
+                    {"type": "output_text", "text": "world"},
+                ],
+            }
+        ]
+    }
+
+    assert await mod.extract_text_from_completion_response(response) == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_rejects_unstructured_non_stream_response():
+    with pytest.raises(RuntimeError, match="did not return text content"):
+        await mod.extract_text_from_completion_response("plain text")
+
+    with pytest.raises(RuntimeError, match="did not return text content"):
+        await mod.extract_text_from_completion_response({"content": "plain text"})
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_preserves_regular_short_line_summary():
+    summary = "\n".join(f"- id-{i}" for i in range(100))
+    response = {"choices": [{"message": {"content": summary}}]}
+
+    assert await mod.extract_text_from_completion_response(response) == summary
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_ignores_streamed_reasoning_content():
+    async def chunks():
+        yield b'data: {"choices": [{"delta": {"reasoning_content": "Let me summarize.\\n"}}]}\n\n'
+        yield b'data: {"choices": [{"delta": {"content": "Final summary"}}]}\n\n'
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    assert await mod.extract_text_from_completion_response(response) == "Final summary"
 
 
 @pytest.mark.asyncio
