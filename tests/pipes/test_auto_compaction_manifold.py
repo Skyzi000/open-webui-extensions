@@ -1266,7 +1266,7 @@ def test_summary_task_metadata_removes_tool_and_arena_state():
     assert summary_metadata["chat_id"] == "chat-1"
     assert summary_metadata["task"] == mod.INTERNAL_SUMMARY_TASK
     assert summary_metadata["tools"] == {}
-    assert summary_metadata["tool_ids"] == []
+    assert summary_metadata["tool_ids"] == ["tool"]
     assert "selected_model_id" not in summary_metadata
 
 
@@ -1285,8 +1285,6 @@ async def test_summary_task_metadata_drops_unpickleable_core_values():
     assert summary_metadata["params"] == {"function_calling": "native"}
     assert "mcp_clients" not in summary_metadata
     assert summary_metadata["task"] == mod.INTERNAL_SUMMARY_TASK
-    assert summary_metadata["tools"] == {}
-    assert summary_metadata["tool_ids"] == []
 
 
 @pytest.mark.asyncio
@@ -1314,12 +1312,13 @@ async def test_summary_generation_overrides_request_state_metadata(monkeypatch, 
         metadata={"chat_id": "chat-1", "selected_model_id": "arena-a", "tools": {"bad": {}}, "tool_ids": ["bad"]},
         summary_model_id="target",
         source_messages=[{"role": "user", "content": "old"}],
+        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
     )
 
     assert result == "summary"
     assert captured["state_metadata"]["task"] == mod.INTERNAL_SUMMARY_TASK
     assert captured["state_metadata"]["tools"] == {}
-    assert captured["state_metadata"]["tool_ids"] == []
+    assert captured["state_metadata"]["tool_ids"] == ["bad"]
     assert "selected_model_id" not in captured["state_metadata"]
     assert captured["form_metadata"] == captured["state_metadata"]
     assert captured["bypass_system_prompt"] is False
@@ -1354,12 +1353,88 @@ async def test_summary_generation_decodes_own_wrapper_summary_model(monkeypatch,
         metadata={"chat_id": "chat-1"},
         summary_model_id=wrapper_summary_model,
         source_messages=[{"role": "user", "content": "old"}],
+        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
     )
 
     assert result == "summary"
     assert captured["model"] == "target.summary"
-    assert captured["stream"] is False
+    assert captured["stream"] is True
     assert captured["metadata"]["task"] == mod.INTERNAL_SUMMARY_TASK
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_preserves_tools_but_disables_forced_tool_choice(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    captured = []
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured.append(form_data)
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    source_messages = [
+        {"role": "system", "content": "target system"},
+        {"role": "user", "content": "old"},
+    ]
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    metadata = {
+        "chat_id": "chat-1",
+        "selected_model_id": "arena-a",
+        "tools": {"lookup": {"spec": tools[0]["function"]}},
+        "tool_ids": ["lookup"],
+    }
+    base_body = {
+        "model": "target",
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "messages": [*source_messages, {"role": "user", "content": "active"}],
+        "tools": tools,
+        "metadata": {"chat_id": "chat-1"},
+        "previous_response_id": "resp_should_not_survive_compaction",
+    }
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata=metadata,
+        summary_model_id="target.summary",
+        source_messages=source_messages,
+        base_body={**base_body, "tool_choice": "required"},
+    )
+
+    assert result == "summary"
+    form_data = captured[-1]
+    assert form_data["model"] == "target.summary"
+    assert form_data["stream"] is True
+    assert form_data["stream_options"] == {"include_usage": True}
+    assert form_data["tools"] == tools
+    assert form_data["tool_choice"] == "none"
+    assert "previous_response_id" not in form_data
+    assert form_data["messages"][:-1] == source_messages
+    assert form_data["messages"][-1]["role"] == "user"
+    assert "AUTO-COMPACTION CHECKPOINT SUMMARY" in form_data["messages"][-1]["content"]
+    assert form_data["metadata"]["task"] == mod.INTERNAL_SUMMARY_TASK
+    assert form_data["metadata"]["tools"] == {}
+    assert form_data["metadata"]["tool_ids"] == ["lookup"]
+    assert "selected_model_id" not in form_data["metadata"]
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata=metadata,
+        summary_model_id="target.summary",
+        source_messages=source_messages,
+        base_body={**base_body, "tool_choice": "auto"},
+    )
+
+    assert result == "summary"
+    assert captured[-1]["tool_choice"] == "auto"
 
 
 @pytest.mark.asyncio
@@ -1380,15 +1455,19 @@ async def test_summary_generation_uses_handoff_checkpoint_prompt(monkeypatch, pi
         metadata={"chat_id": "chat-1"},
         summary_model_id="target",
         source_messages=[{"role": "user", "content": "old"}],
+        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
     )
 
     assert result == "summary"
-    prompt = captured["messages"][0]["content"]
+    assert captured["messages"][0] == {"role": "user", "content": "old"}
+    assert captured["messages"][-1]["role"] == "user"
+    prompt = captured["messages"][-1]["content"]
     assert "AUTO-COMPACTION CHECKPOINT SUMMARY" in prompt
     assert "Open WebUI chat" in prompt
     assert "future model call" in prompt
     assert "existing <auto_compaction_context>" in prompt
     assert "Do not invent facts" in prompt
+    assert "Do not call tools" in prompt
 
 
 @pytest.mark.asyncio
@@ -1416,6 +1495,7 @@ async def test_summary_generation_passes_open_webui_user_model_to_inner_completi
         metadata={"chat_id": "chat-1"},
         summary_model_id="target",
         source_messages=[{"role": "user", "content": "old"}],
+        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
     )
 
     assert result == "summary"
@@ -1443,6 +1523,28 @@ async def test_tool_history_compaction_summarizes_before_latest_tool_round_and_p
         metadata={"chat_id": "chat-1"},
         pipe_function_id="auto_compact",
         summary_model_id="target",
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "old request"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "active request"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "search", "arguments": '{"q":"alpha"}'},
+                        }
+                    ],
+                },
+                original_tool,
+            ],
+        },
         messages=[
             {"role": "system", "content": "system prompt"},
             {"role": "user", "content": "old request"},
@@ -1528,6 +1630,7 @@ async def test_tool_history_compaction_summarizes_all_but_latest_sequential_tool
         metadata={"chat_id": "chat-1"},
         pipe_function_id="auto_compact",
         summary_model_id="target",
+        base_body={"model": "target", "stream": True, "messages": messages},
         messages=messages,
     )
 
@@ -1546,6 +1649,59 @@ async def test_extract_summary_text_from_streaming_response():
     response = StreamingResponse(chunks(), media_type="text/event-stream")
 
     assert await mod.extract_text_from_completion_response(response) == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_rejects_tool_call_response():
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+
+    with pytest.raises(RuntimeError, match="tool call"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_rejects_raw_responses_tool_call_output():
+    response = {
+        "id": "resp-1",
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "lookup",
+                "arguments": "{}",
+            }
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="tool call"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_rejects_streamed_tool_call_response():
+    async def chunks():
+        yield b'data: {"choices": [{"delta": {"tool_calls": [{"id": "call-1"}]}}]}\n\n'
+        yield b'data: {"choices": [{"finish_reason": "tool_calls", "delta": {}}]}\n\n'
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    with pytest.raises(RuntimeError, match="tool call"):
+        await mod.extract_text_from_completion_response(response)
 
 
 @pytest.mark.asyncio
@@ -3363,7 +3519,7 @@ async def test_tool_loop_checkpoints_extend_previous_tool_checkpoint_without_his
 
 
 @pytest.mark.asyncio
-async def test_pipe_compacts_active_tool_result_directly_when_history_parent_exists_and_summary_fits(
+async def test_pipe_compacts_history_before_latest_tool_round_when_prior_checkpoint_exists(
     monkeypatch,
     pipe_request,
     pipe_user,
@@ -3478,7 +3634,7 @@ async def test_pipe_compacts_active_tool_result_directly_when_history_parent_exi
 
 
 @pytest.mark.asyncio
-async def test_pipe_compacts_active_tool_result_directly_when_normal_parent_exists_and_summary_fits(
+async def test_pipe_compacts_history_before_latest_tool_round_when_checkpoint_parent_includes_retained_history(
     monkeypatch,
     pipe_request,
     pipe_user,
@@ -3738,7 +3894,12 @@ async def test_pipe_does_not_retry_non_context_target_errors(monkeypatch, pipe_r
 
 
 @pytest.mark.asyncio
-async def test_pipe_retries_tool_loop_by_summarizing_tool_result(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_retries_tool_loop_by_summarizing_history_before_latest_tool_round(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
     calls = []
     summary_inputs = []
 
@@ -3897,21 +4058,23 @@ async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_me
 
     monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
 
+    messages = [
+        {"role": "user", "content": "active"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        original_tool,
+    ]
     compacted, did_compact = await mod._compact_retry_tool_results(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
         pipe_function_id="auto_compact",
         summary_model_id="target",
-        messages=[
-            {"role": "user", "content": "active"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"id": "call-1", "type": "function"}],
-            },
-            original_tool,
-        ],
+        base_body={"model": "target", "stream": True, "messages": messages},
+        messages=messages,
     )
 
     assert did_compact is True

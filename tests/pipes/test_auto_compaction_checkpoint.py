@@ -884,7 +884,7 @@ async def test_compact_body_extends_from_parent_summary_plus_delta(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_compact_body_uses_canonical_checkpoint_source_for_summary(monkeypatch):
+async def test_compact_body_uses_raw_summary_source_but_canonical_checkpoint_hash(monkeypatch):
     captured = {}
 
     async def noop_initialize(**kwargs):
@@ -898,6 +898,7 @@ async def test_compact_body_uses_canonical_checkpoint_source_for_summary(monkeyp
             return None
 
         async def insert_ready(self, row):
+            captured["inserted_row"] = row
             return row
 
     async def generate_summary_text(**kwargs):
@@ -953,18 +954,8 @@ async def test_compact_body_uses_canonical_checkpoint_source_for_summary(monkeyp
 
     assert did_compact is True
     summary_file = captured["source_messages"][0]["files"][0]
-    assert summary_file == {
-        "file": {
-            "data": {"content": "page text"},
-            "filename": "page.txt",
-            "hash": "abc123",
-            "id": "file-1",
-            "meta": {"source": "https://example.com/a"},
-        },
-        "name": "https://example.com/a",
-        "type": "text",
-        "url": "https://example.com/a",
-    }
+    assert summary_file == body["messages"][0]["files"][0]
+    assert captured["inserted_row"]["source_hash"] == mod.compute_source_hash(body["messages"][:2])
     assert "summary" in compacted["messages"][0]["content"]
 
 

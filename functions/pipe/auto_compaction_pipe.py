@@ -59,7 +59,7 @@ MAX_CONTEXT_RETRY_ATTEMPTS = 2
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES = 512
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT = 32
 COMPACTION_SUMMARY_EMBED_MARKER = "<!--auto-compaction-summary-embed:v1-->"
-SUMMARY_SYSTEM_PROMPT = (
+SUMMARY_PROMPT = (
     "You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY for an Open WebUI chat. "
     "Create a concise handoff summary for a future model call that will continue the same chat.\n\n"
     "Preserve:\n"
@@ -70,7 +70,11 @@ SUMMARY_SYSTEM_PROMPT = (
     "If the input contains an existing <auto_compaction_context>, merge that prior checkpoint with the following newer messages. "
     "Do not discard earlier checkpoint information merely because it is summarized.\n\n"
     "Do not invent facts. Do not introduce new instructions. Do not include irrelevant transcript detail. "
-    "Be concise, structured, and focused on continuity."
+    "Be concise, structured, and focused on continuity.\n\n"
+    "The preceding messages are the exact checkpoint source to summarize. "
+    "Messages after this checkpoint source may be retained raw separately; do not infer omitted active requests.\n\n"
+    "Output only the checkpoint summary body. Do not continue the conversation. "
+    "Do not call tools. Do not ask follow-up questions."
 )
 
 try:
@@ -2341,6 +2345,43 @@ def _merge_stream_tool_call_delta(tool_calls: list[dict[str, Any]], delta_tool_c
         function["arguments"] = str(function.get("arguments") or "") + arguments
 
 
+def _summary_tool_call_error() -> RuntimeError:
+    return RuntimeError("Summary model returned a tool call instead of text content")
+
+
+def _choice_has_tool_call(choice: Any) -> bool:
+    if not isinstance(choice, dict):
+        return False
+    if choice.get("finish_reason") == "tool_calls":
+        return True
+    message = choice.get("message")
+    if isinstance(message, dict) and (message.get("tool_calls") or message.get("function_call")):
+        return True
+    delta = choice.get("delta")
+    return isinstance(delta, dict) and bool(delta.get("tool_calls") or delta.get("function_call"))
+
+
+def _stream_payload_has_tool_call(payload: dict[str, Any]) -> bool:
+    payload_type = payload.get("type")
+    if isinstance(payload_type, str) and "function_call" in payload_type:
+        return True
+    item = payload.get("item")
+    if isinstance(item, dict) and item.get("type") in {"function_call", "tool_call"}:
+        return True
+    choices = payload.get("choices")
+    return isinstance(choices, list) and any(_choice_has_tool_call(choice) for choice in choices)
+
+
+def _responses_output_has_tool_call(response: dict[str, Any]) -> bool:
+    output = response.get("output")
+    if not isinstance(output, list):
+        return False
+    for item in output:
+        if isinstance(item, dict) and item.get("type") in {"function_call", "tool_call"}:
+            return True
+    return False
+
+
 async def emit_compaction_status(
     event_emitter: Callable[[Any], Awaitable[None]] | None,
     *,
@@ -2366,13 +2407,18 @@ async def emit_compaction_status(
         return
 
 
-async def extract_text_from_completion_response(response: Any) -> str:
+async def extract_text_from_completion_response(response: Any, *, tools_enabled: bool = False) -> str:
     if isinstance(response, str):
         return response
     if isinstance(response, dict):
+        if _responses_output_has_tool_call(response):
+            raise _summary_tool_call_error()
         choices = response.get("choices")
         if isinstance(choices, list) and choices:
-            message = choices[0].get("message") or {}
+            choice = choices[0]
+            if _choice_has_tool_call(choice):
+                raise _summary_tool_call_error()
+            message = choice.get("message") or {}
             for key in ("content", "reasoning_content"):
                 value = message.get(key)
                 if isinstance(value, str) and value.strip():
@@ -2383,10 +2429,12 @@ async def extract_text_from_completion_response(response: Any) -> str:
                 return value.strip()
     if isinstance(response, StreamingResponse):
         parts: list[str] = []
+        saw_tool_call = False
         async for chunk in response.body_iterator:
             events = extract_sse_json_events(chunk)
             if events:
                 for payload in events:
+                    saw_tool_call = saw_tool_call or _stream_payload_has_tool_call(payload)
                     choices = payload.get("choices")
                     if isinstance(choices, list) and choices:
                         delta = choices[0].get("delta") or {}
@@ -2403,8 +2451,12 @@ async def extract_text_from_completion_response(response: Any) -> str:
             else:
                 parts.append(str(chunk))
         text = "".join(parts).strip()
+        if saw_tool_call:
+            raise _summary_tool_call_error()
         if text:
             return text
+    if tools_enabled:
+        raise RuntimeError("Summary model returned a tool call or no text content while tools were available")
     raise RuntimeError("Summary model did not return text content")
 
 
@@ -2414,15 +2466,6 @@ def build_summary_task_metadata(metadata: dict[str, Any] | None) -> dict[str, An
     copied.pop("mcp_clients", None)
     copied["task"] = INTERNAL_SUMMARY_TASK
     copied["tools"] = {}
-    copied["tool_ids"] = []
-    return copied
-
-
-def _strip_tool_request_fields(body: dict[str, Any]) -> dict[str, Any]:
-    copied = _copy_body_preserving_metadata(body)
-    for key in ("tools", "tool_choice", "tool_ids"):
-        copied.pop(key, None)
-    copied["stream"] = False
     return copied
 
 
@@ -2432,6 +2475,56 @@ def _resolve_summary_model_for_call(summary_model_id: str, *, pipe_function_id: 
     return summary_model_id
 
 
+def _is_forced_tool_choice(value: Any) -> bool:
+    if isinstance(value, dict):
+        choice_type = value.get("type")
+        if choice_type in (None, "function", "tool"):
+            return True
+        return choice_type not in {"auto", "none"}
+    if isinstance(value, str):
+        return value not in {"auto", "none"}
+    return False
+
+
+def _is_forced_function_call(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value.get("name"))
+    if isinstance(value, str):
+        return value not in {"auto", "none"}
+    return False
+
+
+def neutralize_summary_tool_choice(body: dict[str, Any]) -> None:
+    if body.get("tools") and _is_forced_tool_choice(body.get("tool_choice")):
+        body["tool_choice"] = "none"
+    elif not body.get("tools"):
+        body.pop("tool_choice", None)
+    if body.get("functions") and _is_forced_function_call(body.get("function_call")):
+        body["function_call"] = "none"
+    elif not body.get("functions"):
+        body.pop("function_call", None)
+
+
+def build_summary_request_message() -> dict[str, str]:
+    return {"role": "user", "content": SUMMARY_PROMPT}
+
+
+def build_summary_completion_body(
+    base_body: dict[str, Any],
+    *,
+    summary_model_id: str,
+    source_messages: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    body = _copy_body_preserving_metadata(base_body)
+    body["model"] = _resolve_summary_model_for_call(summary_model_id)
+    body["messages"] = [*copy.deepcopy(source_messages), build_summary_request_message()]
+    body["metadata"] = build_summary_task_metadata(metadata)
+    body.pop("previous_response_id", None)
+    neutralize_summary_tool_choice(body)
+    return body
+
+
 async def _generate_summary_text(
     *,
     request: Any,
@@ -2439,6 +2532,7 @@ async def _generate_summary_text(
     metadata: dict[str, Any],
     summary_model_id: str,
     source_messages: list[dict[str, Any]],
+    base_body: dict[str, Any],
 ) -> str:
     summary_metadata = build_summary_task_metadata(metadata)
     inner_request = RequestStateProxy(
@@ -2449,18 +2543,11 @@ async def _generate_summary_text(
     )
     from open_webui.utils.chat import generate_chat_completion
 
-    body = _strip_tool_request_fields(
-        {
-            "model": _resolve_summary_model_for_call(summary_model_id),
-            "messages": [
-                {
-                    "role": "system",
-                    "content": SUMMARY_SYSTEM_PROMPT,
-                },
-                *copy.deepcopy(source_messages),
-            ],
-            "metadata": summary_metadata,
-        }
+    body = build_summary_completion_body(
+        base_body,
+        summary_model_id=summary_model_id,
+        source_messages=source_messages,
+        metadata=metadata,
     )
     await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
     response = await generate_chat_completion(
@@ -2472,7 +2559,7 @@ async def _generate_summary_text(
     )
     if is_retryable_context_error(response, status_code=400):
         raise RetryableContextOverflow("Summary model reported a context-window error")
-    return await extract_text_from_completion_response(response)
+    return await extract_text_from_completion_response(response, tools_enabled=bool(body.get("tools")))
 
 
 async def _compact_retry_tool_results(
@@ -2482,6 +2569,7 @@ async def _compact_retry_tool_results(
     metadata: dict[str, Any],
     pipe_function_id: str,
     summary_model_id: str,
+    base_body: dict[str, Any],
     messages: list[dict[str, Any]],
     use_parent_checkpoint: bool = False,
     parent_checkpoint: dict[str, Any] | None = None,
@@ -2508,6 +2596,7 @@ async def _compact_retry_tool_results(
             pipe_function_id=pipe_function_id,
             metadata=metadata,
             summary_model_id=summary_model_id,
+            base_body=base_body,
             source_messages=source_messages,
             summary_meta=summary_meta,
             use_parent_checkpoint=use_parent_checkpoint,
@@ -2628,28 +2717,30 @@ async def _get_or_create_compaction_summary(
     pipe_function_id: str,
     metadata: dict[str, Any],
     summary_model_id: str,
+    base_body: dict[str, Any],
     source_messages: list[dict[str, Any]],
     summary_meta: dict[str, Any],
     use_parent_checkpoint: bool = True,
     parent_checkpoint: dict[str, Any] | None = None,
 ) -> str:
-    checkpoint_source_prefix = canonicalize_messages_for_source_hash(source_messages)
+    summary_source_prefix = copy.deepcopy(source_messages)
 
     async def summary_factory(parent: dict[str, Any] | None) -> str:
         if parent:
             parent_count = int(parent.get("source_message_count") or 0)
             source = [
                 render_summary_message(str(parent["summary_text"]), parent.get("summary_meta") or {}),
-                *checkpoint_source_prefix[parent_count:],
+                *copy.deepcopy(summary_source_prefix[parent_count:]),
             ]
         else:
-            source = checkpoint_source_prefix
+            source = copy.deepcopy(summary_source_prefix)
         return await _generate_summary_text(
             request=request,
             user=user,
             metadata=metadata,
             summary_model_id=summary_model_id,
             source_messages=source,
+            base_body=base_body,
         )
 
     return await _get_or_create_checkpoint_summary(
@@ -3031,6 +3122,7 @@ async def _compact_body(
                 metadata=metadata,
                 pipe_function_id=pipe_function_id,
                 summary_model_id=summary_model_id,
+                base_body=body,
                 messages=messages,
                 use_parent_checkpoint=False,
             )
@@ -3053,6 +3145,7 @@ async def _compact_body(
                             metadata=metadata,
                             pipe_function_id=pipe_function_id,
                             summary_model_id=summary_model_id,
+                            base_body=body,
                             messages=messages,
                             use_parent_checkpoint=True,
                         )
@@ -3081,6 +3174,7 @@ async def _compact_body(
                 pipe_function_id=pipe_function_id,
                 metadata=metadata,
                 summary_model_id=summary_model_id,
+                base_body=body,
                 source_messages=cut.summarization_prefix,
                 summary_meta=history_summary_meta,
             )
@@ -3099,6 +3193,7 @@ async def _compact_body(
                 metadata=metadata,
                 pipe_function_id=pipe_function_id,
                 summary_model_id=summary_model_id,
+                base_body=body,
                 messages=messages,
                 parent_checkpoint=history_checkpoint,
             )
@@ -3130,6 +3225,7 @@ async def _compact_body(
             pipe_function_id=pipe_function_id,
             metadata=metadata,
             summary_model_id=summary_model_id,
+            base_body=body,
             source_messages=cut.summarization_prefix,
             summary_meta=summary_meta,
         )
