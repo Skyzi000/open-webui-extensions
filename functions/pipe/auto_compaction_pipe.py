@@ -16,9 +16,11 @@ import fnmatch
 import hashlib
 import html
 import json
+import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
 
@@ -41,6 +43,11 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+
+try:
+    import markdown as _markdown_mod
+except Exception:
+    _markdown_mod = None
 
 
 PIPE_FUNCTION_ID = "auto_compact"
@@ -757,6 +764,241 @@ def _decode_xml_cdata(value: str) -> str:
     return html.unescape(value)
 
 
+_MD_ALLOWED_TAGS = frozenset(
+    {
+        "p",
+        "br",
+        "hr",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
+        "strong",
+        "b",
+        "em",
+        "i",
+        "u",
+        "s",
+        "del",
+        "ins",
+        "blockquote",
+        "pre",
+        "code",
+        "kbd",
+        "samp",
+        "var",
+        "a",
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "th",
+        "td",
+        "span",
+        "div",
+    }
+)
+_MD_VOID_TAGS = frozenset({"br", "hr"})
+_MD_ALLOWED_ATTRS: dict[str, frozenset[str]] = {
+    "a": frozenset({"href", "title"}),
+    "code": frozenset({"class"}),
+    "pre": frozenset({"class"}),
+    "span": frozenset({"class"}),
+    "th": frozenset({"align", "style"}),
+    "td": frozenset({"align", "style"}),
+}
+_MD_CLASS_RE = re.compile(r"^[a-zA-Z][\w\-]{0,40}$")
+_MD_STYLE_RE = re.compile(r"^\s*text-align\s*:\s*(left|center|right)\s*;?\s*$", re.IGNORECASE)
+_MD_RAW_HTML_TAG_RE = re.compile(
+    r"^</?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*)?/?>$|^<!--.*-->$|^<![A-Za-z][^<>]*>$|^<\?[^<>]*\?>$"
+)
+_MD_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def _html_escape(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return html.escape(text, quote=True).replace("'", "&#x27;")
+
+
+def _is_safe_http_url(url: str) -> bool:
+    if not isinstance(url, str):
+        return False
+    if any(char < " " for char in url):
+        return False
+    stripped = url.strip()
+    lower = stripped.lower()
+    return lower.startswith("http://") or lower.startswith("https://")
+
+
+class _MarkdownSanitizer(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.out: list[str] = []
+        self._stack: list[str] = []
+
+    def _build_attrs(self, tag: str, attrs: list[tuple[str, str | None]]) -> str:
+        allowed = _MD_ALLOWED_ATTRS.get(tag, frozenset())
+        safe_pairs: list[tuple[str, str]] = []
+        href_present = False
+        for name, value in attrs:
+            lname = (name or "").lower()
+            if lname not in allowed:
+                continue
+            attr_value = value or ""
+            if tag == "a" and lname == "href":
+                if not _is_safe_http_url(attr_value):
+                    continue
+                href_present = True
+                safe_pairs.append((lname, attr_value))
+            elif lname == "class":
+                tokens = [token for token in attr_value.split() if _MD_CLASS_RE.match(token)]
+                if tokens:
+                    safe_pairs.append((lname, " ".join(tokens)))
+            elif lname == "style":
+                if _MD_STYLE_RE.match(attr_value):
+                    safe_pairs.append((lname, attr_value.strip()))
+            elif lname == "align" and attr_value.lower() in {"left", "center", "right"}:
+                safe_pairs.append((lname, attr_value.lower()))
+            elif lname == "title":
+                safe_pairs.append((lname, attr_value))
+        attrs_str = "".join(f' {name}="{_html_escape(value)}"' for name, value in safe_pairs)
+        if tag == "a" and href_present:
+            attrs_str += ' target="_blank" rel="noopener noreferrer"'
+        return attrs_str
+
+    def _process_start(self, tag: str, attrs: list[tuple[str, str | None]], self_close: bool) -> None:
+        if tag not in _MD_ALLOWED_TAGS:
+            self.out.append(_html_escape(self.get_starttag_text() or f"<{tag}>"))
+            return
+        attrs_str = self._build_attrs(tag, attrs)
+        if tag in _MD_VOID_TAGS:
+            self.out.append(f"<{tag}{attrs_str}>")
+            return
+        if self_close:
+            self.out.append(f"<{tag}{attrs_str}></{tag}>")
+            return
+        self.out.append(f"<{tag}{attrs_str}>")
+        self._stack.append(tag)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._process_start(tag.lower(), attrs, self_close=False)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._process_start(tag.lower(), attrs, self_close=True)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag not in _MD_ALLOWED_TAGS or tag in _MD_VOID_TAGS:
+            self.out.append(_html_escape(f"</{tag}>"))
+            return
+        if tag not in self._stack:
+            return
+        while self._stack:
+            top = self._stack.pop()
+            self.out.append(f"</{top}>")
+            if top == tag:
+                break
+
+    def handle_data(self, data: str) -> None:
+        self.out.append(_html_escape(data))
+
+    def handle_entityref(self, name: str) -> None:
+        self.out.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self.out.append(f"&#{name};")
+
+    def close(self) -> None:
+        super().close()
+        while self._stack:
+            self.out.append(f"</{self._stack.pop()}>")
+
+
+def _escape_markdown_raw_html_line(line: str) -> str:
+    output: list[str] = []
+    index = 0
+    inline_code_ticks = 0
+    while index < len(line):
+        if line[index] == "`":
+            end = index + 1
+            while end < len(line) and line[end] == "`":
+                end += 1
+            tick_count = end - index
+            if inline_code_ticks == 0:
+                inline_code_ticks = tick_count
+            elif inline_code_ticks == tick_count:
+                inline_code_ticks = 0
+            output.append(line[index:end])
+            index = end
+            continue
+        if inline_code_ticks == 0 and line[index] == "<":
+            end = line.find(">", index + 1)
+            if end >= 0:
+                candidate = line[index : end + 1]
+                if _MD_RAW_HTML_TAG_RE.match(candidate):
+                    output.append(_html_escape(candidate))
+                    index = end + 1
+                    continue
+        output.append(line[index])
+        index += 1
+    return "".join(output)
+
+
+def _escape_markdown_raw_html(text: str) -> str:
+    lines: list[str] = []
+    in_fence = False
+    fence_marker = ""
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        newline = line[len(body) :]
+        match = _MD_FENCE_RE.match(body)
+        if match:
+            marker = match.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker[0] * len(marker)
+                lines.append(line)
+                continue
+            if marker[0] == fence_marker[0] and len(marker) >= len(fence_marker):
+                in_fence = False
+                fence_marker = ""
+                lines.append(line)
+                continue
+        if in_fence or body.startswith(("    ", "\t")):
+            lines.append(line)
+            continue
+        lines.append(_escape_markdown_raw_html_line(body) + newline)
+    return "".join(lines)
+
+
+def _render_summary_markdown(text: Any) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    if _markdown_mod is None:
+        return f'<pre class="md-fallback">{_html_escape(text)}</pre>'
+    try:
+        raw_html = _markdown_mod.markdown(
+            _escape_markdown_raw_html(text),
+            extensions=["extra", "sane_lists", "nl2br"],
+            output_format="html",
+        )
+    except Exception:
+        return f'<pre class="md-fallback">{_html_escape(text)}</pre>'
+    sanitizer = _MarkdownSanitizer()
+    try:
+        sanitizer.feed(raw_html)
+        sanitizer.close()
+    except Exception:
+        return f'<pre class="md-fallback">{_html_escape(text)}</pre>'
+    return "".join(sanitizer.out)
+
+
 def render_historical_user_message_excerpts(
     source_messages: list[dict[str, Any]],
     *,
@@ -873,73 +1115,172 @@ def _find_xml_element_end_outside_cdata(text: str, start: int, end_tag: str) -> 
 
 
 def render_compaction_summary_embed_html(summary_text: str) -> str:
-    escaped_summary = html.escape(str(summary_text or "").strip(), quote=False)
+    summary_body_html = _render_summary_markdown(str(summary_text or "").strip())
+    if summary_body_html:
+        rendered_summary = f'<div class="summary-body md">{summary_body_html}</div>'
+    else:
+        rendered_summary = f'<div class="summary-body plain">{_html_escape(summary_text)}</div>'
     styles = "".join(
         [
             "*{box-sizing:border-box}",
             (
-                "html,body{margin:0;padding:0;background:transparent;color:#111827;"
+                ":root{color-scheme:light;--fg:#374151;--fg-strong:#111827;--fg-muted:#6b7280;"
+                "--border:rgba(209,213,219,.75);--border-open:rgba(156,163,175,.55);"
+                "--surface:rgba(249,250,251,.92);--surface-open:#fff;--body-bg:rgba(255,255,255,.82);"
+                "--hover:rgba(243,244,246,.85);--shadow:0 1px 2px rgba(15,23,42,.04)}"
+            ),
+            (
+                ":root[data-theme='dark']{color-scheme:dark;--fg:#d1d5db;--fg-strong:#f9fafb;"
+                "--fg-muted:#9ca3af;--border:rgba(75,85,99,.78);--border-open:rgba(107,114,128,.72);"
+                "--surface:rgba(17,24,39,.68);--surface-open:rgba(17,24,39,.9);"
+                "--body-bg:rgba(3,7,18,.32);--hover:rgba(31,41,55,.72);--shadow:none}"
+            ),
+            (
+                "@media (prefers-color-scheme:dark){:root:not([data-theme='light']){color-scheme:dark;"
+                "--fg:#d1d5db;--fg-strong:#f9fafb;--fg-muted:#9ca3af;--border:rgba(75,85,99,.78);"
+                "--border-open:rgba(107,114,128,.72);--surface:rgba(17,24,39,.68);"
+                "--surface-open:rgba(17,24,39,.9);--body-bg:rgba(3,7,18,.32);"
+                "--hover:rgba(31,41,55,.72);--shadow:none}}"
+            ),
+            (
+                "html,body{margin:0;padding:0;background:transparent;color:var(--fg);"
                 "font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
                 "font-size:13px;line-height:1.45}"
             ),
             "body{padding:2px}",
             (
-                ".card{border:1px solid rgba(107,114,128,.35);border-radius:6px;"
-                "background:rgba(249,250,251,.92);overflow:hidden;margin:0}"
+                ".card{border:1px solid var(--border);border-radius:8px;background:var(--surface);"
+                "overflow:hidden;margin:0;box-shadow:var(--shadow);transition:border-color .18s ease,"
+                "background-color .18s ease,box-shadow .18s ease}"
             ),
-            ".card[open]{background:#fff}",
+            ".card[data-expanded='true']{border-color:var(--border-open);background:var(--surface-open)}",
             (
                 "summary{display:flex;align-items:center;justify-content:space-between;gap:12px;"
-                "padding:6px 10px;cursor:pointer;user-select:none;font-weight:600;color:#111827;"
-                "font-size:12.5px;line-height:1.35}"
+                "padding:7px 10px;cursor:pointer;user-select:none;font-weight:500;color:var(--fg-strong);"
+                "font-size:12.5px;line-height:1.35;transition:background-color .18s ease,color .18s ease}"
             ),
+            "summary:hover{background:var(--hover)}",
             "summary::-webkit-details-marker{display:none}",
             ".title{overflow-wrap:anywhere}",
-            ".meta{font-size:12px;font-weight:500;color:#6b7280;white-space:nowrap}",
             (
-                ".body{border-top:1px solid rgba(107,114,128,.25);padding:12px;"
-                "background:rgba(255,255,255,.8);max-height:36em;overflow:auto;scrollbar-width:thin}"
+                ".chevron{position:relative;width:16px;height:16px;flex:0 0 auto;color:var(--fg-muted);"
+                "transition:color .18s ease}.chevron:before{content:'';position:absolute;left:4px;top:3px;"
+                "width:7px;height:7px;border-right:1.7px solid currentColor;border-bottom:1.7px solid currentColor;"
+                "transform:rotate(45deg);transition:transform .28s cubic-bezier(.22,1,.36,1),top .28s cubic-bezier(.22,1,.36,1)}"
+            ),
+            ".card[data-expanded='true'] .chevron:before{top:6px;transform:rotate(225deg)}",
+            ".card[open]:not([data-js='true']) .chevron:before{top:6px;transform:rotate(225deg)}",
+            (
+                ".body-wrap{height:0;opacity:0;overflow:hidden;transition:height .28s cubic-bezier(.22,1,.36,1),"
+                "opacity .18s ease}.card[data-expanded='true'] .body-wrap{opacity:1}"
+            ),
+            ".card[open]:not([data-js='true']) .body-wrap{height:auto;opacity:1}",
+            (
+                ".body{border-top:1px solid var(--border);padding:12px;background:var(--body-bg);"
+                "max-height:36em;overflow:auto;scrollbar-width:thin}"
             ),
             (
-                "pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;"
+                ".summary-body{margin:0;overflow-wrap:anywhere;word-break:break-word;"
+                "font-size:12.5px;line-height:1.55;color:var(--fg-strong)}"
+            ),
+            ".summary-body.plain,.summary-body .md-fallback{white-space:pre-wrap}",
+            (
+                ".summary-body.plain,.summary-body .md-fallback,.summary-body.md pre,.summary-body.md code{"
                 "font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;"
-                "font-size:12px;line-height:1.5;color:#111827}"
+                "font-size:12px}"
+            ),
+            ".summary-body.md h1,.summary-body.md h2,.summary-body.md h3,.summary-body.md h4{margin:10px 0 5px;font-weight:600;line-height:1.3}",
+            ".summary-body.md h1{font-size:16px}.summary-body.md h2{font-size:15px}",
+            ".summary-body.md h3{font-size:14px}.summary-body.md h4,.summary-body.md h5,.summary-body.md h6{font-size:13px}",
+            ".summary-body.md p{margin:5px 0;overflow-wrap:anywhere;word-break:break-word}",
+            ".summary-body.md ul,.summary-body.md ol{margin:5px 0;padding-left:20px}",
+            ".summary-body.md li{margin:2px 0;overflow-wrap:anywhere;word-break:break-word}",
+            (
+                ".summary-body.md code{padding:1px 5px;border-radius:3px;background:rgba(127,127,127,.2);"
+                "overflow-wrap:anywhere;word-break:break-all}"
             ),
             (
-                "@media (prefers-color-scheme: dark){html,body{color:#e5e7eb}"
-                ".card{border-color:rgba(156,163,175,.38);background:rgba(17,24,39,.72)}"
-                ".card[open]{background:rgba(17,24,39,.92)}summary{color:#f9fafb}"
-                ".meta{color:#9ca3af}.body{border-top-color:rgba(156,163,175,.28);"
-                "background:rgba(3,7,18,.35)}pre{color:#e5e7eb}}"
+                ".summary-body.md pre{padding:8px 10px;border-radius:5px;background:rgba(127,127,127,.17);"
+                "overflow-x:auto;margin:6px 0;line-height:1.4;white-space:pre-wrap}"
             ),
+            ".summary-body.md pre code{background:transparent;padding:0}",
+            ".summary-body.md blockquote{margin:6px 0;padding:2px 10px;border-left:3px solid rgba(127,127,127,.4);opacity:.85}",
+            ".summary-body.md a{color:#2563eb;text-decoration:underline;text-underline-offset:2px}",
+            ":root[data-theme='dark'] .summary-body.md a{color:#60a5fa}",
+            ".summary-body.md table{border-collapse:collapse;margin:6px 0;font-size:12px;display:block;overflow-x:auto}",
+            ".summary-body.md th,.summary-body.md td{padding:4px 8px;border:1px solid rgba(127,127,127,.3)}",
+            ".summary-body.md hr{border:none;border-top:1px solid rgba(127,127,127,.3);margin:8px 0}",
+            (
+                "@media (prefers-reduced-motion:reduce){.card,summary,.chevron,.chevron:before,.body-wrap{"
+                "transition:none!important}}"
+            ),
+        ]
+    )
+    initial_script = "".join(
+        [
+            "(function(){",
+            "function applyInitialTheme(){var dark=false;var parentThemeRead=false;try{dark=parent.document.documentElement.classList.contains('dark')||(parent.document.body&&parent.document.body.classList.contains('dark'));parentThemeRead=true;}catch(e){dark=false;}",
+            "if(!parentThemeRead&&window.matchMedia){dark=window.matchMedia('(prefers-color-scheme: dark)').matches;}",
+            "document.documentElement.dataset.theme=dark?'dark':'light';}",
+            "applyInitialTheme();",
+            "parent.postMessage({type:'iframe:height',height:0},'*');",
+            "})();",
         ]
     )
     script = "".join(
         [
             "(function(){",
+            "var root=document.documentElement;",
+            "var card=document.querySelector('.card');",
+            "var summary=document.querySelector('summary');",
+            "var wrap=document.querySelector('.body-wrap');",
+            "var inner=document.querySelector('.body');",
+            "if(card){card.dataset.js='true';}",
+            "function syncTheme(){var dark=false;var parentThemeRead=false;try{dark=parent.document.documentElement.classList.contains('dark')||(parent.document.body&&parent.document.body.classList.contains('dark'));parentThemeRead=true;}catch(e){dark=false;}",
+            "if(!parentThemeRead&&window.matchMedia){dark=window.matchMedia('(prefers-color-scheme: dark)').matches;}",
+            "root.dataset.theme=dark?'dark':'light';}",
+            "function postHeightValue(height){parent.postMessage({type:'iframe:height',height:Math.max(0,Math.ceil(height||0))},'*');}",
+            "function documentHeight(){var b=document.body;return b?b.scrollHeight:document.documentElement.scrollHeight;}",
             "function postHeight(){requestAnimationFrame(function(){",
             "var b=document.body;",
             "var h=b?b.scrollHeight:document.documentElement.scrollHeight;",
-            "parent.postMessage({type:'iframe:height',height:h},'*');",
+            "postHeightValue(h);",
             "});}",
+            "function reducedMotion(){try{return !!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);}catch(e){return false;}}",
+            "function visibleBodyHeight(){if(!inner){return 0;}var height=inner.getBoundingClientRect().height;return Math.ceil(height||inner.offsetHeight||inner.clientHeight||0);}",
+            "function currentWrapHeight(){if(!wrap){return 0;}var height=wrap.getBoundingClientRect().height;return Math.ceil(height||wrap.offsetHeight||0);}",
+            "function baseDocumentHeight(){return Math.max(0,documentHeight()-currentWrapHeight());}",
+            "var iframeAnimationId=0;",
+            "function ease(t){return 1-Math.pow(1-t,3);}",
+            "function animateIframeHeight(from,to,duration){iframeAnimationId+=1;var id=iframeAnimationId;var start=(window.performance&&window.performance.now)?window.performance.now():Date.now();function step(now){if(id!==iframeAnimationId){return;}var elapsed=Math.max(0,now-start);var progress=duration>0?Math.min(1,elapsed/duration):1;var value=from+(to-from)*ease(progress);postHeightValue(value);if(progress<1){requestAnimationFrame(step);}else{postHeight();}}requestAnimationFrame(step);}",
+            "function animate(open){if(!card||!wrap||!inner){return;}",
+            "card.dataset.expanded=open?'true':'false';",
+            "if(reducedMotion()){if(open){card.open=true;wrap.style.height='auto';wrap.style.opacity='1';}else{wrap.style.height='0px';wrap.style.opacity='0';card.open=false;}postHeight();return;}",
+            "var startDocHeight=documentHeight();",
+            "if(open){card.open=true;wrap.style.height='0px';wrap.style.opacity='0';postHeightValue(startDocHeight);requestAnimationFrame(function(){var visibleHeight=visibleBodyHeight();var baseHeight=baseDocumentHeight();var targetDocHeight=baseHeight+visibleHeight;wrap.style.height=visibleHeight+'px';wrap.style.opacity='1';animateIframeHeight(startDocHeight,targetDocHeight,280);});}",
+            "else{var visibleHeight=visibleBodyHeight();var baseHeight=baseDocumentHeight();var targetDocHeight=baseHeight;wrap.style.height=visibleHeight+'px';wrap.style.opacity='1';postHeightValue(startDocHeight);requestAnimationFrame(function(){wrap.style.height='0px';wrap.style.opacity='0';animateIframeHeight(startDocHeight,targetDocHeight,280);});}}",
+            "if(summary){summary.addEventListener('click',function(event){event.preventDefault();animate(!(card.dataset.expanded==='true'));});}",
+            "if(wrap){wrap.addEventListener('transitionend',function(event){if(event.propertyName!=='height'){return;}if(card.dataset.expanded==='true'){wrap.style.height='auto';}else{card.open=false;}postHeight();});}",
+            "syncTheme();",
+            "try{var observer=new MutationObserver(function(){syncTheme();postHeight();});observer.observe(parent.document.documentElement,{attributes:true,attributeFilter:['class']});if(parent.document.body){observer.observe(parent.document.body,{attributes:true,attributeFilter:['class']});}}catch(e){}",
             "postHeight();",
             "window.addEventListener('DOMContentLoaded',postHeight);",
             "window.addEventListener('load',postHeight);",
-            "document.addEventListener('toggle',postHeight,true);",
+            "if(window.matchMedia){try{window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){syncTheme();postHeight();});}catch(e){}}",
             "})();",
         ]
     )
     return (
         f"{COMPACTION_SUMMARY_EMBED_MARKER}"
         "<!doctype html><html><head><meta charset=\"utf-8\">"
-        "<script>parent.postMessage({type:'iframe:height',height:0},'*');</script>"
+        f"<script>{initial_script}</script>"
         f"<style>{styles}</style></head><body>"
-        "<details class=\"card\">"
+        "<details class=\"card\" data-expanded=\"false\">"
         "<summary>"
-        "<span class=\"title\">Auto-compaction checkpoint</span>"
-        "<span class=\"meta\">Full summary</span>"
+        "<span class=\"title\">Compact summary</span>"
+        "<span class=\"chevron\" aria-hidden=\"true\"></span>"
         "</summary>"
-        f"<div class=\"body\"><pre>{escaped_summary}</pre></div>"
+        f"<div class=\"body-wrap\"><div class=\"body\">{rendered_summary}</div></div>"
         "</details>"
         f"<script>{script}</script></body></html>"
     )

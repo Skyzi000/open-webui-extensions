@@ -62,10 +62,39 @@ def test_compaction_summary_embed_html_contains_full_escaped_summary():
     embed_html = mod.render_compaction_summary_embed_html(summary)
 
     assert "<details" in embed_html
-    assert "Auto-compaction checkpoint" in embed_html
+    assert "Compact summary" in embed_html
+    assert "Full summary" not in embed_html
     assert "line 1" in embed_html
     assert "long summary " * 20 in embed_html
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in embed_html
+    assert "<script>alert(1)</script>" not in embed_html
+
+
+def test_compaction_summary_embed_html_renders_sanitized_markdown_summary():
+    summary = (
+        "# Heading\n\n"
+        "- first item\n"
+        "- second item\n\n"
+        "**strong**\n\n"
+        "`code <value>`\n\n"
+        "[safe](https://example.com/path?q=1)\n\n"
+        'raw <b onclick="alert(1)">bold</b>\n\n'
+        'raw <a href="javascript:alert(2)">link</a>\n\n'
+        "<script>alert(1)</script>\n\n"
+        "[unsafe](javascript:alert(1))"
+    )
+
+    embed_html = mod.render_compaction_summary_embed_html(summary)
+
+    assert "<h1>Heading</h1>" in embed_html
+    assert "<li>first item</li>" in embed_html
+    assert "<strong>strong</strong>" in embed_html
+    assert "<code>code &lt;value&gt;</code>" in embed_html
+    assert '<a href="https://example.com/path?q=1" target="_blank" rel="noopener noreferrer">safe</a>' in embed_html
+    assert "&lt;b onclick=&quot;alert(1)&quot;&gt;bold&lt;/b&gt;" in embed_html
+    assert "&lt;a href=&quot;javascript:alert(2)&quot;&gt;link&lt;/a&gt;" in embed_html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in embed_html
+    assert 'href="javascript:alert' not in embed_html
     assert "<script>alert(1)</script>" not in embed_html
 
 
@@ -74,14 +103,21 @@ def test_compaction_summary_embed_html_bounds_expanded_summary_height():
 
     embed_html = mod.render_compaction_summary_embed_html(summary)
 
+    assert "<details" in embed_html
+    assert "Compact summary" in embed_html
     assert "max-height:" in embed_html
     assert "overflow:auto" in embed_html
-    assert "parent.postMessage({type:'iframe:height',height:0},'*');" in embed_html
-    assert "postHeight();" in embed_html
-    assert "DOMContentLoaded" in embed_html
-    assert "document.body;" in embed_html
-    assert "b?b.scrollHeight:document.documentElement.scrollHeight" in embed_html
-    assert "padding:6px 10px" in embed_html
+
+    # Core's FullHeightIframe only resizes from iframe:height postMessage events.
+    assert "type:'iframe:height'" in embed_html
+
+    # If IFRAME_CSP blocks inline script, native details[open] must still reveal the body.
+    assert "[open]" in embed_html
+    assert ".body-wrap{height:auto;opacity:1}" in embed_html
+    assert "data-js" in embed_html
+
+    # Regression guards for the two known bad sizing approaches.
+    assert "inner.scrollHeight" not in embed_html
     assert "Math.max(document.documentElement.scrollHeight,document.body.scrollHeight,1)" not in embed_html
 
 
@@ -2466,8 +2502,6 @@ async def test_pipe_compacts_above_threshold_and_removes_previous_response_id(mo
     assert embed_events[0]["data"]["replace"] is False
     assert len(embed_events[0]["data"]["embeds"]) == 1
     embed_html = embed_events[0]["data"]["embeds"][0]
-    assert "<details" in embed_html
-    assert "Auto-compaction checkpoint" in embed_html
     assert "summary text" in embed_html
 
 
@@ -4102,8 +4136,6 @@ async def test_pipe_retries_tool_loop_by_summarizing_history_before_latest_tool_
     assert embed_events[0]["data"]["replace"] is False
     assert len(embed_events[0]["data"]["embeds"]) == 1
     embed_html = embed_events[0]["data"]["embeds"][0]
-    assert "<details" in embed_html
-    assert "Auto-compaction checkpoint" in embed_html
     assert "combined retry summary" in embed_html
 
 
@@ -4335,8 +4367,6 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     assert embed_events[0]["data"]["replace"] is False
     assert len(embed_events[0]["data"]["embeds"]) == 1
     embed_html = embed_events[0]["data"]["embeds"][0]
-    assert "<details" in embed_html
-    assert "Auto-compaction checkpoint" in embed_html
     assert "combined old tool summary" in embed_html
 
 
