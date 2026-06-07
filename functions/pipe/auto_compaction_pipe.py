@@ -16,6 +16,7 @@ import fnmatch
 import hashlib
 import html
 import json
+import math
 import re
 import time
 from contextlib import suppress
@@ -66,6 +67,15 @@ PROFILE_HASH_FAMILY = "checkpoint-profile-v1"
 MAX_CONTEXT_RETRY_ATTEMPTS = 2
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES = 512
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT = 32
+PROVIDER_MODEL_CACHE_WAIT_DEFAULT_TIMEOUT_SECONDS = 10.0
+PROVIDER_MODEL_CACHE_WAIT_POLL_SECONDS = 0.05
+OLLAMA_PROVIDER_MODEL_CACHE_REFRESH_REQUESTS = 2
+CORE_FUNCTION_MODEL_LISTING_COROUTINE = ("get_function_models", "open_webui/functions.py")
+PROVIDER_MODEL_CACHE_REFRESH_COROUTINES = {
+    "OPENAI_MODELS": (("fetch_openai_models", "open_webui/utils/models.py"),),
+    "OLLAMA_MODELS": (("fetch_ollama_models", "open_webui/utils/models.py"),),
+}
+MISSING_CORE_REQUEST = object()
 COMPACTION_SUMMARY_EMBED_MARKER = "<!--auto-compaction-summary-embed:v1-->"
 SUMMARY_PROMPT = (
     "You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY for an Open WebUI chat. "
@@ -2001,6 +2011,27 @@ def _iter_model_cache_values(value: Any) -> Any:
     return ()
 
 
+def _normalize_cache_model(attr: str, model: dict[str, Any]) -> dict[str, Any]:
+    if attr != "OLLAMA_MODELS" or _model_id(model) is not None:
+        return model
+
+    model_id = model.get("model")
+    if not isinstance(model_id, str) or not model_id:
+        return model
+
+    return {
+        "id": model_id,
+        "name": model.get("name") or model_id,
+        "object": model.get("object", "model"),
+        "created": model.get("created", 0),
+        "owned_by": model.get("owned_by", "ollama"),
+        "ollama": model.get("ollama", model),
+        "loaded": model.get("loaded", "expires_at" in model),
+        "connection_type": model.get("connection_type", "local"),
+        "tags": model.get("tags", []),
+    }
+
+
 def _iter_cache_models_from_state(state: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for attr in ("MODELS", "BASE_MODELS", "OPENAI_MODELS", "OLLAMA_MODELS"):
@@ -2009,8 +2040,154 @@ def _iter_cache_models_from_state(state: Any) -> list[dict[str, Any]]:
             iterator = iter(_iter_model_cache_values(value))
         except TypeError:
             continue
-        out.extend(item for item in iterator if isinstance(item, dict))
+        out.extend(_normalize_cache_model(attr, item) for item in iterator if isinstance(item, dict))
     return out
+
+
+def _enabled_provider_model_cache_attrs(state: Any) -> list[str]:
+    config = getattr(state, "config", None)
+    attrs: list[str] = []
+    if getattr(config, "ENABLE_OPENAI_API", False):
+        attrs.append("OPENAI_MODELS")
+    if getattr(config, "ENABLE_OLLAMA_API", False):
+        attrs.append("OLLAMA_MODELS")
+    return attrs
+
+
+def _provider_model_cache_wait_timeout_seconds() -> float:
+    with suppress(Exception):
+        from open_webui.env import AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST
+
+        if AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST is not None:
+            timeout = float(AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST)
+            if timeout > 0:
+                return timeout
+    return PROVIDER_MODEL_CACHE_WAIT_DEFAULT_TIMEOUT_SECONDS
+
+
+def _provider_cache_has_models(state: Any, attr: str) -> bool:
+    value = getattr(state, attr, None)
+    try:
+        iterator = iter(_iter_model_cache_values(value))
+    except TypeError:
+        return False
+    return any(isinstance(item, dict) for item in iterator)
+
+
+def _iter_task_coroutine_frames(task: Any) -> Iterable[tuple[str, str, Any]]:
+    coro = task.get_coro()
+    seen: set[int] = set()
+    while coro is not None and id(coro) not in seen:
+        seen.add(id(coro))
+        code = getattr(coro, "cr_code", None) or getattr(coro, "gi_code", None)
+        frame = getattr(coro, "cr_frame", None) or getattr(coro, "gi_frame", None)
+        if code is not None:
+            yield code.co_name, str(code.co_filename).replace("\\", "/"), frame
+        coro = getattr(coro, "cr_await", None) or getattr(coro, "gi_yieldfrom", None)
+
+
+def _coroutine_code_matches(code_name: str, filename: str, expected: tuple[str, str]) -> bool:
+    expected_name, expected_filename = expected
+    return code_name == expected_name and filename.endswith(expected_filename)
+
+
+def _task_coroutine_request(task: Any, expected: tuple[str, str]) -> Any:
+    for code_name, filename, frame in _iter_task_coroutine_frames(task):
+        if not _coroutine_code_matches(code_name, filename, expected):
+            continue
+        if frame is None:
+            return MISSING_CORE_REQUEST
+        return frame.f_locals.get("request", MISSING_CORE_REQUEST)
+    return MISSING_CORE_REQUEST
+
+
+def _provider_model_cache_refresh_pending_attrs(provider_cache_attrs: Iterable[str]) -> set[str]:
+    wanted = {
+        attr for attr in provider_cache_attrs if attr in PROVIDER_MODEL_CACHE_REFRESH_COROUTINES
+    }
+    if not wanted:
+        return set()
+
+    # Only Core's get_all_base_models() gather gives pipes() sibling provider tasks to wait for.
+    try:
+        current_task = asyncio.current_task()
+    except RuntimeError:
+        return set()
+    if current_task is None:
+        return set()
+    current_request = _task_coroutine_request(current_task, CORE_FUNCTION_MODEL_LISTING_COROUTINE)
+    if current_request is MISSING_CORE_REQUEST:
+        return set()
+
+    try:
+        tasks = asyncio.all_tasks()
+    except RuntimeError:
+        return set()
+
+    pending: set[str] = set()
+    for task in tasks:
+        if task is current_task or task.done():
+            continue
+        for attr in wanted - pending:
+            if any(
+                _task_coroutine_request(task, expected) is current_request
+                for expected in PROVIDER_MODEL_CACHE_REFRESH_COROUTINES[attr]
+            ):
+                pending.add(attr)
+        if pending == wanted:
+            return pending
+    return pending
+
+
+def _provider_model_caches_ready(
+    state: Any,
+    initial_provider_caches: dict[str, Any],
+    pending_provider_cache_attrs: Iterable[str],
+) -> bool:
+    pending_attrs = set(pending_provider_cache_attrs)
+    for attr, initial_cache in initial_provider_caches.items():
+        if _provider_cache_has_models(state, attr):
+            continue
+        if getattr(state, attr, None) is not initial_cache:
+            continue
+        if attr not in pending_attrs:
+            continue
+        return False
+    return True
+
+
+async def _wait_for_provider_model_caches(
+    state: Any,
+    *,
+    initial_provider_caches: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    provider_cache_attrs = _enabled_provider_model_cache_attrs(state)
+    if not provider_cache_attrs:
+        return []
+
+    timeout = max(0.0, float(_provider_model_cache_wait_timeout_seconds()))
+    if "OLLAMA_MODELS" in provider_cache_attrs:
+        # Core's Ollama refresh waits for /api/tags, then /api/ps before assigning
+        # OLLAMA_MODELS. Each request can consume the model-list timeout.
+        timeout *= OLLAMA_PROVIDER_MODEL_CACHE_REFRESH_REQUESTS
+    poll_seconds = max(0.001, float(PROVIDER_MODEL_CACHE_WAIT_POLL_SECONDS))
+    attempts = max(0, math.ceil(timeout / poll_seconds))
+    if initial_provider_caches is None:
+        initial_provider_caches = {attr: getattr(state, attr, None) for attr in provider_cache_attrs}
+
+    # Core fetches provider models and function models in the same gather call.
+    # Empty caches are final if no sibling Core provider fetch is still pending.
+    for _ in range(attempts):
+        models = _iter_cache_models_from_state(state)
+        pending_provider_cache_attrs = _provider_model_cache_refresh_pending_attrs(provider_cache_attrs)
+        if _provider_model_caches_ready(state, initial_provider_caches, pending_provider_cache_attrs):
+            return models
+        await asyncio.sleep(poll_seconds)
+        models = _iter_cache_models_from_state(state)
+        pending_provider_cache_attrs = _provider_model_cache_refresh_pending_attrs(provider_cache_attrs)
+        if _provider_model_caches_ready(state, initial_provider_caches, pending_provider_cache_attrs):
+            return models
+    return _iter_cache_models_from_state(state)
 
 
 def validate_summary_model_id(configured_summary_model: str, target_model_id: str, models: dict[str, Any]) -> str:
@@ -2288,9 +2465,19 @@ def _sse_data_chunk(data: str) -> str:
 
 def _response_to_sse_chunk(response: Response) -> str:
     text = _response_body_text(response)
+    parsed = _json_from_response(response)
+    if isinstance(response, JSONResponse) and response.status_code >= 400:
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            return _sse_data_chunk(text)
+        message_source = parsed.get("error") if isinstance(parsed, dict) and parsed.get("error") else parsed
+        return _sse_data_chunk(
+            json.dumps(
+                _error_response(_completion_error_message(message_source), code="provider_error"),
+                ensure_ascii=False,
+            )
+        )
     if isinstance(response, JSONResponse):
         return _sse_data_chunk(text)
-    parsed = _json_from_response(response)
     if isinstance(parsed, (dict, list)):
         return _sse_data_chunk(json.dumps(parsed, ensure_ascii=False))
     return _sse_data_chunk(
@@ -2573,6 +2760,10 @@ class RequestStateProxy:
 
 
 async def _close_stream_response(response: StreamingResponse) -> None:
+    if getattr(response, "_auto_compact_stream_closed", False):
+        return
+    with suppress(Exception):
+        setattr(response, "_auto_compact_stream_closed", True)
     body_iterator = getattr(response, "body_iterator", None)
     aclose = getattr(body_iterator, "aclose", None)
     if callable(aclose):
@@ -3023,17 +3214,20 @@ async def extract_text_from_completion_response(response: Any, *, tools_enabled:
         if not is_sse_response:
             await _close_stream_response(response)
             raise RuntimeError("Summary model did not return a structured OpenAI-compatible response")
-        async for chunk in response.body_iterator:
-            sse_values, _ = sse_parser.feed(chunk)
-            for value in sse_values:
+        try:
+            async for chunk in response.body_iterator:
+                sse_values, _ = sse_parser.feed(chunk)
+                for value in sse_values:
+                    saw_tool_call = saw_tool_call or _append_summary_sse_value(value, parts)
+            for value in sse_parser.flush()[0]:
                 saw_tool_call = saw_tool_call or _append_summary_sse_value(value, parts)
-        for value in sse_parser.flush()[0]:
-            saw_tool_call = saw_tool_call or _append_summary_sse_value(value, parts)
-        text = "".join(parts).strip()
-        if saw_tool_call:
-            raise _summary_tool_call_error()
-        if text:
-            return text
+            text = "".join(parts).strip()
+            if saw_tool_call:
+                raise _summary_tool_call_error()
+            if text:
+                return text
+        finally:
+            await _close_stream_response(response)
     if tools_enabled:
         raise RuntimeError("Summary model returned a tool call or no text content while tools were available")
     raise RuntimeError("Summary model did not return text content")
@@ -3946,7 +4140,20 @@ class Pipe:
             return []
 
         pipe_function_id = runtime_pipe_function_id(self)
-        targets = filter_target_models(_iter_cache_models_from_state(state), self.valves, pipe_function_id=pipe_function_id)
+        provider_cache_attrs = _enabled_provider_model_cache_attrs(state)
+        initial_provider_caches = {attr: getattr(state, attr, None) for attr in provider_cache_attrs}
+        model_candidates = _iter_cache_models_from_state(state)
+        pending_provider_cache_attrs = _provider_model_cache_refresh_pending_attrs(provider_cache_attrs)
+        if pending_provider_cache_attrs and not _provider_model_caches_ready(
+            state,
+            initial_provider_caches,
+            pending_provider_cache_attrs,
+        ):
+            model_candidates = await _wait_for_provider_model_caches(
+                state,
+                initial_provider_caches=initial_provider_caches,
+            )
+        targets = filter_target_models(model_candidates, self.valves, pipe_function_id=pipe_function_id)
         await sync_wrapper_model_records(pipe_function_id=pipe_function_id, target_models=targets, valves=self.valves)
 
         entries: list[dict[str, str]] = []

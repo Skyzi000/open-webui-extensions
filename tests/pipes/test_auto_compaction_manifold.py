@@ -104,6 +104,469 @@ async def test_pipes_uses_runtime_registered_id_for_filtering_and_sync(monkeypat
     ]
 
 
+@pytest.mark.asyncio
+async def test_pipes_does_not_direct_fetch_provider_models_when_state_caches_remain_empty(monkeypatch):
+    captured = {}
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["pipe_function_id"] = kwargs["pipe_function_id"]
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    async def fetch_provider_models(*args, **kwargs):
+        return [{"id": "direct-target", "name": "Direct Target"}]
+
+    models_module = types.ModuleType("open_webui.utils.models")
+    models_module.fetch_openai_models = fetch_provider_models
+    models_module.fetch_ollama_models = fetch_provider_models
+
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(
+        state=SimpleNamespace(
+            MODELS={},
+            BASE_MODELS=[],
+            OPENAI_MODELS={},
+            OLLAMA_MODELS={},
+            config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=False),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", models_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+    monkeypatch.setattr(mod, "_provider_model_cache_wait_timeout_seconds", lambda: 0)
+
+    result = await mod.Pipe().pipes()
+
+    assert captured == {
+        "pipe_function_id": "auto_compact",
+        "target_ids": [],
+    }
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_pipes_waits_for_sibling_provider_cache_population(monkeypatch):
+    captured = {}
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    state = SimpleNamespace(
+        MODELS={},
+        BASE_MODELS=[],
+        OPENAI_MODELS={},
+        OLLAMA_MODELS={},
+        config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=False),
+    )
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(state=state)
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+    monkeypatch.setattr(mod, "_provider_model_cache_wait_timeout_seconds", lambda: 0.1)
+    monkeypatch.setattr(mod, "PROVIDER_MODEL_CACHE_WAIT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+
+    async def populate_cache():
+        await asyncio.sleep(0)
+        state.OPENAI_MODELS = {"sibling-target": {"id": "sibling-target", "name": "Sibling Target"}}
+
+    task = asyncio.create_task(populate_cache())
+    try:
+        result = await mod.Pipe().pipes()
+    finally:
+        await task
+
+    assert captured["target_ids"] == ["sibling-target"]
+    assert result == [{"id": "sibling-target", "name": "Compact: Sibling Target"}]
+
+
+@pytest.mark.asyncio
+async def test_pipes_waits_for_all_enabled_provider_cache_population(monkeypatch):
+    captured = {}
+    sleep_calls = 0
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    async def sleep(seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            state.OPENAI_MODELS = {"openai-target": {"id": "openai-target", "name": "OpenAI Target"}}
+        elif sleep_calls == 2:
+            state.OLLAMA_MODELS = {"ollama-target": {"model": "ollama-target", "name": "Ollama Target"}}
+
+    state = SimpleNamespace(
+        MODELS={},
+        BASE_MODELS=[],
+        OPENAI_MODELS={},
+        OLLAMA_MODELS={},
+        config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=True),
+    )
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(state=state)
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+    monkeypatch.setattr(mod.asyncio, "sleep", sleep)
+    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+
+    result = await mod.Pipe().pipes()
+
+    assert sleep_calls == 2
+    assert captured["target_ids"] == ["openai-target", "ollama-target"]
+    assert result == [
+        {"id": "openai-target", "name": "Compact: OpenAI Target"},
+        {"id": "ollama-target", "name": "Compact: Ollama Target"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipes_waits_when_one_of_multiple_provider_caches_is_still_empty(monkeypatch):
+    captured = {}
+    sleep_calls = 0
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    async def sleep(seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        state.OLLAMA_MODELS = {"ollama-target": {"model": "ollama-target", "name": "Ollama Target"}}
+
+    state = SimpleNamespace(
+        MODELS={},
+        BASE_MODELS=[],
+        OPENAI_MODELS={"openai-target": {"id": "openai-target", "name": "OpenAI Target"}},
+        OLLAMA_MODELS={},
+        config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=True),
+    )
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(state=state)
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+    monkeypatch.setattr(mod.asyncio, "sleep", sleep)
+    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+
+    result = await mod.Pipe().pipes()
+
+    assert sleep_calls == 1
+    assert captured["target_ids"] == ["openai-target", "ollama-target"]
+    assert result == [
+        {"id": "openai-target", "name": "Compact: OpenAI Target"},
+        {"id": "ollama-target", "name": "Compact: Ollama Target"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipes_does_not_wait_for_disabled_provider_cache(monkeypatch):
+    captured = {}
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    async def sleep(seconds):
+        raise AssertionError("pipes() should not wait for disabled provider caches")
+
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(
+        state=SimpleNamespace(
+            MODELS={},
+            BASE_MODELS=[],
+            OPENAI_MODELS={"openai-target": {"id": "openai-target", "name": "OpenAI Target"}},
+            OLLAMA_MODELS={},
+            config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=False),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+    monkeypatch.setattr(mod.asyncio, "sleep", sleep)
+
+    result = await mod.Pipe().pipes()
+
+    assert captured["target_ids"] == ["openai-target"]
+    assert result == [{"id": "openai-target", "name": "Compact: OpenAI Target"}]
+
+
+@pytest.mark.asyncio
+async def test_pipes_does_not_wait_when_empty_provider_cache_already_refreshed(monkeypatch):
+    captured = {}
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    async def sleep(seconds):
+        raise AssertionError("already-refreshed empty provider cache should not wait")
+
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(
+        state=SimpleNamespace(
+            MODELS={},
+            BASE_MODELS=[],
+            OPENAI_MODELS={},
+            OLLAMA_MODELS={},
+            config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=False),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+    monkeypatch.setattr(mod.asyncio, "sleep", sleep)
+
+    result = await mod.Pipe().pipes()
+
+    assert captured["target_ids"] == []
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_provider_cache_pending_detection_requires_core_request_identity():
+    def build_async_function(name: str, filename: str, body: str, **namespace):
+        scope = dict(namespace)
+        exec(compile(f"async def {name}(request):\n{body}", filename, "exec"), scope)
+        return scope[name]
+
+    event = asyncio.Event()
+    fetch_openai_models = build_async_function(
+        "fetch_openai_models",
+        "/site-packages/open_webui/utils/models.py",
+        "    await event.wait()\n",
+        event=event,
+    )
+    get_function_models = build_async_function(
+        "get_function_models",
+        "/site-packages/open_webui/functions.py",
+        "    return mod._provider_model_cache_refresh_pending_attrs(['OPENAI_MODELS'])\n",
+        mod=mod,
+    )
+    request = object()
+    other_request = object()
+
+    task = asyncio.create_task(fetch_openai_models(other_request))
+    await asyncio.sleep(0)
+    try:
+        assert mod._provider_model_cache_refresh_pending_attrs(["OPENAI_MODELS"]) == set()
+        function_task = asyncio.create_task(get_function_models(request))
+        assert await function_task == set()
+    finally:
+        event.set()
+        await task
+
+    event = asyncio.Event()
+    fetch_openai_models = build_async_function(
+        "fetch_openai_models",
+        "/site-packages/open_webui/utils/models.py",
+        "    await event.wait()\n",
+        event=event,
+    )
+    task = asyncio.create_task(fetch_openai_models(request))
+    await asyncio.sleep(0)
+    try:
+        function_task = asyncio.create_task(get_function_models(request))
+        assert await function_task == {"OPENAI_MODELS"}
+    finally:
+        event.set()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_pipes_does_not_wait_for_other_request_provider_refresh(monkeypatch):
+    captured = {}
+
+    def build_async_function(name: str, filename: str, body: str, **namespace):
+        scope = dict(namespace)
+        exec(compile(f"async def {name}(request):\n{body}", filename, "exec"), scope)
+        return scope[name]
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    async def sleep(seconds):
+        raise AssertionError("pipes() should not wait for another request's provider refresh")
+
+    state = SimpleNamespace(
+        MODELS={},
+        BASE_MODELS=[],
+        OPENAI_MODELS={},
+        OLLAMA_MODELS={},
+        config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=False),
+    )
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(state=state)
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+
+    event = asyncio.Event()
+    fetch_openai_models = build_async_function(
+        "fetch_openai_models",
+        "/site-packages/open_webui/utils/models.py",
+        "    await event.wait()\n",
+        event=event,
+    )
+    get_function_models = build_async_function(
+        "get_function_models",
+        "/site-packages/open_webui/functions.py",
+        "    return await pipe.pipes()\n",
+        pipe=mod.Pipe(),
+    )
+
+    other_task = asyncio.create_task(fetch_openai_models(object()))
+    real_sleep = asyncio.sleep
+    await real_sleep(0)
+    monkeypatch.setattr(mod.asyncio, "sleep", sleep)
+    try:
+        result = await get_function_models(object())
+    finally:
+        event.set()
+        await other_task
+
+    assert captured["target_ids"] == []
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_pipes_waits_for_ollama_two_stage_provider_refresh(monkeypatch):
+    captured = {}
+    sleep_calls = 0
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    async def sleep(seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 25:
+            state.OLLAMA_MODELS = {"ollama-target": {"model": "ollama-target", "name": "Ollama Target"}}
+
+    state = SimpleNamespace(
+        MODELS={},
+        BASE_MODELS=[],
+        OPENAI_MODELS={},
+        OLLAMA_MODELS={},
+        config=SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=True),
+    )
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(state=state)
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+    monkeypatch.setattr(mod, "_provider_model_cache_wait_timeout_seconds", lambda: 1.0)
+    monkeypatch.setattr(mod.asyncio, "sleep", sleep)
+    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+
+    result = await mod.Pipe().pipes()
+
+    assert sleep_calls == 25
+    assert captured["target_ids"] == ["ollama-target"]
+    assert result == [{"id": "ollama-target", "name": "Compact: Ollama Target"}]
+
+
+@pytest.mark.asyncio
+async def test_pipes_normalizes_ollama_provider_cache_models(monkeypatch):
+    captured = {}
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_models"] = kwargs["target_models"]
+
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(
+        state=SimpleNamespace(
+            MODELS={},
+            BASE_MODELS=[],
+            OPENAI_MODELS={},
+            OLLAMA_MODELS={"llama3.2:latest": {"model": "llama3.2:latest", "name": "Llama 3.2", "tags": ["local"]}},
+            config=SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=True),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+
+    result = await mod.Pipe().pipes()
+
+    assert captured["target_models"] == [
+        {
+            "id": "llama3.2:latest",
+            "name": "Llama 3.2",
+            "object": "model",
+            "created": 0,
+            "owned_by": "ollama",
+            "ollama": {"model": "llama3.2:latest", "name": "Llama 3.2", "tags": ["local"]},
+            "loaded": False,
+            "connection_type": "local",
+            "tags": ["local"],
+        }
+    ]
+    assert result == [{"id": "llama3.2:latest", "name": "Compact: Llama 3.2"}]
+
+
+@pytest.mark.asyncio
+async def test_pipes_waits_until_core_model_list_timeout_for_sibling_provider_cache(monkeypatch):
+    captured = {}
+    sleep_calls = 0
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    async def sleep(seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 25:
+            state.OPENAI_MODELS = {"slow-target": {"id": "slow-target", "name": "Slow Target"}}
+
+    state = SimpleNamespace(
+        MODELS={},
+        BASE_MODELS=[],
+        OPENAI_MODELS={},
+        OLLAMA_MODELS={},
+        config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=False),
+    )
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(state=state)
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+    monkeypatch.setattr(mod, "_provider_model_cache_wait_timeout_seconds", lambda: 2.0)
+    monkeypatch.setattr(mod.asyncio, "sleep", sleep)
+    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+
+    result = await mod.Pipe().pipes()
+
+    assert sleep_calls == 25
+    assert captured["target_ids"] == ["slow-target"]
+    assert result == [{"id": "slow-target", "name": "Compact: Slow Target"}]
+
+
+@pytest.mark.asyncio
+async def test_pipes_stops_waiting_when_sibling_provider_cache_refresh_completes_empty(monkeypatch):
+    captured = {}
+    sleep_calls = 0
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    async def sleep(seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        state.OPENAI_MODELS = {}
+
+    state = SimpleNamespace(
+        MODELS={},
+        BASE_MODELS=[],
+        OPENAI_MODELS={},
+        OLLAMA_MODELS={},
+        config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=False),
+    )
+    initial_cache = state.OPENAI_MODELS
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(state=state)
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+    monkeypatch.setattr(mod.asyncio, "sleep", sleep)
+    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+
+    result = await mod.Pipe().pipes()
+
+    assert state.OPENAI_MODELS is not initial_cache
+    assert sleep_calls == 1
+    assert captured["target_ids"] == []
+    assert result == []
+
+
 def test_compaction_summary_embed_html_contains_full_escaped_summary():
     summary = "line 1\n" + ("long summary " * 200) + "<script>alert(1)</script>"
 
@@ -1219,6 +1682,7 @@ def test_sse_error_payload_is_classified_before_any_content():
 @pytest.mark.asyncio
 async def test_streaming_forwarder_retries_split_initial_sse_context_error():
     closed = False
+    background_count = 0
 
     async def chunks():
         nonlocal closed
@@ -1228,8 +1692,12 @@ async def test_streaming_forwarder_retries_split_initial_sse_context_error():
         finally:
             closed = True
 
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream")
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -1241,6 +1709,7 @@ async def test_streaming_forwarder_retries_split_initial_sse_context_error():
         )
 
     assert closed is True
+    assert background_count == 1
 
 
 @pytest.mark.asyncio
@@ -1335,6 +1804,66 @@ async def test_non_context_json_response_is_returned_as_sse_event():
         emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
 
     assert emitted == ['data: {"error":{"code":"provider_error","message":"unavailable"}}\n\n']
+
+
+@pytest.mark.asyncio
+async def test_non_context_json_detail_response_is_returned_as_sse_error_event():
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = JSONResponse({"detail": "provider unavailable"}, status_code=500)
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    emitted = []
+    async for chunk in prepared.body_iterator:
+        emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+
+    assert emitted == ['data: {"error": {"code": "provider_error", "message": "provider unavailable"}}\n\n']
+
+
+@pytest.mark.asyncio
+async def test_non_context_json_message_response_is_returned_as_sse_error_event():
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = JSONResponse({"message": "rate limited"}, status_code=429)
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    emitted = []
+    async for chunk in prepared.body_iterator:
+        emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+
+    assert emitted == ['data: {"error": {"code": "provider_error", "message": "rate limited"}}\n\n']
+
+
+@pytest.mark.asyncio
+async def test_non_context_json_string_error_response_is_returned_as_sse_error_event():
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = JSONResponse({"error": "rate limited"}, status_code=429)
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    emitted = []
+    async for chunk in prepared.body_iterator:
+        emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+
+    assert emitted == ['data: {"error": {"code": "provider_error", "message": "rate limited"}}\n\n']
 
 
 @pytest.mark.asyncio
@@ -2009,13 +2538,20 @@ async def test_tool_history_compaction_summarizes_all_but_latest_sequential_tool
 
 @pytest.mark.asyncio
 async def test_extract_summary_text_from_streaming_response():
+    background_ran = False
+
     async def chunks():
         yield b'data: {"choices": [{"delta": {"content": "hello "}}]}\n\n'
         yield b'data: {"choices": [{"delta": {"content": "world"}}]}\n\n'
 
-    response = StreamingResponse(chunks(), media_type="text/event-stream")
+    async def background():
+        nonlocal background_ran
+        background_ran = True
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
 
     assert await mod.extract_text_from_completion_response(response) == "hello world"
+    assert background_ran is True
 
 
 @pytest.mark.asyncio
@@ -2068,6 +2604,8 @@ async def test_extract_summary_text_preserves_streamed_delta_newlines():
 
 @pytest.mark.asyncio
 async def test_extract_summary_text_ignores_non_structured_sse_data():
+    background_ran = False
+
     async def chunks():
         yield b"data: plain text\n\n"
         yield b'data: "json string"\n\n'
@@ -2075,10 +2613,15 @@ async def test_extract_summary_text_ignores_non_structured_sse_data():
         yield b'data: {"q":"alpha"}\n\n'
         yield b"data: [DONE]\n\n"
 
-    response = StreamingResponse(chunks(), media_type="text/event-stream")
+    async def background():
+        nonlocal background_ran
+        background_ran = True
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
 
     with pytest.raises(RuntimeError, match="did not return text content"):
         await mod.extract_text_from_completion_response(response)
+    assert background_ran is True
 
 
 @pytest.mark.asyncio
