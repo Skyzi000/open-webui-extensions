@@ -2448,9 +2448,9 @@ def extract_sse_data_values(chunk: bytes | str) -> list[str]:
     return values
 
 
-def extract_sse_json_events(chunk: bytes | str) -> list[dict[str, Any]]:
+def _sse_json_events_from_values(values: Iterable[str]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
-    for data in extract_sse_data_values(chunk):
+    for data in values:
         try:
             payload = json.loads(data.strip())
         except Exception:
@@ -2458,6 +2458,23 @@ def extract_sse_json_events(chunk: bytes | str) -> list[dict[str, Any]]:
         if isinstance(payload, dict):
             events.append(payload)
     return events
+
+
+class _SSEJSONEventParser:
+    def __init__(self) -> None:
+        self._parser = _SSEDataParser()
+
+    def feed(self, chunk: bytes | str) -> list[dict[str, Any]]:
+        values, _ = self._parser.feed(chunk)
+        return _sse_json_events_from_values(values)
+
+    def flush(self) -> list[dict[str, Any]]:
+        values, _ = self._parser.flush()
+        return _sse_json_events_from_values(values)
+
+
+def extract_sse_json_events(chunk: bytes | str) -> list[dict[str, Any]]:
+    return _sse_json_events_from_values(extract_sse_data_values(chunk))
 
 
 def first_chunk_is_retryable_context_error(chunk: bytes | str) -> bool:
@@ -2570,10 +2587,11 @@ async def prepare_streaming_response(
 
     iterator = response.body_iterator.__aiter__()
     buffered_chunks: list[bytes | str] = []
+    sse_parser = _SSEJSONEventParser()
     try:
         while True:
             chunk = _coerce_stream_chunk(await iterator.__anext__())
-            events = extract_sse_json_events(chunk)
+            events = sse_parser.feed(chunk)
             for payload in events:
                 usage = extract_usage_from_stream_payload(payload)
                 if usage:
@@ -2594,6 +2612,24 @@ async def prepare_streaming_response(
                     raise RetryableContextOverflow("Target model reported a context-window error before output")
                 break
     except StopAsyncIteration:
+        events = sse_parser.flush()
+        for payload in events:
+            usage = extract_usage_from_stream_payload(payload)
+            if usage:
+                store_request_scoped_usage(
+                    request=request,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    wrapper_model_id=wrapper_model_id,
+                    usage=usage,
+                )
+        if events:
+            first_payload = events[0]
+            if first_payload.get("error") and is_retryable_context_error(first_payload, status_code=400):
+                if restore:
+                    restore()
+                await _close_stream_response(response)
+                raise RetryableContextOverflow("Target model reported a context-window error before output")
         if restore:
             restore()
         await _close_stream_response(response)
@@ -2607,15 +2643,14 @@ async def prepare_streaming_response(
         raise
 
     async def stream() -> AsyncIterator[bytes | str]:
-        emitted_visible = False
         try:
             for buffered_chunk in buffered_chunks:
-                emitted_visible = emitted_visible or chunk_has_user_visible_output(buffered_chunk)
                 yield buffered_chunk
 
             async for raw_chunk in iterator:
                 chunk = _coerce_stream_chunk(raw_chunk)
-                for payload in extract_sse_json_events(chunk):
+                events = sse_parser.feed(chunk)
+                for payload in events:
                     usage = extract_usage_from_stream_payload(payload)
                     if usage:
                         store_request_scoped_usage(
@@ -2625,8 +2660,17 @@ async def prepare_streaming_response(
                             wrapper_model_id=wrapper_model_id,
                             usage=usage,
                         )
-                emitted_visible = emitted_visible or chunk_has_user_visible_output(chunk)
                 yield chunk
+            for payload in sse_parser.flush():
+                usage = extract_usage_from_stream_payload(payload)
+                if usage:
+                    store_request_scoped_usage(
+                        request=request,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        wrapper_model_id=wrapper_model_id,
+                        usage=usage,
+                    )
         finally:
             if restore:
                 restore()
@@ -3595,9 +3639,49 @@ async def _coerce_non_streaming_completion_response(response: Any, *, model_id: 
         tool_calls: list[dict[str, Any]] = []
         finish_reason: str | None = None
         provider_error: dict[str, Any] | None = None
+
+        def process_payload(payload: dict[str, Any]) -> None:
+            nonlocal finish_reason, provider_error, usage
+            if payload.get("error"):
+                if is_retryable_context_error(payload, status_code=400):
+                    raise RetryableContextOverflow(str(payload.get("error")))
+                provider_error = _error_response(_completion_error_message(payload), code="provider_error")
+                return
+            chunk_usage = extract_usage_from_stream_payload(payload)
+            if chunk_usage:
+                usage = chunk_usage
+            choices = payload.get("choices")
+            if isinstance(choices, list) and choices:
+                choice = choices[0]
+                if isinstance(choice.get("finish_reason"), str):
+                    finish_reason = choice["finish_reason"]
+                message = choice.get("message") or {}
+                delta = choice.get("delta") or {}
+                for container in (message, delta):
+                    content = container.get("content") or container.get("reasoning_content")
+                    if isinstance(content, str):
+                        parts.append(content)
+                    container_tool_calls = container.get("tool_calls")
+                    if isinstance(container_tool_calls, list):
+                        for tool_call in container_tool_calls:
+                            if isinstance(tool_call, dict):
+                                _merge_stream_tool_call_delta(tool_calls, tool_call)
+            if payload.get("type") == "response.output_text.delta":
+                delta = payload.get("delta")
+                if isinstance(delta, str):
+                    parts.append(delta)
+
+        media_type = getattr(response, "media_type", None) or response.headers.get("content-type", "")
+        is_sse_response = "text/event-stream" in media_type
+        sse_parser = _SSEJSONEventParser()
         try:
             async for raw_chunk in response.body_iterator:
                 chunk = _coerce_stream_chunk(raw_chunk)
+                if is_sse_response:
+                    events = sse_parser.feed(chunk)
+                    for payload in events:
+                        process_payload(payload)
+                    continue
                 events = extract_sse_json_events(chunk)
                 if not events:
                     if _chunk_is_sse_done_only(chunk):
@@ -3605,34 +3689,10 @@ async def _coerce_non_streaming_completion_response(response: Any, *, model_id: 
                     parts.append(chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk))
                     continue
                 for payload in events:
-                    if payload.get("error"):
-                        if is_retryable_context_error(payload, status_code=400):
-                            raise RetryableContextOverflow(str(payload.get("error")))
-                        provider_error = _error_response(_completion_error_message(payload), code="provider_error")
-                        continue
-                    chunk_usage = extract_usage_from_stream_payload(payload)
-                    if chunk_usage:
-                        usage = chunk_usage
-                    choices = payload.get("choices")
-                    if isinstance(choices, list) and choices:
-                        choice = choices[0]
-                        if isinstance(choice.get("finish_reason"), str):
-                            finish_reason = choice["finish_reason"]
-                        message = choice.get("message") or {}
-                        delta = choice.get("delta") or {}
-                        for container in (message, delta):
-                            content = container.get("content") or container.get("reasoning_content")
-                            if isinstance(content, str):
-                                parts.append(content)
-                            container_tool_calls = container.get("tool_calls")
-                            if isinstance(container_tool_calls, list):
-                                for tool_call in container_tool_calls:
-                                    if isinstance(tool_call, dict):
-                                        _merge_stream_tool_call_delta(tool_calls, tool_call)
-                    if payload.get("type") == "response.output_text.delta":
-                        delta = payload.get("delta")
-                        if isinstance(delta, str):
-                            parts.append(delta)
+                    process_payload(payload)
+            if is_sse_response:
+                for payload in sse_parser.flush():
+                    process_payload(payload)
         finally:
             await _close_stream_response(response)
         if provider_error is not None:
@@ -4006,18 +4066,26 @@ class Pipe:
                             historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                         )
                     compacted_once = compacted_once or compacted
-                    if compacted and emit_progress_status:
-                        await emit_compaction_status(
-                            __event_emitter__,
-                            action="compacted",
-                            description="Compacted chat history is ready for the target model",
-                            done=True,
-                        )
-                        summary_text = extract_compaction_summary_text_from_messages(candidate.get("messages"))
-                        await emit_compaction_summary_embed(
-                            __event_emitter__,
-                            summary_text=summary_text,
-                        )
+                    if emit_progress_status:
+                        if compacted:
+                            await emit_compaction_status(
+                                __event_emitter__,
+                                action="compacted",
+                                description="Compacted chat history is ready for the target model",
+                                done=True,
+                            )
+                            summary_text = extract_compaction_summary_text_from_messages(candidate.get("messages"))
+                            await emit_compaction_summary_embed(
+                                __event_emitter__,
+                                summary_text=summary_text,
+                            )
+                        else:
+                            await emit_compaction_status(
+                                __event_emitter__,
+                                action="skipped",
+                                description="Could not compact chat history safely; forwarding unchanged",
+                                done=True,
+                            )
                 except UnsupportedCompactionInput as exc:
                     await emit_compaction_status(
                         __event_emitter__,

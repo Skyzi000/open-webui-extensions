@@ -1099,6 +1099,33 @@ def test_sse_error_payload_is_classified_before_any_content():
 
 
 @pytest.mark.asyncio
+async def test_streaming_forwarder_retries_split_initial_sse_context_error():
+    closed = False
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield b'data: {"error": {"code": "context_length_'
+            yield b'exceeded", "message": "too long"}}\n\n'
+        finally:
+            closed = True
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+
+    assert closed is True
+
+
+@pytest.mark.asyncio
 async def test_streaming_forwarder_surfaces_context_error_after_first_non_error_event():
     async def chunks():
         yield b'data: {"usage": {"prompt_tokens": 1, "completion_tokens": 0}}\n\n'
@@ -2602,6 +2629,39 @@ async def test_non_streaming_stream_response_skips_done_chunk():
     result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
 
     assert result["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_stream_response_reassembles_split_sse_event():
+    response = StreamingResponse(
+        iter(
+            [
+                b'data: {"choices": [{"delta": ',
+                b'{"content": "ok"}}]}\n\n',
+            ]
+        ),
+        media_type="text/event-stream",
+    )
+
+    result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_stream_response_retries_split_sse_context_error():
+    response = StreamingResponse(
+        iter(
+            [
+                b'data: {"error": {"code": "context_length_',
+                b'exceeded", "message": "too long"}}\n\n',
+            ]
+        ),
+        media_type="text/event-stream",
+    )
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod._coerce_non_streaming_completion_response(response, model_id="target")
 
 
 @pytest.mark.asyncio
@@ -4758,6 +4818,64 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     assert len(embed_events[0]["data"]["embeds"]) == 1
     embed_html = embed_events[0]["data"]["embeds"][0]
     assert "combined old tool summary" in embed_html
+
+
+@pytest.mark.asyncio
+async def test_pipe_closes_compaction_status_when_usage_threshold_has_no_safe_prefix(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 500, "input_tokens": 500, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def forward_target(**kwargs):
+        return {"ok": True, "messages": kwargs["body"]["messages"]}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [{"role": "user", "content": "active"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"ok": True, "messages": [{"role": "user", "content": "active"}]}
+    status_events = [event for event in events if event["type"] == "status"]
+    assert [event["data"]["action"] for event in status_events] == [
+        "auto_compaction_compacting",
+        "auto_compaction_skipped",
+    ]
+    assert status_events[-1]["data"]["done"] is True
+    assert "Could not compact" in status_events[-1]["data"]["description"]
 
 
 @pytest.mark.asyncio
