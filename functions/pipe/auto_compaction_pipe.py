@@ -3147,6 +3147,20 @@ def _stream_payload_is_known_transport_event(payload: dict[str, Any]) -> bool:
     return _stream_payload_is_control_event(payload)
 
 
+def _stream_payload_error_source(payload: dict[str, Any]) -> Any | None:
+    if payload.get("error") is not None:
+        return payload
+    payload_type = payload.get("type")
+    if payload_type == "error":
+        return payload
+    if payload_type == "response.failed":
+        response = payload.get("response")
+        if isinstance(response, dict) and response.get("error") is not None:
+            return {"error": response["error"]}
+        return payload
+    return None
+
+
 def _append_summary_sse_value(value: str, parts: list[str]) -> bool:
     try:
         payload = json.loads(value.strip())
@@ -3154,6 +3168,12 @@ def _append_summary_sse_value(value: str, parts: list[str]) -> bool:
         return False
     if not isinstance(payload, dict):
         return False
+
+    error_source = _stream_payload_error_source(payload)
+    if error_source is not None:
+        if is_retryable_context_error(error_source, status_code=400):
+            raise RetryableContextOverflow("Summary model reported a context-window error")
+        raise RuntimeError(f"Summary model provider error: {_completion_error_message(error_source)}")
 
     is_known_transport_event = _stream_payload_is_known_transport_event(payload)
     saw_tool_call = is_known_transport_event and _stream_payload_has_tool_call(payload)
@@ -3295,6 +3315,7 @@ def build_summary_completion_body(
     body["messages"] = [*copy.deepcopy(source_messages), build_summary_request_message()]
     body["metadata"] = build_summary_task_metadata(metadata)
     body.pop("previous_response_id", None)
+    body.pop("response_format", None)
     neutralize_summary_tool_choice(body)
     return body
 

@@ -2121,6 +2121,50 @@ async def test_summary_generation_overrides_request_state_metadata(monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_summary_generation_strips_request_response_format_without_overriding_model_params(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    captured = {}
+    model_response_format = {"type": "json_schema", "json_schema": {"name": "Configured", "schema": {"type": "object"}}}
+    pipe_request.app.state.MODELS = {
+        "summary": {
+            "id": "summary",
+            "name": "Summary",
+            "params": {"response_format": model_response_format},
+        }
+    }
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["form_body"] = dict(form_data)
+        captured["model_params"] = request.app.state.MODELS["summary"]["params"]
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="summary",
+        source_messages=[{"role": "user", "content": "old"}],
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+            "response_format": {"type": "json_object"},
+        },
+    )
+
+    assert result == "summary"
+    assert "response_format" not in captured["form_body"]
+    assert captured["model_params"]["response_format"] is model_response_format
+
+
+@pytest.mark.asyncio
 async def test_summary_generation_decodes_own_wrapper_summary_model(monkeypatch, pipe_request, pipe_user):
     captured = {}
 
@@ -2625,6 +2669,45 @@ async def test_extract_summary_text_ignores_non_structured_sse_data():
 
 
 @pytest.mark.asyncio
+async def test_extract_summary_text_propagates_streamed_context_error():
+    async def chunks():
+        payload = {"error": {"code": "context_length_exceeded", "message": "maximum context length exceeded"}}
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_propagates_responses_api_error_event():
+    async def chunks():
+        payload = {"type": "error", "code": "context_length_exceeded", "message": "maximum context length exceeded"}
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_propagates_responses_api_failed_event():
+    async def chunks():
+        payload = {
+            "type": "response.failed",
+            "response": {"error": {"code": "server_error", "message": "The model failed to generate a response."}},
+        }
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    with pytest.raises(RuntimeError, match="The model failed to generate a response"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
 async def test_extract_summary_text_rejects_non_sse_streaming_response():
     async def chunks():
         yield b"plain text"
@@ -2753,6 +2836,30 @@ async def test_extract_summary_text_rejects_streamed_message_content_with_tool_c
 
     with pytest.raises(RuntimeError, match="tool call"):
         await mod.extract_text_from_completion_response(response)
+
+
+def test_build_summary_completion_body_strips_response_format():
+    source_messages = [{"role": "user", "content": "hello"}]
+    base_body = {
+        "model": "target",
+        "messages": source_messages,
+        "stream": True,
+        "temperature": 0.2,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "Answer", "schema": {"type": "object"}},
+        },
+    }
+
+    body = mod.build_summary_completion_body(
+        base_body,
+        summary_model_id="summary",
+        source_messages=source_messages,
+        metadata={"chat_id": "chat-1"},
+    )
+
+    assert "response_format" not in body
+    assert body["temperature"] == 0.2
 
 
 @pytest.mark.asyncio
