@@ -56,6 +56,53 @@ def test_target_filter_excludes_presets_based_on_own_wrappers():
     assert [m["id"] for m in targets] == ["gpt-4.1", "normal-preset"]
 
 
+@pytest.mark.asyncio
+async def test_pipes_uses_runtime_registered_id_for_filtering_and_sync(monkeypatch):
+    captured = {}
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["pipe_function_id"] = kwargs["pipe_function_id"]
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(
+        state=SimpleNamespace(
+            MODELS={
+                "target": {"id": "target", "name": "Target"},
+                mod.build_wrapper_model_id("compact_alias", "target"): {
+                    "id": mod.build_wrapper_model_id("compact_alias", "target"),
+                    "name": "Own Wrapper",
+                    "pipe": {"type": "pipe"},
+                },
+                mod.build_wrapper_model_id("auto_compact", "target"): {
+                    "id": mod.build_wrapper_model_id("auto_compact", "target"),
+                    "name": "Other Registered Wrapper",
+                    "pipe": {"type": "pipe"},
+                },
+            }
+        )
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+    monkeypatch.setattr(mod.Pipe, "__module__", "function_compact_alias")
+
+    pipe = mod.Pipe()
+
+    result = await pipe.pipes()
+
+    assert captured == {
+        "pipe_function_id": "compact_alias",
+        "target_ids": ["target", mod.build_wrapper_model_id("auto_compact", "target")],
+    }
+    assert result == [
+        {"id": "target", "name": "Compact: Target"},
+        {
+            "id": mod.build_wrapper_model_id("auto_compact", "target"),
+            "name": "Compact: Other Registered Wrapper",
+        },
+    ]
+
+
 def test_compaction_summary_embed_html_contains_full_escaped_summary():
     summary = "line 1\n" + ("long summary " * 200) + "<script>alert(1)</script>"
 
@@ -833,6 +880,22 @@ async def test_target_access_can_resolve_targets_from_base_model_cache(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_target_access_rejects_generated_wrapper_for_runtime_registered_id(pipe_request, pipe_user):
+    wrapper_id = mod.build_wrapper_model_id("compact_alias", "target")
+    pipe_request.app.state.MODELS = {
+        wrapper_id: {"id": wrapper_id, "name": "Alias Wrapper", "owned_by": "openai"}
+    }
+
+    with pytest.raises(HTTPException):
+        await mod._validate_target_access(
+            target_model_id=wrapper_id,
+            request=pipe_request,
+            user=pipe_user,
+            pipe_function_id="compact_alias",
+        )
+
+
+@pytest.mark.asyncio
 async def test_forward_target_injects_resolved_base_model_into_request_models(monkeypatch, pipe_request, pipe_user):
     target_model = {"id": "LiteLLM.glm-5.1", "name": "GLM", "owned_by": "openai"}
     pipe_request.app.state.MODELS = {}
@@ -1412,6 +1475,32 @@ async def test_summary_generation_decodes_own_wrapper_summary_model(monkeypatch,
     assert captured["model"] == "target.summary"
     assert captured["stream"] is True
     assert captured["metadata"]["task"] == mod.INTERNAL_SUMMARY_TASK
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_decodes_runtime_registered_wrapper_summary_model(monkeypatch, pipe_request, pipe_user):
+    captured = {}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["model"] = form_data["model"]
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id=mod.build_wrapper_model_id("compact_alias", "target.summary"),
+        source_messages=[{"role": "user", "content": "old"}],
+        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
+        pipe_function_id="compact_alias",
+    )
+
+    assert result == "summary"
+    assert captured["model"] == "target.summary"
 
 
 @pytest.mark.asyncio
@@ -2084,6 +2173,92 @@ async def test_pipe_forwards_below_threshold_to_decoded_target_with_metadata(mon
     assert captured["forward_body"]["stream_options"]["include_usage"] is True
     assert captured["forward_body"]["messages"] == body["messages"]
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_uses_runtime_registered_id_for_decode_and_checkpoint_scope(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        captured["access_pipe_function_id"] = kwargs["pipe_function_id"]
+        captured["validated_target"] = kwargs["target_model_id"]
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 10, "output_tokens": 0}
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        captured["checkpoint_pipe_function_id"] = kwargs["pipe_function_id"]
+        return None
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+    monkeypatch.setattr(mod.Pipe, "__module__", "function_compact_alias")
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+
+    result = await pipe.pipe(
+        {
+            "model": mod.build_wrapper_model_id("compact_alias", "target"),
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old answer"},
+            ],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result == {"ok": True}
+    assert captured["access_pipe_function_id"] == "compact_alias"
+    assert captured["validated_target"] == "target"
+    assert captured["checkpoint_pipe_function_id"] == "compact_alias"
+    assert captured["forward_body"]["model"] == "target"
+
+
+@pytest.mark.asyncio
+async def test_pipe_rejects_wrapper_prefix_that_does_not_match_runtime_registered_id(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    async def forward_target(**kwargs):
+        raise AssertionError("mismatched wrapper prefix must not be forwarded")
+
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+    monkeypatch.setattr(mod.Pipe, "__module__", "function_compact_alias")
+
+    result = await mod.Pipe().pipe(
+        {
+            "model": mod.build_wrapper_model_id("auto_compact", "target"),
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["error"]["code"] == "invalid_wrapper_id"
+    assert "compact_alias" in result["error"]["message"]
 
 
 @pytest.mark.asyncio

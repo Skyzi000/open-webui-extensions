@@ -1,5 +1,5 @@
 """
-title: Auto Compaction Pipe
+title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
@@ -228,6 +228,21 @@ def encode_target_model_id(target_model_id: str) -> str:
 
 def build_wrapper_model_id(pipe_function_id: str, target_model_id: str) -> str:
     return f"{pipe_function_id}.{encode_target_model_id(target_model_id)}"
+
+
+def pipe_function_id_from_module_name(module_name: Any, *, fallback: str = PIPE_FUNCTION_ID) -> str:
+    if isinstance(module_name, str):
+        module_basename = module_name.rsplit(".", 1)[-1]
+        prefix = "function_"
+        if module_basename.startswith(prefix):
+            function_id = module_basename[len(prefix) :]
+            if function_id:
+                return function_id
+    return fallback
+
+
+def runtime_pipe_function_id(pipe: Any, *, fallback: str = PIPE_FUNCTION_ID) -> str:
+    return pipe_function_id_from_module_name(getattr(pipe.__class__, "__module__", None), fallback=fallback)
 
 
 def decode_wrapper_model_id(wrapper_model_id: str, *, expected_pipe_function_id: str = PIPE_FUNCTION_ID) -> WrapperIdentity:
@@ -2989,9 +3004,10 @@ def build_summary_completion_body(
     summary_model_id: str,
     source_messages: list[dict[str, Any]],
     metadata: dict[str, Any],
+    pipe_function_id: str = PIPE_FUNCTION_ID,
 ) -> dict[str, Any]:
     body = _copy_body_preserving_metadata(base_body)
-    body["model"] = _resolve_summary_model_for_call(summary_model_id)
+    body["model"] = _resolve_summary_model_for_call(summary_model_id, pipe_function_id=pipe_function_id)
     body["messages"] = [*copy.deepcopy(source_messages), build_summary_request_message()]
     body["metadata"] = build_summary_task_metadata(metadata)
     body.pop("previous_response_id", None)
@@ -3007,6 +3023,7 @@ async def _generate_summary_text(
     summary_model_id: str,
     source_messages: list[dict[str, Any]],
     base_body: dict[str, Any],
+    pipe_function_id: str = PIPE_FUNCTION_ID,
 ) -> str:
     summary_metadata = build_summary_task_metadata(metadata)
     inner_request = RequestStateProxy(
@@ -3022,6 +3039,7 @@ async def _generate_summary_text(
         summary_model_id=summary_model_id,
         source_messages=source_messages,
         metadata=metadata,
+        pipe_function_id=pipe_function_id,
     )
     await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
     response = await generate_chat_completion(
@@ -3211,6 +3229,7 @@ async def _get_or_create_compaction_summary(
             summary_model_id=summary_model_id,
             source_messages=source,
             base_body=base_body,
+            pipe_function_id=pipe_function_id,
         )
 
     return await _get_or_create_checkpoint_summary(
@@ -3473,10 +3492,14 @@ async def _validate_target_access(
     target_model_id: str,
     request: Any,
     user: Any,
+    pipe_function_id: str = PIPE_FUNCTION_ID,
 ) -> None:
     models = await _model_dict_from_request(request)
     model = models.get(target_model_id)
-    if model is None or _is_arena_model(model) or is_generated_wrapper_model_id(target_model_id):
+    if model is None or _is_arena_model(model) or is_generated_wrapper_model_id(
+        target_model_id,
+        pipe_function_id=pipe_function_id,
+    ):
         raise HTTPException(status_code=403, detail="Model not found")
 
     user_model = coerce_open_webui_user(user)
@@ -3816,8 +3839,9 @@ class Pipe:
         except Exception:
             return []
 
-        targets = filter_target_models(_iter_cache_models_from_state(state), self.valves)
-        await sync_wrapper_model_records(pipe_function_id=PIPE_FUNCTION_ID, target_models=targets, valves=self.valves)
+        pipe_function_id = runtime_pipe_function_id(self)
+        targets = filter_target_models(_iter_cache_models_from_state(state), self.valves, pipe_function_id=pipe_function_id)
+        await sync_wrapper_model_records(pipe_function_id=pipe_function_id, target_models=targets, valves=self.valves)
 
         entries: list[dict[str, str]] = []
         prefix = str(self.valves.model_name_prefix or "")
@@ -3843,8 +3867,9 @@ class Pipe:
 
         is_streaming = body.get("stream") is True
         selected_wrapper_id = str(body.get("model") or "")
+        pipe_function_id = runtime_pipe_function_id(self)
         try:
-            identity = decode_wrapper_model_id(selected_wrapper_id, expected_pipe_function_id=PIPE_FUNCTION_ID)
+            identity = decode_wrapper_model_id(selected_wrapper_id, expected_pipe_function_id=pipe_function_id)
         except ValueError as exc:
             return _error_response(str(exc), code="invalid_wrapper_id")
 
@@ -3854,7 +3879,12 @@ class Pipe:
         message_id = metadata.get("message_id") or metadata.get("user_message_id")
 
         try:
-            await _validate_target_access(target_model_id=identity.target_model_id, request=__request__, user=user)
+            await _validate_target_access(
+                target_model_id=identity.target_model_id,
+                request=__request__,
+                user=user,
+                pipe_function_id=pipe_function_id,
+            )
         except Exception:
             return _error_response("Model not found", code="model_access_denied")
 
