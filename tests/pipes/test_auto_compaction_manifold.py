@@ -8,6 +8,7 @@ import types
 
 import pytest
 from fastapi import HTTPException
+from pydantic import BaseModel, ConfigDict
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
@@ -333,10 +334,52 @@ def test_wrapper_model_form_inherits_target_meta_used_by_core_middleware():
     assert form["meta"]["defaultFeatureIds"] == ["web_search"]
     assert form["meta"]["terminalId"] == "terminal-1"
     assert form["meta"]["tags"] == [{"name": "target-tag"}]
-    assert form["meta"]["description"] == "Auto-compacting wrapper for target-with-meta"
+    assert form["meta"]["description"] == "Target description"
     assert form["meta"]["auto_compaction"] == {
         "pipe_function_id": "auto_compact",
         "target_model_id": "target-with-meta",
+    }
+
+
+def test_wrapper_model_form_inherits_top_level_display_metadata_without_wrapper_description():
+    target = {
+        "id": "provider-target",
+        "name": "Provider Target",
+        "description": "Provider target description",
+        "profile_image_url": "https://example.com/provider.png",
+        "capabilities": {"vision": True},
+        "tags": ["provider", {"name": "custom"}],
+    }
+
+    form = mod.build_wrapper_model_form(
+        pipe_function_id="auto_compact",
+        function_owner_user_id="function-owner",
+        target_model=target,
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert form["meta"]["description"] == "Provider target description"
+    assert form["meta"]["profile_image_url"] == "https://example.com/provider.png"
+    assert form["meta"]["capabilities"] == {"vision": True}
+    assert form["meta"]["tags"] == [{"name": "provider"}, {"name": "custom"}]
+    assert form["meta"]["auto_compaction"] == {
+        "pipe_function_id": "auto_compact",
+        "target_model_id": "provider-target",
+    }
+
+
+def test_wrapper_model_form_does_not_invent_description_when_target_has_none():
+    form = mod.build_wrapper_model_form(
+        pipe_function_id="auto_compact",
+        function_owner_user_id="function-owner",
+        target_model={"id": "plain-target", "name": "Plain Target"},
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert "description" not in form["meta"]
+    assert form["meta"]["auto_compaction"] == {
+        "pipe_function_id": "auto_compact",
+        "target_model_id": "plain-target",
     }
 
 
@@ -527,6 +570,82 @@ async def test_wrapper_sync_uses_target_model_record_params_for_wrapper_record(m
 
 
 @pytest.mark.asyncio
+async def test_wrapper_sync_ignores_non_dict_top_level_provider_capabilities(monkeypatch):
+    calls = {"insert": [], "update": []}
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "provider-target")
+
+    class FakeFunction:
+        user_id = "function-owner"
+
+    class FakeFunctions:
+        @staticmethod
+        async def get_function_by_id(function_id):
+            return FakeFunction()
+
+    class FakeModelParams:
+        def __init__(self, **kwargs):
+            self.payload = kwargs
+
+    class FakeModelMeta(BaseModel):
+        description: str | None = None
+        profile_image_url: str | None = None
+        capabilities: dict | None = None
+
+        model_config = ConfigDict(extra="allow")
+
+    class FakeModelForm:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            if model_id in {"provider-target", wrapper_id}:
+                return None
+            raise AssertionError(f"unexpected model id: {model_id}")
+
+        @staticmethod
+        async def update_model_by_id(model_id, model_form):
+            calls["update"].append((model_id, model_form))
+
+        @staticmethod
+        async def insert_new_model(model_form, user_id):
+            calls["insert"].append((user_id, model_form))
+
+    functions_module = types.ModuleType("open_webui.models.functions")
+    functions_module.Functions = FakeFunctions
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.ModelForm = FakeModelForm
+    models_module.ModelMeta = FakeModelMeta
+    models_module.ModelParams = FakeModelParams
+    models_module.Models = FakeModels
+    monkeypatch.setitem(sys.modules, "open_webui.models.functions", functions_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[
+            {
+                "id": "provider-target",
+                "name": "Provider Target",
+                "description": "Provider target description",
+                "profile_image_url": "https://example.com/provider.png",
+                "capabilities": ["vision"],
+            }
+        ],
+        valves=mod.Pipe.Valves(),
+    )
+
+    inserted = calls["insert"][0][1]
+    meta = inserted.meta.model_dump(exclude_none=True)
+    assert inserted.id == wrapper_id
+    assert meta["description"] == "Provider target description"
+    assert meta["profile_image_url"] == "https://example.com/provider.png"
+    assert "capabilities" not in meta
+    assert calls["update"] == []
+
+
+@pytest.mark.asyncio
 async def test_wrapper_sync_does_not_make_base_target_public_without_model_info(monkeypatch):
     calls = {"insert": [], "update": []}
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "base-target")
@@ -654,7 +773,6 @@ async def test_wrapper_sync_skips_update_when_existing_record_matches(monkeypatc
                 "name": "Compact: Same Target",
                 "params": {"stream_response": True},
                 "meta": {
-                    "description": "Auto-compacting wrapper for same-target",
                     "auto_compaction": {
                         "pipe_function_id": "auto_compact",
                         "target_model_id": "same-target",

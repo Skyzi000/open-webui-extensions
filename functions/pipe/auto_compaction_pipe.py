@@ -1747,6 +1747,37 @@ def _payload_meta(payload: dict[str, Any]) -> dict[str, Any]:
     return copy.deepcopy(meta) if isinstance(meta, dict) else {}
 
 
+def _normalize_meta_tags(tags: Any) -> list[dict[str, Any]]:
+    if not isinstance(tags, list):
+        return []
+    normalized = []
+    for tag in tags:
+        if isinstance(tag, str):
+            normalized.append({"name": tag})
+        elif isinstance(tag, dict) and isinstance(tag.get("name"), str):
+            normalized.append(copy.deepcopy(tag))
+    return normalized
+
+
+def _copy_top_level_display_metadata(meta: dict[str, Any], target_model: dict[str, Any]) -> dict[str, Any]:
+    copied = copy.deepcopy(meta)
+
+    for key in ("description", "profile_image_url"):
+        value = target_model.get(key)
+        if copied.get(key) is None and isinstance(value, str):
+            copied[key] = value
+
+    capabilities = _dump_model_value(target_model.get("capabilities"))
+    if copied.get("capabilities") is None and isinstance(capabilities, dict):
+        copied["capabilities"] = copy.deepcopy(capabilities)
+
+    if copied.get("tags") is None:
+        tags = _normalize_meta_tags(target_model.get("tags"))
+        if tags:
+            copied["tags"] = tags
+    return copied
+
+
 def _payload_params(payload: dict[str, Any]) -> dict[str, Any]:
     params = _dump_model_value(payload.get("params"))
     return copy.deepcopy(params) if isinstance(params, dict) else {}
@@ -1794,6 +1825,7 @@ def build_target_model_contract(target_model: dict[str, Any], target_model_info:
     top_level_meta = _dump_model_value(target_model.get("meta"))
     if not meta and isinstance(top_level_meta, dict):
         meta = copy.deepcopy(top_level_meta)
+    meta = _copy_top_level_display_metadata(meta, target_model)
 
     target_params = _payload_params(record_info) or _payload_params(app_info)
     top_level_params = _dump_model_value(target_model.get("params"))
@@ -1851,7 +1883,6 @@ def build_wrapper_model_form(
         ):
             access_grants.append(owner_read)
     meta = copy.deepcopy(target.meta)
-    meta["description"] = f"Auto-compacting wrapper for {target_id}"
     meta["auto_compaction"] = {
         "pipe_function_id": pipe_function_id,
         "target_model_id": target_id,
