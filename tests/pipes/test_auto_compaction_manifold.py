@@ -1874,6 +1874,17 @@ async def test_extract_summary_text_from_streaming_response():
 
 
 @pytest.mark.asyncio
+async def test_extract_summary_text_from_streamed_chat_completion_message():
+    async def chunks():
+        payload = {"choices": [{"message": {"role": "assistant", "content": "pipe summary"}}]}
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    assert await mod.extract_text_from_completion_response(response) == "pipe summary"
+
+
+@pytest.mark.asyncio
 async def test_extract_summary_text_from_split_sse_event_chunks():
     async def chunks():
         yield b'data: {"choices": [{"delta": '
@@ -2027,6 +2038,28 @@ async def test_extract_summary_text_rejects_streamed_tool_call_response():
     async def chunks():
         yield b'data: {"choices": [{"delta": {"tool_calls": [{"id": "call-1"}]}}]}\n\n'
         yield b'data: {"choices": [{"finish_reason": "tool_calls", "delta": {}}]}\n\n'
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    with pytest.raises(RuntimeError, match="tool call"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_rejects_streamed_message_content_with_tool_call():
+    async def chunks():
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "not a final summary",
+                        "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "lookup"}}],
+                    }
+                }
+            ]
+        }
+        yield f"data: {json.dumps(payload)}\n\n".encode()
 
     response = StreamingResponse(chunks(), media_type="text/event-stream")
 

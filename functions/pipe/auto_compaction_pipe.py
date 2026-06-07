@@ -2836,13 +2836,29 @@ def _responses_output_text(response: dict[str, Any]) -> str | None:
     return "".join(parts)
 
 
-def _stream_payload_delta_text(payload: dict[str, Any]) -> str | None:
+def _choice_message_text(choice: Any) -> str | None:
+    if not isinstance(choice, dict):
+        return None
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    return None
+
+
+def _stream_payload_text(payload: dict[str, Any]) -> str | None:
     choices = payload.get("choices")
     if isinstance(choices, list) and choices:
-        delta = choices[0].get("delta") or {}
+        choice = choices[0]
+        delta = choice.get("delta") or {}
         content = delta.get("content")
         if isinstance(content, str):
             return content
+        message_content = _choice_message_text(choice)
+        if message_content is not None:
+            return message_content
     if payload.get("type") == "response.output_text.delta":
         delta = payload.get("delta")
         if isinstance(delta, str):
@@ -2877,9 +2893,9 @@ def _append_summary_sse_value(value: str, parts: list[str]) -> bool:
     saw_tool_call = is_known_transport_event and _stream_payload_has_tool_call(payload)
     if not is_known_transport_event:
         return False
-    delta_text = _stream_payload_delta_text(payload)
-    if delta_text is not None:
-        parts.append(delta_text)
+    text = _stream_payload_text(payload)
+    if text is not None:
+        parts.append(text)
     return saw_tool_call
 
 
@@ -2917,8 +2933,7 @@ async def extract_text_from_completion_response(response: Any, *, tools_enabled:
             choice = choices[0]
             if _choice_has_tool_call(choice):
                 raise _summary_tool_call_error()
-            message = choice.get("message") or {}
-            value = message.get("content")
+            value = _choice_message_text(choice)
             if isinstance(value, str) and value.strip():
                 return value.strip()
         responses_text = _responses_output_text(response)
