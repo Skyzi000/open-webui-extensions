@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import asyncio
+import copy
 import json
 import sys
 import types
@@ -1576,6 +1577,7 @@ def test_valve_defaults_are_conservative_for_v1_continuation():
 
     assert valves.trigger_total_tokens == 100000
     assert valves.force_include_usage is True
+    assert valves.summary_tool_policy == "fallback_on_tool_call"
     assert valves.historical_message_excerpt_bytes == mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES
     assert valves.historical_message_excerpt_count == mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT
     assert not hasattr(valves, "keep_tail_messages")
@@ -2470,6 +2472,178 @@ async def test_summary_generation_preserves_tools_but_disables_forced_tool_choic
 
     assert result == "summary"
     assert captured[-1]["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_retries_without_tools_after_tool_call_response(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    captured = []
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured.append(copy.deepcopy(form_data))
+        if len(captured) == 1:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {"name": "lookup", "arguments": "{}"},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+        return {"choices": [{"message": {"content": "summary after retry"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    source_messages = [
+        {"role": "system", "content": "target system"},
+        {"role": "user", "content": "old"},
+    ]
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    base_body = {
+        "model": "target",
+        "stream": True,
+        "messages": [*source_messages, {"role": "user", "content": "active"}],
+        "tools": tools,
+        "tool_choice": "auto",
+        "functions": [{"name": "legacy_lookup", "parameters": {"type": "object"}}],
+        "function_call": "auto",
+        "parallel_tool_calls": True,
+    }
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1", "tool_ids": ["lookup"]},
+        summary_model_id="target.summary",
+        source_messages=source_messages,
+        base_body=base_body,
+    )
+
+    assert result == "summary after retry"
+    assert len(captured) == 2
+    assert captured[0]["tools"] == tools
+    assert captured[0]["tool_choice"] == "auto"
+    assert "tools" not in captured[1]
+    assert "tool_choice" not in captured[1]
+    assert "functions" not in captured[1]
+    assert "function_call" not in captured[1]
+    assert "parallel_tool_calls" not in captured[1]
+    assert captured[1]["messages"] == captured[0]["messages"]
+    assert captured[1]["metadata"] == captured[0]["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_strips_tools_before_first_request_when_configured(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    captured = []
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured.append(copy.deepcopy(form_data))
+        return {"choices": [{"message": {"content": "summary without tools"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    source_messages = [{"role": "user", "content": "old"}]
+    base_body = {
+        "model": "target",
+        "messages": [*source_messages, {"role": "user", "content": "active"}],
+        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        "tool_choice": "auto",
+        "functions": [{"name": "legacy_lookup", "parameters": {"type": "object"}}],
+        "function_call": "auto",
+        "parallel_tool_calls": True,
+    }
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1", "tool_ids": ["lookup"]},
+        summary_model_id="target.summary",
+        source_messages=source_messages,
+        base_body=base_body,
+        summary_tool_policy="always_strip",
+    )
+
+    assert result == "summary without tools"
+    assert len(captured) == 1
+    assert "tools" not in captured[0]
+    assert "tool_choice" not in captured[0]
+    assert "functions" not in captured[0]
+    assert "function_call" not in captured[0]
+    assert "parallel_tool_calls" not in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_errors_on_tool_call_when_fallback_disabled(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    captured = []
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured.append(copy.deepcopy(form_data))
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    source_messages = [{"role": "user", "content": "old"}]
+    base_body = {
+        "model": "target",
+        "messages": [*source_messages, {"role": "user", "content": "active"}],
+        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        "tool_choice": "auto",
+    }
+
+    with pytest.raises(mod.SummaryToolCallError):
+        await mod._generate_summary_text(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={"chat_id": "chat-1", "tool_ids": ["lookup"]},
+            summary_model_id="target.summary",
+            source_messages=source_messages,
+            base_body=base_body,
+            summary_tool_policy="error_on_tool_call",
+        )
+
+    assert len(captured) == 1
+    assert captured[0]["tools"] == base_body["tools"]
+    assert captured[0]["tool_choice"] == "auto"
 
 
 @pytest.mark.asyncio

@@ -23,7 +23,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from types import SimpleNamespace
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -70,6 +70,7 @@ DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT = 32
 PROVIDER_MODEL_CACHE_WAIT_DEFAULT_TIMEOUT_SECONDS = 10.0
 PROVIDER_MODEL_CACHE_WAIT_POLL_SECONDS = 0.05
 OLLAMA_PROVIDER_MODEL_CACHE_REFRESH_REQUESTS = 2
+SummaryToolPolicy = Literal["always_strip", "fallback_on_tool_call", "error_on_tool_call"]
 CORE_FUNCTION_MODEL_LISTING_COROUTINE = ("get_function_models", "open_webui/functions.py")
 PROVIDER_MODEL_CACHE_REFRESH_COROUTINES = {
     "OPENAI_MODELS": (("fetch_openai_models", "open_webui/utils/models.py"),),
@@ -3065,8 +3066,12 @@ def _merge_stream_tool_call_delta(tool_calls: list[dict[str, Any]], delta_tool_c
         function["arguments"] = str(function.get("arguments") or "") + arguments
 
 
-def _summary_tool_call_error() -> RuntimeError:
-    return RuntimeError("Summary model returned a tool call instead of text content")
+class SummaryToolCallError(RuntimeError):
+    pass
+
+
+def _summary_tool_call_error() -> SummaryToolCallError:
+    return SummaryToolCallError("Summary model returned a tool call instead of text content")
 
 
 def _choice_has_tool_call(choice: Any) -> bool:
@@ -3323,6 +3328,11 @@ def neutralize_summary_tool_choice(body: dict[str, Any]) -> None:
         body.pop("function_call", None)
 
 
+def strip_summary_tools_for_retry(body: dict[str, Any]) -> None:
+    for key in ("tools", "tool_choice", "functions", "function_call", "parallel_tool_calls"):
+        body.pop(key, None)
+
+
 def build_summary_request_message() -> dict[str, str]:
     return {"role": "user", "content": SUMMARY_PROMPT}
 
@@ -3334,6 +3344,7 @@ def build_summary_completion_body(
     source_messages: list[dict[str, Any]],
     metadata: dict[str, Any],
     pipe_function_id: str = PIPE_FUNCTION_ID,
+    summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
 ) -> dict[str, Any]:
     body = _copy_body_preserving_metadata(base_body)
     body["model"] = _resolve_summary_model_for_call(summary_model_id, pipe_function_id=pipe_function_id)
@@ -3342,6 +3353,8 @@ def build_summary_completion_body(
     body.pop("previous_response_id", None)
     body.pop("response_format", None)
     neutralize_summary_tool_choice(body)
+    if summary_tool_policy == "always_strip":
+        strip_summary_tools_for_retry(body)
     return body
 
 
@@ -3354,6 +3367,7 @@ async def _generate_summary_text(
     source_messages: list[dict[str, Any]],
     base_body: dict[str, Any],
     pipe_function_id: str = PIPE_FUNCTION_ID,
+    summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
 ) -> str:
     summary_metadata = build_summary_task_metadata(metadata)
     inner_request = RequestStateProxy(
@@ -3370,6 +3384,7 @@ async def _generate_summary_text(
         source_messages=source_messages,
         metadata=metadata,
         pipe_function_id=pipe_function_id,
+        summary_tool_policy=summary_tool_policy,
     )
     await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
     response = await generate_chat_completion(
@@ -3381,7 +3396,23 @@ async def _generate_summary_text(
     )
     if is_retryable_context_error(response, status_code=400):
         raise RetryableContextOverflow("Summary model reported a context-window error")
-    return await extract_text_from_completion_response(response, tools_enabled=bool(body.get("tools")))
+    try:
+        return await extract_text_from_completion_response(response, tools_enabled=bool(body.get("tools")))
+    except SummaryToolCallError:
+        if summary_tool_policy != "fallback_on_tool_call" or (not body.get("tools") and not body.get("functions")):
+            raise
+        retry_body = copy.deepcopy(body)
+        strip_summary_tools_for_retry(retry_body)
+        response = await generate_chat_completion(
+            inner_request,
+            retry_body,
+            user=coerce_open_webui_user(user),
+            bypass_filter=True,
+            bypass_system_prompt=False,
+        )
+        if is_retryable_context_error(response, status_code=400):
+            raise RetryableContextOverflow("Summary model reported a context-window error")
+        return await extract_text_from_completion_response(response, tools_enabled=False)
 
 
 async def _compact_retry_tool_results(
@@ -3394,6 +3425,7 @@ async def _compact_retry_tool_results(
     base_body: dict[str, Any],
     messages: list[dict[str, Any]],
     parent_checkpoint: dict[str, Any] | None = None,
+    summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
 ) -> tuple[list[dict[str, Any]], bool]:
     cut = select_tool_result_compaction_cut(messages)
     if cut is None:
@@ -3421,6 +3453,7 @@ async def _compact_retry_tool_results(
             source_messages=source_messages,
             summary_meta=summary_meta,
             parent_checkpoint=parent_checkpoint,
+            summary_tool_policy=summary_tool_policy,
         )
     except Exception as exc:
         if isinstance(exc, ParentCheckpointExtensionFailed) and (
@@ -3540,6 +3573,7 @@ async def _get_or_create_compaction_summary(
     source_messages: list[dict[str, Any]],
     summary_meta: dict[str, Any],
     parent_checkpoint: dict[str, Any] | None = None,
+    summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
 ) -> str:
     summary_source_prefix = copy.deepcopy(source_messages)
 
@@ -3560,6 +3594,7 @@ async def _get_or_create_compaction_summary(
             source_messages=source,
             base_body=base_body,
             pipe_function_id=pipe_function_id,
+            summary_tool_policy=summary_tool_policy,
         )
 
     return await _get_or_create_checkpoint_summary(
@@ -4021,6 +4056,7 @@ async def _compact_body(
     summary_model_id: str,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
+    summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
 ) -> tuple[dict[str, Any], bool]:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -4041,6 +4077,7 @@ async def _compact_body(
                 summary_model_id=summary_model_id,
                 base_body=body,
                 messages=messages,
+                summary_tool_policy=summary_tool_policy,
             )
         except UnsupportedCompactionInput as exc:
             if exc.code != "latest_tool_result_too_large":
@@ -4064,6 +4101,7 @@ async def _compact_body(
                 base_body=body,
                 source_messages=cut.summarization_prefix,
                 summary_meta=history_summary_meta,
+                summary_tool_policy=summary_tool_policy,
             )
             history_checkpoint = await _lookup_ready_checkpoint_for_source(
                 request=request,
@@ -4083,6 +4121,7 @@ async def _compact_body(
                 base_body=body,
                 messages=messages,
                 parent_checkpoint=history_checkpoint,
+                summary_tool_policy=summary_tool_policy,
             )
         if did_compact_tools:
             compacted = _copy_body_preserving_metadata(body)
@@ -4115,6 +4154,7 @@ async def _compact_body(
             base_body=body,
             source_messages=cut.summarization_prefix,
             summary_meta=summary_meta,
+            summary_tool_policy=summary_tool_policy,
         )
         compacted["messages"] = replace_prefix_with_summary(
             messages,
@@ -4161,6 +4201,16 @@ class Pipe:
         force_include_usage: bool = Field(
             default=True,
             description="Set stream_options.include_usage=true on copied streaming target requests when supported.",
+        )
+        summary_tool_policy: SummaryToolPolicy = Field(
+            default="fallback_on_tool_call",
+            description=(
+                "Controls summary requests for tool-enabled chats. The default fallback_on_tool_call keeps tool "
+                "definitions on the first summary request to preserve provider-visible request shape and prompt-cache "
+                "reuse, then retries without tools only if the summary model actually emits a tool call. "
+                "always_strip removes tools up front for dedicated summary models or when cache reuse is unimportant. "
+                "error_on_tool_call keeps tools and fails instead of silently retrying if a tool call is returned."
+            ),
         )
         historical_message_excerpt_bytes: int = Field(
             default=DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
@@ -4348,6 +4398,7 @@ class Pipe:
                             summary_model_id=summary_model_id,
                             historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                             historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                            summary_tool_policy=self.valves.summary_tool_policy,
                         )
                     compacted_once = compacted_once or compacted
                     if emit_progress_status:
