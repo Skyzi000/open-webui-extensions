@@ -76,6 +76,10 @@ PROVIDER_MODEL_CACHE_REFRESH_COROUTINES = {
     "OPENAI_MODELS": (("fetch_openai_models", "open_webui/utils/models.py"),),
     "OLLAMA_MODELS": (("fetch_ollama_models", "open_webui/utils/models.py"),),
 }
+PROVIDER_MODEL_CACHE_ENABLE_FLAGS = {
+    "OPENAI_MODELS": "ENABLE_OPENAI_API",
+    "OLLAMA_MODELS": "ENABLE_OLLAMA_API",
+}
 MISSING_CORE_REQUEST = object()
 COMPACTION_SUMMARY_EMBED_MARKER = "<!--auto-compaction-summary-embed:v1-->"
 SUMMARY_PROMPT = (
@@ -2033,25 +2037,62 @@ def _normalize_cache_model(attr: str, model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _provider_model_cache_enabled_state(state: Any, attr: str) -> bool | None:
+    flag = PROVIDER_MODEL_CACHE_ENABLE_FLAGS.get(attr)
+    if flag is None:
+        return None
+    config = getattr(state, "config", None)
+    if config is None or not hasattr(config, flag):
+        return None
+    return bool(getattr(config, flag))
+
+
+def _disabled_provider_model_cache_attrs(state: Any) -> set[str]:
+    return {
+        attr
+        for attr in PROVIDER_MODEL_CACHE_ENABLE_FLAGS
+        if _provider_model_cache_enabled_state(state, attr) is False
+    }
+
+
+def _is_provider_cache_origin_model(model: dict[str, Any], attr: str) -> bool:
+    if attr == "OPENAI_MODELS":
+        return isinstance(model.get("openai"), dict)
+    if attr == "OLLAMA_MODELS":
+        return isinstance(model.get("ollama"), dict)
+    return False
+
+
+def _is_disabled_provider_cache_origin_model(model: dict[str, Any], disabled_provider_attrs: set[str]) -> bool:
+    return any(_is_provider_cache_origin_model(model, attr) for attr in disabled_provider_attrs)
+
+
 def _iter_cache_models_from_state(state: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
+    disabled_provider_attrs = _disabled_provider_model_cache_attrs(state)
     for attr in ("MODELS", "BASE_MODELS", "OPENAI_MODELS", "OLLAMA_MODELS"):
+        if attr in disabled_provider_attrs:
+            continue
         value = getattr(state, attr, None)
         try:
             iterator = iter(_iter_model_cache_values(value))
         except TypeError:
             continue
-        out.extend(_normalize_cache_model(attr, item) for item in iterator if isinstance(item, dict))
+        for item in iterator:
+            if not isinstance(item, dict):
+                continue
+            model = _normalize_cache_model(attr, item)
+            if _is_disabled_provider_cache_origin_model(model, disabled_provider_attrs):
+                continue
+            out.append(model)
     return out
 
 
 def _enabled_provider_model_cache_attrs(state: Any) -> list[str]:
-    config = getattr(state, "config", None)
     attrs: list[str] = []
-    if getattr(config, "ENABLE_OPENAI_API", False):
-        attrs.append("OPENAI_MODELS")
-    if getattr(config, "ENABLE_OLLAMA_API", False):
-        attrs.append("OLLAMA_MODELS")
+    for attr in PROVIDER_MODEL_CACHE_ENABLE_FLAGS:
+        if _provider_model_cache_enabled_state(state, attr) is True:
+            attrs.append(attr)
     return attrs
 
 

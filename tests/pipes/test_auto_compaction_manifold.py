@@ -288,6 +288,41 @@ async def test_pipes_does_not_wait_for_disabled_provider_cache(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pipes_excludes_disabled_provider_stale_cache_models(monkeypatch):
+    captured = {}
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    state = SimpleNamespace(
+        MODELS={
+            "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}},
+            "other-pipe.child": {
+                "id": "other-pipe.child",
+                "name": "Other Pipe",
+                "owned_by": "openai",
+                "pipe": {"type": "pipe"},
+            },
+        },
+        BASE_MODELS=[
+            {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}},
+        ],
+        OPENAI_MODELS={"direct-openai": {"id": "direct-openai", "name": "Direct OpenAI", "openai": {}}},
+        OLLAMA_MODELS={"direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}},
+        config=SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False),
+    )
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(state=state)
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+
+    result = await mod.Pipe().pipes()
+
+    assert captured["target_ids"] == ["other-pipe.child"]
+    assert result == [{"id": "other-pipe.child", "name": "Compact: Other Pipe"}]
+
+
+@pytest.mark.asyncio
 async def test_pipes_does_not_wait_when_empty_provider_cache_already_refreshed(monkeypatch):
     captured = {}
 
@@ -1415,6 +1450,39 @@ async def test_target_access_allows_admin_raw_provider_target_without_model_reco
     monkeypatch.setitem(sys.modules, "open_webui.config", config_module)
 
     await mod._validate_target_access(target_model_id="raw-target", request=pipe_request, user=admin_user)
+
+
+@pytest.mark.asyncio
+async def test_target_access_rejects_disabled_provider_stale_cache_target(monkeypatch, pipe_request, pipe_user):
+    install_fake_open_webui_user_model(monkeypatch)
+    pipe_request.app.state.config = SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False)
+    pipe_request.app.state.MODELS = {
+        "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}}
+    }
+    pipe_request.app.state.BASE_MODELS = [
+        {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}}
+    ]
+    pipe_request.app.state.OPENAI_MODELS = {
+        "direct-openai": {"id": "direct-openai", "name": "Direct OpenAI", "openai": {}}
+    }
+    pipe_request.app.state.OLLAMA_MODELS = {
+        "direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}
+    }
+
+    async def check_model_access(user, model, db=None):
+        return None
+
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+
+    for target_model_id in ("stale-openai", "stale-ollama", "direct-openai", "direct-ollama"):
+        with pytest.raises(HTTPException):
+            await mod._validate_target_access(
+                target_model_id=target_model_id,
+                request=pipe_request,
+                user=pipe_user,
+            )
 
 
 @pytest.mark.asyncio
