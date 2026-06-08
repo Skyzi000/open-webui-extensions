@@ -1679,6 +1679,22 @@ def test_sse_error_payload_is_classified_before_any_content():
     assert mod.first_chunk_is_retryable_context_error(chunk)
 
 
+def test_responses_failed_payload_is_classified_before_any_content():
+    payload = {
+        "type": "response.failed",
+        "response": {
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "too long",
+            }
+        },
+    }
+    chunk = f"data: {json.dumps(payload)}\n\n".encode()
+
+    assert mod.extract_sse_json_events(chunk) == [payload]
+    assert mod.first_chunk_is_retryable_context_error(chunk)
+
+
 @pytest.mark.asyncio
 async def test_streaming_forwarder_retries_split_initial_sse_context_error():
     closed = False
@@ -1710,6 +1726,166 @@ async def test_streaming_forwarder_retries_split_initial_sse_context_error():
 
     assert closed is True
     assert background_count == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_retries_initial_responses_failed_context_error():
+    closed = False
+    background_count = 0
+
+    async def chunks():
+        nonlocal closed
+        try:
+            payload = {
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "too long",
+                    }
+                },
+            }
+            yield f"data: {json.dumps(payload)}\n\n".encode()
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_retries_responses_failed_after_pre_output_events():
+    closed = False
+    background_count = 0
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield b'data: {"type": "response.created", "response": {"id": "resp-1"}}\n\n'
+            yield b'data: {"type": "response.in_progress", "response": {"id": "resp-1"}}\n\n'
+            payload = {
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "too long",
+                    }
+                },
+            }
+            yield f"data: {json.dumps(payload)}\n\n".encode()
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "response.refusal.delta",
+        "response.reasoning_summary_text.delta",
+        "response.mcp_call_arguments.delta",
+        "response.custom_tool_call_input.delta",
+    ],
+)
+async def test_streaming_forwarder_treats_responses_output_deltas_as_visible_output(event_type):
+    requested_second_chunk = False
+    closed = False
+    background_count = 0
+    first_chunk = f'data: {{"type": "{event_type}", "delta": "visible"}}\n\n'.encode()
+
+    async def chunks():
+        nonlocal requested_second_chunk, closed
+        try:
+            yield first_chunk
+            requested_second_chunk = True
+            yield b'data: {"type": "response.completed", "response": {"id": "resp-1"}}\n\n'
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    assert requested_second_chunk is False
+    iterator = prepared.body_iterator.__aiter__()
+    assert await iterator.__anext__() == first_chunk
+    await iterator.aclose()
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_surfaces_context_error_after_same_chunk_non_error_event():
+    chunk = (
+        b'data: {"usage": {"prompt_tokens": 1, "completion_tokens": 0}}\n\n'
+        b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+    )
+
+    async def chunks():
+        yield chunk
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    emitted = []
+    async for emitted_chunk in prepared.body_iterator:
+        emitted.append(emitted_chunk)
+
+    assert emitted == [chunk]
 
 
 @pytest.mark.asyncio

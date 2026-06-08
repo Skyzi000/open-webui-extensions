@@ -2697,24 +2697,41 @@ def extract_sse_json_events(chunk: bytes | str) -> list[dict[str, Any]]:
 
 def first_chunk_is_retryable_context_error(chunk: bytes | str) -> bool:
     events = extract_sse_json_events(chunk)
-    return bool(events and events[0].get("error") and is_retryable_context_error(events[0], status_code=400))
+    if not events:
+        return False
+    error_source = _stream_payload_error_source(events[0])
+    return bool(error_source is not None and is_retryable_context_error(error_source, status_code=400))
+
+
+def _stream_payload_has_user_visible_output(payload: dict[str, Any]) -> bool:
+    if payload.get("error"):
+        return False
+    payload_type = payload.get("type")
+    if isinstance(payload_type, str) and payload_type.startswith("response.") and payload_type.endswith(".delta"):
+        return True
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        delta = choices[0].get("delta") or {}
+        if any(delta.get(key) for key in ("content", "reasoning_content", "tool_calls")):
+            return True
+    return False
+
+
+def _stream_payload_is_responses_pre_output_control_event(payload: dict[str, Any]) -> bool:
+    if _stream_payload_error_source(payload) is not None:
+        return False
+    payload_type = payload.get("type")
+    return payload_type in {"response.created", "response.in_progress"}
+
+
+def _stream_events_are_responses_pre_output_control_events(events: list[dict[str, Any]]) -> bool:
+    return bool(events) and all(_stream_payload_is_responses_pre_output_control_event(payload) for payload in events)
 
 
 def chunk_has_user_visible_output(chunk: bytes | str) -> bool:
     for payload in extract_sse_json_events(chunk):
-        if payload.get("error"):
-            continue
-        if payload.get("type") in {
-            "response.output_text.delta",
-            "response.reasoning_text.delta",
-            "response.function_call_arguments.delta",
-        }:
+        if _stream_payload_has_user_visible_output(payload):
             return True
-        choices = payload.get("choices")
-        if isinstance(choices, list) and choices:
-            delta = choices[0].get("delta") or {}
-            if any(delta.get(key) for key in ("content", "reasoning_content", "tool_calls")):
-                return True
     return False
 
 
@@ -2810,6 +2827,7 @@ async def prepare_streaming_response(
     iterator = response.body_iterator.__aiter__()
     buffered_chunks: list[bytes | str] = []
     sse_parser = _SSEJSONEventParser()
+    can_retry_context_error = True
     try:
         while True:
             chunk = _coerce_stream_chunk(await iterator.__anext__())
@@ -2824,14 +2842,19 @@ async def prepare_streaming_response(
                         wrapper_model_id=wrapper_model_id,
                         usage=usage,
                     )
+                if can_retry_context_error:
+                    error_source = _stream_payload_error_source(payload)
+                    if error_source is not None and is_retryable_context_error(error_source, status_code=400):
+                        await _close_stream_response(response)
+                        if restore:
+                            restore()
+                        raise RetryableContextOverflow("Target model reported a context-window error before output")
+                if not _stream_payload_is_responses_pre_output_control_event(payload):
+                    can_retry_context_error = False
             buffered_chunks.append(chunk)
-            if events:
-                first_payload = events[0]
-                if first_payload.get("error") and is_retryable_context_error(first_payload, status_code=400):
-                    await _close_stream_response(response)
-                    if restore:
-                        restore()
-                    raise RetryableContextOverflow("Target model reported a context-window error before output")
+            if events and not (
+                can_retry_context_error and _stream_events_are_responses_pre_output_control_events(events)
+            ):
                 break
     except StopAsyncIteration:
         events = sse_parser.flush()
@@ -2845,13 +2868,15 @@ async def prepare_streaming_response(
                     wrapper_model_id=wrapper_model_id,
                     usage=usage,
                 )
-        if events:
-            first_payload = events[0]
-            if first_payload.get("error") and is_retryable_context_error(first_payload, status_code=400):
-                if restore:
-                    restore()
-                await _close_stream_response(response)
-                raise RetryableContextOverflow("Target model reported a context-window error before output")
+            if can_retry_context_error:
+                error_source = _stream_payload_error_source(payload)
+                if error_source is not None and is_retryable_context_error(error_source, status_code=400):
+                    if restore:
+                        restore()
+                    await _close_stream_response(response)
+                    raise RetryableContextOverflow("Target model reported a context-window error before output")
+            if not _stream_payload_is_responses_pre_output_control_event(payload):
+                can_retry_context_error = False
         if restore:
             restore()
         await _close_stream_response(response)
