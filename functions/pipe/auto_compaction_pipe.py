@@ -67,6 +67,10 @@ PROFILE_HASH_FAMILY = "checkpoint-profile-v1"
 MAX_CONTEXT_RETRY_ATTEMPTS = 2
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES = 512
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT = 32
+SUMMARY_META_FORMAT_VERSION_KEY = "summary_meta_format_version"
+SUMMARY_META_FORMAT_VERSION = 1
+SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY = "historical_user_messages"
+SUMMARY_META_HISTORICAL_USER_MESSAGES_FORMAT_VERSION = 1
 PROVIDER_MODEL_CACHE_WAIT_DEFAULT_TIMEOUT_SECONDS = 10.0
 PROVIDER_MODEL_CACHE_WAIT_POLL_SECONDS = 0.05
 OLLAMA_PROVIDER_MODEL_CACHE_REFRESH_REQUESTS = 2
@@ -217,6 +221,13 @@ class ToolResultCompactionCut:
 
 class RetryableContextOverflow(Exception):
     """Raised only before any user-visible target output has been emitted."""
+
+
+class CompactionSummaryResult(str):
+    def __new__(cls, summary_text: Any, *, checkpoint: dict[str, Any] | None = None):
+        obj = str.__new__(cls, str(summary_text))
+        obj.checkpoint = checkpoint
+        return obj
 
 
 class UnsupportedCompactionInput(Exception):
@@ -1046,15 +1057,11 @@ def render_historical_user_message_excerpts(
     if count_limit <= 0:
         return ""
 
-    excerpts: list[str] = []
-    for message in source_messages:
-        if message.get("role") != "user":
-            continue
-        text = _message_content_as_excerpt_text(message).strip()
-        if not text:
-            continue
-        excerpts.append(truncate_text_middle_by_utf8_bytes(text, excerpt_bytes))
-    excerpts = excerpts[-count_limit:]
+    excerpts = [item["text"] for item in _build_historical_user_message_excerpt_items(
+        source_messages,
+        excerpt_bytes=excerpt_bytes,
+        max_messages=count_limit,
+    )]
     if not excerpts:
         return ""
 
@@ -1070,6 +1077,151 @@ def render_historical_user_message_excerpts(
     return "\n".join(lines)
 
 
+def _coerce_nonnegative_int(value: Any, *, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except Exception:
+        return max(0, int(default))
+
+
+def _build_historical_user_message_excerpt_items(
+    source_messages: list[dict[str, Any]],
+    *,
+    excerpt_bytes: int,
+    max_messages: int,
+) -> list[dict[str, Any]]:
+    count_limit = _coerce_nonnegative_int(max_messages)
+    if count_limit <= 0:
+        return []
+
+    excerpts: list[str] = []
+    for message in source_messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = _message_content_as_excerpt_text(message).strip()
+        if not text:
+            continue
+        excerpts.append(truncate_text_middle_by_utf8_bytes(text, excerpt_bytes))
+    excerpts = excerpts[-count_limit:]
+    return [{"ordinal": index, "text": excerpt} for index, excerpt in enumerate(excerpts, start=1)]
+
+
+def _normalize_stored_historical_user_messages(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    raw_messages = value.get("messages")
+    if not isinstance(raw_messages, list):
+        return None
+
+    messages: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_messages, start=1):
+        if not isinstance(item, dict) or "text" not in item:
+            continue
+        text = item.get("text")
+        if text is None:
+            continue
+        ordinal = _coerce_nonnegative_int(item.get("ordinal"), default=index) or index
+        messages.append({"ordinal": ordinal, "text": str(text)})
+    if not messages:
+        return None
+
+    max_count = _coerce_nonnegative_int(value.get("max_count"), default=len(messages))
+    max_bytes = _coerce_nonnegative_int(value.get("max_bytes_per_message"), default=0)
+    return {
+        "format_version": SUMMARY_META_HISTORICAL_USER_MESSAGES_FORMAT_VERSION,
+        "order": "chronological",
+        "max_count": max_count,
+        "max_bytes_per_message": max_bytes,
+        "selected_count": len(messages),
+        "messages": messages,
+    }
+
+
+def normalize_summary_meta(summary_meta: dict[str, Any] | None) -> dict[str, Any]:
+    meta = copy.deepcopy(summary_meta) if isinstance(summary_meta, dict) else {}
+    stored = _normalize_stored_historical_user_messages(meta.get(SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY))
+    if stored is None:
+        meta.pop(SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY, None)
+    else:
+        meta[SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY] = stored
+    return meta
+
+
+def enrich_summary_meta_with_historical_excerpts(
+    summary_meta: dict[str, Any] | None,
+    source_messages: list[dict[str, Any]],
+    *,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> dict[str, Any]:
+    meta = normalize_summary_meta(summary_meta)
+    meta[SUMMARY_META_FORMAT_VERSION_KEY] = SUMMARY_META_FORMAT_VERSION
+    meta.pop(SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY, None)
+
+    count_limit = _coerce_nonnegative_int(historical_message_excerpt_count)
+    if count_limit <= 0:
+        return meta
+
+    excerpt_bytes = _coerce_nonnegative_int(historical_message_excerpt_bytes)
+    messages = _build_historical_user_message_excerpt_items(
+        source_messages,
+        excerpt_bytes=excerpt_bytes,
+        max_messages=count_limit,
+    )
+    if not messages:
+        return meta
+
+    meta[SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY] = {
+        "format_version": SUMMARY_META_HISTORICAL_USER_MESSAGES_FORMAT_VERSION,
+        "order": "chronological",
+        "max_count": count_limit,
+        "max_bytes_per_message": excerpt_bytes,
+        "selected_count": len(messages),
+        "messages": messages,
+    }
+    return meta
+
+
+def build_checkpoint_summary_meta(
+    source_messages: list[dict[str, Any]],
+    *,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> dict[str, Any]:
+    return enrich_summary_meta_with_historical_excerpts(
+        {"has_multimodal": _messages_have_multimodal(source_messages)},
+        source_messages,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+
+
+def render_stored_historical_user_message_excerpts(summary_meta: dict[str, Any] | None) -> str:
+    meta = normalize_summary_meta(summary_meta)
+    stored = meta.get(SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY)
+    if not isinstance(stored, dict):
+        return ""
+    messages = stored.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return ""
+
+    lines = [
+        (
+            f'<historical_user_messages order="{_xml_attr(stored.get("order") or "chronological")}" '
+            f'selected_count="{len(messages)}" '
+            f'max_count="{_coerce_nonnegative_int(stored.get("max_count"), default=len(messages))}" '
+            f'max_bytes_per_message="{_coerce_nonnegative_int(stored.get("max_bytes_per_message"))}">'
+        )
+    ]
+    for index, item in enumerate(messages, start=1):
+        if not isinstance(item, dict):
+            continue
+        ordinal = _coerce_nonnegative_int(item.get("ordinal"), default=index) or index
+        lines.append(f'<historical_user_message ordinal="{ordinal}">{_xml_cdata(item.get("text", ""))}</historical_user_message>')
+    lines.append("</historical_user_messages>")
+    return "\n".join(lines)
+
+
 def render_summary_message(
     summary_text: str,
     summary_meta: dict[str, Any] | None = None,
@@ -1081,8 +1233,8 @@ def render_summary_message(
     meta_section = ""
     if summary_meta and summary_meta.get("has_multimodal"):
         meta_section = "\n<metadata><has_multimodal>true</has_multimodal></metadata>"
-    excerpts = ""
-    if historical_source_messages:
+    excerpts = render_stored_historical_user_message_excerpts(summary_meta)
+    if not excerpts and historical_source_messages:
         excerpts = render_historical_user_message_excerpts(
             historical_source_messages,
             excerpt_bytes=historical_message_excerpt_bytes,
@@ -1100,6 +1252,59 @@ def render_summary_message(
             "</auto_compaction_context>"
         ),
     }
+
+
+def render_summary_message_from_checkpoint(
+    checkpoint: dict[str, Any],
+    *,
+    historical_source_messages: list[dict[str, Any]] | None = None,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+) -> dict[str, Any]:
+    summary_meta = normalize_summary_meta(checkpoint.get("summary_meta") if isinstance(checkpoint, dict) else {})
+    fallback_source_messages = None
+    if (
+        SUMMARY_META_FORMAT_VERSION_KEY not in summary_meta
+        and SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY not in summary_meta
+    ):
+        fallback_source_messages = historical_source_messages
+    return render_summary_message(
+        str(checkpoint.get("summary_text") or ""),
+        summary_meta,
+        historical_source_messages=fallback_source_messages,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+
+
+def _checkpoint_from_summary_result(summary_text: Any) -> dict[str, Any] | None:
+    checkpoint = getattr(summary_text, "checkpoint", None)
+    return checkpoint if isinstance(checkpoint, dict) else None
+
+
+def _render_summary_message_from_result(
+    summary_text: Any,
+    summary_meta: dict[str, Any] | None,
+    *,
+    historical_source_messages: list[dict[str, Any]] | None = None,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+) -> dict[str, Any]:
+    checkpoint = _checkpoint_from_summary_result(summary_text)
+    if checkpoint is not None:
+        return render_summary_message_from_checkpoint(
+            checkpoint,
+            historical_source_messages=historical_source_messages,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+    return render_summary_message(
+        str(summary_text),
+        summary_meta,
+        historical_source_messages=historical_source_messages,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
 
 
 def extract_compaction_summary_text_from_messages(messages: Any) -> str | None:
@@ -1357,7 +1562,7 @@ def replace_prefix_with_summary(
     if cut.preserved_system_message is not None:
         compacted.append(copy.deepcopy(cut.preserved_system_message))
     compacted.append(
-        render_summary_message(
+        _render_summary_message_from_result(
             summary_text,
             summary_meta,
             historical_source_messages=cut.summarization_prefix,
@@ -1405,10 +1610,9 @@ def replace_prefix_with_parent_checkpoint_and_delta(
     if cut.preserved_system_message is not None:
         compacted.append(copy.deepcopy(cut.preserved_system_message))
     compacted.append(
-        render_summary_message(
-            str(parent["summary_text"]),
-            parent.get("summary_meta") or {},
-            historical_source_messages=cut.summarization_prefix,
+        render_summary_message_from_checkpoint(
+            parent,
+            historical_source_messages=cut.summarization_prefix[:parent_count],
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
@@ -1470,7 +1674,7 @@ def build_checkpoint_row(
         "source_message_count": int(source_message_count),
         "source_hash": source_hash,
         "summary_text": summary_text,
-        "summary_meta": summary_meta or {},
+        "summary_meta": normalize_summary_meta(summary_meta),
         "state": "ready",
         "parent_checkpoint_id": parent_checkpoint_id,
         "created_at": timestamp,
@@ -3475,6 +3679,8 @@ async def _compact_retry_tool_results(
     messages: list[dict[str, Any]],
     parent_checkpoint: dict[str, Any] | None = None,
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
 ) -> tuple[list[dict[str, Any]], bool]:
     cut = select_tool_result_compaction_cut(messages)
     if cut is None:
@@ -3488,7 +3694,11 @@ async def _compact_retry_tool_results(
             "Cannot compact tool history without a durable checkpoint identity",
             code="checkpoint_identity_missing",
         )
-    summary_meta = {"has_multimodal": _messages_have_multimodal(source_messages)}
+    summary_meta = build_checkpoint_summary_meta(
+        source_messages,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
     try:
         summary = await _get_or_create_compaction_summary(
             request=request,
@@ -3503,6 +3713,8 @@ async def _compact_retry_tool_results(
             summary_meta=summary_meta,
             parent_checkpoint=parent_checkpoint,
             summary_tool_policy=summary_tool_policy,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
         )
     except Exception as exc:
         if isinstance(exc, ParentCheckpointExtensionFailed) and (
@@ -3522,7 +3734,15 @@ async def _compact_retry_tool_results(
     compacted: list[dict[str, Any]] = []
     if cut.preserved_system_message is not None:
         compacted.append(copy.deepcopy(cut.preserved_system_message))
-    compacted.append(render_summary_message(summary, summary_meta))
+    compacted.append(
+        _render_summary_message_from_result(
+            summary,
+            summary_meta,
+            historical_source_messages=source_messages,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+    )
     compacted.extend(copy.deepcopy(cut.tail_messages))
     return compacted, True
 
@@ -3540,6 +3760,7 @@ async def _get_or_create_checkpoint_summary(
 ) -> str:
     profile_hash = compute_profile_hash()
     source_hash = compute_source_hash(source_messages)
+    summary_meta = normalize_summary_meta(summary_meta)
     lock_key = (CHECKPOINT_NAMESPACE, user_id, chat_id, pipe_function_id, profile_hash, source_hash)
     lock = get_generation_lock(lock_key)
 
@@ -3559,7 +3780,7 @@ async def _get_or_create_checkpoint_summary(
             if existing:
                 with suppress(Exception):
                     await store.touch(existing["id"])
-                return str(existing["summary_text"])
+                return CompactionSummaryResult(existing["summary_text"], checkpoint=existing)
 
             parent = None
             if parent_checkpoint is not None:
@@ -3603,7 +3824,7 @@ async def _get_or_create_checkpoint_summary(
             )
             inserted = await store.insert_ready(row)
             if inserted:
-                return str(inserted["summary_text"])
+                return CompactionSummaryResult(inserted["summary_text"], checkpoint=inserted)
             raise RuntimeError("Checkpoint insert did not return a ready row")
     finally:
         release_generation_lock(lock_key, lock)
@@ -3623,6 +3844,8 @@ async def _get_or_create_compaction_summary(
     summary_meta: dict[str, Any],
     parent_checkpoint: dict[str, Any] | None = None,
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
 ) -> str:
     summary_source_prefix = copy.deepcopy(source_messages)
 
@@ -3630,7 +3853,12 @@ async def _get_or_create_compaction_summary(
         if parent:
             parent_count = int(parent.get("source_message_count") or 0)
             source = [
-                render_summary_message(str(parent["summary_text"]), parent.get("summary_meta") or {}),
+                render_summary_message_from_checkpoint(
+                    parent,
+                    historical_source_messages=summary_source_prefix[:parent_count],
+                    historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                    historical_message_excerpt_count=historical_message_excerpt_count,
+                ),
                 *copy.deepcopy(summary_source_prefix[parent_count:]),
             ]
         else:
@@ -4210,6 +4438,8 @@ async def _compact_body(
                 base_body=body,
                 messages=messages,
                 summary_tool_policy=summary_tool_policy,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
             )
         except UnsupportedCompactionInput as exc:
             if exc.code != "latest_tool_result_too_large":
@@ -4221,7 +4451,11 @@ async def _compact_body(
                     "Cannot compact tool history without a durable checkpoint identity",
                     code="checkpoint_identity_missing",
                 ) from exc
-            history_summary_meta = {"has_multimodal": _messages_have_multimodal(cut.summarization_prefix)}
+            history_summary_meta = build_checkpoint_summary_meta(
+                cut.summarization_prefix,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
+            )
             await _get_or_create_compaction_summary(
                 request=request,
                 user=user,
@@ -4234,6 +4468,8 @@ async def _compact_body(
                 source_messages=cut.summarization_prefix,
                 summary_meta=history_summary_meta,
                 summary_tool_policy=summary_tool_policy,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
             )
             history_checkpoint = await _lookup_ready_checkpoint_for_source(
                 request=request,
@@ -4254,6 +4490,8 @@ async def _compact_body(
                 messages=messages,
                 parent_checkpoint=history_checkpoint,
                 summary_tool_policy=summary_tool_policy,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
             )
         if did_compact_tools:
             compacted = _copy_body_preserving_metadata(body)
@@ -4271,7 +4509,11 @@ async def _compact_body(
     if not user_id or not _chat_id_supported(chat_id):
         return body, False
 
-    summary_meta = {"has_multimodal": _messages_have_multimodal(cut.summarization_prefix)}
+    summary_meta = build_checkpoint_summary_meta(
+        cut.summarization_prefix,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
 
     compacted = _copy_body_preserving_metadata(body)
     try:
@@ -4287,6 +4529,8 @@ async def _compact_body(
             source_messages=cut.summarization_prefix,
             summary_meta=summary_meta,
             summary_tool_policy=summary_tool_policy,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
         )
         compacted["messages"] = replace_prefix_with_summary(
             messages,

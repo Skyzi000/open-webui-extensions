@@ -251,3 +251,179 @@ def test_historical_user_excerpt_count_zero_disables_excerpt_section():
     )
 
     assert "<historical_user_messages" not in compacted[0]["content"]
+
+
+def test_checkpoint_summary_meta_stores_excerpts_without_mutating_summary_text():
+    source_messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "newer request"},
+    ]
+
+    summary_meta = mod.enrich_summary_meta_with_historical_excerpts(
+        {"has_multimodal": False},
+        source_messages,
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=2,
+    )
+    row = mod.build_checkpoint_row(
+        namespace="ns",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+        source_message_count=len(source_messages),
+        summary_text="AI generated summary only.",
+        summary_meta=summary_meta,
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    assert row["summary_text"] == "AI generated summary only."
+    stored = row["summary_meta"]["historical_user_messages"]
+    assert stored == {
+        "format_version": 1,
+        "order": "chronological",
+        "max_count": 2,
+        "max_bytes_per_message": 64,
+        "selected_count": 2,
+        "messages": [
+            {"ordinal": 1, "text": "old request"},
+            {"ordinal": 2, "text": "newer request"},
+        ],
+    }
+    rendered = mod.render_summary_message_from_checkpoint(row)
+    assert "AI generated summary only." in rendered["content"]
+    assert '<historical_user_message ordinal="1"><![CDATA[old request]]></historical_user_message>' in rendered["content"]
+    assert '<historical_user_message ordinal="2"><![CDATA[newer request]]></historical_user_message>' in rendered["content"]
+
+
+def test_checkpoint_summary_meta_count_zero_does_not_store_or_render_excerpts():
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    summary_meta = mod.enrich_summary_meta_with_historical_excerpts(
+        {"has_multimodal": False},
+        source_messages,
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=0,
+    )
+    row = mod.build_checkpoint_row(
+        namespace="ns",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+        source_message_count=len(source_messages),
+        summary_text="Summary",
+        summary_meta=summary_meta,
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    assert "historical_user_messages" not in row["summary_meta"]
+    assert "<historical_user_messages" not in mod.render_summary_message_from_checkpoint(row)["content"]
+    assert (
+        "<historical_user_messages"
+        not in mod.render_summary_message_from_checkpoint(row, historical_source_messages=source_messages)["content"]
+    )
+
+
+def test_checkpoint_render_uses_stored_excerpts_not_current_excerpt_limits():
+    source_messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "newer request"},
+    ]
+    summary_meta = mod.enrich_summary_meta_with_historical_excerpts(
+        {},
+        source_messages,
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=2,
+    )
+    row = mod.build_checkpoint_row(
+        namespace="ns",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+        source_message_count=len(source_messages),
+        summary_text="Summary",
+        summary_meta=summary_meta,
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    expected = mod.render_summary_message_from_checkpoint(row)
+    changed_valve_render = mod.render_summary_message(
+        row["summary_text"],
+        row["summary_meta"],
+        historical_source_messages=[{"role": "user", "content": "current valve must not matter"}],
+        historical_message_excerpt_bytes=1,
+        historical_message_excerpt_count=0,
+    )
+
+    assert changed_valve_render == expected
+
+
+def test_legacy_checkpoint_without_excerpts_can_render_from_source_prefix_when_available():
+    source_messages = [
+        {"role": "user", "content": "legacy old"},
+        {"role": "assistant", "content": "legacy answer"},
+    ]
+    legacy_row = mod.build_checkpoint_row(
+        namespace="ns",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+        source_message_count=len(source_messages),
+        summary_text="Legacy summary",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    without_source = mod.render_summary_message_from_checkpoint(legacy_row)
+    with_source = mod.render_summary_message_from_checkpoint(legacy_row, historical_source_messages=source_messages)
+
+    assert "Legacy summary" in without_source["content"]
+    assert "<historical_user_messages" not in without_source["content"]
+    assert '<historical_user_message ordinal="1"><![CDATA[legacy old]]></historical_user_message>' in with_source["content"]
+
+
+def test_legacy_parent_checkpoint_respects_disabled_excerpt_fallback():
+    messages = [
+        {"role": "user", "content": "legacy old"},
+        {"role": "assistant", "content": "legacy answer"},
+        {"role": "user", "content": "active"},
+    ]
+    cut = mod.select_safe_message_cut(messages)
+    parent = mod.build_checkpoint_row(
+        namespace="ns",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash=mod.compute_source_hash(cut.summarization_prefix),
+        source_message_count=len(cut.summarization_prefix),
+        summary_text="Legacy parent summary",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    compacted = mod.replace_prefix_with_parent_checkpoint_and_delta(
+        cut,
+        parent,
+        historical_message_excerpt_count=0,
+    )
+
+    assert "Legacy parent summary" in compacted[0]["content"]
+    assert "<historical_user_messages" not in compacted[0]["content"]

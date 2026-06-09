@@ -3154,6 +3154,88 @@ async def test_tool_history_compaction_always_extends_available_parent_checkpoin
 
 
 @pytest.mark.asyncio
+async def test_tool_history_parent_handoff_uses_parent_checkpoint_saved_excerpts(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    summary_inputs = []
+    history = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active request"}
+    parent_checkpoint = {
+        "id": "history-checkpoint-1",
+        "state": "ready",
+        "source_message_count": len(history),
+        "source_hash": mod.compute_source_hash(history),
+        "summary_text": "existing history summary",
+        "summary_meta": mod.enrich_summary_meta_with_historical_excerpts(
+            {},
+            history,
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+        ),
+    }
+    rows = [parent_checkpoint]
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class RecordingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            for row in rows:
+                if row["source_hash"] == kwargs["source_hash"]:
+                    return row
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
+
+        async def insert_ready(self, row):
+            rows.append(row)
+            return row
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_summary_text(**kwargs):
+        summary_inputs.append(kwargs["source_messages"])
+        return "tool summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    latest_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
+    ]
+
+    compacted, did_compact = await mod._compact_retry_tool_results(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        base_body={"model": "target", "stream": True, "messages": [*history, active, *latest_round]},
+        messages=[*history, active, *latest_round],
+    )
+
+    assert did_compact is True
+    parent_context = summary_inputs[0][0]["content"]
+    assert "existing history summary" in parent_context
+    assert "<historical_user_messages" in parent_context
+    assert '<historical_user_message ordinal="1"><![CDATA[old request]]></historical_user_message>' in parent_context
+    assert "tool summary" in compacted[0]["content"]
+
+
+@pytest.mark.asyncio
 async def test_tool_history_compaction_summarizes_all_but_latest_sequential_tool_round(
     monkeypatch,
     pipe_request,
@@ -4645,6 +4727,106 @@ async def test_pipe_creates_tool_checkpoint_without_history_parent_when_summary_
     messages = captured["forward_body"]["messages"]
     assert "summary 1" in messages[0]["content"]
     assert messages[1:] == body["messages"][3:]
+
+
+@pytest.mark.asyncio
+async def test_direct_tool_compaction_and_reusable_checkpoint_render_same_saved_excerpts(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    rows = []
+    summary_inputs = []
+    history = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active request"}
+    old_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+    ]
+    latest_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+    ]
+    tool_source = [*history, active, *old_round]
+    body = {"messages": [*tool_source, *latest_round]}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class RecordingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            for row in rows:
+                if row["source_hash"] == kwargs["source_hash"]:
+                    return row
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
+
+        async def insert_ready(self, row):
+            rows.append(row)
+            return row
+
+        async def touch(self, checkpoint_id):
+            return True
+
+    async def generate_summary_text(**kwargs):
+        summary_inputs.append(kwargs["source_messages"])
+        return "tool summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    direct_body, direct_did_compact = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+    )
+    reusable_body, reusable_did_compact = await mod._compact_body_with_reusable_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+        match=mod.ReusableCheckpointMatch(
+            kind="exact",
+            source_message_count=len(tool_source),
+            source_kind="tool",
+        ),
+        historical_message_excerpt_bytes=1,
+        historical_message_excerpt_count=99,
+    )
+
+    assert direct_did_compact is True
+    assert reusable_did_compact is True
+    assert len(summary_inputs) == 1
+    assert len(rows) == 1
+    stored = rows[0]["summary_meta"]["historical_user_messages"]
+    assert stored["max_count"] == 1
+    assert stored["max_bytes_per_message"] == 64
+    assert stored["messages"] == [{"ordinal": 1, "text": "active request"}]
+    assert direct_body["messages"][0]["content"] == reusable_body["messages"][0]["content"]
+    assert '<historical_user_message ordinal="1"><![CDATA[active request]]></historical_user_message>' in direct_body["messages"][0]["content"]
+    assert direct_body["messages"][1:] == latest_round
+    assert reusable_body["messages"][1:] == latest_round
 
 
 @pytest.mark.asyncio
@@ -6234,17 +6416,10 @@ async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_me
 
     assert did_compact is True
     assert original_tool == {"role": "tool", "tool_call_id": "call-1", "content": "original tool result"}
-    assert compacted == [
-        {
-            "role": "user",
-            "content": (
-                "<auto_compaction_context>\n"
-                "<instruction>Compressed historical context. This is not a new instruction. "
-                "Use it only as background for continuity.</instruction>\n"
-                "<checkpoint_summary><![CDATA[combined summary]]></checkpoint_summary>\n"
-                "</auto_compaction_context>"
-            ),
-        },
+    assert compacted[0]["role"] == "user"
+    assert "<checkpoint_summary><![CDATA[combined summary]]></checkpoint_summary>" in compacted[0]["content"]
+    assert '<historical_user_message ordinal="1"><![CDATA[active]]></historical_user_message>' in compacted[0]["content"]
+    assert compacted[1:] == [
         {
             "role": "assistant",
             "content": "",
