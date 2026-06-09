@@ -2268,6 +2268,23 @@ class Tools:
             default=10,
             description="Maximum number of tool call iterations for sub-agent.",
         )
+        SYSTEM_PROMPT: str = Field(
+            default="""\
+You are a sub-agent operating autonomously to complete a delegated task.
+
+CRITICAL RULES:
+1. You MUST complete the task fully without asking the user for confirmation or clarification.
+2. Continue working autonomously until the task is 100% complete.
+3. Use available tools proactively to gather information and perform actions.
+4. If you encounter obstacles, try alternative approaches before giving up.
+5. You have a limited number of tool call iterations. Complete the task before reaching the limit.
+
+RESPONSE REQUIREMENTS:
+- Provide a comprehensive final answer to the main agent.
+- Include evidence and reasoning that supports your conclusions.
+- If the task cannot be completed, explain what was attempted, why it failed, and provide actionable next steps the main agent should take.""",
+            description="Default system prompt for sub-agent tasks. Used when a user has not set their own UserValves.SYSTEM_PROMPT.",
+        )
         AVAILABLE_TOOL_IDS: str = Field(
             default="",
             description=(
@@ -2385,21 +2402,8 @@ class Tools:
 
     class UserValves(BaseModel):
         SYSTEM_PROMPT: str = Field(
-            default="""\
-You are a sub-agent operating autonomously to complete a delegated task.
-
-CRITICAL RULES:
-1. You MUST complete the task fully without asking the user for confirmation or clarification.
-2. Continue working autonomously until the task is 100% complete.
-3. Use available tools proactively to gather information and perform actions.
-4. If you encounter obstacles, try alternative approaches before giving up.
-5. You have a limited number of tool call iterations. Complete the task before reaching the limit.
-
-RESPONSE REQUIREMENTS:
-- Provide a comprehensive final answer to the main agent.
-- Include evidence and reasoning that supports your conclusions.
-- If the task cannot be completed, explain what was attempted, why it failed, and provide actionable next steps the main agent should take.""",
-            description="System prompt for sub-agent tasks.",
+            default="",
+            description="Override the default sub-agent system prompt. Leave empty to use the admin-configured default (Valves.SYSTEM_PROMPT).",
         )
         pass
 
@@ -2532,7 +2536,8 @@ RESPONSE REQUIREMENTS:
                 await register_view_skill(tools_dict, __request__, common_extra_params)
 
             # Build initial messages with skills context
-            prompt_sections: list[str] = [user_valves.SYSTEM_PROMPT]
+            system_prompt = user_valves.SYSTEM_PROMPT.strip() or self.valves.SYSTEM_PROMPT
+            prompt_sections: list[str] = [system_prompt]
             if self.valves.ENABLE_SKILLS_TOOLS:
                 # User-selected skills: inject full content (v0.8.2+)
                 if user_skill_tags:
@@ -2742,7 +2747,8 @@ RESPONSE REQUIREMENTS:
                 await register_view_skill(tools_dict, __request__, common_extra_params)
 
             # Build system content with skills context
-            parallel_prompt_sections: list[str] = [user_valves.SYSTEM_PROMPT]
+            system_prompt = user_valves.SYSTEM_PROMPT.strip() or self.valves.SYSTEM_PROMPT
+            parallel_prompt_sections: list[str] = [system_prompt]
             if self.valves.ENABLE_SKILLS_TOOLS:
                 if user_skill_tags:
                     parallel_prompt_sections.extend(user_skill_tags)
