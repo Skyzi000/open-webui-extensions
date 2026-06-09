@@ -2283,7 +2283,7 @@ RESPONSE REQUIREMENTS:
 - Provide a comprehensive final answer to the main agent.
 - Include evidence and reasoning that supports your conclusions.
 - If the task cannot be completed, explain what was attempted, why it failed, and provide actionable next steps the main agent should take.""",
-            description="Default system prompt for sub-agent tasks. Used when a user has not set their own UserValves.SYSTEM_PROMPT.",
+            description="Default system prompt for sub-agent tasks. Used when a user has not set their own UserValves.USER_SYSTEM_PROMPT.",
         )
         AVAILABLE_TOOL_IDS: str = Field(
             default="",
