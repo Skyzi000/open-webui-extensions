@@ -81,6 +81,7 @@ PROVIDER_MODEL_CACHE_ENABLE_FLAGS = {
     "OLLAMA_MODELS": "ENABLE_OLLAMA_API",
 }
 MISSING_CORE_REQUEST = object()
+TARGET_MODEL_RECORD_UNKNOWN = object()
 COMPACTION_SUMMARY_EMBED_MARKER = "<!--auto-compaction-summary-embed:v1-->"
 SUMMARY_PROMPT = (
     "You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY for an Open WebUI chat. "
@@ -183,6 +184,11 @@ class TargetModelContract:
     wrapper_params: dict[str, Any]
     access_grants: list[dict[str, Any]]
     owner_user_id: str | None
+
+
+@dataclass(frozen=True)
+class CoreChatModelRoute:
+    model_id: str
 
 
 @dataclass(frozen=True)
@@ -3427,6 +3433,8 @@ async def _generate_summary_text(
         pipe_function_id=pipe_function_id,
         summary_tool_policy=summary_tool_policy,
     )
+    route = await _resolve_core_chat_model_route(inner_request, str(body.get("model") or ""))
+    body["model"] = route.model_id
     await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
     response = await generate_chat_completion(
         inner_request,
@@ -3884,13 +3892,91 @@ def _should_bypass_target_access_check(user: Any) -> bool:
         return False
 
 
-async def _target_has_db_model_record(target_model_id: str) -> bool:
+async def _get_target_db_model_record(target_model_id: str) -> Any:
     try:
         from open_webui.models.models import Models
 
-        return await Models.get_model_by_id(target_model_id) is not None
+        return await Models.get_model_by_id(target_model_id)
     except Exception:
-        return True
+        return TARGET_MODEL_RECORD_UNKNOWN
+
+
+def _target_record_base_model_id(model_info: Any) -> str | None:
+    if model_info is None or model_info is TARGET_MODEL_RECORD_UNKNOWN:
+        return None
+    if isinstance(model_info, dict):
+        base_model_id = model_info.get("base_model_id")
+    else:
+        base_model_id = getattr(model_info, "base_model_id", None)
+    return base_model_id if isinstance(base_model_id, str) and base_model_id else None
+
+
+def _custom_model_fallback_enabled() -> bool:
+    try:
+        from open_webui.env import ENABLE_CUSTOM_MODEL_FALLBACK
+
+        return bool(ENABLE_CUSTOM_MODEL_FALLBACK)
+    except Exception:
+        return False
+
+
+def _custom_model_fallback_model_id(request: Any, models: dict[str, Any]) -> str | None:
+    if not _custom_model_fallback_enabled():
+        return None
+    config = getattr(getattr(request, "app", None), "state", None)
+    config = getattr(config, "config", None)
+    default_models = str(getattr(config, "DEFAULT_MODELS", None) or "").split(",")
+    fallback_model_id = default_models[0].strip() if default_models and default_models[0] else None
+    if fallback_model_id and fallback_model_id in models:
+        return fallback_model_id
+    return None
+
+
+def _global_model_access_bypass_enabled() -> bool:
+    try:
+        from open_webui.env import BYPASS_MODEL_ACCESS_CONTROL
+
+        return bool(BYPASS_MODEL_ACCESS_CONTROL)
+    except Exception:
+        return False
+
+
+async def _resolve_core_chat_model_route(request: Any, model_id: str) -> CoreChatModelRoute:
+    models = await _model_dict_from_request(request)
+    if model_id not in models:
+        return CoreChatModelRoute(model_id=model_id)
+    model_info = await _get_target_db_model_record(model_id)
+    base_model_id = _target_record_base_model_id(model_info)
+    if base_model_id and base_model_id not in models:
+        fallback_model_id = _custom_model_fallback_model_id(request, models)
+        if fallback_model_id:
+            return CoreChatModelRoute(model_id=fallback_model_id)
+    return CoreChatModelRoute(model_id=model_id)
+
+
+async def _validate_chat_completion_runtime_model_access(
+    *,
+    request: Any,
+    user: Any,
+    model_id: str,
+) -> None:
+    # Mirrors utils.chat.generate_chat_completion's access gate, which this
+    # pipe bypasses when forwarding to avoid re-running filters/wrappers.
+    user_model = coerce_open_webui_user(user)
+    if _global_model_access_bypass_enabled() or getattr(user_model, "role", None) != "user":
+        return
+    models = await _model_dict_from_request(request)
+    model = models.get(model_id)
+    if model is None:
+        raise HTTPException(status_code=403, detail="Model not found")
+    try:
+        from open_webui.utils.models import check_model_access
+
+        await check_model_access(user_model, model)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail="Model not found") from exc
 
 
 async def _validate_target_access(
@@ -3908,11 +3994,16 @@ async def _validate_target_access(
     ):
         raise HTTPException(status_code=403, detail="Model not found")
 
+    model_info = await _get_target_db_model_record(target_model_id)
+    base_model_id = _target_record_base_model_id(model_info)
+    if base_model_id and base_model_id not in models and _custom_model_fallback_model_id(request, models) is None:
+        raise HTTPException(status_code=403, detail="Model not found")
+
     user_model = coerce_open_webui_user(user)
     if _should_bypass_target_access_check(user_model):
         return
 
-    if getattr(user_model, "role", None) == "admin" and not await _target_has_db_model_record(target_model_id):
+    if getattr(user_model, "role", None) == "admin" and model_info is None:
         return
 
     try:
@@ -4345,7 +4436,20 @@ class Pipe:
             return _error_response(str(exc), code="invalid_summary_model")
 
         inner = _copy_body_preserving_metadata(body)
-        inner["model"] = identity.target_model_id
+        target_route = await _resolve_core_chat_model_route(
+            __request__,
+            identity.target_model_id,
+        )
+        if target_route.model_id != identity.target_model_id:
+            try:
+                await _validate_chat_completion_runtime_model_access(
+                    request=__request__,
+                    user=user,
+                    model_id=target_route.model_id,
+                )
+            except Exception:
+                return _error_response("Model not found", code="model_access_denied")
+        inner["model"] = target_route.model_id
         inner["metadata"] = _copy_metadata_preserving_references(metadata)
         if is_streaming and self.valves.force_include_usage:
             inner = inject_stream_usage_options(inner, force_include_usage=True)
