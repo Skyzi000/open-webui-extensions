@@ -2401,7 +2401,7 @@ RESPONSE REQUIREMENTS:
         pass
 
     class UserValves(BaseModel):
-        SYSTEM_PROMPT: str = Field(
+        USER_SYSTEM_PROMPT: str = Field(
             default="",
             description="Override the default sub-agent system prompt. Leave empty to use the admin-configured default (Valves.SYSTEM_PROMPT).",
         )
@@ -2536,7 +2536,7 @@ RESPONSE REQUIREMENTS:
                 await register_view_skill(tools_dict, __request__, common_extra_params)
 
             # Build initial messages with skills context
-            system_prompt = user_valves.SYSTEM_PROMPT.strip() or self.valves.SYSTEM_PROMPT
+            system_prompt = user_valves.USER_SYSTEM_PROMPT.strip() or self.valves.SYSTEM_PROMPT
             prompt_sections: list[str] = [system_prompt]
             if self.valves.ENABLE_SKILLS_TOOLS:
                 # User-selected skills: inject full content (v0.8.2+)
@@ -2747,7 +2747,7 @@ RESPONSE REQUIREMENTS:
                 await register_view_skill(tools_dict, __request__, common_extra_params)
 
             # Build system content with skills context
-            system_prompt = user_valves.SYSTEM_PROMPT.strip() or self.valves.SYSTEM_PROMPT
+            system_prompt = user_valves.USER_SYSTEM_PROMPT.strip() or self.valves.SYSTEM_PROMPT
             parallel_prompt_sections: list[str] = [system_prompt]
             if self.valves.ENABLE_SKILLS_TOOLS:
                 if user_skill_tags:
