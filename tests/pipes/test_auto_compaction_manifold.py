@@ -1951,6 +1951,205 @@ async def test_streaming_forwarder_retries_split_initial_sse_context_error():
 
 
 @pytest.mark.asyncio
+async def test_streaming_forwarder_waits_for_split_sse_field_name_before_retrying_context_error():
+    closed = False
+    background_count = 0
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield b"da"
+            yield b'ta: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_waits_for_split_sse_payload_before_retrying_context_error():
+    closed = False
+    background_count = 0
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield b"data: "
+            yield b'{"error": {"code": "context_length_'
+            yield b'exceeded", "message": "too long"}}\n\n'
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_ignores_empty_sse_data_before_retrying_context_error():
+    closed = False
+    background_count = 0
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield b"data:\n\n"
+            yield b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_ignores_bare_empty_sse_data_before_retrying_context_error():
+    closed = False
+    background_count = 0
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield b"data\n\n"
+            yield b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ignored_field", [b"ping: 1\n\n", b"x-trace: proxy\n\n"])
+async def test_streaming_forwarder_ignores_unknown_sse_fields_before_retrying_context_error(ignored_field):
+    closed = False
+    background_count = 0
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield ignored_field
+            yield b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_treats_sse_content_type_case_insensitively():
+    closed = False
+    background_count = 0
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="Text/Event-Stream", background=BackgroundTask(background))
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
 async def test_streaming_forwarder_retries_initial_responses_failed_context_error():
     closed = False
     background_count = 0
@@ -2083,6 +2282,55 @@ async def test_streaming_forwarder_treats_responses_output_deltas_as_visible_out
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_chunk", "media_type"),
+    [
+        (b"plain text token", "text/plain"),
+        (b'data: "plain text token"\n\n', "text/event-stream"),
+    ],
+)
+async def test_streaming_forwarder_starts_unparsed_stream_after_first_chunk(first_chunk, media_type):
+    requested_second_chunk = False
+    closed = False
+    background_count = 0
+
+    async def chunks():
+        nonlocal requested_second_chunk, closed
+        try:
+            yield first_chunk
+            requested_second_chunk = True
+            await asyncio.sleep(60)
+            yield b"late token"
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type=media_type, background=BackgroundTask(background))
+
+    prepared = await asyncio.wait_for(
+        mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        ),
+        timeout=0.2,
+    )
+
+    assert requested_second_chunk is False
+    iterator = prepared.body_iterator.__aiter__()
+    assert await iterator.__anext__() == first_chunk
+    await iterator.aclose()
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
 async def test_streaming_forwarder_surfaces_context_error_after_same_chunk_non_error_event():
     chunk = (
         b'data: {"usage": {"prompt_tokens": 1, "completion_tokens": 0}}\n\n'
@@ -2108,6 +2356,57 @@ async def test_streaming_forwarder_surfaces_context_error_after_same_chunk_non_e
         emitted.append(emitted_chunk)
 
     assert emitted == [chunk]
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_surfaces_context_error_after_same_chunk_scalar_sse_output():
+    chunk = (
+        b'data: "hello"\n\n'
+        b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+    )
+
+    async def chunks():
+        yield chunk
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    prepared = await mod.prepare_streaming_response(
+        response,
+        request=request,
+        chat_id="chat-1",
+        message_id="message-1",
+        wrapper_model_id="auto_compact.target",
+    )
+
+    emitted = []
+    async for emitted_chunk in prepared.body_iterator:
+        emitted.append(emitted_chunk)
+
+    assert emitted == [chunk]
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_retries_context_error_before_same_chunk_scalar_sse_output():
+    chunk = (
+        b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+        b'data: "hello"\n\n'
+    )
+
+    async def chunks():
+        yield chunk
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
 
 
 @pytest.mark.asyncio
@@ -2166,6 +2465,54 @@ async def test_streaming_forwarder_retries_iterator_context_exception_before_vis
     response = StreamingResponse(
         chunks(),
         media_type="text/event-stream",
+        background=BackgroundTask(background),
+    )
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+            restore=restore,
+        )
+
+    assert restored is True
+    assert closed is True
+    assert background_ran is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_retries_non_sse_context_exception_after_empty_chunk():
+    closed = False
+    background_ran = False
+    restored = False
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield b""
+            raise HTTPException(
+                status_code=400,
+                detail={"error": {"code": "context_length_exceeded", "message": "too long"}},
+            )
+            yield b""
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_ran
+        background_ran = True
+
+    def restore():
+        nonlocal restored
+        restored = True
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(
+        chunks(),
+        media_type="text/plain",
         background=BackgroundTask(background),
     )
 

@@ -2847,11 +2847,30 @@ def is_retryable_context_error(value: Any, *, status_code: int | None = None) ->
     return any(pattern in joined_messages for pattern in _CONTEXT_MESSAGE_PATTERNS)
 
 
+_SSE_FIELD_NAMES = ("data", "event", "id", "retry")
+_SSE_FIELD_MARKERS = tuple(f"{name}:" for name in _SSE_FIELD_NAMES) + (":",)
+
+
+def _text_can_start_sse_field(stripped: str) -> bool:
+    if not stripped:
+        return False
+    first_line = stripped.splitlines()[0]
+    return (
+        first_line in _SSE_FIELD_NAMES
+        or first_line.startswith(_SSE_FIELD_MARKERS)
+        or any(marker.startswith(first_line) for marker in _SSE_FIELD_MARKERS)
+        or ":" in first_line
+    )
+
+
 class _SSEDataParser:
     def __init__(self) -> None:
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._buffer = ""
         self._data_lines: list[str] = []
+
+    def has_pending_event_or_field(self) -> bool:
+        return bool(self._data_lines) or _text_can_start_sse_field(self._buffer.lstrip())
 
     def feed(self, chunk: bytes | str) -> tuple[list[str], bool]:
         text = self._decoder.decode(chunk, final=False) if isinstance(chunk, bytes) else str(chunk)
@@ -2886,10 +2905,12 @@ class _SSEDataParser:
                 if value is not None:
                     values.append(value)
                 continue
-            if not line.startswith("data:"):
+            field, separator, data = line.partition(":")
+            if field != "data":
                 continue
             saw_data_field = True
-            data = line[len("data:") :]
+            if not separator:
+                data = ""
             if data.startswith(" "):
                 data = data[1:]
             self._data_lines.append(data)
@@ -2918,14 +2939,21 @@ def extract_sse_data_values(chunk: bytes | str) -> list[str]:
     return values
 
 
+def _sse_json_event_from_value(data: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(data.strip())
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
 def _sse_json_events_from_values(values: Iterable[str]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for data in values:
-        try:
-            payload = json.loads(data.strip())
-        except Exception:
-            continue
-        if isinstance(payload, dict):
+        payload = _sse_json_event_from_value(data)
+        if payload is not None:
             events.append(payload)
     return events
 
@@ -2937,6 +2965,13 @@ class _SSEJSONEventParser:
     def feed(self, chunk: bytes | str) -> list[dict[str, Any]]:
         values, _ = self._parser.feed(chunk)
         return _sse_json_events_from_values(values)
+
+    def feed_events_and_values(self, chunk: bytes | str) -> tuple[list[dict[str, Any]], list[str]]:
+        values, _ = self._parser.feed(chunk)
+        return _sse_json_events_from_values(values), values
+
+    def has_pending_event_or_field(self) -> bool:
+        return self._parser.has_pending_event_or_field()
 
     def flush(self) -> list[dict[str, Any]]:
         values, _ = self._parser.flush()
@@ -2978,6 +3013,20 @@ def _stream_payload_is_responses_pre_output_control_event(payload: dict[str, Any
 
 def _stream_events_are_responses_pre_output_control_events(events: list[dict[str, Any]]) -> bool:
     return bool(events) and all(_stream_payload_is_responses_pre_output_control_event(payload) for payload in events)
+
+
+def _chunk_starts_unstructured_stream(chunk: bytes | str) -> bool:
+    text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+    stripped = text.lstrip()
+    return bool(stripped) and not _text_can_start_sse_field(stripped)
+
+
+def _stream_chunk_is_empty(chunk: bytes | str) -> bool:
+    return chunk == b"" or chunk == ""
+
+
+def _sse_values_include_unstructured_output(values: Iterable[str]) -> bool:
+    return any(value != "" for value in values)
 
 
 def chunk_has_user_visible_output(chunk: bytes | str) -> bool:
@@ -3080,11 +3129,22 @@ async def prepare_streaming_response(
     buffered_chunks: list[bytes | str] = []
     sse_parser = _SSEJSONEventParser()
     can_retry_context_error = True
+    media_type = getattr(response, "media_type", None) or response.headers.get("content-type", "")
+    is_sse_response = "text/event-stream" in str(media_type).lower()
     try:
         while True:
             chunk = _coerce_stream_chunk(await iterator.__anext__())
-            events = sse_parser.feed(chunk)
-            for payload in events:
+            if is_sse_response:
+                events, sse_values = sse_parser.feed_events_and_values(chunk)
+            else:
+                events, sse_values = [], []
+            for value in sse_values:
+                if value == "":
+                    continue
+                payload = _sse_json_event_from_value(value)
+                if payload is None:
+                    can_retry_context_error = False
+                    continue
                 usage = extract_usage_from_stream_payload(payload)
                 if usage:
                     store_request_scoped_usage(
@@ -3104,6 +3164,15 @@ async def prepare_streaming_response(
                 if not _stream_payload_is_responses_pre_output_control_event(payload):
                     can_retry_context_error = False
             buffered_chunks.append(chunk)
+            if not is_sse_response:
+                if _stream_chunk_is_empty(chunk):
+                    continue
+                break
+            if not events and (
+                _sse_values_include_unstructured_output(sse_values)
+                or (_chunk_starts_unstructured_stream(chunk) and not sse_parser.has_pending_event_or_field())
+            ):
+                break
             if events and not (
                 can_retry_context_error and _stream_events_are_responses_pre_output_control_events(events)
             ):
@@ -3148,8 +3217,21 @@ async def prepare_streaming_response(
 
             async for raw_chunk in iterator:
                 chunk = _coerce_stream_chunk(raw_chunk)
-                events = sse_parser.feed(chunk)
-                for payload in events:
+                if is_sse_response:
+                    events = sse_parser.feed(chunk)
+                    for payload in events:
+                        usage = extract_usage_from_stream_payload(payload)
+                        if usage:
+                            store_request_scoped_usage(
+                                request=request,
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                wrapper_model_id=wrapper_model_id,
+                                usage=usage,
+                            )
+                yield chunk
+            if is_sse_response:
+                for payload in sse_parser.flush():
                     usage = extract_usage_from_stream_payload(payload)
                     if usage:
                         store_request_scoped_usage(
@@ -3159,17 +3241,6 @@ async def prepare_streaming_response(
                             wrapper_model_id=wrapper_model_id,
                             usage=usage,
                         )
-                yield chunk
-            for payload in sse_parser.flush():
-                usage = extract_usage_from_stream_payload(payload)
-                if usage:
-                    store_request_scoped_usage(
-                        request=request,
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        wrapper_model_id=wrapper_model_id,
-                        usage=usage,
-                    )
         finally:
             if restore:
                 restore()
