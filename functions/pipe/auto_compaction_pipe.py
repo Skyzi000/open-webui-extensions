@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.1.1
+version: 0.1.2
 license: MIT
 """
 
@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
 
 from fastapi import HTTPException
+from open_webui.constants import TASKS
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     BigInteger,
@@ -178,6 +179,50 @@ class ReusableCheckpointMatch:
     kind: str
     source_message_count: int
     source_kind: str = "message"
+
+
+@dataclass(frozen=True)
+class TaskPromptSpec:
+    config_attr: str
+    default_attr: str
+    builder_name: str
+    strip_configured: bool = False
+
+
+TASK_PROMPT_SPECS = {
+    TASKS.TITLE_GENERATION.value: TaskPromptSpec(
+        "TITLE_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE",
+        "title_generation_template",
+    ),
+    TASKS.FOLLOW_UP_GENERATION.value: TaskPromptSpec(
+        "FOLLOW_UP_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_FOLLOW_UP_GENERATION_PROMPT_TEMPLATE",
+        "follow_up_generation_template",
+    ),
+    TASKS.TAGS_GENERATION.value: TaskPromptSpec(
+        "TAGS_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_TAGS_GENERATION_PROMPT_TEMPLATE",
+        "tags_generation_template",
+    ),
+    TASKS.QUERY_GENERATION.value: TaskPromptSpec(
+        "QUERY_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE",
+        "query_generation_template",
+        strip_configured=True,
+    ),
+    TASKS.IMAGE_PROMPT_GENERATION.value: TaskPromptSpec(
+        "IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE",
+        "image_prompt_generation_template",
+    ),
+    TASKS.AUTOCOMPLETE_GENERATION.value: TaskPromptSpec(
+        "AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE",
+        "autocomplete_generation_template",
+        strip_configured=True,
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -2683,6 +2728,135 @@ def _copy_body_preserving_metadata(body: dict[str, Any]) -> dict[str, Any]:
     return copied
 
 
+def _normalized_task_name(task: Any) -> str:
+    value = getattr(task, "value", None)
+    if isinstance(value, str) and value:
+        return value
+    text = str(task or "")
+    if "." in text:
+        text = text.rsplit(".", 1)[-1].lower()
+    return text
+
+
+def _task_body_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    task_body = metadata.get("task_body")
+    return task_body if isinstance(task_body, dict) else None
+
+
+def _task_body_history_messages(metadata: dict[str, Any]) -> list[dict[str, Any]] | None:
+    task_name = _normalized_task_name(metadata.get("task"))
+    if task_name not in TASK_PROMPT_SPECS:
+        return None
+    task_body = _task_body_from_metadata(metadata)
+    if task_body is None:
+        return None
+    messages = task_body.get("messages")
+    if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
+        return None
+    return messages
+
+
+def _task_history_source_body_for_compaction(
+    body: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any] | None:
+    messages = _task_body_history_messages(metadata)
+    if not messages:
+        return None
+    source_body = _copy_body_preserving_metadata(body)
+    source_body["messages"] = copy.deepcopy(messages)
+    source_body.pop("previous_response_id", None)
+    return source_body
+
+
+def _task_template_from_request(request: Any, spec: TaskPromptSpec) -> str | None:
+    config = getattr(getattr(getattr(request, "app", None), "state", None), "config", None)
+    configured = getattr(config, spec.config_attr, None) if config is not None else None
+    if isinstance(configured, str) and (configured.strip() if spec.strip_configured else configured):
+        return configured
+    try:
+        import open_webui.config as core_config
+
+        default_template = getattr(core_config, spec.default_attr, None)
+    except Exception:
+        default_template = None
+    return default_template if isinstance(default_template, str) and default_template else None
+
+
+async def _render_task_prompt_from_messages(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> str | None:
+    task_name = _normalized_task_name(metadata.get("task"))
+    spec = TASK_PROMPT_SPECS.get(task_name)
+    task_body = _task_body_from_metadata(metadata)
+    if spec is None or task_body is None:
+        return None
+    template = _task_template_from_request(request, spec)
+    if template is None:
+        return None
+    try:
+        import open_webui.utils.task as core_task
+
+        builder = getattr(core_task, spec.builder_name)
+        if task_name == TASKS.AUTOCOMPLETE_GENERATION.value:
+            prompt = task_body.get("prompt")
+            if not isinstance(prompt, str):
+                return None
+            return await builder(template, prompt, messages, task_body.get("type"), user)
+        return await builder(template, messages, user)
+    except Exception:
+        return None
+
+
+def _replace_task_prompt_message(body: dict[str, Any], content: str) -> list[dict[str, Any]]:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
+        return [{"role": "user", "content": content}]
+
+    replaced = [dict(message) for message in messages]
+    for index in range(len(replaced) - 1, -1, -1):
+        if replaced[index].get("role") == "user":
+            replaced[index]["content"] = content
+            return replaced
+    replaced.append({"role": "user", "content": content})
+    return replaced
+
+
+async def _rebuild_task_body_from_compacted_history(
+    *,
+    request: Any,
+    user: Any,
+    base_body: dict[str, Any],
+    metadata: dict[str, Any],
+    compacted_history_messages: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    content = await _render_task_prompt_from_messages(
+        request=request,
+        user=user,
+        metadata=metadata,
+        messages=compacted_history_messages,
+    )
+    if content is None:
+        return None
+
+    rebuilt = _copy_body_preserving_metadata(base_body)
+    rebuilt["messages"] = _replace_task_prompt_message(rebuilt, content)
+    rebuilt.pop("previous_response_id", None)
+
+    rebuilt_metadata = _copy_metadata_preserving_references(rebuilt.get("metadata") or metadata)
+    task_body = _task_body_from_metadata(rebuilt_metadata)
+    if task_body is not None:
+        task_body = _copy_metadata_preserving_references(task_body)
+        task_body["messages"] = copy.deepcopy(compacted_history_messages)
+        rebuilt_metadata["task_body"] = task_body
+        rebuilt["metadata"] = rebuilt_metadata
+    return rebuilt
+
+
 def inject_stream_usage_options(body: dict[str, Any], *, force_include_usage: bool = True) -> dict[str, Any]:
     if not force_include_usage or body.get("stream") is not True:
         return body
@@ -2799,15 +2973,21 @@ def _structured_error_strings(value: Any) -> tuple[list[str], list[str], int | N
 _CONTEXT_CODE_PATTERNS = (
     "context_length_exceeded",
     "context_window_exceeded",
+    "context_length",
+    "context_limit",
     "max_context_length",
     "maximum_context_length",
+    "input_length_exceeded",
     "input_too_long",
     "prompt_too_long",
     "request_too_large",
+    "token_limit_exceeded",
 )
 _NEGATIVE_ERROR_PATTERNS = (
     "rate limit",
     "rate-limit",
+    "rate_limit",
+    "too many requests",
     "quota",
     "token-per-minute",
     "tokens per minute",
@@ -2821,11 +3001,32 @@ _CONTEXT_MESSAGE_PATTERNS = (
     "max context length",
     "context length exceeded",
     "context window",
+    "context limit",
+    "context size",
+    "exceed context",
+    "exceeds context",
+    "exceeded context",
     "prompt is too long",
     "prompt too long",
     "input is too long",
     "input too long",
+    "input token count exceeds",
+    "input tokens are",
+    "input tokens exceed",
+    "prompt tokens exceed",
     "too many input tokens",
+    "request too large",
+)
+_OUTPUT_TOKEN_PARAMETER_PATTERNS = (
+    "max_tokens",
+    "max_completion_tokens",
+    "max output tokens",
+    "max_output_tokens",
+)
+_OUTPUT_TOKEN_PARAMETER_CONTEXT_ANCHORS = (
+    "context",
+    "input",
+    "prompt",
     "request too large",
 )
 
@@ -2836,12 +3037,16 @@ def is_retryable_context_error(value: Any, *, status_code: int | None = None) ->
 
     joined_codes = " ".join(codes).lower()
     joined_messages = " ".join(messages).lower()
-    if any(pattern in joined_codes for pattern in _NEGATIVE_ERROR_PATTERNS):
+    if any(pattern in joined_codes for pattern in _NEGATIVE_ERROR_PATTERNS) or any(
+        pattern in joined_messages for pattern in _NEGATIVE_ERROR_PATTERNS
+    ):
+        return False
+    if any(pattern in joined_messages for pattern in _OUTPUT_TOKEN_PARAMETER_PATTERNS) and not any(
+        pattern in joined_messages for pattern in _OUTPUT_TOKEN_PARAMETER_CONTEXT_ANCHORS
+    ):
         return False
     if any(pattern in joined_codes for pattern in _CONTEXT_CODE_PATTERNS):
         return True
-    if any(pattern in joined_messages for pattern in _NEGATIVE_ERROR_PATTERNS):
-        return False
     if status not in (400, 413, 422):
         return False
     return any(pattern in joined_messages for pattern in _CONTEXT_MESSAGE_PATTERNS)
@@ -3392,6 +3597,17 @@ class SummaryToolCallError(RuntimeError):
     pass
 
 
+_SUMMARY_INCOMPLETE_FINISH_REASON_PATTERNS = (
+    "length",
+    "content_filter",
+    "max_token",
+    "max_output",
+    "max output",
+    "truncat",
+    "incomplete",
+)
+
+
 def _summary_tool_call_error() -> SummaryToolCallError:
     return SummaryToolCallError("Summary model returned a tool call instead of text content")
 
@@ -3399,13 +3615,53 @@ def _summary_tool_call_error() -> SummaryToolCallError:
 def _choice_has_tool_call(choice: Any) -> bool:
     if not isinstance(choice, dict):
         return False
-    if choice.get("finish_reason") == "tool_calls":
+    if choice.get("finish_reason") in {"tool_calls", "function_call"}:
         return True
     message = choice.get("message")
     if isinstance(message, dict) and (message.get("tool_calls") or message.get("function_call")):
         return True
     delta = choice.get("delta")
     return isinstance(delta, dict) and bool(delta.get("tool_calls") or delta.get("function_call"))
+
+
+def _summary_incomplete_finish_reason(reason: Any) -> str | None:
+    if not isinstance(reason, str) or not reason:
+        return None
+    normalized = reason.lower().replace("-", "_")
+    if any(pattern in normalized for pattern in _SUMMARY_INCOMPLETE_FINISH_REASON_PATTERNS):
+        return reason
+    return None
+
+
+def _summary_response_incomplete_reason(response: Any) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    status_value = response.get("status")
+    if isinstance(status_value, str) and status_value.lower() == "incomplete":
+        details = response.get("incomplete_details")
+        if isinstance(details, dict):
+            reason = details.get("reason")
+            if isinstance(reason, str) and reason:
+                return reason
+        return status_value
+    reason = _summary_incomplete_finish_reason(response.get("finish_reason"))
+    if reason is not None:
+        return reason
+    choices = response.get("choices")
+    if isinstance(choices, list):
+        choice = choices[0] if choices else None
+        if isinstance(choice, dict):
+            reason = _summary_incomplete_finish_reason(choice.get("finish_reason"))
+            if reason is not None:
+                return reason
+    nested_response = response.get("response")
+    if isinstance(nested_response, dict):
+        return _summary_response_incomplete_reason(nested_response)
+    return None
+
+
+def _raise_incomplete_summary(reason: str) -> None:
+    raise RuntimeError(f"Summary model stopped before completing the checkpoint summary: {reason}")
 
 
 def _stream_payload_has_tool_call(payload: dict[str, Any]) -> bool:
@@ -3527,6 +3783,10 @@ def _append_summary_sse_value(value: str, parts: list[str]) -> bool:
             raise RetryableContextOverflow("Summary model reported a context-window error")
         raise RuntimeError(f"Summary model provider error: {_completion_error_message(error_source)}")
 
+    incomplete_reason = _summary_response_incomplete_reason(payload)
+    if incomplete_reason is not None:
+        _raise_incomplete_summary(incomplete_reason)
+
     is_known_transport_event = _stream_payload_is_known_transport_event(payload)
     saw_tool_call = is_known_transport_event and _stream_payload_has_tool_call(payload)
     if not is_known_transport_event:
@@ -3566,6 +3826,9 @@ async def extract_text_from_completion_response(response: Any, *, tools_enabled:
     if isinstance(response, dict):
         if _responses_output_has_tool_call(response):
             raise _summary_tool_call_error()
+        incomplete_reason = _summary_response_incomplete_reason(response)
+        if incomplete_reason is not None:
+            _raise_incomplete_summary(incomplete_reason)
         choices = response.get("choices")
         if isinstance(choices, list) and choices:
             choice = choices[0]
@@ -4622,6 +4885,86 @@ async def _compact_body(
     return compacted, True
 
 
+async def _compact_task_body_with_reusable_checkpoint(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    match: ReusableCheckpointMatch,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> tuple[dict[str, Any], bool]:
+    source_body = _task_history_source_body_for_compaction(body, metadata)
+    if source_body is None:
+        return body, False
+    compacted_source, compacted = await _compact_body_with_reusable_checkpoint(
+        request=request,
+        user=user,
+        metadata=metadata,
+        body=source_body,
+        pipe_function_id=pipe_function_id,
+        match=match,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+    if not compacted:
+        return body, False
+    rebuilt = await _rebuild_task_body_from_compacted_history(
+        request=request,
+        user=user,
+        base_body=body,
+        metadata=metadata,
+        compacted_history_messages=compacted_source["messages"],
+    )
+    if rebuilt is None:
+        raise RuntimeError("Task prompt could not be rebuilt from compacted history")
+    return rebuilt, True
+
+
+async def _compact_task_body(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    target_model_id: str,
+    summary_model_id: str,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+    summary_tool_policy: SummaryToolPolicy,
+) -> tuple[dict[str, Any], bool]:
+    source_body = _task_history_source_body_for_compaction(body, metadata)
+    if source_body is None:
+        return body, False
+    compacted_source, compacted = await _compact_body(
+        request=request,
+        user=user,
+        metadata=metadata,
+        body=source_body,
+        pipe_function_id=pipe_function_id,
+        target_model_id=target_model_id,
+        summary_model_id=summary_model_id,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+        summary_tool_policy=summary_tool_policy,
+    )
+    if not compacted:
+        return body, False
+    rebuilt = await _rebuild_task_body_from_compacted_history(
+        request=request,
+        user=user,
+        base_body=body,
+        metadata=metadata,
+        compacted_history_messages=compacted_source["messages"],
+    )
+    if rebuilt is None:
+        raise RuntimeError("Task prompt could not be rebuilt from compacted history")
+    return rebuilt, True
+
+
 class Pipe:
     class Valves(BaseModel):
         model_name_prefix: str = Field(
@@ -4648,6 +4991,14 @@ class Pipe:
         force_include_usage: bool = Field(
             default=True,
             description="Set stream_options.include_usage=true on copied streaming target requests when supported.",
+        )
+        compact_task_prompts_from_task_body: bool = Field(
+            default=False,
+            description=(
+                "Opt in to compacting Open WebUI task requests by rebuilding the task prompt from metadata.task_body. "
+                "This can reuse checkpoints for task prompts, but it does not support inlet/pipeline filters that "
+                "rewrite body.messages without also updating metadata.task_body."
+            ),
         )
         summary_tool_policy: SummaryToolPolicy = Field(
             default="fallback_on_tool_call",
@@ -4731,7 +5082,12 @@ class Pipe:
 
         user = __user__ or {}
         metadata = _copy_metadata_preserving_references(__metadata__ or {})
+        metadata_task_body = _task_body_from_metadata(metadata)
         chat_id = metadata.get("chat_id")
+        if not chat_id and metadata_task_body is not None:
+            chat_id = metadata_task_body.get("chat_id")
+        if chat_id and not metadata.get("chat_id"):
+            metadata["chat_id"] = chat_id
         message_id = metadata.get("message_id") or metadata.get("user_message_id")
 
         try:
@@ -4769,8 +5125,14 @@ class Pipe:
         if is_streaming and self.valves.force_include_usage:
             inner = inject_stream_usage_options(inner, force_include_usage=True)
 
-        is_summary_task = metadata.get("task") == INTERNAL_SUMMARY_TASK
+        is_summary_task = _normalized_task_name(metadata.get("task")) == INTERNAL_SUMMARY_TASK
         supported_context = _chat_id_supported(chat_id) and not is_summary_task
+        task_source_body = (
+            _task_history_source_body_for_compaction(inner, metadata)
+            if supported_context and self.valves.compact_task_prompts_from_task_body
+            else None
+        )
+        checkpoint_lookup_body = task_source_body if task_source_body is not None else inner
 
         request_usage = get_request_scoped_usage(
             request=__request__,
@@ -4803,7 +5165,7 @@ class Pipe:
                     request=__request__,
                     user=user,
                     metadata=metadata,
-                    body=inner,
+                    body=checkpoint_lookup_body,
                     pipe_function_id=identity.pipe_function_id,
                 )
             except Exception as exc:
@@ -4837,29 +5199,55 @@ class Pipe:
                             done=False,
                         )
                     if reusable_checkpoint_only is not None and not compacted_once:
-                        candidate, compacted = await _compact_body_with_reusable_checkpoint(
-                            request=__request__,
-                            user=user,
-                            metadata=metadata,
-                            body=candidate,
-                            pipe_function_id=identity.pipe_function_id,
-                            match=reusable_checkpoint_only,
-                            historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
-                            historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
-                        )
+                        if task_source_body is not None:
+                            candidate, compacted = await _compact_task_body_with_reusable_checkpoint(
+                                request=__request__,
+                                user=user,
+                                metadata=metadata,
+                                body=candidate,
+                                pipe_function_id=identity.pipe_function_id,
+                                match=reusable_checkpoint_only,
+                                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                            )
+                        else:
+                            candidate, compacted = await _compact_body_with_reusable_checkpoint(
+                                request=__request__,
+                                user=user,
+                                metadata=metadata,
+                                body=candidate,
+                                pipe_function_id=identity.pipe_function_id,
+                                match=reusable_checkpoint_only,
+                                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                            )
                     else:
-                        candidate, compacted = await _compact_body(
-                            request=__request__,
-                            user=user,
-                            metadata=metadata,
-                            body=candidate,
-                            pipe_function_id=identity.pipe_function_id,
-                            target_model_id=identity.target_model_id,
-                            summary_model_id=summary_model_id,
-                            historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
-                            historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
-                            summary_tool_policy=self.valves.summary_tool_policy,
-                        )
+                        if task_source_body is not None:
+                            candidate, compacted = await _compact_task_body(
+                                request=__request__,
+                                user=user,
+                                metadata=metadata,
+                                body=candidate,
+                                pipe_function_id=identity.pipe_function_id,
+                                target_model_id=identity.target_model_id,
+                                summary_model_id=summary_model_id,
+                                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                                summary_tool_policy=self.valves.summary_tool_policy,
+                            )
+                        else:
+                            candidate, compacted = await _compact_body(
+                                request=__request__,
+                                user=user,
+                                metadata=metadata,
+                                body=candidate,
+                                pipe_function_id=identity.pipe_function_id,
+                                target_model_id=identity.target_model_id,
+                                summary_model_id=summary_model_id,
+                                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                                summary_tool_policy=self.valves.summary_tool_policy,
+                            )
                     compacted_once = compacted_once or compacted
                     if emit_progress_status:
                         if compacted:

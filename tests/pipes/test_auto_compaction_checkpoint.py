@@ -640,6 +640,42 @@ async def test_checkpoint_summary_surfaces_insert_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_does_not_store_incomplete_summary(monkeypatch):
+    async def noop_initialize(**kwargs):
+        return None
+
+    class NoInsertStore:
+        async def lookup_ready(self, **kwargs):
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return None
+
+        async def insert_ready(self, row):
+            raise AssertionError("incomplete summaries must not be stored")
+
+    async def summary_factory(parent):
+        assert parent is None
+        return await mod.extract_text_from_completion_response(
+            {"choices": [{"message": {"content": "partial summary"}, "finish_reason": "length"}]}
+        )
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: NoInsertStore())
+
+    with pytest.raises(RuntimeError, match="stopped before completing"):
+        await mod._get_or_create_checkpoint_summary(
+            request=None,
+            user_id="user-1",
+            chat_id="chat-1",
+            pipe_function_id="auto_compact",
+            source_messages=[{"role": "user", "content": "old"}],
+            summary_meta={},
+            summary_factory=summary_factory,
+        )
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_store_concurrent_insert_conflict_returns_existing_ready_row():
     from sqlalchemy.exc import IntegrityError
 

@@ -1797,6 +1797,7 @@ def test_valve_defaults_are_conservative_for_v1_continuation():
 
     assert valves.trigger_total_tokens == 100000
     assert valves.force_include_usage is True
+    assert valves.compact_task_prompts_from_task_body is False
     assert valves.summary_tool_policy == "fallback_on_tool_call"
     assert valves.historical_message_excerpt_bytes == mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES
     assert valves.historical_message_excerpt_count == mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT
@@ -1879,6 +1880,14 @@ def test_context_window_classifier_avoids_rate_limit_quota_and_tpm_false_positiv
     assert not mod.is_retryable_context_error(
         {"error": {"message": "token-per-minute limit exceeded"}},
     )
+    assert not mod.is_retryable_context_error(
+        {"error": {"code": "token_limit_exceeded", "message": "quota exceeded"}},
+        status_code=400,
+    )
+    assert not mod.is_retryable_context_error(
+        {"error": {"code": "context_length", "message": "rate limit exceeded"}},
+        status_code=400,
+    )
 
 
 def test_context_window_message_fallback_uses_only_error_message_fields():
@@ -1890,6 +1899,62 @@ def test_context_window_message_fallback_uses_only_error_message_fields():
 
     assert not mod.is_retryable_context_error(body_with_unrelated_serialized_text, status_code=400)
     assert mod.is_retryable_context_error(body_with_error_message, status_code=400)
+
+
+def test_context_window_classifier_handles_proxy_and_local_model_variants():
+    assert mod.is_retryable_context_error(
+        {
+            "error": {
+                "type": "invalid_request_error",
+                "message": "input length and max_tokens exceed context limit: 200000 + 4096 > 200000",
+            }
+        },
+        status_code=400,
+    )
+    assert mod.is_retryable_context_error(
+        {"error": {"message": "This model supports at most 8192 tokens, but input tokens are 9000"}},
+        status_code=400,
+    )
+    assert mod.is_retryable_context_error(
+        {"error": {"message": "The prompt tokens exceed the configured token limit"}},
+        status_code=422,
+    )
+    assert not mod.is_retryable_context_error(
+        {"error": {"message": "rate_limit_exceeded: too many requests"}},
+        status_code=400,
+    )
+
+
+def test_context_window_classifier_rejects_input_length_validation_errors():
+    assert not mod.is_retryable_context_error(
+        {"error": {"message": "input length must be at least 1"}},
+        status_code=400,
+    )
+    assert not mod.is_retryable_context_error(
+        {"error": {"message": "invalid input length"}},
+        status_code=422,
+    )
+    assert not mod.is_retryable_context_error(
+        {"error": {"message": "input length must be less than max_batch_size"}},
+        status_code=400,
+    )
+    assert not mod.is_retryable_context_error(
+        {"error": {"message": "max_tokens must be less than the configured token limit"}},
+        status_code=400,
+    )
+    assert not mod.is_retryable_context_error(
+        {
+            "error": {
+                "code": "token_limit_exceeded",
+                "message": "max_tokens must be less than the configured token limit",
+            }
+        },
+        status_code=400,
+    )
+    assert not mod.is_retryable_context_error(
+        {"error": {"message": "max_completion_tokens exceeds the maximum number of tokens"}},
+        status_code=422,
+    )
 
 
 def test_sse_error_payload_is_classified_before_any_content():
@@ -3805,6 +3870,70 @@ async def test_extract_summary_text_preserves_regular_short_line_summary():
 
 
 @pytest.mark.asyncio
+async def test_extract_summary_text_ignores_unused_incomplete_choices():
+    response = {
+        "choices": [
+            {"message": {"content": "complete summary"}, "finish_reason": "stop"},
+            {"message": {"content": "unused partial summary"}, "finish_reason": "length"},
+        ]
+    }
+
+    assert await mod.extract_text_from_completion_response(response) == "complete summary"
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_rejects_length_finished_chat_completion():
+    response = {"choices": [{"message": {"content": "partial summary"}, "finish_reason": "length"}]}
+
+    with pytest.raises(RuntimeError, match="stopped before completing"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_rejects_max_output_finished_chat_completion():
+    response = {"choices": [{"message": {"content": "partial summary"}, "finish_reason": "max_output_tokens"}]}
+
+    with pytest.raises(RuntimeError, match="stopped before completing"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_rejects_length_finished_streaming_completion():
+    async def chunks():
+        yield b'data: {"choices": [{"delta": {"content": "partial summary"}}]}\n\n'
+        yield b'data: {"choices": [{"finish_reason": "length", "delta": {}}]}\n\n'
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    with pytest.raises(RuntimeError, match="stopped before completing"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_rejects_max_output_finished_streaming_completion():
+    async def chunks():
+        yield b'data: {"choices": [{"delta": {"content": "partial summary"}}]}\n\n'
+        yield b'data: {"choices": [{"finish_reason": "max_output_tokens", "delta": {}}]}\n\n'
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    with pytest.raises(RuntimeError, match="stopped before completing"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_rejects_incomplete_responses_api_output():
+    response = {
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output_text": "partial summary",
+    }
+
+    with pytest.raises(RuntimeError, match="stopped before completing"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
 async def test_extract_summary_text_ignores_streamed_reasoning_content():
     async def chunks():
         yield b'data: {"choices": [{"delta": {"reasoning_content": "Let me summarize.\\n"}}]}\n\n'
@@ -4568,6 +4697,65 @@ async def test_pipe_non_streaming_retries_with_compaction_after_context_error(
     assert "retry summary" in calls[1]["messages"][0]["content"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_message",
+    [
+        "input length must be at least 1",
+        "max_tokens must be less than the configured token limit",
+    ],
+)
+async def test_pipe_non_streaming_does_not_retry_provider_validation_error(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+    provider_message,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def get_or_create_checkpoint_summary(**kwargs):
+        raise AssertionError("validation errors must not trigger compaction retry")
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        calls.append(form_data)
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": provider_message}},
+        )
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [{"role": "user", "content": "active"}],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result == {"error": {"code": "provider_error", "message": provider_message}}
+    assert len(calls) == 1
+
+
 def test_chat_completion_response_requires_core_template(monkeypatch):
     misc_module = types.ModuleType("open_webui.utils.misc")
     monkeypatch.setitem(sys.modules, "open_webui.utils.misc", misc_module)
@@ -4929,6 +5117,239 @@ async def test_pipe_reuses_existing_checkpoint_even_when_previous_compacted_usag
     assert "existing summary" in forwarded["messages"][0]["content"]
     assert forwarded["messages"][1:] == [{"role": "user", "content": "active"}]
     assert events == []
+
+
+def test_task_template_selection_matches_core_whitespace_rules(pipe_request):
+    pipe_request.app.state.config = SimpleNamespace(
+        TITLE_GENERATION_PROMPT_TEMPLATE="   ",
+        QUERY_GENERATION_PROMPT_TEMPLATE="   ",
+        AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE="   ",
+    )
+
+    title_template = mod._task_template_from_request(
+        pipe_request,
+        mod.TASK_PROMPT_SPECS[mod.TASKS.TITLE_GENERATION.value],
+    )
+    query_template = mod._task_template_from_request(
+        pipe_request,
+        mod.TASK_PROMPT_SPECS[mod.TASKS.QUERY_GENERATION.value],
+    )
+    autocomplete_template = mod._task_template_from_request(
+        pipe_request,
+        mod.TASK_PROMPT_SPECS[mod.TASKS.AUTOCOMPLETE_GENERATION.value],
+    )
+
+    assert title_template == "   "
+    assert query_template != "   "
+    assert "{{MESSAGES" in query_template
+    assert autocomplete_template != "   "
+    assert "{{PROMPT}}" in autocomplete_template
+
+
+@pytest.mark.asyncio
+async def test_pipe_does_not_rebuild_task_prompt_from_task_body_by_default(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+    exact_source = [
+        {"role": "user", "content": "old raw request"},
+        {"role": "assistant", "content": "old raw answer"},
+        {"role": "user", "content": "older raw follow-up"},
+        {"role": "assistant", "content": "older raw follow-up answer"},
+    ]
+    checkpoint = {
+        "id": "checkpoint-task",
+        "state": "ready",
+        "source_message_count": len(exact_source),
+        "source_hash": mod.compute_source_hash(exact_source),
+        "summary_text": "checkpointed task history",
+        "summary_meta": {mod.SUMMARY_META_FORMAT_VERSION_KEY: mod.SUMMARY_META_FORMAT_VERSION},
+    }
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 8, "output_tokens": 2}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class ExistingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            captured.setdefault("lookup_source_hashes", []).append(kwargs["source_hash"])
+            if kwargs["source_hash"] == checkpoint["source_hash"]:
+                return checkpoint
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return None
+
+        async def insert_ready(self, row):
+            raise AssertionError("default task handling must not create a checkpoint from task_body")
+
+        async def touch(self, checkpoint_id):
+            captured["touched"] = checkpoint_id
+            return True
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("default task handling must not call the summary model")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+
+    pipe_request.app.state.config = SimpleNamespace(TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}")
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    task_history = [*exact_source, {"role": "user", "content": "active task input"}]
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": "pipeline system instruction"},
+            {"role": "user", "content": "FILTERED TASK PROMPT"},
+        ],
+    }
+    metadata = {
+        **pipe_metadata,
+        "task": mod.TASKS.TAGS_GENERATION.value,
+        "task_body": {
+            "model": wrapper_id,
+            "chat_id": pipe_metadata["chat_id"],
+            "messages": task_history,
+        },
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+
+    assert result == {"ok": True}
+    assert "touched" not in captured
+    forwarded = captured["forward_body"]
+    assert forwarded["messages"] == body["messages"]
+    assert "checkpointed task history" not in forwarded["messages"][1]["content"]
+    assert "old raw request" not in forwarded["messages"][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_rebuilds_open_webui_task_prompt_with_reusable_checkpoint(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+    exact_source = [
+        {"role": "user", "content": "old raw request"},
+        {"role": "assistant", "content": "old raw answer"},
+        {"role": "user", "content": "older raw follow-up"},
+        {"role": "assistant", "content": "older raw follow-up answer"},
+    ]
+    checkpoint = {
+        "id": "checkpoint-task",
+        "state": "ready",
+        "source_message_count": len(exact_source),
+        "source_hash": mod.compute_source_hash(exact_source),
+        "summary_text": "checkpointed task history",
+        "summary_meta": {mod.SUMMARY_META_FORMAT_VERSION_KEY: mod.SUMMARY_META_FORMAT_VERSION},
+    }
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 8, "output_tokens": 2}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    class ExistingCheckpointStore:
+        async def lookup_ready(self, **kwargs):
+            if kwargs["source_hash"] == checkpoint["source_hash"]:
+                return checkpoint
+            return None
+
+        async def find_longest_parent(self, **kwargs):
+            return None
+
+        async def insert_ready(self, row):
+            raise AssertionError("task checkpoint reuse must not create a new checkpoint")
+
+        async def touch(self, checkpoint_id):
+            captured["touched"] = checkpoint_id
+            return True
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("task checkpoint reuse must not call the summary model")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore())
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+
+    pipe_request.app.state.config = SimpleNamespace(TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}")
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.compact_task_prompts_from_task_body = True
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    task_history = [*exact_source, {"role": "user", "content": "active task input"}]
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": "pipeline system instruction"},
+            {"role": "user", "content": "Task:\nold raw request\nold raw answer\nactive task input"},
+        ],
+    }
+    metadata = {
+        **pipe_metadata,
+        "task": mod.TASKS.TAGS_GENERATION.value,
+        "task_body": {
+            "model": wrapper_id,
+            "chat_id": pipe_metadata["chat_id"],
+            "messages": task_history,
+        },
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+
+    assert result == {"ok": True}
+    assert captured["touched"] == "checkpoint-task"
+    forwarded = captured["forward_body"]
+    assert forwarded["messages"][0] == {"role": "system", "content": "pipeline system instruction"}
+    forwarded_prompt = forwarded["messages"][1]["content"]
+    assert "checkpointed task history" in forwarded_prompt
+    assert "active task input" in forwarded_prompt
+    assert "old raw request" not in forwarded_prompt
+    assert "old raw answer" not in forwarded_prompt
+    task_body_messages = forwarded["metadata"]["task_body"]["messages"]
+    assert "checkpointed task history" in task_body_messages[0]["content"]
+    assert task_body_messages[1:] == [{"role": "user", "content": "active task input"}]
 
 
 @pytest.mark.asyncio

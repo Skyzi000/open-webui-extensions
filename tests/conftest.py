@@ -1,6 +1,7 @@
 """Pytest configuration and shared fixtures for Open WebUI extensions testing."""
 
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 _temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _temp_db_path = _temp_db.name
 _temp_db.close()
+_temp_static_dir = tempfile.mkdtemp(prefix="owui-static-")
 
 # Set environment variables before importing Open WebUI modules
 os.environ.setdefault("ENV", "dev")
@@ -18,6 +20,7 @@ os.environ.setdefault("WEBUI_SECRET_KEY", "test-secret-key")
 os.environ.setdefault("DATABASE_URL", f"sqlite:///{_temp_db_path}")
 os.environ.setdefault("ENABLE_OLLAMA_API", "false")
 os.environ.setdefault("ENABLE_OPENAI_API", "false")
+os.environ["STATIC_DIR"] = _temp_static_dir
 
 
 def pytest_configure(config):
@@ -38,6 +41,7 @@ def pytest_unconfigure(config):
         Path(_temp_db_path).unlink(missing_ok=True)
     except Exception:
         pass
+    shutil.rmtree(_temp_static_dir, ignore_errors=True)
 
 
 @pytest.fixture
