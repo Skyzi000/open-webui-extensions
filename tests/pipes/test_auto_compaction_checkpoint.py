@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import copy
+import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -305,6 +308,8 @@ def test_checkpoint_table_contract_names_and_columns():
         "summary_meta",
         "state",
         "parent_checkpoint_id",
+        "claim_token",
+        "claim_expires_at",
         "created_at",
         "updated_at",
         "last_used_at",
@@ -403,6 +408,145 @@ def test_generation_lock_cleanup_removes_unused_lock():
     assert key not in mod._GENERATION_LOCKS
 
 
+class ClaimStore:
+    """In-memory CheckpointStore stand-in implementing the DB claim interface."""
+
+    def __init__(self, rows=None):
+        self.rows = [dict(row) for row in (rows or [])]
+        self.claimed_rows = []
+        self.completed_rows = []
+        self.released = []
+        self.touched = []
+
+    def _match(self, source_hash):
+        for row in self.rows:
+            if row.get("source_hash") == source_hash:
+                return row
+        return None
+
+    async def lookup_any(self, **kwargs):
+        row = self._match(kwargs["source_hash"])
+        return dict(row) if row else None
+
+    async def lookup_ready(self, **kwargs):
+        row = self._match(kwargs["source_hash"])
+        if row is not None and row.get("state") == "ready":
+            return dict(row)
+        return None
+
+    async def find_longest_parent(self, **kwargs):
+        return mod.select_longest_matching_parent(self.rows, kwargs["source_messages"])
+
+    async def claim_pending(self, row):
+        if self._match(row["source_hash"]) is not None:
+            return False
+        stored = dict(row)
+        self.rows.append(stored)
+        self.claimed_rows.append(dict(stored))
+        return True
+
+    async def reclaim_pending(self, checkpoint_id, *, claim_token, expires_at, now=None):
+        for row in self.rows:
+            if row.get("id") != checkpoint_id or row.get("state") != "pending":
+                continue
+            expires = row.get("claim_expires_at")
+            if expires is not None and now is not None and int(expires) > int(now):
+                return False
+            row["claim_token"] = claim_token
+            row["claim_expires_at"] = expires_at
+            return True
+        return False
+
+    async def extend_claim(self, checkpoint_id, *, claim_token, expires_at):
+        for row in self.rows:
+            if (
+                row.get("id") == checkpoint_id
+                and row.get("state") == "pending"
+                and row.get("claim_token") == claim_token
+            ):
+                row["claim_expires_at"] = expires_at
+                return True
+        return False
+
+    async def release_claim(self, checkpoint_id, *, claim_token):
+        for row in list(self.rows):
+            if (
+                row.get("id") == checkpoint_id
+                and row.get("state") == "pending"
+                and row.get("claim_token") == claim_token
+            ):
+                self.rows.remove(row)
+                self.released.append(checkpoint_id)
+                return True
+        return False
+
+    async def complete_pending(self, checkpoint_id, *, claim_token, summary_text, parent_checkpoint_id, now=None):
+        for row in self.rows:
+            if (
+                row.get("id") == checkpoint_id
+                and row.get("state") == "pending"
+                and row.get("claim_token") == claim_token
+            ):
+                row.update(
+                    state="ready",
+                    summary_text=summary_text,
+                    parent_checkpoint_id=parent_checkpoint_id,
+                    claim_token=None,
+                    claim_expires_at=None,
+                )
+                self.completed_rows.append(dict(row))
+                return dict(row)
+        return None
+
+    async def touch(self, checkpoint_id, *, now=None):
+        self.touched.append(checkpoint_id)
+        return True
+
+
+def make_checkpoint_row(
+    source_messages,
+    *,
+    state="pending",
+    summary_text="",
+    claim_token="claim-token-1",
+    claim_expires_at=10**12,
+    now=100,
+):
+    return mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages),
+        source_message_count=len(source_messages),
+        summary_text=summary_text,
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state=state,
+        claim_token=claim_token,
+        claim_expires_at=claim_expires_at,
+        now=now,
+    )
+
+
+async def noop_initialize(**kwargs):
+    return None
+
+
+async def run_get_or_create(source_messages, summary_factory, *, summary_meta=None, parent_checkpoint=None):
+    return await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        summary_meta=summary_meta or {},
+        summary_factory=summary_factory,
+        parent_checkpoint=parent_checkpoint,
+    )
+
+
 def test_checkpoint_row_uses_stable_identity_and_contract_fields():
     row = mod.build_checkpoint_row(
         namespace=mod.CHECKPOINT_NAMESPACE,
@@ -446,10 +590,36 @@ def test_checkpoint_row_uses_stable_identity_and_contract_fields():
         "summary_meta": {"has_multimodal": False},
         "state": "ready",
         "parent_checkpoint_id": "parent-1",
+        "claim_token": None,
+        "claim_expires_at": None,
         "created_at": 123,
         "updated_at": 123,
         "last_used_at": 123,
     }
+
+
+def test_checkpoint_row_supports_pending_claim_state():
+    row = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+        source_message_count=3,
+        summary_text="",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state="pending",
+        claim_token="claim-1",
+        claim_expires_at=456,
+        now=123,
+    )
+
+    assert row["state"] == "pending"
+    assert row["summary_text"] == ""
+    assert row["claim_token"] == "claim-1"
+    assert row["claim_expires_at"] == 456
 
 
 @pytest.mark.asyncio
@@ -484,64 +654,135 @@ async def test_checkpoint_store_queries_filter_by_pipe_function_id():
         profile_hash="profile",
         source_hash="source",
     )
+    await store.lookup_any(
+        namespace="auto_compact",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+    )
     await store.find_longest_parent(
         namespace="auto_compact",
         user_id="user-1",
         chat_id="chat-1",
         pipe_function_id="auto_compact",
         profile_hash="profile",
-        prefix_hashes={1: "source"},
+        source_messages=[{"role": "user", "content": "old"}],
     )
 
     assert statements
     assert all("pipe_function_id =" in statement for statement in statements)
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_parent_query_filters_by_count_without_in_clause():
+    from sqlalchemy.dialects import sqlite
+
+    statements = []
+
+    class FakeMappings:
+        def all(self):
+            return []
+
+    class FakeResult:
+        def mappings(self):
+            return FakeMappings()
+
+    class FakeDb:
+        async def execute(self, statement):
+            statements.append(str(statement.compile(dialect=sqlite.dialect())))
+            return FakeResult()
+
+    store = mod.CheckpointStore(db=FakeDb())
+
+    await store.find_longest_parent(
+        namespace="auto_compact",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_messages=[{"role": "user", "content": f"m{index}"} for index in range(50)],
+    )
+
+    assert len(statements) == 1
+    assert "source_message_count <=" in statements[0]
+    assert " IN " not in statements[0]
+
+
 def test_parent_checkpoint_selection_requires_exact_source_hash():
+    source_messages = [
+        {"role": "user", "content": "m1"},
+        {"role": "assistant", "content": "m2"},
+        {"role": "user", "content": "m3"},
+        {"role": "assistant", "content": "m4"},
+    ]
     rows = [
-        {"id": "short", "source_message_count": 2, "source_hash": "h2", "state": "ready"},
+        {
+            "id": "short",
+            "source_message_count": 2,
+            "source_hash": mod.compute_source_hash(source_messages[:2]),
+            "state": "ready",
+        },
         {"id": "mismatch", "source_message_count": 4, "source_hash": "wrong", "state": "ready"},
-        {"id": "long", "source_message_count": 3, "source_hash": "h3", "state": "ready"},
+        {
+            "id": "long",
+            "source_message_count": 3,
+            "source_hash": mod.compute_source_hash(source_messages[:3]),
+            "state": "ready",
+        },
+        {
+            "id": "pending",
+            "source_message_count": 4,
+            "source_hash": mod.compute_source_hash(source_messages),
+            "state": "pending",
+        },
     ]
 
-    parent = mod.select_longest_matching_parent(rows, {2: "h2", 3: "h3", 4: "h4"})
+    parent = mod.select_longest_matching_parent(rows, source_messages)
 
     assert parent["id"] == "long"
 
 
-def test_ready_checkpoint_lookup_ignores_non_ready_rows():
+def test_parent_checkpoint_selection_hashes_only_candidate_counts(monkeypatch):
+    source_messages = [{"role": "user", "content": f"m{index}"} for index in range(6)]
+    real_compute = mod.compute_source_hash
+    hashed_counts = []
+
+    def counting_compute(messages):
+        hashed_counts.append(len(messages))
+        return real_compute(messages)
+
+    monkeypatch.setattr(mod, "compute_source_hash", counting_compute)
     rows = [
-        {"id": "pending", "state": "pending", "source_hash": "h1"},
-        {"id": "ready", "state": "ready", "source_hash": "h1"},
+        {"id": "wrong-long", "source_message_count": 4, "source_hash": "wrong", "state": "ready"},
+        {
+            "id": "match",
+            "source_message_count": 2,
+            "source_hash": real_compute(source_messages[:2]),
+            "state": "ready",
+        },
+        {"id": "wrong-long-too", "source_message_count": 4, "source_hash": "also-wrong", "state": "ready"},
     ]
 
-    assert mod.select_ready_checkpoint(rows, source_hash="h1")["id"] == "ready"
+    parent = mod.select_longest_matching_parent(rows, source_messages)
+
+    assert parent["id"] == "match"
+    assert sorted(set(hashed_counts)) == [2, 4]
+    assert len(hashed_counts) == 2
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_exact_hit_uses_ready_summary_without_calling_summary_factory(monkeypatch):
-    existing = {
-        "id": "checkpoint-1",
-        "state": "ready",
-        "source_hash": mod.compute_source_hash([{"role": "user", "content": "old"}]),
-        "summary_text": "existing summary",
-    }
-
-    async def noop_initialize(**kwargs):
-        return None
-
-    class HitStore:
-        def __init__(self):
-            self.touched = []
-
-        async def lookup_ready(self, **kwargs):
-            return existing
-
-        async def touch(self, checkpoint_id):
-            self.touched.append(checkpoint_id)
-            return True
-
-    store = HitStore()
+async def test_checkpoint_exact_hit_uses_ready_summary_without_claiming(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    existing = make_checkpoint_row(
+        source_messages,
+        state="ready",
+        summary_text="existing summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([existing])
 
     async def summary_factory(parent):
         raise AssertionError("summary factory must not run for an exact checkpoint hit")
@@ -549,73 +790,214 @@ async def test_checkpoint_exact_hit_uses_ready_summary_without_calling_summary_f
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
 
-    result = await mod._get_or_create_checkpoint_summary(
-        request=None,
-        user_id="user-1",
-        chat_id="chat-1",
-        pipe_function_id="auto_compact",
-        source_messages=[{"role": "user", "content": "old"}],
-        summary_meta={},
-        summary_factory=summary_factory,
-    )
+    result = await run_get_or_create(source_messages, summary_factory)
 
     assert result == "existing summary"
-    assert store.touched == ["checkpoint-1"]
+    assert store.touched == [existing["id"]]
+    assert store.claimed_rows == []
 
 
 @pytest.mark.asyncio
 async def test_checkpoint_exact_hit_survives_last_used_update_failure(monkeypatch):
-    existing = {
-        "id": "checkpoint-1",
-        "state": "ready",
-        "source_hash": mod.compute_source_hash([{"role": "user", "content": "old"}]),
-        "summary_text": "existing summary",
-    }
+    source_messages = [{"role": "user", "content": "old"}]
+    existing = make_checkpoint_row(
+        source_messages,
+        state="ready",
+        summary_text="existing summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
 
-    async def noop_initialize(**kwargs):
-        return None
-
-    class HitStore:
-        async def lookup_ready(self, **kwargs):
-            return existing
-
-        async def touch(self, checkpoint_id):
+    class FailingTouchStore(ClaimStore):
+        async def touch(self, checkpoint_id, *, now=None):
             raise RuntimeError("touch failed")
 
     async def summary_factory(parent):
         raise AssertionError("summary factory must not run when touch fails")
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: HitStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: FailingTouchStore([existing]))
 
-    result = await mod._get_or_create_checkpoint_summary(
-        request=None,
-        user_id="user-1",
-        chat_id="chat-1",
-        pipe_function_id="auto_compact",
-        source_messages=[{"role": "user", "content": "old"}],
-        summary_meta={},
-        summary_factory=summary_factory,
-    )
+    result = await run_get_or_create(source_messages, summary_factory)
 
     assert result == "existing summary"
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_summary_surfaces_insert_failure(monkeypatch):
+async def test_checkpoint_miss_claims_generates_and_completes_ready_row(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    store = ClaimStore()
     calls = []
 
-    async def noop_initialize(**kwargs):
-        return None
+    async def summary_factory(parent):
+        calls.append(parent)
+        return "generated summary"
 
-    class FailingInsertStore:
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    result = await run_get_or_create(
+        source_messages,
+        summary_factory,
+        summary_meta={"has_multimodal": False},
+    )
+
+    assert result == "generated summary"
+    assert calls == [None]
+    assert len(store.claimed_rows) == 1
+    assert store.claimed_rows[0]["state"] == "pending"
+    assert store.claimed_rows[0]["summary_text"] == ""
+    assert store.claimed_rows[0]["claim_token"]
+    assert store.claimed_rows[0]["claim_expires_at"] > int(time.time()) - 5
+    assert store.claimed_rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
+    assert len(store.completed_rows) == 1
+    assert store.completed_rows[0]["state"] == "ready"
+    assert store.completed_rows[0]["summary_text"] == "generated summary"
+    assert store.completed_rows[0]["parent_checkpoint_id"] is None
+    assert result.checkpoint["state"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_pending_checkpoint_waiter_returns_ready_row_without_generating(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    pending = make_checkpoint_row(source_messages, claim_token="other-worker")
+    ready = dict(
+        pending,
+        state="ready",
+        summary_text="other worker summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+
+    class EventualReadyStore(ClaimStore):
+        def __init__(self):
+            super().__init__([pending])
+            self.lookup_calls = 0
+
+        async def lookup_any(self, **kwargs):
+            self.lookup_calls += 1
+            if self.lookup_calls >= 3:
+                return dict(ready)
+            return dict(pending)
+
+    store = EventualReadyStore()
+
+    async def summary_factory(parent):
+        raise AssertionError("waiters must not generate a summary while another worker owns the claim")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0.01)
+
+    result = await run_get_or_create(source_messages, summary_factory)
+
+    assert result == "other worker summary"
+    assert store.touched == [ready["id"]]
+    assert store.claimed_rows == []
+
+
+@pytest.mark.asyncio
+async def test_pending_checkpoint_wait_times_out_with_explicit_error(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    pending = make_checkpoint_row(source_messages, claim_token="other-worker")
+    store = ClaimStore([pending])
+
+    async def summary_factory(parent):
+        raise AssertionError("waiters must not generate a summary on wait timeout")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(RuntimeError, match="[Tt]imed out"):
+        await run_get_or_create(source_messages, summary_factory)
+
+    assert store.completed_rows == []
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_claim_is_reclaimed_and_completed(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    stale = make_checkpoint_row(source_messages, claim_token="crashed-worker", claim_expires_at=1, now=1)
+    store = ClaimStore([stale])
+    calls = []
+
+    async def summary_factory(parent):
+        calls.append(parent)
+        return "reclaimed summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    result = await run_get_or_create(source_messages, summary_factory)
+
+    assert result == "reclaimed summary"
+    assert calls == [None]
+    assert len(store.completed_rows) == 1
+    assert store.completed_rows[0]["summary_text"] == "reclaimed summary"
+    assert store.rows[0]["state"] == "ready"
+    assert store.rows[0]["claim_token"] is None
+
+
+@pytest.mark.asyncio
+async def test_lost_claim_falls_back_to_ready_row_from_other_worker(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    other_ready = make_checkpoint_row(
+        source_messages,
+        state="ready",
+        summary_text="other summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+
+    class LostClaimStore(ClaimStore):
+        async def complete_pending(self, checkpoint_id, **kwargs):
+            return None
+
         async def lookup_ready(self, **kwargs):
+            return dict(other_ready)
+
+    store = LostClaimStore()
+
+    async def summary_factory(parent):
+        return "my summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    result = await run_get_or_create(source_messages, summary_factory)
+
+    assert result == "other summary"
+
+
+@pytest.mark.asyncio
+async def test_lost_claim_without_ready_row_surfaces_error(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+
+    class LostClaimStore(ClaimStore):
+        async def complete_pending(self, checkpoint_id, **kwargs):
             return None
 
-        async def find_longest_parent(self, **kwargs):
-            return None
+    store = LostClaimStore()
 
-        async def insert_ready(self, row):
+    async def summary_factory(parent):
+        return "my summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    with pytest.raises(RuntimeError, match="claim was lost"):
+        await run_get_or_create(source_messages, summary_factory)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_summary_surfaces_claim_failure_before_generation(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    calls = []
+
+    class FailingClaimStore(ClaimStore):
+        async def claim_pending(self, row):
             raise RuntimeError("db down")
 
     async def summary_factory(parent):
@@ -623,36 +1005,18 @@ async def test_checkpoint_summary_surfaces_insert_failure(monkeypatch):
         return "generated summary"
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: FailingInsertStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: FailingClaimStore())
 
     with pytest.raises(RuntimeError, match="db down"):
-        await mod._get_or_create_checkpoint_summary(
-            request=None,
-            user_id="user-1",
-            chat_id="chat-1",
-            pipe_function_id="auto_compact",
-            source_messages=[{"role": "user", "content": "old"}],
-            summary_meta={},
-            summary_factory=summary_factory,
-        )
+        await run_get_or_create(source_messages, summary_factory)
 
-    assert calls == [None]
+    assert calls == []
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_does_not_store_incomplete_summary(monkeypatch):
-    async def noop_initialize(**kwargs):
-        return None
-
-    class NoInsertStore:
-        async def lookup_ready(self, **kwargs):
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return None
-
-        async def insert_ready(self, row):
-            raise AssertionError("incomplete summaries must not be stored")
+async def test_checkpoint_does_not_store_incomplete_summary_and_releases_claim(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    store = ClaimStore()
 
     async def summary_factory(parent):
         assert parent is None
@@ -661,55 +1025,140 @@ async def test_checkpoint_does_not_store_incomplete_summary(monkeypatch):
         )
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: NoInsertStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
 
     with pytest.raises(RuntimeError, match="stopped before completing"):
-        await mod._get_or_create_checkpoint_summary(
-            request=None,
-            user_id="user-1",
-            chat_id="chat-1",
-            pipe_function_id="auto_compact",
-            source_messages=[{"role": "user", "content": "old"}],
-            summary_meta={},
-            summary_factory=summary_factory,
-        )
+        await run_get_or_create(source_messages, summary_factory)
+
+    assert store.completed_rows == []
+    assert store.released == [store.claimed_rows[0]["id"]]
+    assert store.rows == []
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_store_concurrent_insert_conflict_returns_existing_ready_row():
+async def test_checkpoint_extension_uses_parent_summary_and_stores_lineage(monkeypatch):
+    parent_source = [{"role": "user", "content": "old"}]
+    parent = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="parent summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([parent])
+    calls = []
+
+    async def summary_factory(candidate_parent):
+        calls.append(candidate_parent)
+        return "extended summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "new"},
+    ]
+    result = await run_get_or_create(
+        source_messages,
+        summary_factory,
+        summary_meta={"has_multimodal": False},
+    )
+
+    assert result == "extended summary"
+    assert len(calls) == 1
+    assert calls[0]["id"] == parent["id"]
+    assert len(store.completed_rows) == 1
+    assert store.completed_rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
+    assert store.completed_rows[0]["source_message_count"] == 2
+    assert store.completed_rows[0]["parent_checkpoint_id"] == parent["id"]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_reuse_survives_target_and_summary_model_changes(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    existing = make_checkpoint_row(
+        source_messages,
+        state="ready",
+        summary_text="existing summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    lookup_keys = []
+
+    class RecordingClaimStore(ClaimStore):
+        async def lookup_any(self, **kwargs):
+            lookup_keys.append(kwargs)
+            return await super().lookup_any(**kwargs)
+
+    store = RecordingClaimStore([existing])
+
+    async def summary_factory(parent):
+        raise AssertionError("checkpoint reuse must not depend on current target or summary model")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    first = await run_get_or_create(source_messages, summary_factory)
+    second = await run_get_or_create(
+        source_messages,
+        summary_factory,
+        summary_meta={"summary_model": "changed", "target_model": "changed"},
+    )
+
+    assert first == "existing summary"
+    assert second == "existing summary"
+    assert lookup_keys[0]["profile_hash"] == lookup_keys[1]["profile_hash"]
+    assert lookup_keys[0]["source_hash"] == lookup_keys[1]["source_hash"]
+
+
+@pytest.mark.asyncio
+async def test_parent_checkpoint_failure_releases_claim_and_does_not_resubmit_raw_prefix(monkeypatch):
+    parent_source = [{"role": "user", "content": "old"}]
+    parent = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="parent summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([parent])
+    calls = []
+
+    async def summary_factory(candidate_parent):
+        calls.append(candidate_parent)
+        raise RuntimeError("summary context overflow")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    with pytest.raises(mod.ParentCheckpointExtensionFailed) as exc_info:
+        await run_get_or_create(
+            [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "new"},
+            ],
+            summary_factory,
+        )
+
+    assert len(calls) == 1
+    assert exc_info.value.parent["id"] == parent["id"]
+    assert store.completed_rows == []
+    assert store.released == [store.claimed_rows[0]["id"]]
+    assert [row["id"] for row in store.rows] == [parent["id"]]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_store_claim_conflict_returns_false():
     from sqlalchemy.exc import IntegrityError
-
-    existing = {
-        "id": "checkpoint-1",
-        "namespace": "auto_compact",
-        "user_id": "user-1",
-        "chat_id": "chat-1",
-        "pipe_function_id": "auto_compact",
-        "profile_hash": "profile",
-        "source_hash": "source",
-        "state": "ready",
-        "summary_text": "existing summary",
-    }
-
-    class FakeMappings:
-        def first(self):
-            return existing
-
-    class FakeResult:
-        def mappings(self):
-            return FakeMappings()
 
     class FakeDb:
         def __init__(self):
-            self.execute_calls = 0
             self.commit_calls = 0
             self.rollback_calls = 0
 
         async def execute(self, statement):
-            self.execute_calls += 1
-            if self.execute_calls == 1:
-                raise IntegrityError("insert", {}, Exception("duplicate"))
-            return FakeResult()
+            raise IntegrityError("insert", {}, Exception("duplicate"))
 
         async def commit(self):
             self.commit_calls += 1
@@ -719,170 +1168,35 @@ async def test_checkpoint_store_concurrent_insert_conflict_returns_existing_read
 
     db = FakeDb()
     store = mod.CheckpointStore(db=db)
-    row = {
-        "id": "checkpoint-1",
-        "namespace": "auto_compact",
-        "user_id": "user-1",
-        "chat_id": "chat-1",
-        "pipe_function_id": "auto_compact",
-        "profile_hash": "profile",
-        "source_hash": "source",
-        "state": "ready",
-        "source_message_count": 1,
-        "summary_text": "generated summary",
-        "summary_meta": {},
-        "schema_version": 1,
-        "parent_checkpoint_id": None,
-        "created_at": 1,
-        "updated_at": 1,
-        "last_used_at": 1,
-    }
+    row = make_checkpoint_row([{"role": "user", "content": "old"}])
 
-    result = await store.insert_ready(row)
-
-    assert result == existing
-    assert db.execute_calls == 2
+    assert await store.claim_pending(row) is False
     assert db.commit_calls == 0
     assert db.rollback_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_miss_generates_summary_and_stores_ready_row(monkeypatch):
-    inserted_rows = []
-
-    async def noop_initialize(**kwargs):
-        return None
-
-    class MissStore:
-        async def lookup_ready(self, **kwargs):
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return None
-
-        async def insert_ready(self, row):
-            inserted_rows.append(row)
-            return row
-
-    async def summary_factory(parent):
-        assert parent is None
-        return "generated summary"
-
-    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: MissStore())
-
-    source_messages = [{"role": "user", "content": "old"}]
-    result = await mod._get_or_create_checkpoint_summary(
-        request=None,
-        user_id="user-1",
-        chat_id="chat-1",
-        pipe_function_id="auto_compact",
-        source_messages=source_messages,
-        summary_meta={"has_multimodal": False},
-        summary_factory=summary_factory,
-    )
-
-    assert result == "generated summary"
-    assert len(inserted_rows) == 1
-    assert inserted_rows[0]["state"] == "ready"
-    assert inserted_rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
-    assert inserted_rows[0]["summary_text"] == "generated summary"
-    assert inserted_rows[0]["parent_checkpoint_id"] is None
-
-
-@pytest.mark.asyncio
-async def test_checkpoint_extension_uses_parent_summary_and_stores_lineage(monkeypatch):
-    parent = {
-        "id": "parent-1",
-        "state": "ready",
-        "source_message_count": 1,
-        "source_hash": mod.compute_source_hash([{"role": "user", "content": "old"}]),
-        "summary_text": "parent summary",
-        "summary_meta": {},
-    }
-    calls = []
-    inserted_rows = []
-
-    async def noop_initialize(**kwargs):
-        return None
-
-    class ParentStore:
-        async def lookup_ready(self, **kwargs):
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            calls.append(("parent_lookup", kwargs["prefix_hashes"]))
-            return parent
-
-        async def insert_ready(self, row):
-            inserted_rows.append(row)
-            return row
-
-    async def summary_factory(candidate_parent):
-        calls.append(("summary_parent", candidate_parent))
-        return "extended summary"
-
-    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ParentStore())
-
-    source_messages = [
-        {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "new"},
-    ]
-    result = await mod._get_or_create_checkpoint_summary(
-        request=None,
-        user_id="user-1",
-        chat_id="chat-1",
-        pipe_function_id="auto_compact",
-        source_messages=source_messages,
-        summary_meta={"has_multimodal": False},
-        summary_factory=summary_factory,
-    )
-
-    assert result == "extended summary"
-    assert ("summary_parent", parent) in calls
-    assert len(inserted_rows) == 1
-    assert inserted_rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
-    assert inserted_rows[0]["source_message_count"] == 2
-    assert inserted_rows[0]["parent_checkpoint_id"] == "parent-1"
-
-
-@pytest.mark.asyncio
 async def test_compact_body_extends_from_parent_summary_plus_delta(monkeypatch):
-    parent = {
-        "id": "parent-1",
-        "state": "ready",
-        "source_message_count": 2,
-        "source_hash": mod.compute_source_hash(
-            [
-                {"role": "user", "content": "old"},
-                {"role": "assistant", "content": "old answer"},
-            ]
-        ),
-        "summary_text": "parent summary",
-        "summary_meta": {},
-    }
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    parent = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="parent summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([parent])
     captured = {}
-
-    async def noop_initialize(**kwargs):
-        return None
-
-    class ParentStore:
-        async def lookup_ready(self, **kwargs):
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return parent
-
-        async def insert_ready(self, row):
-            return row
 
     async def generate_summary_text(**kwargs):
         captured["source_messages"] = kwargs["source_messages"]
         return "extended summary"
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ParentStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     body = {
@@ -921,28 +1235,15 @@ async def test_compact_body_extends_from_parent_summary_plus_delta(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_compact_body_uses_raw_summary_source_but_canonical_checkpoint_hash(monkeypatch):
+    store = ClaimStore()
     captured = {}
-
-    async def noop_initialize(**kwargs):
-        return None
-
-    class EmptyStore:
-        async def lookup_ready(self, **kwargs):
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return None
-
-        async def insert_ready(self, row):
-            captured["inserted_row"] = row
-            return row
 
     async def generate_summary_text(**kwargs):
         captured["source_messages"] = kwargs["source_messages"]
         return "summary"
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: EmptyStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     body = {
@@ -991,147 +1292,31 @@ async def test_compact_body_uses_raw_summary_source_but_canonical_checkpoint_has
     assert did_compact is True
     summary_file = captured["source_messages"][0]["files"][0]
     assert summary_file == body["messages"][0]["files"][0]
-    assert captured["inserted_row"]["source_hash"] == mod.compute_source_hash(body["messages"][:2])
+    assert store.claimed_rows[0]["source_hash"] == mod.compute_source_hash(body["messages"][:2])
+    assert store.completed_rows[0]["summary_text"] == "summary"
     assert "summary" in compacted["messages"][0]["content"]
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_reuse_survives_target_and_summary_model_changes(monkeypatch):
-    existing = {
-        "id": "checkpoint-1",
-        "state": "ready",
-        "source_hash": mod.compute_source_hash([{"role": "user", "content": "old"}]),
-        "summary_text": "existing summary",
-    }
-    lookup_keys = []
-
-    async def noop_initialize(**kwargs):
-        return None
-
-    class HitStore:
-        async def lookup_ready(self, **kwargs):
-            lookup_keys.append(kwargs)
-            return existing
-
-        async def touch(self, checkpoint_id):
-            return True
-
-    async def summary_factory(parent):
-        raise AssertionError("checkpoint reuse must not depend on current target or summary model")
-
-    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: HitStore())
-
-    source_messages = [{"role": "user", "content": "old"}]
-    first = await mod._get_or_create_checkpoint_summary(
-        request=None,
-        user_id="user-1",
-        chat_id="chat-1",
-        pipe_function_id="auto_compact",
-        source_messages=source_messages,
-        summary_meta={},
-        summary_factory=summary_factory,
-    )
-    second = await mod._get_or_create_checkpoint_summary(
-        request=None,
-        user_id="user-1",
-        chat_id="chat-1",
-        pipe_function_id="auto_compact",
-        source_messages=source_messages,
-        summary_meta={"summary_model": "changed", "target_model": "changed"},
-        summary_factory=summary_factory,
-    )
-
-    assert first == "existing summary"
-    assert second == "existing summary"
-    assert lookup_keys[0]["profile_hash"] == lookup_keys[1]["profile_hash"]
-    assert lookup_keys[0]["source_hash"] == lookup_keys[1]["source_hash"]
-
-
-@pytest.mark.asyncio
-async def test_parent_checkpoint_failure_does_not_resubmit_raw_prefix(monkeypatch):
-    parent = {
-        "id": "parent-1",
-        "state": "ready",
-        "source_message_count": 1,
-        "source_hash": mod.compute_source_hash([{"role": "user", "content": "old"}]),
-        "summary_text": "parent summary",
-        "summary_meta": {},
-    }
-    calls = []
-
-    async def noop_initialize(**kwargs):
-        return None
-
-    class ParentStore:
-        async def lookup_ready(self, **kwargs):
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return parent
-
-        async def insert_ready(self, row):
-            raise AssertionError("insert should not run when summary fails")
-
-    async def summary_factory(candidate_parent):
-        calls.append(candidate_parent)
-        raise RuntimeError("summary context overflow")
-
-    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ParentStore())
-
-    with pytest.raises(mod.ParentCheckpointExtensionFailed) as exc_info:
-        await mod._get_or_create_checkpoint_summary(
-            request=None,
-            user_id="user-1",
-            chat_id="chat-1",
-            pipe_function_id="auto_compact",
-            source_messages=[
-                {"role": "user", "content": "old"},
-                {"role": "assistant", "content": "new"},
-            ],
-            summary_meta={},
-            summary_factory=summary_factory,
-        )
-
-    assert calls == [parent]
-    assert exc_info.value.parent == parent
-
-
-@pytest.mark.asyncio
 async def test_compact_body_uses_parent_checkpoint_delta_when_extension_summary_fails(monkeypatch):
-    parent = {
-        "id": "parent-1",
-        "state": "ready",
-        "source_message_count": 2,
-        "source_hash": mod.compute_source_hash(
-            [
-                {"role": "user", "content": "old"},
-                {"role": "assistant", "content": "old answer"},
-            ]
-        ),
-        "summary_text": "parent summary",
-        "summary_meta": {},
-    }
-
-    async def noop_initialize(**kwargs):
-        return None
-
-    class ParentStore:
-        async def lookup_ready(self, **kwargs):
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return parent
-
-        async def insert_ready(self, row):
-            raise AssertionError("failed extension summaries must not insert a full-prefix checkpoint")
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    parent = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="parent summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([parent])
 
     async def generate_summary_text(**kwargs):
         raise mod.RetryableContextOverflow("summary context overflow")
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ParentStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     body = {
@@ -1171,3 +1356,264 @@ async def test_compact_body_uses_parent_checkpoint_delta_when_extension_summary_
         {"role": "assistant", "content": "delta answer"},
         {"role": "user", "content": "active"},
     ]
+    assert store.completed_rows == []
+    assert [row["id"] for row in store.rows] == [parent["id"]]
+
+
+def test_checkpoint_ddl_tolerates_only_duplicate_object_errors():
+    from sqlalchemy.exc import OperationalError
+
+    class FakeNested:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeConn:
+        def __init__(self, error):
+            self.error = error
+
+        def begin_nested(self):
+            return FakeNested()
+
+        def execute(self, statement):
+            raise self.error
+
+    duplicate_table = OperationalError("CREATE TABLE x", {}, Exception("table x already exists"))
+    mod._execute_checkpoint_ddl_tolerating_duplicates(FakeConn(duplicate_table), "CREATE TABLE x")
+
+    duplicate_column = OperationalError("ALTER TABLE x", {}, Exception("duplicate column name: claim_token"))
+    mod._execute_checkpoint_ddl_tolerating_duplicates(FakeConn(duplicate_column), "ALTER TABLE x")
+
+    broken = OperationalError("CREATE TABLE x", {}, Exception("disk I/O error"))
+    with pytest.raises(OperationalError):
+        mod._execute_checkpoint_ddl_tolerating_duplicates(FakeConn(broken), "CREATE TABLE x")
+
+
+def _engine_store_factory(engine):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False)
+
+    class EngineCheckpointStore(mod.CheckpointStore):
+        async def _context(self):
+            return sessionmaker()
+
+    return EngineCheckpointStore
+
+
+async def _checkpoint_table_columns(engine):
+    import sqlalchemy
+
+    async with engine.connect() as conn:
+        return await conn.run_sync(
+            lambda sync_conn: {
+                column["name"]
+                for column in sqlalchemy.inspect(sync_conn).get_columns(mod.CHECKPOINT_TABLE_NAME)
+            }
+        )
+
+
+@pytest.fixture
+async def claim_engine(tmp_path, monkeypatch):
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path}/checkpoints.db",
+        poolclass=NullPool,
+        connect_args={"timeout": 30},
+    )
+    monkeypatch.setattr(mod, "_CHECKPOINT_SCHEMA_READY", False)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_callers_generate_summary_only_once(claim_engine, monkeypatch):
+    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", _engine_store_factory(claim_engine))
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0.02)
+
+    source_messages = [{"role": "user", "content": "old"}]
+    factory_calls = []
+
+    def make_summary_factory(label):
+        async def summary_factory(parent):
+            factory_calls.append(label)
+            await asyncio.sleep(0.2)
+            return "generated summary"
+
+        return summary_factory
+
+    async def run(label):
+        return await mod._get_or_create_checkpoint_summary(
+            request=None,
+            user_id="user-1",
+            chat_id="chat-1",
+            pipe_function_id="auto_compact",
+            source_messages=source_messages,
+            summary_meta={"summary_model": label},
+            summary_factory=make_summary_factory(label),
+        )
+
+    first, second = await asyncio.gather(run("summary-model-a"), run("summary-model-b"))
+
+    assert first == "generated summary"
+    assert second == "generated summary"
+    assert len(factory_calls) == 1
+    assert first.checkpoint["id"] == second.checkpoint["id"]
+    assert first.checkpoint["state"] == "ready"
+    assert second.checkpoint["state"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_stale_owner_cannot_overwrite_reclaimed_checkpoint(claim_engine):
+    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
+    store = _engine_store_factory(claim_engine)()
+    source_messages = [{"role": "user", "content": "old"}]
+    pending = make_checkpoint_row(source_messages, claim_token="stale-owner", claim_expires_at=100, now=100)
+
+    assert await store.claim_pending(pending) is True
+    assert await store.claim_pending(dict(pending, claim_token="rival")) is False
+    assert (
+        await store.reclaim_pending(pending["id"], claim_token="too-early", expires_at=10**12, now=50)
+        is False
+    )
+    assert (
+        await store.reclaim_pending(pending["id"], claim_token="fresh-owner", expires_at=10**12, now=200)
+        is True
+    )
+    assert (
+        await store.complete_pending(
+            pending["id"],
+            claim_token="stale-owner",
+            summary_text="stale summary",
+            parent_checkpoint_id=None,
+        )
+        is None
+    )
+
+    completed = await store.complete_pending(
+        pending["id"],
+        claim_token="fresh-owner",
+        summary_text="fresh summary",
+        parent_checkpoint_id=None,
+    )
+
+    assert completed is not None
+    assert completed["state"] == "ready"
+    assert completed["summary_text"] == "fresh summary"
+    assert completed["claim_token"] is None
+    assert (
+        await store.reclaim_pending(pending["id"], claim_token="late", expires_at=10**12, now=10**11)
+        is False
+    )
+    ready = await store.lookup_ready(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages),
+    )
+    assert ready is not None
+    assert ready["summary_text"] == "fresh summary"
+
+
+@pytest.mark.asyncio
+async def test_released_claim_lets_next_caller_claim_again(claim_engine):
+    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
+    store = _engine_store_factory(claim_engine)()
+    source_messages = [{"role": "user", "content": "old"}]
+    pending = make_checkpoint_row(source_messages, claim_token="failed-owner")
+
+    assert await store.claim_pending(pending) is True
+    assert await store.release_claim(pending["id"], claim_token="other-token") is False
+    assert await store.release_claim(pending["id"], claim_token="failed-owner") is True
+    assert await store.claim_pending(dict(pending, claim_token="next-owner")) is True
+
+
+@pytest.mark.asyncio
+async def test_schema_init_migrates_existing_table_and_preserves_ready_rows(claim_engine):
+    from sqlalchemy import text
+
+    source_messages = [{"role": "user", "content": "old"}]
+    legacy = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages),
+        source_message_count=len(source_messages),
+        summary_text="legacy summary",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=100,
+    )
+    legacy_create = (
+        f'CREATE TABLE "{mod.CHECKPOINT_TABLE_NAME}" ('
+        "id TEXT PRIMARY KEY, namespace TEXT NOT NULL, schema_version INTEGER NOT NULL, "
+        "user_id TEXT NOT NULL, chat_id TEXT NOT NULL, pipe_function_id TEXT NOT NULL, "
+        "profile_hash TEXT NOT NULL, source_message_count INTEGER NOT NULL, source_hash TEXT NOT NULL, "
+        "summary_text TEXT NOT NULL, summary_meta JSON NOT NULL, state TEXT NOT NULL, "
+        "parent_checkpoint_id TEXT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, "
+        "last_used_at BIGINT NOT NULL)"
+    )
+    legacy_params = {
+        key: value
+        for key, value in legacy.items()
+        if key not in ("claim_token", "claim_expires_at")
+    }
+    legacy_params["summary_meta"] = json.dumps(legacy_params["summary_meta"])
+    async with claim_engine.begin() as conn:
+        await conn.execute(text(legacy_create))
+        await conn.execute(
+            text(
+                f'INSERT INTO "{mod.CHECKPOINT_TABLE_NAME}" '
+                "(id, namespace, schema_version, user_id, chat_id, pipe_function_id, profile_hash, "
+                "source_message_count, source_hash, summary_text, summary_meta, state, "
+                "parent_checkpoint_id, created_at, updated_at, last_used_at) "
+                "VALUES (:id, :namespace, :schema_version, :user_id, :chat_id, :pipe_function_id, "
+                ":profile_hash, :source_message_count, :source_hash, :summary_text, :summary_meta, "
+                ":state, :parent_checkpoint_id, :created_at, :updated_at, :last_used_at)"
+            ),
+            legacy_params,
+        )
+
+    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
+
+    columns = await _checkpoint_table_columns(claim_engine)
+    assert {"claim_token", "claim_expires_at"} <= columns
+
+    store = _engine_store_factory(claim_engine)()
+    ready = await store.lookup_ready(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages),
+    )
+    assert ready is not None
+    assert ready["summary_text"] == "legacy summary"
+    assert ready["claim_token"] is None
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_schema_init_tolerates_concurrent_and_repeated_runs(claim_engine):
+    async def init_once():
+        async with claim_engine.begin() as conn:
+            await conn.run_sync(mod._initialize_checkpoint_schema)
+
+    await asyncio.gather(init_once(), init_once())
+    await init_once()
+
+    columns = await _checkpoint_table_columns(claim_engine)
+    assert {"claim_token", "claim_expires_at"} <= columns

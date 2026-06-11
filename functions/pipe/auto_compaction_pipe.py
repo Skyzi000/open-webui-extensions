@@ -19,6 +19,7 @@ import json
 import math
 import re
 import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -38,11 +39,16 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    delete,
     insert,
+    or_,
     select,
+    text as sql_text,
     update,
 )
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import inspect as sqlalchemy_inspect
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
@@ -60,6 +66,10 @@ CHECKPOINT_LOOKUP_UQ = "skyzi000_owui_ext_accp_v1_lookup_uq"
 CHECKPOINT_PREFIX_IDX = "skyzi000_owui_ext_accp_v1_prefix_idx"
 CHECKPOINT_RECENT_IDX = "skyzi000_owui_ext_accp_v1_recent_idx"
 REQUEST_STATE_SCHEMA_READY_KEY = "_auto_compact_checkpoint_schema_ready_v1"
+CHECKPOINT_CLAIM_LEASE_SECONDS = 90
+CHECKPOINT_CLAIM_HEARTBEAT_SECONDS = 30
+CHECKPOINT_PENDING_POLL_SECONDS = 0.25
+CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS = 300.0
 INTERNAL_SUMMARY_TASK = "auto_compaction_summary"
 TEMP_CHAT_PREFIXES = ("local:", "channel:")
 SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
@@ -128,6 +138,8 @@ CHECKPOINT_TABLE = Table(
     Column("summary_meta", JSON, nullable=False),
     Column("state", Text, nullable=False),
     Column("parent_checkpoint_id", Text, nullable=True),
+    Column("claim_token", Text, nullable=True),
+    Column("claim_expires_at", BigInteger, nullable=True),
     Column("created_at", BigInteger, nullable=False),
     Column("updated_at", BigInteger, nullable=False),
     Column("last_used_at", BigInteger, nullable=False),
@@ -153,6 +165,7 @@ CHECKPOINT_TABLE = Table(
 )
 
 _CHECKPOINT_SCHEMA_READY = False
+_SCHEMA_INIT_LOCKS: dict[Any, asyncio.Lock] = {}
 _GENERATION_LOCKS: dict[tuple[str, str, str, str, str, str], asyncio.Lock] = {}
 
 
@@ -639,10 +652,6 @@ def compute_source_hash(messages: list[dict[str, Any]]) -> str:
             "messages": canonicalize_messages_for_source_hash(messages),
         }
     )
-
-
-def compute_prefix_hashes(messages: list[dict[str, Any]]) -> dict[int, str]:
-    return {count: compute_source_hash(messages[:count]) for count in range(1, len(messages) + 1)}
 
 
 def compute_profile_hash(
@@ -1698,6 +1707,9 @@ def build_checkpoint_row(
     summary_text: str,
     summary_meta: dict[str, Any] | None,
     parent_checkpoint_id: str | None,
+    state: str = "ready",
+    claim_token: str | None = None,
+    claim_expires_at: int | None = None,
     now: int | None = None,
 ) -> dict[str, Any]:
     timestamp = int(time.time()) if now is None else int(now)
@@ -1720,33 +1732,84 @@ def build_checkpoint_row(
         "source_hash": source_hash,
         "summary_text": summary_text,
         "summary_meta": normalize_summary_meta(summary_meta),
-        "state": "ready",
+        "state": state,
         "parent_checkpoint_id": parent_checkpoint_id,
+        "claim_token": claim_token,
+        "claim_expires_at": claim_expires_at,
         "created_at": timestamp,
         "updated_at": timestamp,
         "last_used_at": timestamp,
     }
 
 
-def select_ready_checkpoint(rows: Iterable[dict[str, Any]], *, source_hash: str) -> dict[str, Any] | None:
-    for row in rows:
-        if row.get("state") == "ready" and row.get("source_hash") == source_hash:
-            return row
-    return None
-
-
 def select_longest_matching_parent(
     rows: Iterable[dict[str, Any]],
-    prefix_hashes: dict[int, str],
+    source_messages: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
+    prefix_hashes: dict[int, str] = {}
     candidates = sorted(rows, key=lambda row: int(row.get("source_message_count") or 0), reverse=True)
     for row in candidates:
         if row.get("state") != "ready":
             continue
         count = int(row.get("source_message_count") or 0)
-        if prefix_hashes.get(count) == row.get("source_hash"):
+        if count <= 0 or count > len(source_messages):
+            continue
+        if count not in prefix_hashes:
+            prefix_hashes[count] = compute_source_hash(source_messages[:count])
+        if prefix_hashes[count] == row.get("source_hash"):
             return row
     return None
+
+
+_CHECKPOINT_CLAIM_COLUMN_DDL_TYPES = (("claim_token", "TEXT"), ("claim_expires_at", "BIGINT"))
+
+
+def _is_duplicate_schema_object_error(exc: Exception) -> bool:
+    message = str(getattr(exc, "orig", None) or exc).lower()
+    return "already exists" in message or "duplicate" in message
+
+
+def _execute_checkpoint_ddl_tolerating_duplicates(sync_conn: Any, statement: Any) -> None:
+    try:
+        with sync_conn.begin_nested():
+            sync_conn.execute(statement)
+    except (IntegrityError, OperationalError, ProgrammingError) as exc:
+        if not _is_duplicate_schema_object_error(exc):
+            raise
+
+
+def _quoted_checkpoint_table_sql() -> str:
+    if OPEN_WEBUI_DATABASE_SCHEMA:
+        return f'"{OPEN_WEBUI_DATABASE_SCHEMA}"."{CHECKPOINT_TABLE_NAME}"'
+    return f'"{CHECKPOINT_TABLE_NAME}"'
+
+
+def _initialize_checkpoint_schema(sync_conn: Any) -> None:
+    _execute_checkpoint_ddl_tolerating_duplicates(sync_conn, CreateTable(CHECKPOINT_TABLE, if_not_exists=True))
+    for index in CHECKPOINT_TABLE.indexes:
+        _execute_checkpoint_ddl_tolerating_duplicates(sync_conn, CreateIndex(index, if_not_exists=True))
+    existing_columns = {
+        column["name"]
+        for column in sqlalchemy_inspect(sync_conn).get_columns(
+            CHECKPOINT_TABLE_NAME, schema=OPEN_WEBUI_DATABASE_SCHEMA
+        )
+    }
+    for column_name, column_ddl_type in _CHECKPOINT_CLAIM_COLUMN_DDL_TYPES:
+        if column_name in existing_columns:
+            continue
+        _execute_checkpoint_ddl_tolerating_duplicates(
+            sync_conn,
+            sql_text(f"ALTER TABLE {_quoted_checkpoint_table_sql()} ADD COLUMN {column_name} {column_ddl_type}"),
+        )
+
+
+def _schema_init_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _SCHEMA_INIT_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SCHEMA_INIT_LOCKS[loop] = lock
+    return lock
 
 
 async def ensure_checkpoint_table_initialized(
@@ -1769,10 +1832,17 @@ async def ensure_checkpoint_table_initialized(
 
         async_engine = open_webui_async_engine
 
-    async with async_engine.begin() as conn:
-        await conn.run_sync(lambda sync_conn: CHECKPOINT_TABLE.create(sync_conn, checkfirst=True))
-
-    _CHECKPOINT_SCHEMA_READY = True
+    loop = asyncio.get_running_loop()
+    lock = _schema_init_lock()
+    try:
+        async with lock:
+            if not _CHECKPOINT_SCHEMA_READY:
+                async with async_engine.begin() as conn:
+                    await conn.run_sync(_initialize_checkpoint_schema)
+                _CHECKPOINT_SCHEMA_READY = True
+    finally:
+        if not lock.locked() and not getattr(lock, "_waiters", None) and _SCHEMA_INIT_LOCKS.get(loop) is lock:
+            _SCHEMA_INIT_LOCKS.pop(loop, None)
     if state is not None:
         setattr(state, REQUEST_STATE_SCHEMA_READY_KEY, True)
 
@@ -1796,6 +1866,49 @@ class CheckpointStore:
 
         return get_async_db()
 
+    def _identity_clauses(
+        self,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_function_id: str,
+        profile_hash: str,
+    ) -> list[Any]:
+        return [
+            CHECKPOINT_TABLE.c.namespace == namespace,
+            CHECKPOINT_TABLE.c.user_id == user_id,
+            CHECKPOINT_TABLE.c.chat_id == chat_id,
+            CHECKPOINT_TABLE.c.pipe_function_id == pipe_function_id,
+            CHECKPOINT_TABLE.c.profile_hash == profile_hash,
+        ]
+
+    async def lookup_any(
+        self,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_function_id: str,
+        profile_hash: str,
+        source_hash: str,
+    ) -> dict[str, Any] | None:
+        async with await self._context() as db:
+            result = await db.execute(
+                select(CHECKPOINT_TABLE).where(
+                    *self._identity_clauses(
+                        namespace=namespace,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                    ),
+                    CHECKPOINT_TABLE.c.source_hash == source_hash,
+                )
+            )
+            row = result.mappings().first()
+            return dict(row) if row else None
+
     async def lookup_ready(
         self,
         *,
@@ -1809,11 +1922,13 @@ class CheckpointStore:
         async with await self._context() as db:
             result = await db.execute(
                 select(CHECKPOINT_TABLE).where(
-                    CHECKPOINT_TABLE.c.namespace == namespace,
-                    CHECKPOINT_TABLE.c.user_id == user_id,
-                    CHECKPOINT_TABLE.c.chat_id == chat_id,
-                    CHECKPOINT_TABLE.c.pipe_function_id == pipe_function_id,
-                    CHECKPOINT_TABLE.c.profile_hash == profile_hash,
+                    *self._identity_clauses(
+                        namespace=namespace,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                    ),
                     CHECKPOINT_TABLE.c.source_hash == source_hash,
                     CHECKPOINT_TABLE.c.state == "ready",
                 )
@@ -1829,43 +1944,150 @@ class CheckpointStore:
         chat_id: str,
         pipe_function_id: str,
         profile_hash: str,
-        prefix_hashes: dict[int, str],
+        source_messages: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
-        if not prefix_hashes:
+        if not source_messages:
             return None
         async with await self._context() as db:
             result = await db.execute(
                 select(CHECKPOINT_TABLE)
                 .where(
-                    CHECKPOINT_TABLE.c.namespace == namespace,
-                    CHECKPOINT_TABLE.c.user_id == user_id,
-                    CHECKPOINT_TABLE.c.chat_id == chat_id,
-                    CHECKPOINT_TABLE.c.pipe_function_id == pipe_function_id,
-                    CHECKPOINT_TABLE.c.profile_hash == profile_hash,
+                    *self._identity_clauses(
+                        namespace=namespace,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                    ),
                     CHECKPOINT_TABLE.c.state == "ready",
-                    CHECKPOINT_TABLE.c.source_message_count.in_(list(prefix_hashes.keys())),
+                    CHECKPOINT_TABLE.c.source_message_count <= len(source_messages),
                 )
                 .order_by(CHECKPOINT_TABLE.c.source_message_count.desc())
             )
             rows = [dict(row) for row in result.mappings().all()]
-            return select_longest_matching_parent(rows, prefix_hashes)
+        return select_longest_matching_parent(rows, source_messages)
 
-    async def insert_ready(self, row: dict[str, Any]) -> dict[str, Any] | None:
+    async def claim_pending(self, row: dict[str, Any]) -> bool:
         async with await self._context() as db:
             try:
                 await db.execute(insert(CHECKPOINT_TABLE).values(**row))
                 await db.commit()
-                return row
+                return True
             except IntegrityError:
                 await db.rollback()
-                return await self.lookup_ready(
-                    namespace=row["namespace"],
-                    user_id=row["user_id"],
-                    chat_id=row["chat_id"],
-                    pipe_function_id=row["pipe_function_id"],
-                    profile_hash=row["profile_hash"],
-                    source_hash=row["source_hash"],
+                return False
+
+    async def reclaim_pending(
+        self,
+        checkpoint_id: str,
+        *,
+        claim_token: str,
+        expires_at: int,
+        now: int | None = None,
+    ) -> bool:
+        timestamp = int(time.time()) if now is None else int(now)
+        async with await self._context() as db:
+            try:
+                result = await db.execute(
+                    update(CHECKPOINT_TABLE)
+                    .where(
+                        CHECKPOINT_TABLE.c.id == checkpoint_id,
+                        CHECKPOINT_TABLE.c.state == "pending",
+                        or_(
+                            CHECKPOINT_TABLE.c.claim_expires_at.is_(None),
+                            CHECKPOINT_TABLE.c.claim_expires_at <= timestamp,
+                        ),
+                    )
+                    .values(claim_token=claim_token, claim_expires_at=int(expires_at), updated_at=timestamp)
                 )
+                if (result.rowcount or 0) != 1:
+                    await db.rollback()
+                    return False
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def extend_claim(self, checkpoint_id: str, *, claim_token: str, expires_at: int) -> bool:
+        async with await self._context() as db:
+            try:
+                result = await db.execute(
+                    update(CHECKPOINT_TABLE)
+                    .where(
+                        CHECKPOINT_TABLE.c.id == checkpoint_id,
+                        CHECKPOINT_TABLE.c.state == "pending",
+                        CHECKPOINT_TABLE.c.claim_token == claim_token,
+                    )
+                    .values(claim_expires_at=int(expires_at))
+                )
+                if (result.rowcount or 0) != 1:
+                    await db.rollback()
+                    return False
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def release_claim(self, checkpoint_id: str, *, claim_token: str) -> bool:
+        async with await self._context() as db:
+            try:
+                result = await db.execute(
+                    delete(CHECKPOINT_TABLE).where(
+                        CHECKPOINT_TABLE.c.id == checkpoint_id,
+                        CHECKPOINT_TABLE.c.state == "pending",
+                        CHECKPOINT_TABLE.c.claim_token == claim_token,
+                    )
+                )
+                if (result.rowcount or 0) != 1:
+                    await db.rollback()
+                    return False
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def complete_pending(
+        self,
+        checkpoint_id: str,
+        *,
+        claim_token: str,
+        summary_text: str,
+        parent_checkpoint_id: str | None,
+        now: int | None = None,
+    ) -> dict[str, Any] | None:
+        timestamp = int(time.time()) if now is None else int(now)
+        async with await self._context() as db:
+            try:
+                result = await db.execute(
+                    update(CHECKPOINT_TABLE)
+                    .where(
+                        CHECKPOINT_TABLE.c.id == checkpoint_id,
+                        CHECKPOINT_TABLE.c.state == "pending",
+                        CHECKPOINT_TABLE.c.claim_token == claim_token,
+                    )
+                    .values(
+                        state="ready",
+                        summary_text=summary_text,
+                        parent_checkpoint_id=parent_checkpoint_id,
+                        claim_token=None,
+                        claim_expires_at=None,
+                        updated_at=timestamp,
+                        last_used_at=timestamp,
+                    )
+                )
+                if (result.rowcount or 0) != 1:
+                    await db.rollback()
+                    return None
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+            result = await db.execute(select(CHECKPOINT_TABLE).where(CHECKPOINT_TABLE.c.id == checkpoint_id))
+            row = result.mappings().first()
+            return dict(row) if row else None
 
     async def touch(self, checkpoint_id: str, *, now: int | None = None) -> bool:
         timestamp = int(time.time()) if now is None else int(now)
@@ -4081,6 +4303,71 @@ async def _compact_retry_tool_results(
     return compacted, True
 
 
+async def _heartbeat_checkpoint_claim(store: Any, checkpoint_id: str, claim_token: str) -> None:
+    while True:
+        await asyncio.sleep(CHECKPOINT_CLAIM_HEARTBEAT_SECONDS)
+        try:
+            extended = await store.extend_claim(
+                checkpoint_id,
+                claim_token=claim_token,
+                expires_at=int(time.time()) + CHECKPOINT_CLAIM_LEASE_SECONDS,
+            )
+        except Exception:
+            continue
+        if not extended:
+            return
+
+
+async def _claim_or_wait_for_checkpoint(
+    store: Any,
+    *,
+    identity: dict[str, str],
+    source_message_count: int,
+    summary_meta: dict[str, Any],
+    claim_token: str,
+) -> str | dict[str, Any]:
+    """Return the claimed pending checkpoint id, or a ready row produced by another worker."""
+    deadline = time.monotonic() + CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS
+    while True:
+        row = await store.lookup_any(**identity)
+        if row is None:
+            now = int(time.time())
+            pending_row = build_checkpoint_row(
+                **identity,
+                source_message_count=source_message_count,
+                summary_text="",
+                summary_meta=summary_meta,
+                parent_checkpoint_id=None,
+                state="pending",
+                claim_token=claim_token,
+                claim_expires_at=now + CHECKPOINT_CLAIM_LEASE_SECONDS,
+                now=now,
+            )
+            if await store.claim_pending(pending_row):
+                return pending_row["id"]
+            continue
+        if row.get("state") == "ready":
+            with suppress(Exception):
+                await store.touch(row["id"])
+            return row
+        now = int(time.time())
+        expires_at = row.get("claim_expires_at")
+        if expires_at is None or int(expires_at) <= now:
+            if await store.reclaim_pending(
+                row["id"],
+                claim_token=claim_token,
+                expires_at=now + CHECKPOINT_CLAIM_LEASE_SECONDS,
+                now=now,
+            ):
+                return row["id"]
+            continue
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Timed out waiting for another worker to finish generating this checkpoint summary"
+            )
+        await asyncio.sleep(CHECKPOINT_PENDING_POLL_SECONDS)
+
+
 async def _get_or_create_checkpoint_summary(
     *,
     request: Any,
@@ -4095,6 +4382,14 @@ async def _get_or_create_checkpoint_summary(
     profile_hash = compute_profile_hash()
     source_hash = compute_source_hash(source_messages)
     summary_meta = normalize_summary_meta(summary_meta)
+    identity = {
+        "namespace": CHECKPOINT_NAMESPACE,
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "pipe_function_id": pipe_function_id,
+        "profile_hash": profile_hash,
+        "source_hash": source_hash,
+    }
     lock_key = (CHECKPOINT_NAMESPACE, user_id, chat_id, pipe_function_id, profile_hash, source_hash)
     lock = get_generation_lock(lock_key)
 
@@ -4102,64 +4397,71 @@ async def _get_or_create_checkpoint_summary(
         async with lock:
             await ensure_checkpoint_table_initialized(request=request)
             store = CheckpointStore()
+            claim_token = uuid.uuid4().hex
 
-            existing = await store.lookup_ready(
-                namespace=CHECKPOINT_NAMESPACE,
-                user_id=user_id,
-                chat_id=chat_id,
-                pipe_function_id=pipe_function_id,
-                profile_hash=profile_hash,
-                source_hash=source_hash,
-            )
-            if existing:
-                with suppress(Exception):
-                    await store.touch(existing["id"])
-                return CompactionSummaryResult(existing["summary_text"], checkpoint=existing)
-
-            parent = None
-            if parent_checkpoint is not None:
-                parent_count = int(parent_checkpoint.get("source_message_count") or 0)
-                if (
-                    parent_count <= 0
-                    or parent_count > len(source_messages)
-                    or compute_source_hash(source_messages[:parent_count]) != parent_checkpoint.get("source_hash")
-                ):
-                    raise UnsupportedCompactionInput(
-                        "Parent checkpoint cannot be applied safely because its source boundary is invalid",
-                        code="unsafe_checkpoint_parent",
-                    )
-                parent = parent_checkpoint
-            else:
-                parent = await store.find_longest_parent(
-                    namespace=CHECKPOINT_NAMESPACE,
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    pipe_function_id=pipe_function_id,
-                    profile_hash=profile_hash,
-                    prefix_hashes=compute_prefix_hashes(source_messages),
-                )
-            try:
-                summary_text = await summary_factory(parent)
-            except Exception as exc:
-                if parent:
-                    raise ParentCheckpointExtensionFailed(parent, exc) from exc
-                raise
-            row = build_checkpoint_row(
-                namespace=CHECKPOINT_NAMESPACE,
-                user_id=user_id,
-                chat_id=chat_id,
-                pipe_function_id=pipe_function_id,
-                profile_hash=profile_hash,
-                source_hash=source_hash,
+            claimed = await _claim_or_wait_for_checkpoint(
+                store,
+                identity=identity,
                 source_message_count=len(source_messages),
-                summary_text=summary_text,
                 summary_meta=summary_meta,
-                parent_checkpoint_id=parent.get("id") if parent else None,
+                claim_token=claim_token,
             )
-            inserted = await store.insert_ready(row)
-            if inserted:
-                return CompactionSummaryResult(inserted["summary_text"], checkpoint=inserted)
-            raise RuntimeError("Checkpoint insert did not return a ready row")
+            if isinstance(claimed, dict):
+                return CompactionSummaryResult(claimed["summary_text"], checkpoint=claimed)
+            checkpoint_id = claimed
+
+            heartbeat = asyncio.create_task(_heartbeat_checkpoint_claim(store, checkpoint_id, claim_token))
+            try:
+                if parent_checkpoint is not None:
+                    parent_count = int(parent_checkpoint.get("source_message_count") or 0)
+                    if (
+                        parent_count <= 0
+                        or parent_count > len(source_messages)
+                        or compute_source_hash(source_messages[:parent_count])
+                        != parent_checkpoint.get("source_hash")
+                    ):
+                        raise UnsupportedCompactionInput(
+                            "Parent checkpoint cannot be applied safely because its source boundary is invalid",
+                            code="unsafe_checkpoint_parent",
+                        )
+                    parent = parent_checkpoint
+                else:
+                    parent = await store.find_longest_parent(
+                        namespace=CHECKPOINT_NAMESPACE,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                        source_messages=source_messages,
+                    )
+                try:
+                    summary_text = await summary_factory(parent)
+                except Exception as exc:
+                    if parent:
+                        raise ParentCheckpointExtensionFailed(parent, exc) from exc
+                    raise
+                completed = await store.complete_pending(
+                    checkpoint_id,
+                    claim_token=claim_token,
+                    summary_text=summary_text,
+                    parent_checkpoint_id=parent.get("id") if parent else None,
+                )
+                if completed is not None:
+                    return CompactionSummaryResult(completed["summary_text"], checkpoint=completed)
+                existing = await store.lookup_ready(**identity)
+                if existing is not None:
+                    with suppress(Exception):
+                        await store.touch(existing["id"])
+                    return CompactionSummaryResult(existing["summary_text"], checkpoint=existing)
+                raise RuntimeError("Checkpoint claim was lost before the generated summary could be stored")
+            except Exception:
+                with suppress(Exception):
+                    await store.release_claim(checkpoint_id, claim_token=claim_token)
+                raise
+            finally:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
     finally:
         release_generation_lock(lock_key, lock)
 
@@ -4266,7 +4568,7 @@ async def _find_reusable_checkpoint_for_source(
         chat_id=chat_id,
         pipe_function_id=pipe_function_id,
         profile_hash=profile_hash,
-        prefix_hashes=compute_prefix_hashes(source_messages),
+        source_messages=source_messages,
     )
     if parent is not None:
         return "parent", parent

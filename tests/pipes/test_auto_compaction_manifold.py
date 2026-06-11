@@ -16,6 +16,84 @@ from starlette.responses import JSONResponse, PlainTextResponse, StreamingRespon
 from functions.pipe import auto_compaction_pipe as mod
 
 
+class ClaimCheckpointStore:
+    """CheckpointStore stand-in implementing the DB claim interface over shared row dicts."""
+
+    def __init__(self, rows=None):
+        self.rows = rows if rows is not None else []
+        self.claimed_rows = []
+        self.completed_rows = []
+        self.released = []
+        self.touched = []
+
+    def _match(self, source_hash):
+        for row in self.rows:
+            if row.get("source_hash") == source_hash:
+                return row
+        return None
+
+    async def lookup_any(self, **kwargs):
+        row = self._match(kwargs["source_hash"])
+        return dict(row) if row else None
+
+    async def lookup_ready(self, **kwargs):
+        row = self._match(kwargs["source_hash"])
+        if row is not None and row.get("state") == "ready":
+            return dict(row)
+        return None
+
+    async def find_longest_parent(self, **kwargs):
+        return mod.select_longest_matching_parent(self.rows, kwargs["source_messages"])
+
+    async def claim_pending(self, row):
+        if self._match(row["source_hash"]) is not None:
+            return False
+        stored = dict(row)
+        self.rows.append(stored)
+        self.claimed_rows.append(dict(stored))
+        return True
+
+    async def reclaim_pending(self, checkpoint_id, *, claim_token, expires_at, now=None):
+        return False
+
+    async def extend_claim(self, checkpoint_id, *, claim_token, expires_at):
+        return True
+
+    async def release_claim(self, checkpoint_id, *, claim_token):
+        for row in list(self.rows):
+            if (
+                row.get("id") == checkpoint_id
+                and row.get("state") == "pending"
+                and row.get("claim_token") == claim_token
+            ):
+                self.rows.remove(row)
+                self.released.append(checkpoint_id)
+                return True
+        return False
+
+    async def complete_pending(self, checkpoint_id, *, claim_token, summary_text, parent_checkpoint_id, now=None):
+        for row in self.rows:
+            if (
+                row.get("id") == checkpoint_id
+                and row.get("state") == "pending"
+                and row.get("claim_token") == claim_token
+            ):
+                row.update(
+                    state="ready",
+                    summary_text=summary_text,
+                    parent_checkpoint_id=parent_checkpoint_id,
+                    claim_token=None,
+                    claim_expires_at=None,
+                )
+                self.completed_rows.append(dict(row))
+                return dict(row)
+        return None
+
+    async def touch(self, checkpoint_id, *, now=None):
+        self.touched.append(checkpoint_id)
+        return True
+
+
 def install_fake_open_webui_user_model(monkeypatch):
     class FakeUserModel:
         def __init__(self, **data):
@@ -3510,29 +3588,12 @@ async def test_tool_history_compaction_always_extends_available_parent_checkpoin
     async def noop_initialize(**kwargs):
         return None
 
-    class RecordingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            for row in rows:
-                if row["source_hash"] == kwargs["source_hash"]:
-                    return row
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
-            rows.append(row)
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
-
     async def generate_summary_text(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
         return "tool summary"
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     latest_round = [
@@ -3595,29 +3656,12 @@ async def test_tool_history_parent_handoff_uses_parent_checkpoint_saved_excerpts
     async def noop_initialize(**kwargs):
         return None
 
-    class RecordingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            for row in rows:
-                if row["source_hash"] == kwargs["source_hash"]:
-                    return row
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
-            rows.append(row)
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
-
     async def generate_summary_text(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
         return "tool summary"
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     latest_round = [
@@ -5055,20 +5099,19 @@ async def test_pipe_reuses_existing_checkpoint_even_when_previous_compacted_usag
     async def noop_initialize(**kwargs):
         return None
 
-    class ExistingCheckpointStore:
+    class ExistingCheckpointStore(ClaimCheckpointStore):
+        async def lookup_any(self, **kwargs):
+            assert kwargs["pipe_function_id"] == "auto_compact"
+            return await super().lookup_any(**kwargs)
+
         async def lookup_ready(self, **kwargs):
             assert kwargs["pipe_function_id"] == "auto_compact"
-            if kwargs["source_hash"] == checkpoint["source_hash"]:
-                return checkpoint
-            return None
+            return await super().lookup_ready(**kwargs)
 
-        async def find_longest_parent(self, **kwargs):
-            return None
-
-        async def insert_ready(self, row):
+        async def claim_pending(self, row):
             raise AssertionError("exact checkpoint hit must not insert a new row")
 
-        async def touch(self, checkpoint_id):
+        async def touch(self, checkpoint_id, *, now=None):
             captured["touched"] = checkpoint_id
             return True
 
@@ -5083,7 +5126,7 @@ async def test_pipe_reuses_existing_checkpoint_even_when_previous_compacted_usag
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore([checkpoint]))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -5431,23 +5474,6 @@ async def test_pipe_creates_tool_checkpoint_without_history_parent_when_summary_
     async def noop_initialize(**kwargs):
         return None
 
-    class RecordingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            for row in rows:
-                if row["source_hash"] == kwargs["source_hash"]:
-                    return row
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
-            rows.append(row)
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
-
     async def generate_summary_text(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
         return f"summary {len(summary_inputs)}"
@@ -5460,7 +5486,7 @@ async def test_pipe_creates_tool_checkpoint_without_history_parent_when_summary_
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -5532,29 +5558,12 @@ async def test_direct_tool_compaction_and_reusable_checkpoint_render_same_saved_
     async def noop_initialize(**kwargs):
         return None
 
-    class RecordingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            for row in rows:
-                if row["source_hash"] == kwargs["source_hash"]:
-                    return row
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
-            rows.append(row)
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
-
     async def generate_summary_text(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
         return "tool summary"
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     direct_body, direct_did_compact = await mod._compact_body(
@@ -5603,7 +5612,6 @@ async def test_tool_loop_summary_extends_existing_history_parent_when_summary_fi
     pipe_request,
     pipe_user,
 ):
-    inserted = []
     summary_inputs = []
     history = [
         {"role": "user", "content": "old"},
@@ -5623,28 +5631,14 @@ async def test_tool_loop_summary_extends_existing_history_parent_when_summary_fi
     async def noop_initialize(**kwargs):
         return None
 
-    class ExistingHistoryCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            if kwargs["source_hash"] == history_checkpoint["source_hash"]:
-                return history_checkpoint
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent([history_checkpoint], kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
-            inserted.append(row)
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
+    history_store = ClaimCheckpointStore([history_checkpoint])
 
     async def generate_summary_text(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
         return "direct tool summary"
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingHistoryCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: history_store)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     body = {
@@ -5675,9 +5669,9 @@ async def test_tool_loop_summary_extends_existing_history_parent_when_summary_fi
     assert len(summary_inputs) == 1
     assert "existing history summary" in summary_inputs[0][0]["content"]
     assert summary_inputs[0][1:] == [active]
-    assert len(inserted) == 1
-    assert inserted[0]["source_hash"] == mod.compute_source_hash(tool_source)
-    assert inserted[0]["parent_checkpoint_id"] == history_checkpoint["id"]
+    assert len(history_store.completed_rows) == 1
+    assert history_store.completed_rows[0]["source_hash"] == mod.compute_source_hash(tool_source)
+    assert history_store.completed_rows[0]["parent_checkpoint_id"] == history_checkpoint["id"]
     assert "direct tool summary" in compacted["messages"][0]["content"]
     assert compacted["messages"][1:] == body["messages"][3:]
 
@@ -5726,19 +5720,11 @@ async def test_pipe_reuses_exact_tool_checkpoint_without_creating_history_checkp
     async def noop_initialize(**kwargs):
         return None
 
-    class ExistingToolCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            if kwargs["source_hash"] == checkpoint["source_hash"]:
-                return checkpoint
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return None
-
-        async def insert_ready(self, row):
+    class ExistingToolCheckpointStore(ClaimCheckpointStore):
+        async def claim_pending(self, row):
             raise AssertionError("exact tool checkpoint hit must not insert")
 
-        async def touch(self, checkpoint_id):
+        async def touch(self, checkpoint_id, *, now=None):
             touched.append(checkpoint_id)
             return True
 
@@ -5753,7 +5739,7 @@ async def test_pipe_reuses_exact_tool_checkpoint_without_creating_history_checkp
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingToolCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingToolCheckpointStore([checkpoint]))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -5838,19 +5824,14 @@ async def test_pipe_reuses_exact_tool_checkpoint_even_when_usage_is_below_thresh
     async def noop_initialize(**kwargs):
         return None
 
-    class ExistingToolCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            if kwargs["source_hash"] == checkpoint["source_hash"]:
-                return checkpoint
-            return None
-
+    class ExistingToolCheckpointStore(ClaimCheckpointStore):
         async def find_longest_parent(self, **kwargs):
             raise AssertionError("exact tool checkpoint reuse must not need a parent lookup")
 
-        async def insert_ready(self, row):
+        async def claim_pending(self, row):
             raise AssertionError("exact tool checkpoint hit must not insert")
 
-        async def touch(self, checkpoint_id):
+        async def touch(self, checkpoint_id, *, now=None):
             touched.append(checkpoint_id)
             return True
 
@@ -5865,7 +5846,7 @@ async def test_pipe_reuses_exact_tool_checkpoint_even_when_usage_is_below_thresh
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingToolCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingToolCheckpointStore([checkpoint]))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -5942,20 +5923,11 @@ async def test_pipe_reuses_history_checkpoint_for_tool_loop_when_usage_is_below_
     async def noop_initialize(**kwargs):
         return None
 
-    class RecordingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            for row in rows:
-                if row["source_hash"] == kwargs["source_hash"]:
-                    return row
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
+    class RecordingCheckpointStore(ClaimCheckpointStore):
+        async def claim_pending(self, row):
             raise AssertionError("below-threshold checkpoint reuse must not create a new checkpoint")
 
-        async def touch(self, checkpoint_id):
+        async def touch(self, checkpoint_id, *, now=None):
             captured["touched"] = checkpoint_id
             return True
 
@@ -5970,7 +5942,7 @@ async def test_pipe_reuses_history_checkpoint_for_tool_loop_when_usage_is_below_
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -6043,20 +6015,11 @@ async def test_pipe_reuses_longest_history_parent_for_tool_loop_when_usage_is_be
     async def noop_initialize(**kwargs):
         return None
 
-    class RecordingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            for row in rows:
-                if row["source_hash"] == kwargs["source_hash"]:
-                    return row
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
+    class RecordingCheckpointStore(ClaimCheckpointStore):
+        async def claim_pending(self, row):
             raise AssertionError("below-threshold checkpoint reuse must not create a new checkpoint")
 
-        async def touch(self, checkpoint_id):
+        async def touch(self, checkpoint_id, *, now=None):
             captured["touched"] = checkpoint_id
             return True
 
@@ -6071,7 +6034,7 @@ async def test_pipe_reuses_longest_history_parent_for_tool_loop_when_usage_is_be
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -6135,23 +6098,6 @@ async def test_pipe_falls_back_to_history_parent_when_direct_tool_summary_overfl
     async def noop_initialize(**kwargs):
         return None
 
-    class RecordingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            for row in rows:
-                if row["source_hash"] == kwargs["source_hash"]:
-                    return row
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
-            rows.append(row)
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
-
     async def generate_summary_text(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
         if kwargs["source_messages"] == tool_source:
@@ -6168,7 +6114,7 @@ async def test_pipe_falls_back_to_history_parent_when_direct_tool_summary_overfl
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -6234,23 +6180,6 @@ async def test_pipe_falls_back_to_history_checkpoint_when_existing_tool_parent_r
     async def noop_initialize(**kwargs):
         return None
 
-    class RecordingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            for row in rows:
-                if row["source_hash"] == kwargs["source_hash"]:
-                    return row
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
-            rows.append(row)
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
-
     async def generate_summary_text(**kwargs):
         source = kwargs["source_messages"]
         summary_inputs.append(source)
@@ -6265,7 +6194,7 @@ async def test_pipe_falls_back_to_history_checkpoint_when_existing_tool_parent_r
         raise AssertionError(f"unexpected summary input: {source!r}")
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     body = {
@@ -6352,23 +6281,6 @@ async def test_history_fallback_does_not_reselect_failed_longer_tool_parent(
     async def noop_initialize(**kwargs):
         return None
 
-    class RecordingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            for row in rows:
-                if row["source_hash"] == kwargs["source_hash"]:
-                    return row
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
-            rows.append(row)
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
-
     async def generate_summary_text(**kwargs):
         source = kwargs["source_messages"]
         summary_inputs.append(source)
@@ -6383,7 +6295,7 @@ async def test_history_fallback_does_not_reselect_failed_longer_tool_parent(
         raise AssertionError(f"unexpected summary input: {source!r}")
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     body = {"messages": [*tool_source, *latest_round]}
@@ -6443,23 +6355,6 @@ async def test_tool_loop_parent_retry_does_not_swallow_non_context_error(
     async def noop_initialize(**kwargs):
         return None
 
-    class RecordingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            for row in rows:
-                if row["source_hash"] == kwargs["source_hash"]:
-                    return row
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
-            rows.append(row)
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
-
     async def generate_summary_text(**kwargs):
         source = kwargs["source_messages"]
         summary_inputs.append(source)
@@ -6470,7 +6365,7 @@ async def test_tool_loop_parent_retry_does_not_swallow_non_context_error(
         raise AssertionError(f"unexpected summary input: {source!r}")
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     body = {
@@ -6542,23 +6437,6 @@ async def test_tool_loop_checkpoints_extend_previous_tool_checkpoint_without_his
     async def noop_initialize(**kwargs):
         return None
 
-    class RecordingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            for row in rows:
-                if row["source_hash"] == kwargs["source_hash"]:
-                    return row
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return mod.select_longest_matching_parent(rows, kwargs["prefix_hashes"])
-
-        async def insert_ready(self, row):
-            rows.append(row)
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
-
     async def generate_summary_text(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
         if kwargs["source_messages"] == [active, *round_1, *round_2]:
@@ -6566,7 +6444,7 @@ async def test_tool_loop_checkpoints_extend_previous_tool_checkpoint_without_his
         return f"summary {len(summary_inputs)}"
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: RecordingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     metadata = {"chat_id": "chat-1"}
@@ -6657,21 +6535,7 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_prior_checkpo
     async def noop_initialize(**kwargs):
         return None
 
-    class ExistingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            if kwargs["source_hash"] == checkpoint["source_hash"]:
-                return checkpoint
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return checkpoint
-
-        async def insert_ready(self, row):
-            captured["inserted"] = row
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
+    existing_store = ClaimCheckpointStore([checkpoint])
 
     async def generate_summary_text(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
@@ -6685,7 +6549,7 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_prior_checkpo
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: existing_store)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -6725,9 +6589,9 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_prior_checkpo
     assert "existing summary" in summary_inputs[0][0]["content"]
     assert summary_inputs[0][1:] == [{"role": "user", "content": "active"}]
     checkpoint_source = [*exact_source, {"role": "user", "content": "active"}]
-    assert captured["inserted"]["parent_checkpoint_id"] == checkpoint["id"]
-    assert captured["inserted"]["source_message_count"] == len(checkpoint_source)
-    assert captured["inserted"]["source_hash"] == mod.compute_source_hash(checkpoint_source)
+    assert existing_store.completed_rows[0]["parent_checkpoint_id"] == checkpoint["id"]
+    assert existing_store.completed_rows[0]["source_message_count"] == len(checkpoint_source)
+    assert existing_store.completed_rows[0]["source_hash"] == mod.compute_source_hash(checkpoint_source)
     messages = captured["forward_body"]["messages"]
     assert "combined active summary" in messages[0]["content"]
     assert messages[1] == {
@@ -6779,21 +6643,7 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_checkpoint_pa
     async def noop_initialize(**kwargs):
         return None
 
-    class ExistingCheckpointStore:
-        async def lookup_ready(self, **kwargs):
-            if kwargs["source_hash"] == checkpoint["source_hash"]:
-                return checkpoint
-            return None
-
-        async def find_longest_parent(self, **kwargs):
-            return checkpoint
-
-        async def insert_ready(self, row):
-            captured["inserted"] = row
-            return row
-
-        async def touch(self, checkpoint_id):
-            return True
+    existing_store = ClaimCheckpointStore([checkpoint])
 
     async def generate_summary_text(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
@@ -6807,7 +6657,7 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_checkpoint_pa
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: existing_store)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -6848,9 +6698,9 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_checkpoint_pa
     assert "existing summary" in summary_inputs[0][0]["content"]
     assert summary_inputs[0][1:] == [{"role": "user", "content": "active"}]
     checkpoint_source_with_active = [*checkpoint_source, {"role": "user", "content": "active"}]
-    assert captured["inserted"]["parent_checkpoint_id"] == checkpoint["id"]
-    assert captured["inserted"]["source_message_count"] == len(checkpoint_source_with_active)
-    assert captured["inserted"]["source_hash"] == mod.compute_source_hash(checkpoint_source_with_active)
+    assert existing_store.completed_rows[0]["parent_checkpoint_id"] == checkpoint["id"]
+    assert existing_store.completed_rows[0]["source_message_count"] == len(checkpoint_source_with_active)
+    assert existing_store.completed_rows[0]["source_hash"] == mod.compute_source_hash(checkpoint_source_with_active)
     messages = captured["forward_body"]["messages"]
     assert "combined active summary" in messages[0]["content"]
     assert messages[1] == {
