@@ -4454,9 +4454,10 @@ async def _get_or_create_checkpoint_summary(
                         await store.touch(existing["id"])
                     return CompactionSummaryResult(existing["summary_text"], checkpoint=existing)
                 raise RuntimeError("Checkpoint claim was lost before the generated summary could be stored")
-            except Exception:
-                with suppress(Exception):
-                    await store.release_claim(checkpoint_id, claim_token=claim_token)
+            except (asyncio.CancelledError, Exception):
+                # asyncio.CancelledError is outside Exception on Python 3.11+.
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(store.release_claim(checkpoint_id, claim_token=claim_token))
                 raise
             finally:
                 heartbeat.cancel()

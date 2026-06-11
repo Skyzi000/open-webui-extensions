@@ -1036,6 +1036,32 @@ async def test_checkpoint_does_not_store_incomplete_summary_and_releases_claim(m
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_cancellation_releases_claim(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    store = ClaimStore()
+    started = asyncio.Event()
+
+    async def summary_factory(parent):
+        assert parent is None
+        started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    task = asyncio.create_task(run_get_or_create(source_messages, summary_factory))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert store.completed_rows == []
+    assert store.released == [store.claimed_rows[0]["id"]]
+    assert store.rows == []
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_extension_uses_parent_summary_and_stores_lineage(monkeypatch):
     parent_source = [{"role": "user", "content": "old"}]
     parent = make_checkpoint_row(
