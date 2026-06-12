@@ -4124,6 +4124,19 @@ def _is_forced_function_call(value: Any) -> bool:
     return False
 
 
+SUMMARY_INHERITED_RESPONSE_CONTROL_KEYS = (
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "stop",
+)
+
+
+def strip_summary_inherited_response_controls(body: dict[str, Any]) -> None:
+    for key in SUMMARY_INHERITED_RESPONSE_CONTROL_KEYS:
+        body.pop(key, None)
+
+
 def neutralize_summary_tool_choice(body: dict[str, Any]) -> None:
     if body.get("tools") and _is_forced_tool_choice(body.get("tool_choice")):
         body["tool_choice"] = "none"
@@ -4159,6 +4172,7 @@ def build_summary_completion_body(
     body["metadata"] = build_summary_task_metadata(metadata)
     body.pop("previous_response_id", None)
     body.pop("response_format", None)
+    strip_summary_inherited_response_controls(body)
     neutralize_summary_tool_choice(body)
     if summary_tool_policy == "always_strip":
         strip_summary_tools_for_retry(body)

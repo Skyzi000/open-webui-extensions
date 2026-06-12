@@ -3053,6 +3053,52 @@ async def test_summary_generation_strips_request_response_format_without_overrid
 
 
 @pytest.mark.asyncio
+async def test_summary_generation_strips_inherited_response_limits_and_stop(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    captured = {}
+
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
+        captured["form_body"] = dict(form_data)
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={},
+        summary_model_id="summary",
+        source_messages=[{"role": "user", "content": "source"}],
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+            "max_tokens": 32,
+            "max_completion_tokens": 64,
+            "max_output_tokens": 128,
+            "stop": ["END"],
+            "temperature": 0.2,
+            "top_p": 0.9,
+        },
+    )
+
+    assert result == "summary"
+    assert "max_tokens" not in captured["form_body"]
+    assert "max_completion_tokens" not in captured["form_body"]
+    assert "max_output_tokens" not in captured["form_body"]
+    assert "stop" not in captured["form_body"]
+    assert captured["form_body"]["temperature"] == 0.2
+    assert captured["form_body"]["top_p"] == 0.9
+
+
+@pytest.mark.asyncio
 async def test_summary_generation_decodes_own_wrapper_summary_model(monkeypatch, pipe_request, pipe_user):
     captured = {}
 
