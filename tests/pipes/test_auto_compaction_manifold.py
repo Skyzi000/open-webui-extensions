@@ -2377,6 +2377,74 @@ async def test_streaming_forwarder_retries_responses_failed_after_pre_output_eve
 
 
 @pytest.mark.asyncio
+async def test_streaming_forwarder_retries_context_error_after_chat_role_delta():
+    closed = False
+    background_count = 0
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield b'data: {"choices": [{"delta": {"role": "assistant"}}]}\n\n'
+            yield b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_forwarder_retries_context_error_after_same_chunk_chat_role_delta():
+    closed = False
+    background_count = 0
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield (
+                b'data: {"choices": [{"delta": {"role": "assistant", "content": ""}, "finish_reason": null}]}\n\n'
+                b'data: {"error": {"code": "context_length_exceeded", "message": "too long"}}\n\n'
+            )
+        finally:
+            closed = True
+
+    async def background():
+        nonlocal background_count
+        background_count += 1
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+
+    with pytest.raises(mod.RetryableContextOverflow):
+        await mod.prepare_streaming_response(
+            response,
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+
+    assert closed is True
+    assert background_count == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "event_type",
     [

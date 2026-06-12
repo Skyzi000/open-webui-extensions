@@ -3435,7 +3435,25 @@ def _stream_payload_is_responses_pre_output_control_event(payload: dict[str, Any
     if _stream_payload_error_source(payload) is not None:
         return False
     payload_type = payload.get("type")
-    return payload_type in {"response.created", "response.in_progress"}
+    if payload_type in {"response.created", "response.in_progress"}:
+        return True
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            return False
+        if choice.get("finish_reason") not in (None, ""):
+            return False
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            return False
+        if any(
+            delta.get(key)
+            for key in ("content", "reasoning_content", "tool_calls", "function_call")
+        ):
+            return False
+    return True
 
 
 def _stream_events_are_responses_pre_output_control_events(events: list[dict[str, Any]]) -> bool:
