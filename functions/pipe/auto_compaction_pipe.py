@@ -5,6 +5,7 @@ author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
 version: 0.1.2
 license: MIT
+required_open_webui_version: 0.9.6
 """
 
 from __future__ import annotations
