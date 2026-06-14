@@ -9,7 +9,7 @@ import types
 
 import pytest
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
@@ -1881,6 +1881,156 @@ def test_valve_defaults_are_conservative_for_v1_continuation():
     assert valves.historical_message_excerpt_count == mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT
     assert not hasattr(valves, "keep_tail_messages")
     assert not hasattr(valves, "preserve_latest_tool_rounds")
+
+
+def test_trigger_total_tokens_overrides_default_is_empty_string():
+    valves = mod.Pipe.Valves()
+
+    assert valves.trigger_total_tokens_overrides_json == ""
+
+
+def test_trigger_total_tokens_overrides_empty_string_is_valid():
+    valves = mod.Pipe.Valves(trigger_total_tokens_overrides_json="")
+
+    assert valves.trigger_total_tokens_overrides_json == ""
+
+
+def test_trigger_total_tokens_overrides_accepts_valid_ordered_json():
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "overrides": [
+                {"model_patterns": ["claude-fable-5[1m]"], "trigger_total_tokens": 950000},
+                {"model_patterns": ["claude-*", "Claude *"], "trigger_total_tokens": 160000},
+            ],
+        }
+    )
+
+    valves = mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+
+    assert valves.trigger_total_tokens_overrides_json == payload
+
+
+def test_trigger_total_tokens_overrides_rejects_non_json_string():
+    with pytest.raises(ValidationError):
+        mod.Pipe.Valves(trigger_total_tokens_overrides_json="not json")
+
+
+def test_trigger_total_tokens_overrides_rejects_non_list_overrides():
+    payload = json.dumps({"overrides": {"model_patterns": ["claude-*"], "trigger_total_tokens": 1}})
+
+    with pytest.raises(ValidationError):
+        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+
+
+def test_trigger_total_tokens_overrides_rejects_empty_model_patterns():
+    payload = json.dumps({"overrides": [{"model_patterns": [], "trigger_total_tokens": 160000}]})
+
+    with pytest.raises(ValidationError):
+        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+
+
+def test_trigger_total_tokens_overrides_rejects_zero_trigger_total_tokens():
+    payload = json.dumps({"overrides": [{"model_patterns": ["claude-*"], "trigger_total_tokens": 0}]})
+
+    with pytest.raises(ValidationError):
+        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+
+
+def test_trigger_total_tokens_overrides_rejects_unknown_root_key():
+    payload = json.dumps(
+        {
+            "overrides": [{"model_patterns": ["claude-*"], "trigger_total_tokens": 100}],
+            "soft_trigger_total_tokens": 50,
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+
+
+def test_trigger_total_tokens_overrides_rejects_unknown_override_key():
+    payload = json.dumps(
+        {
+            "overrides": [
+                {"model_patterns": ["*"], "trigger_total_tokens": 100, "soft_trigger_total_tokens": 50}
+            ]
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+
+
+def test_resolve_trigger_total_tokens_matches_target_model_id_and_name():
+    valves = mod.Pipe.Valves(
+        trigger_total_tokens=100000,
+        trigger_total_tokens_overrides_json=json.dumps(
+            {"overrides": [{"model_patterns": ["claude-*"], "trigger_total_tokens": 160000}]}
+        ),
+    )
+
+    by_id = mod.resolve_trigger_total_tokens(valves, {"id": "claude-sonnet", "name": "Anthropic"})
+    by_name = mod.resolve_trigger_total_tokens(valves, {"id": "anthropic-1", "name": "claude-opus"})
+
+    assert by_id == 160000
+    assert by_name == 160000
+
+
+def test_resolve_trigger_total_tokens_first_match_wins():
+    valves = mod.Pipe.Valves(
+        trigger_total_tokens=100000,
+        trigger_total_tokens_overrides_json=json.dumps(
+            {
+                "overrides": [
+                    {"model_patterns": ["claude-opus"], "trigger_total_tokens": 950000},
+                    {"model_patterns": ["claude-*"], "trigger_total_tokens": 160000},
+                ]
+            }
+        ),
+    )
+
+    resolved = mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus", "name": "Opus"})
+
+    assert resolved == 950000
+
+
+def test_resolve_trigger_total_tokens_treats_brackets_as_glob_character_class():
+    # Consistent with include/exclude patterns: model_patterns go through fnmatch,
+    # so "[1m]" is a character class (one of "1"/"m"), not the literal suffix "[1m]".
+    valves = mod.Pipe.Valves(
+        trigger_total_tokens=100000,
+        trigger_total_tokens_overrides_json=json.dumps(
+            {"overrides": [{"model_patterns": ["claude-opus-4-8[1m]"], "trigger_total_tokens": 950000}]}
+        ),
+    )
+
+    literal_bracket = mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-8[1m]", "name": "Opus 1M"})
+    char_class_hit = mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-81", "name": "Opus"})
+
+    assert literal_bracket == 100000
+    assert char_class_hit == 950000
+
+
+def test_resolve_trigger_total_tokens_falls_back_to_global_default_on_no_match():
+    valves = mod.Pipe.Valves(
+        trigger_total_tokens=100000,
+        trigger_total_tokens_overrides_json=json.dumps(
+            {"overrides": [{"model_patterns": ["claude-*"], "trigger_total_tokens": 160000}]}
+        ),
+    )
+
+    resolved = mod.resolve_trigger_total_tokens(valves, {"id": "gpt-4.1", "name": "GPT"})
+
+    assert resolved == 100000
+
+
+def test_resolve_trigger_total_tokens_falls_back_when_overrides_empty():
+    valves = mod.Pipe.Valves(trigger_total_tokens=123456)
+
+    resolved = mod.resolve_trigger_total_tokens(valves, {"id": "claude-sonnet", "name": "Anthropic"})
+
+    assert resolved == 123456
 
 
 def test_usage_extraction_handles_chat_completions_and_responses_api_shapes():
@@ -5274,6 +5424,206 @@ async def test_pipe_reuses_existing_checkpoint_even_when_previous_compacted_usag
     assert "existing summary" in forwarded["messages"][0]["content"]
     assert forwarded["messages"][1:] == [{"role": "user", "content": "active"}]
     assert events == []
+
+
+def _install_threshold_decision_stubs(monkeypatch, captured, *, total_tokens):
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": total_tokens, "input_tokens": total_tokens, "output_tokens": 0}
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def get_or_create_checkpoint_summary(**kwargs):
+        return "summary text"
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+
+def _compactable_body():
+    return {
+        "model": mod.build_wrapper_model_id("auto_compact", "target"),
+        "stream": True,
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_pipe_override_lowers_threshold_and_triggers_compaction(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    captured = {}
+    _install_threshold_decision_stubs(monkeypatch, captured, total_tokens=500)
+
+    pipe = mod.Pipe()
+    # Global default would NOT compact 500 tokens, but the per-model override (100) does.
+    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_total_tokens_overrides_json = json.dumps(
+        {"overrides": [{"model_patterns": ["target"], "trigger_total_tokens": 100}]}
+    )
+
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    await pipe.pipe(
+        _compactable_body(),
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
+        "auto_compaction_compacting",
+        "auto_compaction_compacted",
+    ]
+    assert "summary text" in captured["forward_body"]["messages"][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_override_raises_threshold_and_skips_compaction(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    captured = {}
+    _install_threshold_decision_stubs(monkeypatch, captured, total_tokens=500)
+
+    pipe = mod.Pipe()
+    # Global default would compact 500 tokens, but the per-model override (1000000) keeps it forwarding.
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_total_tokens_overrides_json = json.dumps(
+        {"overrides": [{"model_patterns": ["target"], "trigger_total_tokens": 1000000}]}
+    )
+
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = await pipe.pipe(
+        _compactable_body(),
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"ok": True}
+    assert events == []
+    assert captured["forward_body"]["messages"] == _compactable_body()["messages"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_override_non_match_uses_global_trigger_total_tokens(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    captured = {}
+    _install_threshold_decision_stubs(monkeypatch, captured, total_tokens=500)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    # Override targets a different model, so the global default (100) is used and 500 tokens compacts.
+    pipe.valves.trigger_total_tokens_overrides_json = json.dumps(
+        {"overrides": [{"model_patterns": ["other-*"], "trigger_total_tokens": 1000000}]}
+    )
+
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    await pipe.pipe(
+        _compactable_body(),
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
+        "auto_compaction_compacting",
+        "auto_compaction_compacted",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipe_empty_overrides_json_preserves_global_threshold_behavior(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    captured = {}
+    _install_threshold_decision_stubs(monkeypatch, captured, total_tokens=500)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    assert pipe.valves.trigger_total_tokens_overrides_json == ""
+
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    await pipe.pipe(
+        _compactable_body(),
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
+        "auto_compaction_compacting",
+        "auto_compaction_compacted",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipe_returns_error_when_overrides_json_invalid_at_runtime(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 500, "input_tokens": 500, "output_tokens": 0}
+
+    async def forward_target(**kwargs):
+        captured["forwarded"] = True
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    # Bypass save-time validation (validate_assignment is off) to simulate a tampered stored value.
+    pipe.valves.trigger_total_tokens_overrides_json = "not json"
+
+    result = await pipe.pipe(
+        _compactable_body(),
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=None,
+    )
+
+    assert result["error"]["code"] == "invalid_trigger_total_tokens_overrides"
+    assert "forwarded" not in captured
 
 
 def test_task_template_selection_matches_core_whitespace_rules(pipe_request):

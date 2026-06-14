@@ -29,7 +29,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
 
 from fastapi import HTTPException
 from open_webui.constants import TASKS
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -2114,6 +2114,50 @@ def _matches_any_pattern(model: dict[str, Any], patterns: list[str]) -> bool:
     model_id = str(model.get("id") or "")
     name = str(model.get("name") or "")
     return any(fnmatch.fnmatchcase(model_id, pattern) or fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+def parse_trigger_total_tokens_overrides(value: str) -> list[dict[str, Any]]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        root = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"trigger_total_tokens_overrides_json must be valid JSON: {exc}") from exc
+    if not isinstance(root, dict):
+        raise ValueError("trigger_total_tokens_overrides_json must be a JSON object")
+    unknown_root_keys = set(root) - {"schema_version", "overrides"}
+    if unknown_root_keys:
+        raise ValueError(f"trigger_total_tokens_overrides_json has unknown keys: {sorted(unknown_root_keys)}")
+    schema_version = root.get("schema_version", 1)
+    if schema_version != 1:
+        raise ValueError("trigger_total_tokens_overrides_json schema_version must be 1")
+    raw_overrides = root.get("overrides", [])
+    if not isinstance(raw_overrides, list):
+        raise ValueError("trigger_total_tokens_overrides_json overrides must be a list")
+    overrides: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_overrides):
+        if not isinstance(raw, dict):
+            raise ValueError(f"overrides[{index}] must be an object")
+        unknown_override_keys = set(raw) - {"model_patterns", "trigger_total_tokens"}
+        if unknown_override_keys:
+            raise ValueError(f"overrides[{index}] has unknown keys: {sorted(unknown_override_keys)}")
+        patterns = raw.get("model_patterns")
+        if not isinstance(patterns, list) or not patterns or not all(isinstance(p, str) and p for p in patterns):
+            raise ValueError(f"overrides[{index}].model_patterns must be a non-empty list of strings")
+        threshold = raw.get("trigger_total_tokens")
+        if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 1:
+            raise ValueError(f"overrides[{index}].trigger_total_tokens must be an integer >= 1")
+        overrides.append({"model_patterns": list(patterns), "trigger_total_tokens": threshold})
+    return overrides
+
+
+def resolve_trigger_total_tokens(valves: Any, target_model: dict[str, Any]) -> int:
+    overrides = parse_trigger_total_tokens_overrides(getattr(valves, "trigger_total_tokens_overrides_json", ""))
+    for override in overrides:
+        if _matches_any_pattern(target_model, override["model_patterns"]):
+            return int(override["trigger_total_tokens"])
+    return int(valves.trigger_total_tokens)
 
 
 def _is_arena_model(model: dict[str, Any]) -> bool:
@@ -5322,7 +5366,18 @@ class Pipe:
         trigger_total_tokens: int = Field(
             default=100000,
             ge=1,
-            description="Usage-token threshold that starts compaction. Requires the provider/Open WebUI response to report accurate token usage.",
+            description="Global usage-token threshold that starts compaction. Requires the provider/Open WebUI response to report accurate token usage. Override per model with trigger_total_tokens_overrides_json.",
+        )
+        trigger_total_tokens_overrides_json: str = Field(
+            default="",
+            description=(
+                "Optional JSON object overriding trigger_total_tokens per model. Shape: "
+                '{"overrides": [{"model_patterns": ["claude-*", "Claude *"], "trigger_total_tokens": 160000}]}. '
+                "model_patterns are shell-style patterns matched against target model id/name (same as include/exclude); "
+                "overrides are evaluated top-to-bottom and the first match wins, otherwise trigger_total_tokens applies. "
+                'A literal "[" is a glob class, so to match e.g. "claude-opus-4-8[1m]" write "claude-opus-4-8[[]1m]". '
+                "Empty disables overrides. Invalid JSON or unknown keys are rejected on save."
+            ),
         )
         force_include_usage: bool = Field(
             default=True,
@@ -5355,6 +5410,13 @@ class Pipe:
             ge=0,
             description="Maximum number of recent historical user-message excerpts saved in new checkpoints and inserted into compacted context. Set 0 to disable excerpts.",
         )
+
+        @field_validator("trigger_total_tokens_overrides_json")
+        @classmethod
+        def _validate_trigger_total_tokens_overrides_json(cls, value: str) -> str:
+            parse_trigger_total_tokens_overrides(value)
+            return value
+
         pass
 
     def __init__(self):
@@ -5490,8 +5552,16 @@ class Pipe:
             messages=inner.get("messages") if isinstance(inner.get("messages"), list) else [],
         )
         total_tokens = _usage_total(usage)
+        target_model_for_limits = models.get(identity.target_model_id) or {
+            "id": identity.target_model_id,
+            "name": identity.target_model_id,
+        }
+        try:
+            effective_trigger_total_tokens = resolve_trigger_total_tokens(self.valves, target_model_for_limits)
+        except ValueError as exc:
+            return _error_response(str(exc), code="invalid_trigger_total_tokens_overrides")
         usage_should_compact = (
-            supported_context and total_tokens is not None and total_tokens >= self.valves.trigger_total_tokens
+            supported_context and total_tokens is not None and total_tokens >= effective_trigger_total_tokens
         )
         reusable_checkpoint_match = None
         if supported_context:
