@@ -5309,52 +5309,51 @@ class Pipe:
         )
         include_model_patterns: str = Field(
             default="",
-            description="Comma-separated shell-style patterns matched against target model id and display name.",
+            description="Comma-separated shell-style patterns for target model id/name. Empty wraps all eligible models; when set, only matches are wrapped.",
         )
         exclude_model_patterns: str = Field(
             default="",
-            description="Comma-separated shell-style patterns matched against target model id and display name.",
+            description="Comma-separated shell-style patterns for target model id/name. Empty excludes nothing; applied after include, matches are not wrapped.",
         )
         summary_model: str = Field(
             default="",
-            description="Optional admin-selected Open WebUI model for summarization. Empty means use the decoded target model.",
+            description="Optional Open WebUI model for summarization. Recommended empty: use the same underlying target model this wrapper calls, preserving quality and prompt-cache reuse for cost efficiency.",
         )
         trigger_total_tokens: int = Field(
             default=100000,
             ge=1,
-            description="Provider-reported total token threshold that starts compaction.",
+            description="Usage-token threshold that starts compaction. Requires the provider/Open WebUI response to report accurate token usage.",
         )
         force_include_usage: bool = Field(
             default=True,
-            description="Set stream_options.include_usage=true on copied streaming target requests when supported.",
+            description="Default-on convenience setting: add stream_options.include_usage=true to streaming target requests so supporting providers return usage even if per-model usage was not enabled. Disable to manage usage per model.",
         )
         compact_task_prompts_from_task_body: bool = Field(
             default=False,
             description=(
-                "Opt in to compacting Open WebUI task requests by rebuilding the task prompt from metadata.task_body. "
-                "This can reuse checkpoints for task prompts, but it does not support inlet/pipeline filters that "
-                "rewrite body.messages without also updating metadata.task_body."
+                "For supported Open WebUI task requests only, rebuild the task prompt from metadata.task_body "
+                "so checkpoints can be reused. If inlet/pipeline filters rewrite body.messages without "
+                "also updating metadata.task_body, those rewrites are not included in the rebuilt task prompt."
             ),
         )
         summary_tool_policy: SummaryToolPolicy = Field(
             default="fallback_on_tool_call",
             description=(
-                "Controls summary requests for tool-enabled chats. The default fallback_on_tool_call keeps tool "
-                "definitions on the first summary request to preserve provider-visible request shape and prompt-cache "
-                "reuse, then retries without tools only if the summary model actually emits a tool call. "
-                "always_strip removes tools up front for dedicated summary models or when cache reuse is unimportant. "
-                "error_on_tool_call keeps tools and fails instead of silently retrying if a tool call is returned."
+                "Controls summary requests for tool-enabled chats. Forced tool_choice/function_call is disabled in all modes. "
+                "Recommended default fallback_on_tool_call keeps tool definitions on the first request to preserve "
+                "provider-visible shape and maximize prompt-cache reuse opportunities, then retries without tools only if the summary model emits a tool call. "
+                "always_strip removes tools before the first request. error_on_tool_call keeps tools and fails on tool calls."
             ),
         )
         historical_message_excerpt_bytes: int = Field(
             default=DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
             ge=1,
-            description="Maximum UTF-8 bytes retained from the middle-truncated text of each historical user message.",
+            description="Maximum UTF-8 bytes per saved historical user-message excerpt. New checkpoints store middle-truncated excerpts; saved excerpts are reused unchanged.",
         )
         historical_message_excerpt_count: int = Field(
             default=DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
             ge=0,
-            description="Maximum number of recent historical user messages inserted as middle-truncated excerpts. Set 0 to disable excerpts.",
+            description="Maximum number of recent historical user-message excerpts saved in new checkpoints and inserted into compacted context. Set 0 to disable excerpts.",
         )
         pass
 
