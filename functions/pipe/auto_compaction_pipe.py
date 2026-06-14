@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import codecs
 import copy
-import fnmatch
 import hashlib
 import html
 import json
@@ -2110,10 +2109,28 @@ def _split_patterns(text: str) -> list[str]:
     return [part.strip() for part in str(text or "").replace("\n", ",").split(",") if part.strip()]
 
 
+def _wildcard_to_regex(pattern: str) -> str:
+    # Only "*" (any run) and "?" (single char) are wildcards; everything else is literal.
+    # Model ids contain "[" / "]" verbatim, so unlike fnmatch we never treat them as classes.
+    out = []
+    for ch in pattern:
+        if ch == "*":
+            out.append(".*")
+        elif ch == "?":
+            out.append(".")
+        else:
+            out.append(re.escape(ch))
+    return "".join(out)
+
+
 def _matches_any_pattern(model: dict[str, Any], patterns: list[str]) -> bool:
     model_id = str(model.get("id") or "")
     name = str(model.get("name") or "")
-    return any(fnmatch.fnmatchcase(model_id, pattern) or fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+    for pattern in patterns:
+        regex = _wildcard_to_regex(pattern)
+        if re.fullmatch(regex, model_id) is not None or re.fullmatch(regex, name) is not None:
+            return True
+    return False
 
 
 def parse_trigger_total_tokens_overrides(value: str) -> list[dict[str, Any]]:
@@ -5373,9 +5390,10 @@ class Pipe:
             description=(
                 "Optional JSON object overriding trigger_total_tokens per model. Shape: "
                 '{"overrides": [{"model_patterns": ["claude-*", "Claude *"], "trigger_total_tokens": 160000}]}. '
-                "model_patterns are shell-style patterns matched against target model id/name (same as include/exclude); "
-                "overrides are evaluated top-to-bottom and the first match wins, otherwise trigger_total_tokens applies. "
-                'A literal "[" is a glob class, so to match e.g. "claude-opus-4-8[1m]" write "claude-opus-4-8[[]1m]". '
+                "model_patterns match against target model id/name (same as include/exclude); only * (any run) "
+                'and ? (single char) are wildcards and everything else is literal, so "[" needs no escaping: '
+                '"claude-opus-4-8[1m]" matches that exact id and "*[1m]" matches every id ending in "[1m]". '
+                "Overrides are evaluated top-to-bottom and the first match wins, otherwise trigger_total_tokens applies. "
                 "Empty disables overrides. Invalid JSON or unknown keys are rejected on save."
             ),
         )

@@ -1995,9 +1995,9 @@ def test_resolve_trigger_total_tokens_first_match_wins():
     assert resolved == 950000
 
 
-def test_resolve_trigger_total_tokens_treats_brackets_as_glob_character_class():
-    # Consistent with include/exclude patterns: model_patterns go through fnmatch,
-    # so "[1m]" is a character class (one of "1"/"m"), not the literal suffix "[1m]".
+def test_resolve_trigger_total_tokens_matches_literal_bracket_id_without_escaping():
+    # "[" and "]" are literal (not glob classes), so a bracketed id matches as-is and a
+    # different id does not accidentally match via character-class expansion.
     valves = mod.Pipe.Valves(
         trigger_total_tokens=100000,
         trigger_total_tokens_overrides_json=json.dumps(
@@ -2005,11 +2005,35 @@ def test_resolve_trigger_total_tokens_treats_brackets_as_glob_character_class():
         ),
     )
 
-    literal_bracket = mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-8[1m]", "name": "Opus 1M"})
-    char_class_hit = mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-81", "name": "Opus"})
+    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-8[1m]", "name": "Opus 1M"}) == 950000
+    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-81", "name": "Opus"}) == 100000
 
-    assert literal_bracket == 100000
-    assert char_class_hit == 950000
+
+def test_resolve_trigger_total_tokens_bulk_matches_bracket_suffix_with_wildcard():
+    # Motivating bulk case: one override for every "[1m]" model id via "*[1m]".
+    valves = mod.Pipe.Valves(
+        trigger_total_tokens=100000,
+        trigger_total_tokens_overrides_json=json.dumps(
+            {"overrides": [{"model_patterns": ["*[1m]"], "trigger_total_tokens": 950000}]}
+        ),
+    )
+
+    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-8[1m]", "name": "Opus"}) == 950000
+    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-fable-5[1m]", "name": "Fable"}) == 950000
+    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-8", "name": "Opus"}) == 100000
+
+
+def test_matches_any_pattern_uses_star_question_wildcards_with_literal_brackets():
+    model = {"id": "claude-opus-4-8[1m]", "name": "Opus 1M"}
+
+    assert mod._matches_any_pattern(model, ["claude-opus-4-8[1m]"])  # exact id, brackets literal
+    assert mod._matches_any_pattern(model, ["Opus 1M"])  # exact name
+    assert mod._matches_any_pattern(model, ["*[1m]"])  # bulk suffix, brackets literal
+    assert mod._matches_any_pattern(model, ["claude-*"])  # "*" wildcard
+    assert mod._matches_any_pattern(model, ["claude-?pus-4-8[1m]"])  # "?" single char
+    assert not mod._matches_any_pattern(model, ["gpt-*"])  # non-match
+    # character classes are not special: "[1m]" never expands to one-of "1"/"m"
+    assert not mod._matches_any_pattern({"id": "claude-opus-4-81", "name": "Opus"}, ["claude-opus-4-8[1m]"])
 
 
 def test_resolve_trigger_total_tokens_falls_back_to_global_default_on_no_match():
