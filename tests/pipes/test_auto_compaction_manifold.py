@@ -3,7 +3,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 import asyncio
 import copy
+import inspect
 import json
+import math
 import sys
 import types
 
@@ -1889,6 +1891,20 @@ def test_trigger_total_tokens_overrides_default_is_empty_string():
     assert valves.trigger_total_tokens_overrides_json == ""
 
 
+def test_soft_trigger_ratio_default_resolves_against_hard_trigger():
+    valves = mod.Pipe.Valves()
+
+    assert valves.soft_trigger_ratio == 0.8
+    assert (
+        mod.resolve_soft_trigger_total_tokens(
+            valves,
+            {"id": "target", "name": "Target"},
+            valves.trigger_total_tokens,
+        )
+        == 80000
+    )
+
+
 def test_trigger_total_tokens_overrides_empty_string_is_valid():
     valves = mod.Pipe.Valves(trigger_total_tokens_overrides_json="")
 
@@ -1962,6 +1978,22 @@ def test_trigger_total_tokens_overrides_rejects_unknown_override_key():
         mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
 
 
+def test_trigger_total_tokens_overrides_accepts_soft_trigger_ratio_without_hard_threshold():
+    payload = json.dumps({"overrides": [{"model_patterns": ["claude-*"], "soft_trigger_ratio": 0.5}]})
+
+    valves = mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+
+    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-sonnet", "name": "Sonnet"}) == 100000
+    assert (
+        mod.resolve_soft_trigger_total_tokens(
+            valves,
+            {"id": "claude-sonnet", "name": "Sonnet"},
+            100000,
+        )
+        == 50000
+    )
+
+
 def test_resolve_trigger_total_tokens_matches_target_model_id_and_name():
     valves = mod.Pipe.Valves(
         trigger_total_tokens=100000,
@@ -2021,6 +2053,60 @@ def test_resolve_trigger_total_tokens_bulk_matches_bracket_suffix_with_wildcard(
     assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-8[1m]", "name": "Opus"}) == 950000
     assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-fable-5[1m]", "name": "Fable"}) == 950000
     assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-8", "name": "Opus"}) == 100000
+
+
+def test_resolve_soft_trigger_total_tokens_uses_effective_hard_threshold():
+    valves = mod.Pipe.Valves(soft_trigger_ratio=0.75)
+
+    assert mod.resolve_soft_trigger_total_tokens(valves, {"id": "target", "name": "Target"}, 1000) == 750
+    assert mod.resolve_soft_trigger_total_tokens(valves, {"id": "target", "name": "Target"}, 1001) == 750
+
+
+def test_resolve_soft_trigger_total_tokens_uses_model_ratio_override():
+    valves = mod.Pipe.Valves(
+        soft_trigger_ratio=0.8,
+        trigger_total_tokens_overrides_json=json.dumps(
+            {"overrides": [{"model_patterns": ["claude-*"], "soft_trigger_ratio": 0.5}]}
+        ),
+    )
+
+    assert mod.resolve_soft_trigger_total_tokens(valves, {"id": "claude-sonnet", "name": "Sonnet"}, 1000) == 500
+    assert mod.resolve_soft_trigger_total_tokens(valves, {"id": "other", "name": "Other"}, 1000) == 800
+
+
+def test_resolve_soft_trigger_total_tokens_zero_ratio_disables_prefetch():
+    global_disabled = mod.Pipe.Valves(soft_trigger_ratio=0)
+    override_disabled = mod.Pipe.Valves(
+        soft_trigger_ratio=0.8,
+        trigger_total_tokens_overrides_json=json.dumps(
+            {"overrides": [{"model_patterns": ["claude-*"], "soft_trigger_ratio": 0}]}
+        ),
+    )
+
+    assert mod.resolve_soft_trigger_total_tokens(global_disabled, {"id": "target", "name": "Target"}, 1000) is None
+    assert (
+        mod.resolve_soft_trigger_total_tokens(
+            override_disabled,
+            {"id": "claude-sonnet", "name": "Sonnet"},
+            1000,
+        )
+        is None
+    )
+
+
+def test_soft_trigger_ratio_rejects_one_or_greater():
+    with pytest.raises(ValidationError):
+        mod.Pipe.Valves(soft_trigger_ratio=1)
+
+    with pytest.raises(ValidationError):
+        mod.Pipe.Valves(soft_trigger_ratio=math.nan)
+
+
+def test_trigger_total_tokens_overrides_rejects_non_finite_soft_trigger_ratio():
+    payload = json.dumps({"overrides": [{"model_patterns": ["claude-*"], "soft_trigger_ratio": math.nan}]})
+
+    with pytest.raises(ValidationError):
+        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
 
 
 def test_matches_any_pattern_uses_star_question_wildcards_with_literal_brackets():
@@ -7834,3 +7920,541 @@ async def test_pipe_does_not_compact_internal_summary_task(monkeypatch, pipe_req
     await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
 
     assert captured["forward_body"]["messages"] == body["messages"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_does_not_launch_completed_turn_soft_prefetch_for_internal_summary_task(
+    monkeypatch, pipe_request, pipe_user
+):
+    calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 150, "input_tokens": 150, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def forward_target(**kwargs):
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "summary answer"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+    def start_soft_prefetch(**kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        return True
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    metadata = {"chat_id": "chat-1", "message_id": "msg-1", "task": mod.INTERNAL_SUMMARY_TASK}
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_launches_soft_prefetch_below_hard_without_foreground_compaction(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 150, "input_tokens": 150, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("soft prefetch must not synchronously generate summaries")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        captured["on_complete"] = kwargs.get("on_complete")
+        return {"ok": True}
+
+    def start_soft_prefetch(**kwargs):
+        assert "target_model_id" not in kwargs
+        captured["prefetch"] = copy.deepcopy(kwargs)
+        return True
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result == {"ok": True}
+    assert captured["forward_body"]["messages"] == body["messages"]
+    assert captured["prefetch"]["body"]["messages"] == body["messages"]
+    assert callable(captured["on_complete"])
+
+
+def test_soft_prefetch_internal_signatures_do_not_carry_target_model_id():
+    start_signature = inspect.signature(mod._start_soft_compaction_prefetch)
+    prefetch_signature = inspect.signature(mod._prefetch_compaction_checkpoint)
+
+    assert "target_model_id" not in start_signature.parameters
+    assert "target_model_id" not in prefetch_signature.parameters
+    assert "source_messages" in prefetch_signature.parameters
+
+
+def test_soft_prefetch_task_release_logs_background_exception(monkeypatch):
+    captured = {}
+
+    class DoneTask:
+        def exception(self):
+            raise RuntimeError("prefetch failed")
+
+    def log_exception(message, *args):
+        captured["message"] = message
+        captured["args"] = args
+
+    key = ("namespace", "user", "chat", "pipe", "profile", "source")
+    mod._SOFT_PREFETCH_INFLIGHT_KEYS.add(key)
+    monkeypatch.setattr(mod.LOG, "exception", log_exception)
+
+    mod._release_soft_prefetch_task(key, DoneTask())
+
+    assert key not in mod._SOFT_PREFETCH_INFLIGHT_KEYS
+    assert captured == {
+        "message": (
+            "Soft compaction prefetch task failed for user_id=%s chat_id=%s "
+            "pipe_function_id=%s source_hash=%s"
+        ),
+        "args": ("user", "chat", "pipe", "source"),
+    }
+
+
+def test_soft_prefetch_task_release_logs_returned_task_exception(monkeypatch):
+    captured = {}
+    exc = RuntimeError("prefetch failed")
+
+    class DoneTask:
+        def exception(self):
+            return exc
+
+    def log_error(message, *args, exc_info=None):
+        captured["message"] = message
+        captured["args"] = args
+        captured["exc_info"] = exc_info
+
+    key = ("namespace", "user", "chat", "pipe", "profile", "source")
+    mod._SOFT_PREFETCH_INFLIGHT_KEYS.add(key)
+    monkeypatch.setattr(mod.LOG, "error", log_error)
+
+    mod._release_soft_prefetch_task(key, DoneTask())
+
+    assert key not in mod._SOFT_PREFETCH_INFLIGHT_KEYS
+    assert captured == {
+        "message": (
+            "Soft compaction prefetch task failed for user_id=%s chat_id=%s "
+            "pipe_function_id=%s source_hash=%s"
+        ),
+        "args": ("user", "chat", "pipe", "source"),
+        "exc_info": (RuntimeError, exc, exc.__traceback__),
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_soft_prefetch_passes_selected_source_messages_to_task(monkeypatch, pipe_user):
+    selected_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    calls = {"source_selection": 0}
+    launched = {}
+
+    def soft_prefetch_source_messages(body):
+        calls["source_selection"] += 1
+        return copy.deepcopy(selected_source)
+
+    async def get_or_create_compaction_summary(
+        *,
+        request,
+        user,
+        user_id,
+        chat_id,
+        pipe_function_id,
+        metadata,
+        summary_model_id,
+        base_body,
+        source_messages,
+        summary_meta,
+        parent_checkpoint=None,
+        summary_tool_policy,
+        historical_message_excerpt_bytes,
+        historical_message_excerpt_count,
+    ):
+        launched["source_messages"] = copy.deepcopy(source_messages)
+        return "summary"
+
+    def launch_soft_prefetch_task(key, coro):
+        launched["key"] = key
+        launched["coro"] = coro
+        return True
+
+    monkeypatch.setattr(mod, "_soft_prefetch_source_messages", soft_prefetch_source_messages)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(mod, "_launch_soft_prefetch_task", launch_soft_prefetch_task)
+
+    assert (
+        mod._start_soft_compaction_prefetch(
+            request=object(),
+            user=pipe_user,
+            metadata={"chat_id": "chat-1"},
+            body={
+                "model": "target",
+                "messages": [
+                    {"role": "user", "content": "old"},
+                    {"role": "assistant", "content": "old answer"},
+                    {"role": "user", "content": "active"},
+                ],
+            },
+            pipe_function_id="auto_compact",
+            summary_model_id="target",
+            summary_tool_policy="fallback_on_tool_call",
+            historical_message_excerpt_bytes=1024,
+            historical_message_excerpt_count=3,
+        )
+        is True
+    )
+
+    await launched["coro"]
+
+    assert calls["source_selection"] == 1
+    assert launched["source_messages"] == selected_source
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_uses_tool_aware_source_prefix(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    captured = {}
+
+    async def get_or_create_compaction_summary(
+        *,
+        request,
+        user,
+        user_id,
+        chat_id,
+        pipe_function_id,
+        metadata,
+        summary_model_id,
+        base_body,
+        source_messages,
+        summary_meta,
+        parent_checkpoint=None,
+        summary_tool_policy,
+        historical_message_excerpt_bytes,
+        historical_message_excerpt_count,
+    ):
+        captured["source_messages"] = copy.deepcopy(source_messages)
+        return "summary"
+
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+
+    messages = [
+        {"role": "user", "content": "active request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+    ]
+    source_messages = mod._soft_prefetch_source_messages({"model": "target", "messages": messages})
+    assert source_messages == messages[:3]
+
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        metadata=pipe_metadata,
+        body={"model": "target", "messages": messages},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+    )
+
+    assert prefetched is True
+    assert captured["source_messages"] == messages[:3]
+
+
+def test_start_soft_prefetch_preserves_uncopyable_metadata_references(monkeypatch, pipe_user):
+    class Uncopyable:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("cannot copy")
+
+    launched = {}
+
+    def launch_soft_prefetch_task(key, coro):
+        launched["key"] = key
+        coro.close()
+        return True
+
+    monkeypatch.setattr(mod, "_launch_soft_prefetch_task", launch_soft_prefetch_task)
+
+    metadata = {"chat_id": "chat-1", "uncopyable": Uncopyable()}
+    body = {
+        "model": "target",
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    assert (
+        mod._start_soft_compaction_prefetch(
+            request=object(),
+            user=pipe_user,
+            metadata=metadata,
+            body=body,
+            pipe_function_id="auto_compact",
+            summary_model_id="target",
+            summary_tool_policy="fallback_on_tool_call",
+            historical_message_excerpt_bytes=1024,
+            historical_message_excerpt_count=3,
+        )
+        is True
+    )
+    assert launched["key"][2] == "chat-1"
+
+
+@pytest.mark.asyncio
+async def test_pipe_launches_completed_turn_soft_prefetch_for_non_tool_response(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 150, "input_tokens": 150, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def forward_target(**kwargs):
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "answer"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+    def start_soft_prefetch(**kwargs):
+        assert "target_model_id" not in kwargs
+        assert mod._soft_prefetch_source_messages(kwargs["body"])
+        calls.append(copy.deepcopy(kwargs))
+        return True
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert len(calls) == 2
+    completed_messages = calls[-1]["body"]["messages"]
+    assert completed_messages == [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": ""},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipe_skips_completed_turn_soft_prefetch_for_tool_call_response(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 150, "input_tokens": 150, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def forward_target(**kwargs):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"id": "call-1", "type": "function"}],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+
+    def start_soft_prefetch(**kwargs):
+        assert "target_model_id" not in kwargs
+        assert mod._soft_prefetch_source_messages(kwargs["body"])
+        calls.append(copy.deepcopy(kwargs))
+        return True
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert len(calls) == 1
+    assert calls[0]["body"]["messages"] == body["messages"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_completion_observer_reports_text_completion():
+    observed = []
+    chunks = [
+        b'data: {"choices": [{"delta": {"content": "hel"}}]}\n\n',
+        b'data: {"choices": [{"delta": {"content": "lo"}}]}\n\n',
+        b'data: {"usage": {"total_tokens": 150}}\n\n',
+    ]
+    response = StreamingResponse(iter(chunks), media_type="text/event-stream")
+
+    wrapped = mod._attach_streaming_completion_observer(response, observed.append)
+    emitted = [chunk async for chunk in wrapped.body_iterator]
+
+    assert emitted == chunks
+    assert observed == [
+        {
+            "assistant_message": {"role": "assistant", "content": "hello"},
+            "usage": {"total_tokens": 150, "input_tokens": 0, "output_tokens": 0},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streaming_completion_observer_skips_tool_call_completion():
+    observed = []
+    chunks = [
+        b'data: {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-1"}]}}]}\n\n',
+        b'data: {"usage": {"total_tokens": 150}}\n\n',
+    ]
+    response = StreamingResponse(iter(chunks), media_type="text/event-stream")
+
+    wrapped = mod._attach_streaming_completion_observer(response, observed.append)
+    emitted = [chunk async for chunk in wrapped.body_iterator]
+
+    assert emitted == chunks
+    assert observed == []

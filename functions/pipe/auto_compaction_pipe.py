@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.1.2
+version: 0.2.0
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -16,6 +16,7 @@ import copy
 import hashlib
 import html
 import json
+import logging
 import math
 import re
 import time
@@ -97,6 +98,7 @@ PROVIDER_MODEL_CACHE_ENABLE_FLAGS = {
 }
 MISSING_CORE_REQUEST = object()
 TARGET_MODEL_RECORD_UNKNOWN = object()
+LOG = logging.getLogger(__name__)
 COMPACTION_SUMMARY_EMBED_MARKER = "<!--auto-compaction-summary-embed:v1-->"
 SUMMARY_PROMPT = (
     "You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY for an Open WebUI chat. "
@@ -167,6 +169,8 @@ CHECKPOINT_TABLE = Table(
 _CHECKPOINT_SCHEMA_READY = False
 _SCHEMA_INIT_LOCKS: dict[Any, asyncio.Lock] = {}
 _GENERATION_LOCKS: dict[tuple[str, str, str, str, str, str], asyncio.Lock] = {}
+_SOFT_PREFETCH_TASKS: set[asyncio.Task] = set()
+_SOFT_PREFETCH_INFLIGHT_KEYS: set[tuple[str, str, str, str, str, str]] = set()
 
 
 def get_generation_lock(key: tuple[str, str, str, str, str, str]) -> asyncio.Lock:
@@ -178,6 +182,53 @@ def release_generation_lock(key: tuple[str, str, str, str, str, str], lock: asyn
     has_waiters = bool(waiters)
     if not lock.locked() and not has_waiters and _GENERATION_LOCKS.get(key) is lock:
         _GENERATION_LOCKS.pop(key, None)
+
+
+def _release_soft_prefetch_task(
+    key: tuple[str, str, str, str, str, str],
+    task: asyncio.Task,
+) -> None:
+    _SOFT_PREFETCH_INFLIGHT_KEYS.discard(key)
+    _SOFT_PREFETCH_TASKS.discard(task)
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        LOG.exception(
+            "Soft compaction prefetch task failed for user_id=%s chat_id=%s pipe_function_id=%s source_hash=%s",
+            key[1],
+            key[2],
+            key[3],
+            key[5],
+        )
+        return
+    if isinstance(exc, BaseException):
+        LOG.error(
+            "Soft compaction prefetch task failed for user_id=%s chat_id=%s pipe_function_id=%s source_hash=%s",
+            key[1],
+            key[2],
+            key[3],
+            key[5],
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+
+def _launch_soft_prefetch_task(
+    key: tuple[str, str, str, str, str, str],
+    coro: Awaitable[Any],
+) -> bool:
+    if key in _SOFT_PREFETCH_INFLIGHT_KEYS:
+        with suppress(Exception):
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+        return False
+    _SOFT_PREFETCH_INFLIGHT_KEYS.add(key)
+    task = asyncio.create_task(coro)
+    _SOFT_PREFETCH_TASKS.add(task)
+    task.add_done_callback(lambda done: _release_soft_prefetch_task(key, done))
+    return True
 
 
 @dataclass(frozen=True)
@@ -2156,25 +2207,62 @@ def parse_trigger_total_tokens_overrides(value: str) -> list[dict[str, Any]]:
     for index, raw in enumerate(raw_overrides):
         if not isinstance(raw, dict):
             raise ValueError(f"overrides[{index}] must be an object")
-        unknown_override_keys = set(raw) - {"model_patterns", "trigger_total_tokens"}
+        unknown_override_keys = set(raw) - {"model_patterns", "trigger_total_tokens", "soft_trigger_ratio"}
         if unknown_override_keys:
             raise ValueError(f"overrides[{index}] has unknown keys: {sorted(unknown_override_keys)}")
         patterns = raw.get("model_patterns")
         if not isinstance(patterns, list) or not patterns or not all(isinstance(p, str) and p for p in patterns):
             raise ValueError(f"overrides[{index}].model_patterns must be a non-empty list of strings")
-        threshold = raw.get("trigger_total_tokens")
-        if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 1:
-            raise ValueError(f"overrides[{index}].trigger_total_tokens must be an integer >= 1")
-        overrides.append({"model_patterns": list(patterns), "trigger_total_tokens": threshold})
+        override: dict[str, Any] = {"model_patterns": list(patterns)}
+        if "trigger_total_tokens" in raw:
+            threshold = raw.get("trigger_total_tokens")
+            if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 1:
+                raise ValueError(f"overrides[{index}].trigger_total_tokens must be an integer >= 1")
+            override["trigger_total_tokens"] = threshold
+        if "soft_trigger_ratio" in raw:
+            ratio = raw.get("soft_trigger_ratio")
+            if (
+                isinstance(ratio, bool)
+                or not isinstance(ratio, (int, float))
+                or not math.isfinite(ratio)
+                or ratio < 0
+                or ratio >= 1
+            ):
+                raise ValueError(f"overrides[{index}].soft_trigger_ratio must be a number >= 0 and < 1")
+            override["soft_trigger_ratio"] = float(ratio)
+        if "trigger_total_tokens" not in override and "soft_trigger_ratio" not in override:
+            raise ValueError(f"overrides[{index}] must set trigger_total_tokens or soft_trigger_ratio")
+        overrides.append(override)
     return overrides
 
 
 def resolve_trigger_total_tokens(valves: Any, target_model: dict[str, Any]) -> int:
     overrides = parse_trigger_total_tokens_overrides(getattr(valves, "trigger_total_tokens_overrides_json", ""))
     for override in overrides:
-        if _matches_any_pattern(target_model, override["model_patterns"]):
+        if "trigger_total_tokens" in override and _matches_any_pattern(target_model, override["model_patterns"]):
             return int(override["trigger_total_tokens"])
     return int(valves.trigger_total_tokens)
+
+
+def resolve_soft_trigger_ratio(valves: Any, target_model: dict[str, Any]) -> float:
+    overrides = parse_trigger_total_tokens_overrides(getattr(valves, "trigger_total_tokens_overrides_json", ""))
+    for override in overrides:
+        if "soft_trigger_ratio" in override and _matches_any_pattern(target_model, override["model_patterns"]):
+            return float(override["soft_trigger_ratio"])
+    return float(getattr(valves, "soft_trigger_ratio", 0.8) or 0)
+
+
+def resolve_soft_trigger_total_tokens(
+    valves: Any,
+    target_model: dict[str, Any],
+    hard_trigger_total_tokens: int,
+) -> int | None:
+    soft_trigger_ratio = resolve_soft_trigger_ratio(valves, target_model)
+    hard_trigger_total_tokens = int(hard_trigger_total_tokens)
+    soft_trigger_total_tokens = int(hard_trigger_total_tokens * soft_trigger_ratio)
+    if soft_trigger_total_tokens <= 0 or soft_trigger_total_tokens >= hard_trigger_total_tokens:
+        return None
+    return soft_trigger_total_tokens
 
 
 def _is_arena_model(model: dict[str, Any]) -> bool:
@@ -4042,6 +4130,65 @@ def _stream_payload_text(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _observe_streaming_completion_payload(payload: dict[str, Any], state: dict[str, Any]) -> None:
+    usage = extract_usage_from_stream_payload(payload)
+    if usage:
+        state["usage"] = usage
+    if _stream_payload_has_tool_call(payload):
+        state["saw_tool_call"] = True
+    text = _stream_payload_text(payload)
+    if text:
+        state.setdefault("parts", []).append(text)
+
+
+async def _streaming_completion_observer(
+    iterator: AsyncIterator[bytes | str],
+    *,
+    media_type: str,
+    on_complete: Callable[[dict[str, Any]], Any],
+) -> AsyncIterator[bytes | str]:
+    state: dict[str, Any] = {"parts": [], "usage": None, "saw_tool_call": False}
+    is_sse_response = "text/event-stream" in (media_type or "").lower()
+    parser = _SSEJSONEventParser() if is_sse_response else None
+    async for raw_chunk in iterator:
+        chunk = _coerce_stream_chunk(raw_chunk)
+        if is_sse_response and parser is not None:
+            events = parser.feed(chunk)
+        else:
+            events = extract_sse_json_events(chunk)
+        for payload in events:
+            _observe_streaming_completion_payload(payload, state)
+        yield raw_chunk
+    if is_sse_response and parser is not None:
+        for payload in parser.flush():
+            _observe_streaming_completion_payload(payload, state)
+    if state.get("saw_tool_call"):
+        return
+    content = "".join(state.get("parts") or [])
+    if not content:
+        return
+    with suppress(Exception):
+        on_complete(
+            {
+                "assistant_message": {"role": "assistant", "content": content},
+                "usage": state.get("usage"),
+            }
+        )
+
+
+def _attach_streaming_completion_observer(
+    response: StreamingResponse,
+    on_complete: Callable[[dict[str, Any]], Any],
+) -> StreamingResponse:
+    media_type = response.headers.get("content-type", getattr(response, "media_type", "") or "")
+    response.body_iterator = _streaming_completion_observer(
+        response.body_iterator,
+        media_type=media_type,
+        on_complete=on_complete,
+    )
+    return response
+
+
 def _stream_payload_is_control_event(payload: dict[str, Any]) -> bool:
     if "error" in payload or "usage" in payload:
         return True
@@ -4636,6 +4783,143 @@ async def _lookup_ready_checkpoint_for_source(
     )
 
 
+def _soft_prefetch_source_messages(body: dict[str, Any]) -> list[dict[str, Any]] | None:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 2:
+        return None
+    tool_cut = select_tool_result_compaction_cut(messages)
+    if tool_cut is not None and tool_cut.summarization_prefix:
+        return copy.deepcopy(tool_cut.summarization_prefix)
+    cut = select_safe_message_cut(messages)
+    if cut.summarization_prefix:
+        return copy.deepcopy(cut.summarization_prefix)
+    return None
+
+
+async def _prefetch_compaction_checkpoint(
+    *,
+    request: Any,
+    user: Any,
+    user_id: str,
+    chat_id: str,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    summary_model_id: str,
+    source_messages: list[dict[str, Any]],
+    summary_tool_policy: SummaryToolPolicy,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> bool:
+    if not source_messages:
+        return False
+    if not user_id or not _chat_id_supported(chat_id):
+        return False
+    summary_meta = build_checkpoint_summary_meta(
+        source_messages,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+    await _get_or_create_compaction_summary(
+        request=request,
+        user=user,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        metadata=metadata,
+        summary_model_id=summary_model_id,
+        base_body=body,
+        source_messages=source_messages,
+        summary_meta=summary_meta,
+        summary_tool_policy=summary_tool_policy,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+    return True
+
+
+def _start_soft_compaction_prefetch(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    summary_model_id: str,
+    summary_tool_policy: SummaryToolPolicy,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> bool:
+    source_messages = _soft_prefetch_source_messages(body)
+    if not source_messages:
+        return False
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user or {}).get("id") or "")
+    if not user_id or not _chat_id_supported(chat_id):
+        return False
+    key = (
+        CHECKPOINT_NAMESPACE,
+        user_id,
+        chat_id,
+        pipe_function_id,
+        compute_profile_hash(),
+        compute_source_hash(source_messages),
+    )
+    return _launch_soft_prefetch_task(
+        key,
+        _prefetch_compaction_checkpoint(
+            request=request,
+            user=copy.deepcopy(user),
+            user_id=user_id,
+            chat_id=chat_id,
+            metadata=_copy_metadata_preserving_references(metadata),
+            body=_copy_body_preserving_metadata(body),
+            pipe_function_id=pipe_function_id,
+            summary_model_id=summary_model_id,
+            source_messages=source_messages,
+            summary_tool_policy=summary_tool_policy,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        ),
+    )
+
+
+def _choice_assistant_message_for_prefetch(choice: Any) -> dict[str, Any] | None:
+    if _choice_has_tool_call(choice):
+        return None
+    content = _choice_message_text(choice)
+    if content is None:
+        return None
+    return {"role": "assistant", "content": content}
+
+
+def _assistant_message_for_completed_prefetch(response: Any) -> dict[str, Any] | None:
+    if not isinstance(response, dict) or response.get("error"):
+        return None
+    if _responses_output_has_tool_call(response):
+        return None
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices:
+        return _choice_assistant_message_for_prefetch(choices[0])
+    responses_text = _responses_output_text(response)
+    if isinstance(responses_text, str):
+        return {"role": "assistant", "content": responses_text}
+    return None
+
+
+def _completed_turn_prefetch_body(body: dict[str, Any], assistant_message: dict[str, Any]) -> dict[str, Any] | None:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    completed = _copy_body_preserving_metadata(body)
+    completed["messages"] = [
+        *copy.deepcopy(messages),
+        copy.deepcopy(assistant_message),
+        {"role": "user", "content": ""},
+    ]
+    return completed
+
+
 async def _find_reusable_checkpoint_for_source(
     *,
     store: Any,
@@ -5013,15 +5297,19 @@ async def _forward_streaming_target(
     chat_id: str | None,
     message_id: str | None,
     wrapper_model_id: str,
+    on_complete: Callable[[dict[str, Any]], Any] | None = None,
 ) -> StreamingResponse:
     response = await _call_target_completion(request=request, user=user, body=body)
-    return await prepare_streaming_response(
+    prepared = await prepare_streaming_response(
         response,
         request=request,
         chat_id=chat_id,
         message_id=message_id,
         wrapper_model_id=wrapper_model_id,
     )
+    if on_complete is not None:
+        return _attach_streaming_completion_observer(prepared, on_complete)
+    return prepared
 
 
 async def _coerce_non_streaming_completion_response(response: Any, *, model_id: str) -> dict[str, Any]:
@@ -5385,15 +5673,21 @@ class Pipe:
             ge=1,
             description="Global usage-token threshold that starts compaction. Requires the provider/Open WebUI response to report accurate token usage. Override per model with trigger_total_tokens_overrides_json.",
         )
+        soft_trigger_ratio: float = Field(
+            default=0.8,
+            ge=0,
+            lt=1,
+            description="Ratio of the effective trigger_total_tokens that starts background checkpoint prefetch before hard compaction. Set 0 to disable. Override per model with soft_trigger_ratio in trigger_total_tokens_overrides_json.",
+        )
         trigger_total_tokens_overrides_json: str = Field(
             default="",
             description=(
-                "Optional JSON object overriding trigger_total_tokens per model. Shape: "
-                '{"overrides": [{"model_patterns": ["claude-*", "Claude *"], "trigger_total_tokens": 160000}]}. '
+                "Optional JSON object overriding trigger_total_tokens and/or soft_trigger_ratio per model. Shape: "
+                '{"overrides": [{"model_patterns": ["claude-*", "Claude *"], "trigger_total_tokens": 160000, "soft_trigger_ratio": 0.75}]}. '
                 "model_patterns match against target model id/name (same as include/exclude); only * (any run) "
                 'and ? (single char) are wildcards and everything else is literal, so "[" needs no escaping: '
                 '"claude-opus-4-8[1m]" matches that exact id and "*[1m]" matches every id ending in "[1m]". '
-                "Overrides are evaluated top-to-bottom and the first match wins, otherwise trigger_total_tokens applies. "
+                "For each setting, overrides are evaluated top-to-bottom and the first matching override containing that setting wins; soft_trigger_ratio must be >= 0 and < 1. "
                 "Empty disables overrides. Invalid JSON or unknown keys are rejected on save."
             ),
         )
@@ -5581,6 +5875,19 @@ class Pipe:
         usage_should_compact = (
             supported_context and total_tokens is not None and total_tokens >= effective_trigger_total_tokens
         )
+        effective_soft_trigger_total_tokens = resolve_soft_trigger_total_tokens(
+            self.valves,
+            target_model_for_limits,
+            effective_trigger_total_tokens,
+        )
+        soft_should_prefetch = (
+            supported_context
+            and not is_summary_task
+            and total_tokens is not None
+            and effective_soft_trigger_total_tokens is not None
+            and total_tokens >= effective_soft_trigger_total_tokens
+            and total_tokens < effective_trigger_total_tokens
+        )
         reusable_checkpoint_match = None
         if supported_context:
             try:
@@ -5602,6 +5909,46 @@ class Pipe:
             if reusable_checkpoint_match is not None and not usage_should_compact
             else None
         )
+        if soft_should_prefetch:
+            _start_soft_compaction_prefetch(
+                request=__request__,
+                user=user,
+                metadata=metadata,
+                body=checkpoint_lookup_body,
+                pipe_function_id=identity.pipe_function_id,
+                summary_model_id=summary_model_id,
+                summary_tool_policy=self.valves.summary_tool_policy,
+                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+            )
+
+        def launch_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
+            if effective_soft_trigger_total_tokens is None:
+                return
+            completion_total_tokens = _usage_total(completion.get("usage")) or total_tokens
+            if (
+                completion_total_tokens is None
+                or completion_total_tokens < effective_soft_trigger_total_tokens
+                or completion_total_tokens >= effective_trigger_total_tokens
+            ):
+                return
+            assistant_message = completion.get("assistant_message")
+            if not isinstance(assistant_message, dict):
+                return
+            completed_body = _completed_turn_prefetch_body(checkpoint_lookup_body, assistant_message)
+            if completed_body is None:
+                return
+            _start_soft_compaction_prefetch(
+                request=__request__,
+                user=user,
+                metadata=metadata,
+                body=completed_body,
+                pipe_function_id=identity.pipe_function_id,
+                summary_model_id=summary_model_id,
+                summary_tool_policy=self.valves.summary_tool_policy,
+                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+            )
 
         attempt = 0
         compacted_once = False
@@ -5713,19 +6060,31 @@ class Pipe:
 
             try:
                 if is_streaming:
-                    return await _forward_streaming_target(
-                        request=__request__,
-                        user=user,
-                        body=candidate,
-                        chat_id=str(chat_id) if chat_id else None,
-                        message_id=str(message_id) if message_id else None,
-                        wrapper_model_id=selected_wrapper_id,
-                    )
-                return await _forward_non_streaming_target(
+                    streaming_kwargs = {
+                        "request": __request__,
+                        "user": user,
+                        "body": candidate,
+                        "chat_id": str(chat_id) if chat_id else None,
+                        "message_id": str(message_id) if message_id else None,
+                        "wrapper_model_id": selected_wrapper_id,
+                    }
+                    if effective_soft_trigger_total_tokens is not None and not is_summary_task:
+                        streaming_kwargs["on_complete"] = launch_completed_turn_soft_prefetch
+                    return await _forward_streaming_target(**streaming_kwargs)
+                response = await _forward_non_streaming_target(
                     request=__request__,
                     user=user,
                     body=candidate,
                 )
+                assistant_message = None if is_summary_task else _assistant_message_for_completed_prefetch(response)
+                if assistant_message is not None:
+                    launch_completed_turn_soft_prefetch(
+                        {
+                            "assistant_message": assistant_message,
+                            "usage": response.get("usage") if isinstance(response, dict) else None,
+                        }
+                    )
+                return response
             except RetryableContextOverflow:
                 if not supported_context or attempt >= MAX_CONTEXT_RETRY_ATTEMPTS:
                     error_response = _context_exhaustion_error_response(
