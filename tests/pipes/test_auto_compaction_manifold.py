@@ -3022,6 +3022,16 @@ async def test_non_context_json_response_is_returned_as_sse_event():
     assert emitted == ['data: {"error":{"code":"provider_error","message":"unavailable"}}\n\n']
 
 
+def test_sse_data_chunk_preserves_single_event_multiline_payloads():
+    assert mod._sse_data_chunk("line1") == "data: line1\n\n"
+    assert mod._sse_data_chunk("line1\nline2") == "data: line1\ndata: line2\n\n"
+    assert mod._sse_data_chunk("line1\rline2\r\nline3") == "data: line1\ndata: line2\ndata: line3\n\n"
+    assert mod._sse_data_chunk("line1\n") == "data: line1\n\n"
+    assert mod._sse_data_chunk("line1\u2028line2\u2029line3\x85line4") == (
+        "data: line1\u2028line2\u2029line3\x85line4\n\n"
+    )
+
+
 @pytest.mark.asyncio
 async def test_non_context_json_detail_response_is_returned_as_sse_error_event():
     request = SimpleNamespace(state=SimpleNamespace())

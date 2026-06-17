@@ -3258,7 +3258,13 @@ def _json_from_response(response: Response) -> Any:
 
 
 def _sse_data_chunk(data: str) -> str:
-    return f"data: {data}\n\n"
+    text = str(data)
+    lines = re.split(r"\r\n|\r|\n", text)
+    if lines and lines[-1] == "" and text.endswith(("\r", "\n")):
+        lines = lines[:-1]
+    if not lines:
+        lines = [""]
+    return "".join(f"data: {line}\n" for line in lines) + "\n"
 
 
 def _response_to_sse_chunk(response: Response) -> str:
