@@ -8468,3 +8468,26 @@ async def test_streaming_completion_observer_skips_tool_call_completion():
 
     assert emitted == chunks
     assert observed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_chunk",
+    [
+        b'data: {"error": {"code": "provider_error", "message": "boom"}}\n\n',
+        b'data: {"type": "response.failed", "response": {"error": {"code": "server_error", "message": "boom"}}}\n\n',
+    ],
+)
+async def test_streaming_completion_observer_skips_error_terminated_completion(error_chunk):
+    observed = []
+    chunks = [
+        b'data: {"choices": [{"delta": {"content": "hel"}}]}\n\n',
+        error_chunk,
+    ]
+    response = StreamingResponse(iter(chunks), media_type="text/event-stream")
+
+    wrapped = mod._attach_streaming_completion_observer(response, observed.append)
+    emitted = [chunk async for chunk in wrapped.body_iterator]
+
+    assert emitted == chunks
+    assert observed == []

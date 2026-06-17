@@ -4137,6 +4137,9 @@ def _stream_payload_text(payload: dict[str, Any]) -> str | None:
 
 
 def _observe_streaming_completion_payload(payload: dict[str, Any], state: dict[str, Any]) -> None:
+    if _stream_payload_error_source(payload) is not None:
+        state["saw_error"] = True
+        return
     usage = extract_usage_from_stream_payload(payload)
     if usage:
         state["usage"] = usage
@@ -4153,7 +4156,7 @@ async def _streaming_completion_observer(
     media_type: str,
     on_complete: Callable[[dict[str, Any]], Any],
 ) -> AsyncIterator[bytes | str]:
-    state: dict[str, Any] = {"parts": [], "usage": None, "saw_tool_call": False}
+    state: dict[str, Any] = {"parts": [], "usage": None, "saw_tool_call": False, "saw_error": False}
     is_sse_response = "text/event-stream" in (media_type or "").lower()
     parser = _SSEJSONEventParser() if is_sse_response else None
     async for raw_chunk in iterator:
@@ -4168,7 +4171,7 @@ async def _streaming_completion_observer(
     if is_sse_response and parser is not None:
         for payload in parser.flush():
             _observe_streaming_completion_payload(payload, state)
-    if state.get("saw_tool_call"):
+    if state.get("saw_tool_call") or state.get("saw_error"):
         return
     content = "".join(state.get("parts") or [])
     if not content:
