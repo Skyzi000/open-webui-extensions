@@ -267,7 +267,7 @@ async def test_sync_wrapper_model_records_preserves_existing_wrapper_hidden_when
     assert len(calls["updated"]) == 1
     updated_id, updated_form = calls["updated"][0]
     assert updated_id == wrapper_id
-    assert updated_form.name == "Compact: Target"
+    assert updated_form.name == "Target (AutoCompact)"
     assert updated_form.meta.hidden is True
 
 
@@ -345,7 +345,7 @@ async def test_sync_wrapper_model_records_restores_target_hidden_when_hide_valve
     existing_wrapper = FakeModelForm(
         id=wrapper_id,
         base_model_id=None,
-        name="Compact: Target",
+        name="Target (AutoCompact)",
         params=FakeModelParams(),
         meta=FakeModelMeta(
             auto_compaction={
@@ -381,7 +381,7 @@ async def test_sync_wrapper_model_records_keeps_current_wrapper_desired_when_tar
         active_wrapper_id: FakeModelForm(
             id=active_wrapper_id,
             base_model_id=None,
-            name="Compact: Active",
+            name="Active (AutoCompact)",
             params=FakeModelParams(temperature=0.1),
             meta=FakeModelMeta(
                 auto_compaction={
@@ -409,7 +409,7 @@ async def test_sync_wrapper_model_records_keeps_current_wrapper_desired_when_tar
     )
 
     updated_by_id = {model_id: model_form for model_id, model_form in calls["updated"]}
-    assert updated_by_id[active_wrapper_id].name == "Compact: Active Target"
+    assert updated_by_id[active_wrapper_id].name == "Active Target"
     assert updated_by_id[active_wrapper_id].params.stream_response is True
     assert updated_by_id[active_wrapper_id].is_active is True
 
@@ -503,7 +503,7 @@ async def test_sync_wrapper_model_records_restores_target_when_wrapper_update_fa
         wrapper_id: FakeModelForm(
             id=wrapper_id,
             base_model_id=None,
-            name="Compact: Target",
+        name="Target (AutoCompact)",
             params=FakeModelParams(),
             meta=FakeModelMeta(
                 auto_compaction={
@@ -550,7 +550,7 @@ async def test_sync_wrapper_model_records_deactivates_stale_managed_wrappers(mon
         stale_wrapper_id: FakeModelForm(
             id=stale_wrapper_id,
             base_model_id=None,
-            name="Compact: Stale",
+        name="Stale Target (AutoCompact)",
             params=FakeModelParams(),
             meta=FakeModelMeta(
                 hidden=True,
@@ -616,7 +616,7 @@ async def test_sync_wrapper_model_records_restores_hidden_target_before_deactiva
         stale_wrapper_id: FakeModelForm(
             id=stale_wrapper_id,
             base_model_id=None,
-            name="Compact: Stale",
+        name="Stale Target (AutoCompact)",
             params=FakeModelParams(),
             meta=FakeModelMeta(
                 auto_compaction={
@@ -733,7 +733,7 @@ async def test_sync_wrapper_model_records_keeps_preexisting_hidden_target_when_r
         stale_wrapper_id: FakeModelForm(
             id=stale_wrapper_id,
             base_model_id=None,
-            name="Compact: Stale",
+        name="Stale Target (AutoCompact)",
             params=FakeModelParams(),
             meta=FakeModelMeta(
                 auto_compaction={
@@ -781,7 +781,7 @@ async def test_sync_wrapper_model_records_keeps_stale_wrapper_active_when_target
         stale_wrapper_id: FakeModelForm(
             id=stale_wrapper_id,
             base_model_id=None,
-            name="Compact: Stale",
+            name="Stale Target (AutoCompact)",
             params=FakeModelParams(),
             meta=FakeModelMeta(
                 auto_compaction={
@@ -983,10 +983,10 @@ async def test_pipes_uses_runtime_registered_id_for_filtering_and_sync(monkeypat
         "target_ids": ["target", mod.build_wrapper_model_id("auto_compact", "target")],
     }
     assert result == [
-        {"id": "target", "name": "Compact: Target"},
+        {"id": "target", "name": "Target (AutoCompact)"},
         {
             "id": mod.build_wrapper_model_id("auto_compact", "target"),
-            "name": "Compact: Other Registered Wrapper",
+            "name": "Other Registered Wrapper (AutoCompact)",
         },
     ]
 
@@ -1063,7 +1063,7 @@ async def test_pipes_waits_for_sibling_provider_cache_population(monkeypatch):
         await task
 
     assert captured["target_ids"] == ["sibling-target"]
-    assert result == [{"id": "sibling-target", "name": "Compact: Sibling Target"}]
+    assert result == [{"id": "sibling-target", "name": "Sibling Target (AutoCompact)"}]
 
 
 @pytest.mark.asyncio
@@ -1101,8 +1101,8 @@ async def test_pipes_waits_for_all_enabled_provider_cache_population(monkeypatch
     assert sleep_calls == 2
     assert captured["target_ids"] == ["openai-target", "ollama-target"]
     assert result == [
-        {"id": "openai-target", "name": "Compact: OpenAI Target"},
-        {"id": "ollama-target", "name": "Compact: Ollama Target"},
+        {"id": "openai-target", "name": "OpenAI Target (AutoCompact)"},
+        {"id": "ollama-target", "name": "Ollama Target (AutoCompact)"},
     ]
 
 
@@ -1138,8 +1138,8 @@ async def test_pipes_waits_when_one_of_multiple_provider_caches_is_still_empty(m
     assert sleep_calls == 1
     assert captured["target_ids"] == ["openai-target", "ollama-target"]
     assert result == [
-        {"id": "openai-target", "name": "Compact: OpenAI Target"},
-        {"id": "ollama-target", "name": "Compact: Ollama Target"},
+        {"id": "openai-target", "name": "OpenAI Target (AutoCompact)"},
+        {"id": "ollama-target", "name": "Ollama Target (AutoCompact)"},
     ]
 
 
@@ -1170,7 +1170,7 @@ async def test_pipes_does_not_wait_for_disabled_provider_cache(monkeypatch):
     result = await mod.Pipe().pipes()
 
     assert captured["target_ids"] == ["openai-target"]
-    assert result == [{"id": "openai-target", "name": "Compact: OpenAI Target"}]
+    assert result == [{"id": "openai-target", "name": "OpenAI Target (AutoCompact)"}]
 
 
 @pytest.mark.asyncio
@@ -1213,8 +1213,8 @@ async def test_pipes_excludes_disabled_provider_stale_cache_models(monkeypatch):
 
     assert captured["target_ids"] == ["other-pipe.child", "workspace-preset"]
     assert result == [
-        {"id": "other-pipe.child", "name": "Compact: Other Pipe"},
-        {"id": "workspace-preset", "name": "Compact: Workspace Preset"},
+        {"id": "other-pipe.child", "name": "Other Pipe (AutoCompact)"},
+        {"id": "workspace-preset", "name": "Workspace Preset (AutoCompact)"},
     ]
 
 
@@ -1386,7 +1386,7 @@ async def test_pipes_waits_for_ollama_two_stage_provider_refresh(monkeypatch):
 
     assert sleep_calls == 25
     assert captured["target_ids"] == ["ollama-target"]
-    assert result == [{"id": "ollama-target", "name": "Compact: Ollama Target"}]
+    assert result == [{"id": "ollama-target", "name": "Ollama Target (AutoCompact)"}]
 
 
 @pytest.mark.asyncio
@@ -1424,7 +1424,7 @@ async def test_pipes_normalizes_ollama_provider_cache_models(monkeypatch):
             "tags": ["local"],
         }
     ]
-    assert result == [{"id": "llama3.2:latest", "name": "Compact: Llama 3.2"}]
+    assert result == [{"id": "llama3.2:latest", "name": "Llama 3.2 (AutoCompact)"}]
 
 
 @pytest.mark.asyncio
@@ -1460,7 +1460,7 @@ async def test_pipes_waits_until_core_model_list_timeout_for_sibling_provider_ca
 
     assert sleep_calls == 25
     assert captured["target_ids"] == ["slow-target"]
-    assert result == [{"id": "slow-target", "name": "Compact: Slow Target"}]
+    assert result == [{"id": "slow-target", "name": "Slow Target (AutoCompact)"}]
 
 
 @pytest.mark.asyncio
@@ -1606,6 +1606,89 @@ def test_include_exclude_patterns_match_id_and_name_and_deduplicate_targets():
     assert [m["id"] for m in targets] == ["gpt-4.1", "claude-sonnet"]
 
 
+def test_wrapper_model_name_template_auto_uses_target_name_when_target_hidden():
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    form = mod.build_wrapper_model_form(
+        pipe_function_id="auto_compact",
+        function_owner_user_id="owner-1",
+        target_model={"id": "gpt-4.1", "name": "GPT"},
+        valves=valves,
+    )
+
+    assert form["name"] == "GPT"
+
+
+def test_wrapper_model_name_template_supports_postfix_template():
+    form = mod.build_wrapper_model_form(
+        pipe_function_id="auto_compact",
+        function_owner_user_id="owner-1",
+        target_model={"id": "gpt-4.1", "name": "GPT"},
+        valves=mod.Pipe.Valves(model_name_template="{target_name} (AutoCompact)"),
+    )
+
+    assert form["name"] == "GPT (AutoCompact)"
+
+
+@pytest.mark.parametrize("template", ["{target_name.foo}", "{target_id[bad]}"])
+def test_wrapper_model_name_template_falls_back_for_unsupported_format_syntax(template):
+    form = mod.build_wrapper_model_form(
+        pipe_function_id="auto_compact",
+        function_owner_user_id="owner-1",
+        target_model={"id": "gpt-4.1", "name": "GPT"},
+        valves=mod.Pipe.Valves(model_name_template=template),
+    )
+
+    assert form["name"] == "GPT (AutoCompact)"
+
+
+def test_wrapper_model_name_template_rejects_format_width_specs():
+    form = mod.build_wrapper_model_form(
+        pipe_function_id="auto_compact",
+        function_owner_user_id="owner-1",
+        target_model={"id": "gpt-4.1", "name": "GPT"},
+        valves=mod.Pipe.Valves(model_name_template="{target_name:>100000}"),
+    )
+
+    assert len(form["name"]) < 1000
+    assert form["name"] == "GPT (AutoCompact)"
+
+
+@pytest.mark.parametrize("target_name", ["Model {target_id}", "Model {v2}"])
+def test_wrapper_model_name_template_does_not_reinterpret_target_name_braces(target_name):
+    form = mod.build_wrapper_model_form(
+        pipe_function_id="auto_compact",
+        function_owner_user_id="owner-1",
+        target_model={"id": "gpt-4.1", "name": target_name},
+        valves=mod.Pipe.Valves(model_name_template="Wrapped: {target_name}"),
+    )
+
+    assert form["name"] == f"Wrapped: {target_name}"
+
+
+def test_wrapper_model_name_template_does_not_reinterpret_target_id_braces():
+    form = mod.build_wrapper_model_form(
+        pipe_function_id="auto_compact",
+        function_owner_user_id="owner-1",
+        target_model={"id": "provider/{target_name}", "name": "GPT"},
+        valves=mod.Pipe.Valves(model_name_template="Wrapped: {target_id}"),
+    )
+
+    assert form["name"] == "Wrapped: provider/{target_name}"
+
+
+def test_wrapper_model_name_prefix_is_not_migrated_to_template():
+    form = mod.build_wrapper_model_form(
+        pipe_function_id="auto_compact",
+        function_owner_user_id="owner-1",
+        target_model={"id": "gpt-4.1", "name": "GPT"},
+        valves=mod.Pipe.Valves(model_name_prefix="Legacy: "),
+    )
+
+    assert form["name"] == "GPT (AutoCompact)"
+
+
 def test_wrapper_model_records_are_built_for_full_wrapper_id_with_function_owner():
     target = {
         "id": "gpt-4.1",
@@ -1626,13 +1709,13 @@ def test_wrapper_model_records_are_built_for_full_wrapper_id_with_function_owner
         pipe_function_id="auto_compact",
         function_owner_user_id="owner-1",
         target_model=target,
-        valves=mod.Pipe.Valves(model_name_prefix="Compact: "),
+        valves=mod.Pipe.Valves(),
     )
 
     assert form["id"] == mod.build_wrapper_model_id("auto_compact", "gpt-4.1")
     assert form["user_id"] == "owner-1"
     assert form["base_model_id"] is None
-    assert form["name"] == "Compact: GPT"
+    assert form["name"] == "GPT (AutoCompact)"
     assert form["access_grants"] == [
         {
             "id": "grant-1",
@@ -2072,7 +2155,7 @@ async def test_wrapper_sync_does_not_make_base_target_public_without_model_info(
             return {
                 "id": wrapper_id,
                 "base_model_id": None,
-                "name": "Compact: Base Target",
+                "name": "Base Target (AutoCompact)",
                 "params": {},
                 "meta": {
                     "auto_compaction": {
@@ -2165,7 +2248,7 @@ async def test_wrapper_sync_skips_update_when_existing_record_matches(monkeypatc
             return {
                 "id": wrapper_id,
                 "base_model_id": None,
-                "name": "Compact: Same Target",
+            "name": "Same Target (AutoCompact)",
                 "params": {"stream_response": True},
                 "meta": {
                     "auto_compaction": {
@@ -2548,7 +2631,7 @@ async def test_target_access_can_resolve_targets_from_base_model_cache(monkeypat
     pipe_request.app.state.MODELS = {
         mod.build_wrapper_model_id("auto_compact", "LiteLLM.glm-5.1"): {
             "id": mod.build_wrapper_model_id("auto_compact", "LiteLLM.glm-5.1"),
-            "name": "Compact: GLM",
+            "name": "GLM (AutoCompact)",
             "pipe": {"type": "pipe"},
         }
     }

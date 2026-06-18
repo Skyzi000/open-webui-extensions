@@ -2501,6 +2501,32 @@ def build_target_model_contract(target_model: dict[str, Any], target_model_info:
     )
 
 
+def format_wrapper_model_name(
+    target: TargetModelContract,
+    *,
+    template: Any,
+    hide_wrapped_target_models: bool,
+) -> str:
+    template_text = str(template if template is not None else "auto").strip()
+    auto_name = target.name if hide_wrapped_target_models else f"{target.name} (AutoCompact)"
+
+    if not template_text or template_text.lower() == "auto":
+        return auto_name
+
+    # Avoid Python's format mini-language: width specs can allocate huge strings.
+    unsupported_template = template_text.replace("{target_name}", "").replace("{target_id}", "")
+    if "{" in unsupported_template or "}" in unsupported_template:
+        return auto_name
+
+    rendered = re.sub(
+        r"\{target_name\}|\{target_id\}",
+        lambda match: target.name if match.group(0) == "{target_name}" else target.id,
+        template_text,
+    )
+    rendered = rendered.strip()
+    return rendered or auto_name
+
+
 def build_wrapper_model_form(
     *,
     pipe_function_id: str,
@@ -2512,7 +2538,12 @@ def build_wrapper_model_form(
     target = build_target_model_contract(target_model, target_model_info)
     target_id = target.id
     wrapper_id = build_wrapper_model_id(pipe_function_id, target_id)
-    prefix = str(getattr(valves, "model_name_prefix", "Compact: "))
+    hide_wrapped_target_models = bool(getattr(valves, "hide_wrapped_target_models", False))
+    wrapper_name = format_wrapper_model_name(
+        target,
+        template=getattr(valves, "model_name_template", "auto"),
+        hide_wrapped_target_models=hide_wrapped_target_models,
+    )
     access_grants = copy.deepcopy(target.access_grants)
     target_owner = target.owner_user_id
     if target_owner and target_owner != function_owner_user_id:
@@ -2539,7 +2570,7 @@ def build_wrapper_model_form(
         "id": wrapper_id,
         "user_id": function_owner_user_id,
         "base_model_id": None,
-        "name": f"{prefix}{target.name}",
+        "name": wrapper_name,
         "params": copy.deepcopy(target.wrapper_params),
         "meta": meta,
         "access_grants": access_grants,
@@ -6079,9 +6110,12 @@ async def _compact_task_body(
 
 class Pipe:
     class Valves(BaseModel):
-        model_name_prefix: str = Field(
-            default="Compact: ",
-            description="Display prefix for generated compact wrapper models.",
+        model_name_template: str = Field(
+            default="auto",
+            description=(
+                "Wrapper display name template. Use 'auto' to show the raw target name when hide_wrapped_target_models is on, "
+                "otherwise '{target_name} (AutoCompact)'. Available placeholders: {target_name}, {target_id}."
+            ),
         )
         include_model_patterns: str = Field(
             default="",
@@ -6194,11 +6228,19 @@ class Pipe:
         await sync_wrapper_model_records(pipe_function_id=pipe_function_id, target_models=targets, valves=self.valves)
 
         entries: list[dict[str, str]] = []
-        prefix = str(self.valves.model_name_prefix or "")
+        hide_wrapped_target_models = bool(getattr(self.valves, "hide_wrapped_target_models", False))
         for target in targets:
-            target_id = str(target["id"])
-            target_name = str(target.get("name") or target_id)
-            entries.append({"id": encode_target_model_id(target_id), "name": f"{prefix}{target_name}"})
+            target_contract = build_target_model_contract(target, None)
+            entries.append(
+                {
+                    "id": encode_target_model_id(target_contract.id),
+                    "name": format_wrapper_model_name(
+                        target_contract,
+                        template=getattr(self.valves, "model_name_template", "auto"),
+                        hide_wrapped_target_models=hide_wrapped_target_models,
+                    ),
+                }
+            )
         return entries
 
     async def pipe(
