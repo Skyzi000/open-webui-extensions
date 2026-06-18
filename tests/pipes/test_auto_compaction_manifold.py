@@ -107,6 +107,78 @@ def install_fake_open_webui_user_model(monkeypatch):
     return FakeUserModel
 
 
+class FakeModelMeta(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class FakeModelParams(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class FakeModelForm(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    base_model_id: str | None = None
+    name: str
+    meta: FakeModelMeta
+    params: FakeModelParams
+    access_grants: list[dict | None] | None = None
+    is_active: bool = True
+
+
+def install_fake_open_webui_model_modules(monkeypatch, records=None):
+    records = records or {}
+    calls = {
+        "inserted": [],
+        "updated": [],
+        "deleted": [],
+    }
+
+    class FakeFunctions:
+        @staticmethod
+        async def get_function_by_id(function_id):
+            return SimpleNamespace(id=function_id, user_id="function-owner")
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            return records.get(model_id)
+
+        @staticmethod
+        async def get_all_models():
+            return list(records.values())
+
+        @staticmethod
+        async def insert_new_model(model_form, user_id):
+            calls["inserted"].append((model_form, user_id))
+            records[model_form.id] = model_form
+            return model_form
+
+        @staticmethod
+        async def update_model_by_id(model_id, model_form):
+            calls["updated"].append((model_id, model_form))
+            records[model_id] = model_form
+            return model_form
+
+        @staticmethod
+        async def delete_model_by_id(model_id):
+            calls["deleted"].append(model_id)
+            records.pop(model_id, None)
+            return True
+
+    functions_module = types.ModuleType("open_webui.models.functions")
+    functions_module.Functions = FakeFunctions
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.ModelForm = FakeModelForm
+    models_module.ModelMeta = FakeModelMeta
+    models_module.ModelParams = FakeModelParams
+    models_module.Models = FakeModels
+    monkeypatch.setitem(sys.modules, "open_webui.models.functions", functions_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    return records, calls
+
+
 def test_target_filter_excludes_own_wrappers_and_arena_but_allows_other_pipes():
     models = {
         "gpt-4.1": {"id": "gpt-4.1", "name": "GPT"},
@@ -136,6 +208,740 @@ def test_target_filter_excludes_presets_based_on_own_wrappers():
     targets = mod.filter_target_models(models, mod.Pipe.Valves())
 
     assert [m["id"] for m in targets] == ["gpt-4.1", "normal-preset"]
+
+
+def test_wrapper_model_form_does_not_copy_target_hidden():
+    form_payload = mod.build_wrapper_model_form(
+        pipe_function_id="auto_compact",
+        function_owner_user_id="function-owner",
+        target_model={
+            "id": "target",
+            "name": "Target",
+            "info": {
+                "meta": {
+                    "hidden": True,
+                    "description": "target description",
+                },
+                "params": {"temperature": 0.2},
+            },
+        },
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert form_payload["meta"]["description"] == "target description"
+    assert "hidden" not in form_payload["meta"]
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_preserves_existing_wrapper_hidden_when_updating(monkeypatch):
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    existing_wrapper = FakeModelForm(
+        id=wrapper_id,
+        base_model_id=None,
+        name="Old Wrapper Name",
+        params=FakeModelParams(temperature=0.1),
+        meta=FakeModelMeta(
+            hidden=True,
+            auto_compaction={
+                "pipe_function_id": "auto_compact",
+                "target_model_id": "target",
+            },
+        ),
+        access_grants=[],
+        is_active=True,
+    )
+    _, calls = install_fake_open_webui_model_modules(monkeypatch, {wrapper_id: existing_wrapper})
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[
+            {
+                "id": "target",
+                "name": "Target",
+                "info": {"params": {"temperature": 0.2}},
+            }
+        ],
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert len(calls["updated"]) == 1
+    updated_id, updated_form = calls["updated"][0]
+    assert updated_id == wrapper_id
+    assert updated_form.name == "Compact: Target"
+    assert updated_form.meta.hidden is True
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_hides_target_models_when_enabled(monkeypatch):
+    existing_target = FakeModelForm(
+        id="target",
+        base_model_id="provider-target",
+        name="Custom Target Name",
+        params=FakeModelParams(),
+        meta=FakeModelMeta(description="custom target description"),
+        access_grants=[{"principal_type": "group", "principal_id": "team", "permission": "read"}],
+        is_active=True,
+    )
+    _, calls = install_fake_open_webui_model_modules(monkeypatch, {"target": existing_target})
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[
+            {
+                "id": "target",
+                "name": "Target",
+                "info": {
+                    "meta": {"description": "target description"},
+                    "params": {"temperature": 0.2},
+                },
+            }
+        ],
+        valves=valves,
+    )
+
+    updated_by_id = {model_id: model_form for model_id, model_form in calls["updated"]}
+    inserted_by_id = {model_form.id: model_form for model_form, _ in calls["inserted"]}
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    assert updated_by_id["target"].name == "Custom Target Name"
+    assert updated_by_id["target"].base_model_id == "provider-target"
+    assert updated_by_id["target"].params.model_dump(exclude_unset=True) == {}
+    assert updated_by_id["target"].meta.description == "custom target description"
+    assert updated_by_id["target"].meta.hidden is True
+    assert updated_by_id["target"].meta.auto_compaction_target_hidden_by == {
+        "pipe_function_id": "auto_compact",
+        "had_hidden": False,
+        "previous_hidden": False,
+    }
+    assert updated_by_id["target"].access_grants == [
+        {"principal_type": "group", "principal_id": "team", "permission": "read"}
+    ]
+    wrapper_meta = inserted_by_id[wrapper_id].meta.model_dump(exclude_unset=True)
+    assert "hidden" not in wrapper_meta
+    assert "auto_compaction_target_hidden_by" not in wrapper_meta
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_restores_target_hidden_when_hide_valve_disabled(monkeypatch):
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    existing_target = FakeModelForm(
+        id="target",
+        base_model_id="provider-target",
+        name="Custom Target Name",
+        params=FakeModelParams(),
+        meta=FakeModelMeta(
+            hidden=True,
+            auto_compaction_target_hidden_by={
+                "pipe_function_id": "auto_compact",
+                "had_hidden": False,
+                "previous_hidden": False,
+            },
+            description="custom target description",
+        ),
+        access_grants=[],
+        is_active=True,
+    )
+    existing_wrapper = FakeModelForm(
+        id=wrapper_id,
+        base_model_id=None,
+        name="Compact: Target",
+        params=FakeModelParams(),
+        meta=FakeModelMeta(
+            auto_compaction={
+                "pipe_function_id": "auto_compact",
+                "target_model_id": "target",
+            },
+        ),
+        access_grants=[],
+        is_active=True,
+    )
+    _, calls = install_fake_open_webui_model_modules(
+        monkeypatch,
+        {"target": existing_target, wrapper_id: existing_wrapper},
+    )
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "target", "name": "Target"}],
+        valves=mod.Pipe.Valves(),
+    )
+
+    updated_by_id = {model_id: model_form for model_id, model_form in calls["updated"]}
+    target_meta = updated_by_id["target"].meta.model_dump(exclude_unset=True)
+    assert "hidden" not in target_meta
+    assert "auto_compaction_target_hidden_by" not in target_meta
+    assert target_meta["description"] == "custom target description"
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_keeps_current_wrapper_desired_when_target_hide_fails(monkeypatch):
+    active_wrapper_id = mod.build_wrapper_model_id("auto_compact", "active-target")
+    records = {
+        active_wrapper_id: FakeModelForm(
+            id=active_wrapper_id,
+            base_model_id=None,
+            name="Compact: Active",
+            params=FakeModelParams(temperature=0.1),
+            meta=FakeModelMeta(
+                auto_compaction={
+                    "pipe_function_id": "auto_compact",
+                    "target_model_id": "active-target",
+                },
+            ),
+            access_grants=[],
+            is_active=True,
+        )
+    }
+    _, calls = install_fake_open_webui_model_modules(monkeypatch, records)
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    async def fail_hiding_target(**kwargs):
+        raise RuntimeError("target update failed")
+
+    monkeypatch.setattr(mod, "_hide_target_model_record", fail_hiding_target)
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "active-target", "name": "Active Target", "params": {"temperature": 0.3}}],
+        valves=valves,
+    )
+
+    updated_by_id = {model_id: model_form for model_id, model_form in calls["updated"]}
+    assert updated_by_id[active_wrapper_id].name == "Compact: Active Target"
+    assert updated_by_id[active_wrapper_id].params.stream_response is True
+    assert updated_by_id[active_wrapper_id].is_active is True
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_does_not_hide_existing_target_when_wrapper_insert_fails(
+    monkeypatch,
+):
+    existing_target = FakeModelForm(
+        id="target",
+        base_model_id="provider-target",
+        name="Target",
+        params=FakeModelParams(),
+        meta=FakeModelMeta(description="target description"),
+        access_grants=[],
+        is_active=True,
+    )
+    records, calls = install_fake_open_webui_model_modules(monkeypatch, {"target": existing_target})
+    Models = sys.modules["open_webui.models.models"].Models
+    original_insert_new_model = Models.insert_new_model
+
+    async def fail_wrapper_insert(model_form, user_id):
+        if model_form.id == mod.build_wrapper_model_id("auto_compact", "target"):
+            raise RuntimeError("wrapper insert failed")
+        return await original_insert_new_model(model_form, user_id)
+
+    monkeypatch.setattr(Models, "insert_new_model", staticmethod(fail_wrapper_insert))
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "target", "name": "Target"}],
+        valves=valves,
+    )
+
+    target_meta = records["target"].meta.model_dump(exclude_unset=True)
+    assert target_meta == {"description": "target description"}
+    assert calls["updated"] == []
+    assert mod.build_wrapper_model_id("auto_compact", "target") not in records
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_does_not_create_target_override_when_wrapper_insert_fails(
+    monkeypatch,
+):
+    records, calls = install_fake_open_webui_model_modules(monkeypatch)
+    Models = sys.modules["open_webui.models.models"].Models
+    original_insert_new_model = Models.insert_new_model
+
+    async def fail_wrapper_insert(model_form, user_id):
+        if model_form.id == mod.build_wrapper_model_id("auto_compact", "provider-target"):
+            raise RuntimeError("wrapper insert failed")
+        return await original_insert_new_model(model_form, user_id)
+
+    monkeypatch.setattr(Models, "insert_new_model", staticmethod(fail_wrapper_insert))
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "provider-target", "name": "Provider Target"}],
+        valves=valves,
+    )
+
+    assert "provider-target" not in records
+    assert mod.build_wrapper_model_id("auto_compact", "provider-target") not in records
+    assert calls["inserted"] == []
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_restores_target_when_wrapper_update_fails(monkeypatch):
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    records = {
+        "target": FakeModelForm(
+            id="target",
+            base_model_id="provider-target",
+            name="Target",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                hidden=True,
+                auto_compaction_target_hidden_by={
+                    "pipe_function_id": "auto_compact",
+                    "had_hidden": False,
+                    "previous_hidden": False,
+                },
+            ),
+            access_grants=[],
+            is_active=True,
+        ),
+        wrapper_id: FakeModelForm(
+            id=wrapper_id,
+            base_model_id=None,
+            name="Compact: Target",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                auto_compaction={
+                    "pipe_function_id": "auto_compact",
+                    "target_model_id": "target",
+                },
+            ),
+            access_grants=[],
+            is_active=False,
+        ),
+    }
+    records, calls = install_fake_open_webui_model_modules(monkeypatch, records)
+    Models = sys.modules["open_webui.models.models"].Models
+    original_update_model_by_id = Models.update_model_by_id
+
+    async def fail_wrapper_update(model_id, model_form):
+        if model_id == wrapper_id:
+            raise RuntimeError("wrapper update failed")
+        return await original_update_model_by_id(model_id, model_form)
+
+    monkeypatch.setattr(Models, "update_model_by_id", staticmethod(fail_wrapper_update))
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "target", "name": "Target"}],
+        valves=valves,
+    )
+
+    target_meta = records["target"].meta.model_dump(exclude_unset=True)
+    assert "hidden" not in target_meta
+    assert "auto_compaction_target_hidden_by" not in target_meta
+    assert records[wrapper_id].is_active is False
+    assert [model_id for model_id, _ in calls["updated"]] == ["target"]
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_deactivates_stale_managed_wrappers(monkeypatch):
+    active_wrapper_id = mod.build_wrapper_model_id("auto_compact", "active-target")
+    stale_wrapper_id = mod.build_wrapper_model_id("auto_compact", "stale-target")
+    other_pipe_wrapper_id = mod.build_wrapper_model_id("other_pipe", "stale-target")
+    records = {
+        stale_wrapper_id: FakeModelForm(
+            id=stale_wrapper_id,
+            base_model_id=None,
+            name="Compact: Stale",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                hidden=True,
+                auto_compaction={
+                    "pipe_function_id": "auto_compact",
+                    "target_model_id": "stale-target",
+                },
+            ),
+            access_grants=[],
+            is_active=True,
+        ),
+        other_pipe_wrapper_id: FakeModelForm(
+            id=other_pipe_wrapper_id,
+            base_model_id=None,
+            name="Other Pipe",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                auto_compaction={
+                    "pipe_function_id": "other_pipe",
+                    "target_model_id": "stale-target",
+                },
+            ),
+            access_grants=[],
+            is_active=True,
+        ),
+    }
+    _, calls = install_fake_open_webui_model_modules(monkeypatch, records)
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "active-target", "name": "Active Target"}],
+        valves=mod.Pipe.Valves(),
+    )
+
+    updated_by_id = {model_id: model_form for model_id, model_form in calls["updated"]}
+    assert active_wrapper_id not in updated_by_id
+    assert stale_wrapper_id in updated_by_id
+    assert updated_by_id[stale_wrapper_id].is_active is False
+    assert updated_by_id[stale_wrapper_id].meta.hidden is True
+    assert other_pipe_wrapper_id not in updated_by_id
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_restores_hidden_target_before_deactivating_stale_wrapper(monkeypatch):
+    stale_wrapper_id = mod.build_wrapper_model_id("auto_compact", "stale-target")
+    records = {
+        "stale-target": FakeModelForm(
+            id="stale-target",
+            base_model_id="provider-target",
+            name="Stale Target",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                hidden=True,
+                auto_compaction_target_hidden_by={
+                    "pipe_function_id": "auto_compact",
+                    "had_hidden": False,
+                    "previous_hidden": False,
+                },
+            ),
+            access_grants=[],
+            is_active=True,
+        ),
+        stale_wrapper_id: FakeModelForm(
+            id=stale_wrapper_id,
+            base_model_id=None,
+            name="Compact: Stale",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                auto_compaction={
+                    "pipe_function_id": "auto_compact",
+                    "target_model_id": "stale-target",
+                },
+            ),
+            access_grants=[],
+            is_active=True,
+        ),
+    }
+    _, calls = install_fake_open_webui_model_modules(monkeypatch, records)
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[],
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert [model_id for model_id, _ in calls["updated"]] == ["stale-target", stale_wrapper_id]
+    target_meta = calls["updated"][0][1].meta.model_dump(exclude_unset=True)
+    assert "hidden" not in target_meta
+    assert "auto_compaction_target_hidden_by" not in target_meta
+    assert calls["updated"][1][1].is_active is False
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_deletes_pipe_created_target_override_when_stale(monkeypatch):
+    records, calls = install_fake_open_webui_model_modules(monkeypatch)
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "provider-target", "name": "Provider Target"}],
+        valves=valves,
+    )
+
+    target_override = records["provider-target"]
+    assert target_override.meta.hidden is True
+    assert target_override.meta.auto_compaction_target_hidden_by == {
+        "pipe_function_id": "auto_compact",
+        "had_hidden": False,
+        "previous_hidden": False,
+        "created_model_record": True,
+    }
+
+    calls["inserted"].clear()
+    calls["updated"].clear()
+    calls["deleted"].clear()
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[],
+        valves=mod.Pipe.Valves(),
+    )
+
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "provider-target")
+    assert calls["deleted"] == ["provider-target"]
+    assert "provider-target" not in records
+    assert records[wrapper_id].is_active is False
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_deletes_pipe_created_target_override_when_hide_valve_disabled(
+    monkeypatch,
+):
+    records, calls = install_fake_open_webui_model_modules(monkeypatch)
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "provider-target", "name": "Provider Target"}],
+        valves=valves,
+    )
+
+    calls["inserted"].clear()
+    calls["updated"].clear()
+    calls["deleted"].clear()
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "provider-target", "name": "Provider Target"}],
+        valves=mod.Pipe.Valves(),
+    )
+
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "provider-target")
+    assert calls["deleted"] == ["provider-target"]
+    assert "provider-target" not in records
+    assert records[wrapper_id].is_active is True
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_keeps_preexisting_hidden_target_when_restoring(monkeypatch):
+    stale_wrapper_id = mod.build_wrapper_model_id("auto_compact", "stale-target")
+    records = {
+        "stale-target": FakeModelForm(
+            id="stale-target",
+            base_model_id="provider-target",
+            name="Stale Target",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                hidden=True,
+                auto_compaction_target_hidden_by={
+                    "pipe_function_id": "auto_compact",
+                    "had_hidden": True,
+                    "previous_hidden": True,
+                },
+            ),
+            access_grants=[],
+            is_active=True,
+        ),
+        stale_wrapper_id: FakeModelForm(
+            id=stale_wrapper_id,
+            base_model_id=None,
+            name="Compact: Stale",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                auto_compaction={
+                    "pipe_function_id": "auto_compact",
+                    "target_model_id": "stale-target",
+                },
+            ),
+            access_grants=[],
+            is_active=True,
+        ),
+    }
+    _, calls = install_fake_open_webui_model_modules(monkeypatch, records)
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[],
+        valves=mod.Pipe.Valves(),
+    )
+
+    target_meta = calls["updated"][0][1].meta.model_dump(exclude_unset=True)
+    assert target_meta["hidden"] is True
+    assert "auto_compaction_target_hidden_by" not in target_meta
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_keeps_stale_wrapper_active_when_target_restore_fails(monkeypatch):
+    stale_wrapper_id = mod.build_wrapper_model_id("auto_compact", "stale-target")
+    records = {
+        "stale-target": FakeModelForm(
+            id="stale-target",
+            base_model_id="provider-target",
+            name="Stale Target",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                hidden=True,
+                auto_compaction_target_hidden_by={
+                    "pipe_function_id": "auto_compact",
+                    "had_hidden": False,
+                    "previous_hidden": False,
+                },
+            ),
+            access_grants=[],
+            is_active=True,
+        ),
+        stale_wrapper_id: FakeModelForm(
+            id=stale_wrapper_id,
+            base_model_id=None,
+            name="Compact: Stale",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                auto_compaction={
+                    "pipe_function_id": "auto_compact",
+                    "target_model_id": "stale-target",
+                },
+            ),
+            access_grants=[],
+            is_active=True,
+        ),
+    }
+    records, calls = install_fake_open_webui_model_modules(monkeypatch, records)
+    Models = sys.modules["open_webui.models.models"].Models
+    original_update_model_by_id = Models.update_model_by_id
+
+    async def fail_target_restore_update(model_id, model_form):
+        if model_id == "stale-target":
+            raise RuntimeError("restore failed")
+        return await original_update_model_by_id(model_id, model_form)
+
+    monkeypatch.setattr(Models, "update_model_by_id", staticmethod(fail_target_restore_update))
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[],
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert calls["updated"] == []
+    assert records["stale-target"].meta.hidden is True
+    assert records[stale_wrapper_id].is_active is True
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_tracks_multiple_target_hide_owners(monkeypatch):
+    records = {
+        "target": FakeModelForm(
+            id="target",
+            base_model_id="provider-target",
+            name="Target",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(),
+            access_grants=[],
+            is_active=True,
+        )
+    }
+    records, _ = install_fake_open_webui_model_modules(monkeypatch, records)
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="compact_a",
+        target_models=[{"id": "target", "name": "Target"}],
+        valves=valves,
+    )
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="compact_b",
+        target_models=[{"id": "target", "name": "Target"}],
+        valves=valves,
+    )
+
+    target_meta = records["target"].meta.model_dump(exclude_unset=True)
+    assert target_meta["hidden"] is True
+    assert target_meta["auto_compaction_target_hidden_by"] == {
+        "pipe_function_ids": ["compact_a", "compact_b"],
+        "had_hidden": False,
+        "previous_hidden": False,
+    }
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="compact_a",
+        target_models=[],
+        valves=mod.Pipe.Valves(),
+    )
+
+    target_meta = records["target"].meta.model_dump(exclude_unset=True)
+    assert target_meta["hidden"] is True
+    assert target_meta["auto_compaction_target_hidden_by"] == {
+        "pipe_function_id": "compact_b",
+        "had_hidden": False,
+        "previous_hidden": False,
+    }
+    assert records[mod.build_wrapper_model_id("compact_a", "target")].is_active is False
+    assert records[mod.build_wrapper_model_id("compact_b", "target")].is_active is True
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="compact_b",
+        target_models=[],
+        valves=mod.Pipe.Valves(),
+    )
+
+    target_meta = records["target"].meta.model_dump(exclude_unset=True)
+    assert "hidden" not in target_meta
+    assert "auto_compaction_target_hidden_by" not in target_meta
+    assert records[mod.build_wrapper_model_id("compact_b", "target")].is_active is False
+
+
+@pytest.mark.asyncio
+async def test_hide_target_model_record_merges_owners_from_current_record_when_given_stale_snapshot(monkeypatch):
+    records = {
+        "target": FakeModelForm(
+            id="target",
+            base_model_id="provider-target",
+            name="Target",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(),
+            access_grants=[],
+            is_active=True,
+        )
+    }
+    install_fake_open_webui_model_modules(monkeypatch, records)
+    Models = sys.modules["open_webui.models.models"].Models
+
+    stale_snapshot_a = FakeModelForm(
+        id="target",
+        base_model_id="provider-target",
+        name="Target",
+        params=FakeModelParams(),
+        meta=FakeModelMeta(),
+        access_grants=[],
+        is_active=True,
+    )
+    stale_snapshot_b = FakeModelForm(
+        id="target",
+        base_model_id="provider-target",
+        name="Target",
+        params=FakeModelParams(),
+        meta=FakeModelMeta(),
+        access_grants=[],
+        is_active=True,
+    )
+
+    await mod._hide_target_model_record(
+        Models=Models,
+        ModelForm=FakeModelForm,
+        ModelMeta=FakeModelMeta,
+        ModelParams=FakeModelParams,
+        pipe_function_id="compact_a",
+        target_model={"id": "target", "name": "Target"},
+        target_model_info=stale_snapshot_a,
+        owner_user_id="function-owner",
+    )
+    await mod._hide_target_model_record(
+        Models=Models,
+        ModelForm=FakeModelForm,
+        ModelMeta=FakeModelMeta,
+        ModelParams=FakeModelParams,
+        pipe_function_id="compact_b",
+        target_model={"id": "target", "name": "Target"},
+        target_model_info=stale_snapshot_b,
+        owner_user_id="function-owner",
+    )
+
+    target_meta = records["target"].meta.model_dump(exclude_unset=True)
+    assert target_meta["hidden"] is True
+    assert target_meta["auto_compaction_target_hidden_by"] == {
+        "pipe_function_ids": ["compact_a", "compact_b"],
+        "had_hidden": False,
+        "previous_hidden": False,
+    }
 
 
 @pytest.mark.asyncio

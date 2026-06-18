@@ -98,6 +98,8 @@ PROVIDER_MODEL_CACHE_ENABLE_FLAGS = {
 }
 MISSING_CORE_REQUEST = object()
 TARGET_MODEL_RECORD_UNKNOWN = object()
+AUTO_COMPACTION_TARGET_HIDDEN_META_KEY = "auto_compaction_target_hidden_by"
+TARGET_MODEL_VISIBILITY_LOCKS: dict[str, asyncio.Lock] = {}
 LOG = logging.getLogger(__name__)
 COMPACTION_SUMMARY_EMBED_MARKER = "<!--auto-compaction-summary-embed:v1-->"
 SUMMARY_PROMPT = (
@@ -294,6 +296,7 @@ class TargetModelContract:
     id: str
     name: str
     meta: dict[str, Any]
+    target_params: dict[str, Any]
     wrapper_params: dict[str, Any]
     access_grants: list[dict[str, Any]]
     owner_user_id: str | None
@@ -2491,6 +2494,7 @@ def build_target_model_contract(target_model: dict[str, Any], target_model_info:
         id=target_id,
         name=str(target_model.get("name") or target_id),
         meta=meta,
+        target_params=target_params,
         wrapper_params=build_wrapper_core_params(target_params),
         access_grants=grants,
         owner_user_id=owner_user_id,
@@ -2525,6 +2529,8 @@ def build_wrapper_model_form(
         ):
             access_grants.append(owner_read)
     meta = copy.deepcopy(target.meta)
+    meta.pop("hidden", None)
+    meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
     meta["auto_compaction"] = {
         "pipe_function_id": pipe_function_id,
         "target_model_id": target_id,
@@ -2565,6 +2571,163 @@ def _grant_signatures(grants: Any) -> list[tuple[str, str, str]]:
     return sorted(signature for signature in signatures if signature is not None)
 
 
+def _record_meta_dict(record: Any) -> dict[str, Any]:
+    return _payload_dict(_record_field(record, "meta"))
+
+
+def _record_params_dict(record: Any) -> dict[str, Any]:
+    return _payload_dict(_record_field(record, "params"))
+
+
+def _record_access_grants(record: Any) -> list[dict[str, Any]]:
+    return _normalize_access_grants(_record_field(record, "access_grants"))
+
+
+def _record_has_meta_key(record: Any, key: str) -> bool:
+    return key in _record_meta_dict(record)
+
+
+def _record_meta_value(record: Any, key: str, default: Any = None) -> Any:
+    return _record_meta_dict(record).get(key, default)
+
+
+def _target_model_visibility_lock(target_model_id: str) -> asyncio.Lock:
+    lock = TARGET_MODEL_VISIBILITY_LOCKS.get(target_model_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        TARGET_MODEL_VISIBILITY_LOCKS[target_model_id] = lock
+    return lock
+
+
+def _managed_wrapper_pipe_function_id(record: Any) -> str | None:
+    meta = _record_meta_dict(record)
+    auto_compaction = meta.get("auto_compaction")
+    if not isinstance(auto_compaction, dict):
+        return None
+    pipe_function_id = auto_compaction.get("pipe_function_id")
+    return pipe_function_id if isinstance(pipe_function_id, str) and pipe_function_id else None
+
+
+def _managed_wrapper_target_model_id(record: Any) -> str | None:
+    meta = _record_meta_dict(record)
+    auto_compaction = meta.get("auto_compaction")
+    if not isinstance(auto_compaction, dict):
+        return None
+    target_model_id = auto_compaction.get("target_model_id")
+    return target_model_id if isinstance(target_model_id, str) and target_model_id else None
+
+
+def _target_hidden_marker(meta: dict[str, Any]) -> dict[str, Any] | None:
+    marker = meta.get(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY)
+    return marker if isinstance(marker, dict) else None
+
+
+def _target_hidden_marker_owner_ids(marker: dict[str, Any]) -> list[str]:
+    owner_ids: list[str] = []
+    pipe_function_ids = marker.get("pipe_function_ids")
+    if isinstance(pipe_function_ids, list):
+        for owner_id in pipe_function_ids:
+            if isinstance(owner_id, str) and owner_id and owner_id not in owner_ids:
+                owner_ids.append(owner_id)
+    pipe_function_id = marker.get("pipe_function_id")
+    if isinstance(pipe_function_id, str) and pipe_function_id and pipe_function_id not in owner_ids:
+        owner_ids.append(pipe_function_id)
+    return owner_ids
+
+
+def _target_hidden_marker_restore_state(marker: dict[str, Any]) -> tuple[bool, bool, bool]:
+    return (
+        bool(marker.get("had_hidden", False)),
+        bool(marker.get("previous_hidden", False)),
+        bool(marker.get("created_model_record", False)),
+    )
+
+
+def _build_target_hidden_marker(
+    *,
+    pipe_function_ids: list[str],
+    had_hidden: bool,
+    previous_hidden: bool,
+    created_model_record: bool,
+) -> dict[str, Any]:
+    if len(pipe_function_ids) == 1:
+        marker = {
+            "pipe_function_id": pipe_function_ids[0],
+            "had_hidden": had_hidden,
+            "previous_hidden": previous_hidden,
+        }
+    else:
+        marker = {
+            "pipe_function_ids": pipe_function_ids,
+            "had_hidden": had_hidden,
+            "previous_hidden": previous_hidden,
+        }
+    if created_model_record:
+        marker["created_model_record"] = True
+    return marker
+
+
+def _mark_target_model_hidden_by_pipe(
+    meta: dict[str, Any],
+    *,
+    pipe_function_id: str,
+    created_model_record: bool,
+) -> None:
+    marker = _target_hidden_marker(meta)
+    if marker is None:
+        owner_ids = [pipe_function_id]
+        had_hidden = "hidden" in meta
+        previous_hidden = bool(meta.get("hidden", False))
+        owns_created_model_record = created_model_record
+    else:
+        owner_ids = _target_hidden_marker_owner_ids(marker)
+        had_hidden, previous_hidden, owns_created_model_record = _target_hidden_marker_restore_state(marker)
+        if not owner_ids:
+            had_hidden = "hidden" in meta
+            previous_hidden = bool(meta.get("hidden", False))
+            owns_created_model_record = created_model_record
+        if pipe_function_id not in owner_ids:
+            owner_ids.append(pipe_function_id)
+    marker = _build_target_hidden_marker(
+        pipe_function_ids=owner_ids,
+        had_hidden=had_hidden,
+        previous_hidden=previous_hidden,
+        created_model_record=owns_created_model_record,
+    )
+    meta[AUTO_COMPACTION_TARGET_HIDDEN_META_KEY] = marker
+    meta["hidden"] = True
+
+
+def _restore_target_model_hidden_by_pipe(meta: dict[str, Any], *, pipe_function_id: str) -> tuple[bool, bool]:
+    marker = _target_hidden_marker(meta)
+    if marker is None:
+        return False, False
+    owner_ids = _target_hidden_marker_owner_ids(marker)
+    if pipe_function_id not in owner_ids:
+        return False, False
+    had_hidden, previous_hidden, created_model_record = _target_hidden_marker_restore_state(marker)
+    remaining_owner_ids = [owner_id for owner_id in owner_ids if owner_id != pipe_function_id]
+    if remaining_owner_ids:
+        meta[AUTO_COMPACTION_TARGET_HIDDEN_META_KEY] = _build_target_hidden_marker(
+            pipe_function_ids=remaining_owner_ids,
+            had_hidden=had_hidden,
+            previous_hidden=previous_hidden,
+            created_model_record=created_model_record,
+        )
+        meta["hidden"] = True
+    elif created_model_record:
+        meta.pop("hidden", None)
+        meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
+        return True, True
+    elif had_hidden:
+        meta["hidden"] = previous_hidden
+        meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
+    else:
+        meta.pop("hidden", None)
+        meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
+    return True, False
+
+
 def _wrapper_model_record_matches_form(existing: Any, model_form: Any) -> bool:
     for field in ("id", "base_model_id", "name", "is_active"):
         if _record_field(existing, field) != getattr(model_form, field, None):
@@ -2576,6 +2739,214 @@ def _wrapper_model_record_matches_form(existing: Any, model_form: Any) -> bool:
     return _grant_signatures(_record_field(existing, "access_grants")) == _grant_signatures(
         getattr(model_form, "access_grants", [])
     )
+
+
+def _model_form_from_payload(
+    *,
+    ModelForm: Any,
+    ModelMeta: Any,
+    ModelParams: Any,
+    payload: dict[str, Any],
+) -> Any:
+    return ModelForm(
+        id=payload["id"],
+        base_model_id=payload.get("base_model_id"),
+        name=payload["name"],
+        params=ModelParams(**_payload_dict(payload.get("params"))),
+        meta=ModelMeta(**_payload_dict(payload.get("meta"))),
+        access_grants=payload.get("access_grants"),
+        is_active=bool(payload.get("is_active", True)),
+    )
+
+
+def _model_form_from_record(
+    *,
+    ModelForm: Any,
+    ModelMeta: Any,
+    ModelParams: Any,
+    record: Any,
+    meta: dict[str, Any] | None = None,
+    is_active: bool | None = None,
+) -> Any:
+    return ModelForm(
+        id=_record_field(record, "id"),
+        base_model_id=_record_field(record, "base_model_id"),
+        name=_record_field(record, "name"),
+        params=ModelParams(**_record_params_dict(record)),
+        meta=ModelMeta(**(_payload_dict(meta) if meta is not None else _record_meta_dict(record))),
+        access_grants=_record_access_grants(record),
+        is_active=bool(_record_field(record, "is_active") if is_active is None else is_active),
+    )
+
+
+def _target_model_override_form_payload(
+    *,
+    pipe_function_id: str,
+    target_model: dict[str, Any],
+    target_model_info: Any | None = None,
+) -> dict[str, Any]:
+    target = build_target_model_contract(target_model, target_model_info)
+    existing_record = (
+        target_model_info
+        if target_model_info is not None and target_model_info is not TARGET_MODEL_RECORD_UNKNOWN
+        else None
+    )
+    meta = _record_meta_dict(existing_record) if existing_record is not None else copy.deepcopy(target.meta)
+    _mark_target_model_hidden_by_pipe(
+        meta,
+        pipe_function_id=pipe_function_id,
+        created_model_record=existing_record is None,
+    )
+    return {
+        "id": target.id,
+        "base_model_id": _target_record_base_model_id(target_model_info),
+        "name": _record_field(existing_record, "name") or target.name,
+        "params": _record_params_dict(existing_record) if existing_record is not None else copy.deepcopy(target.target_params),
+        "meta": meta,
+        "access_grants": _record_access_grants(existing_record) if existing_record is not None else copy.deepcopy(target.access_grants),
+        "is_active": bool(_record_field(target_model_info, "is_active"))
+        if target_model_info is not None and target_model_info is not TARGET_MODEL_RECORD_UNKNOWN
+        else True,
+    }
+
+
+async def _hide_target_model_record(
+    *,
+    Models: Any,
+    ModelForm: Any,
+    ModelMeta: Any,
+    ModelParams: Any,
+    pipe_function_id: str,
+    target_model: dict[str, Any],
+    target_model_info: Any | None,
+    owner_user_id: str,
+) -> None:
+    target_id = _model_id(target_model)
+    if not target_id:
+        return
+    async with _target_model_visibility_lock(target_id):
+        try:
+            existing = await Models.get_model_by_id(target_id)
+        except Exception:
+            existing = None
+        if (
+            existing is None
+            and target_model_info is not None
+            and target_model_info is not TARGET_MODEL_RECORD_UNKNOWN
+        ):
+            existing = target_model_info
+        payload = _target_model_override_form_payload(
+            pipe_function_id=pipe_function_id,
+            target_model=target_model,
+            target_model_info=existing,
+        )
+        model_form = _model_form_from_payload(
+            ModelForm=ModelForm,
+            ModelMeta=ModelMeta,
+            ModelParams=ModelParams,
+            payload=payload,
+        )
+        if existing:
+            if not _wrapper_model_record_matches_form(existing, model_form):
+                await Models.update_model_by_id(target_id, model_form)
+        else:
+            await Models.insert_new_model(model_form, user_id=owner_user_id)
+
+
+async def _restore_target_model_hidden_record(
+    *,
+    Models: Any,
+    ModelForm: Any,
+    ModelMeta: Any,
+    ModelParams: Any,
+    pipe_function_id: str,
+    target_model_id: str,
+    target_model_info: Any | None = None,
+) -> bool:
+    async with _target_model_visibility_lock(target_model_id):
+        try:
+            existing = await Models.get_model_by_id(target_model_id)
+        except Exception:
+            existing = None
+        if (
+            existing is None
+            and target_model_info is not None
+            and target_model_info is not TARGET_MODEL_RECORD_UNKNOWN
+        ):
+            existing = target_model_info
+        if existing is None or existing is TARGET_MODEL_RECORD_UNKNOWN:
+            return True
+        meta = _record_meta_dict(existing)
+        restored, delete_created_record = _restore_target_model_hidden_by_pipe(
+            meta, pipe_function_id=pipe_function_id
+        )
+        if not restored:
+            return True
+        if delete_created_record:
+            delete_model_by_id = getattr(Models, "delete_model_by_id", None)
+            if not callable(delete_model_by_id):
+                return False
+            try:
+                return bool(await delete_model_by_id(target_model_id))
+            except Exception:
+                return False
+        model_form = _model_form_from_record(
+            ModelForm=ModelForm,
+            ModelMeta=ModelMeta,
+            ModelParams=ModelParams,
+            record=existing,
+            meta=meta,
+        )
+        try:
+            await Models.update_model_by_id(target_model_id, model_form)
+        except Exception:
+            return False
+        return True
+
+
+async def _deactivate_stale_wrapper_model_records(
+    *,
+    Models: Any,
+    ModelForm: Any,
+    ModelMeta: Any,
+    ModelParams: Any,
+    pipe_function_id: str,
+    desired_wrapper_ids: set[str],
+) -> None:
+    try:
+        existing_models = await Models.get_all_models()
+    except Exception:
+        return
+    for existing in existing_models:
+        try:
+            existing_id = _record_field(existing, "id")
+            if (
+                not isinstance(existing_id, str)
+                or existing_id in desired_wrapper_ids
+                or _managed_wrapper_pipe_function_id(existing) != pipe_function_id
+                or _record_field(existing, "is_active") is False
+            ):
+                continue
+            target_model_id = _managed_wrapper_target_model_id(existing)
+            if target_model_id and not await _restore_target_model_hidden_record(
+                Models=Models,
+                ModelForm=ModelForm,
+                ModelMeta=ModelMeta,
+                ModelParams=ModelParams,
+                pipe_function_id=pipe_function_id,
+                target_model_id=target_model_id,
+            ):
+                continue
+            model_form = _model_form_from_record(
+                ModelForm=ModelForm,
+                ModelMeta=ModelMeta,
+                ModelParams=ModelParams,
+                record=existing,
+                is_active=False,
+            )
+            await Models.update_model_by_id(existing_id, model_form)
+        except Exception:
+            continue
 
 
 async def sync_wrapper_model_records(
@@ -2595,13 +2966,27 @@ async def sync_wrapper_model_records(
     if not owner_user_id:
         return
 
+    desired_wrapper_ids: set[str] = set()
     for target_model in target_models:
+        target_id = _model_id(target_model)
+        hide_wrapped_target_models = bool(getattr(valves, "hide_wrapped_target_models", False))
         try:
             target_model_info = None
-            target_id = _model_id(target_model)
             if target_id:
+                desired_wrapper_ids.add(build_wrapper_model_id(pipe_function_id, target_id))
                 with suppress(Exception):
                     target_model_info = await Models.get_model_by_id(target_id)
+            if not hide_wrapped_target_models and target_id:
+                with suppress(Exception):
+                    await _restore_target_model_hidden_record(
+                        Models=Models,
+                        ModelForm=ModelForm,
+                        ModelMeta=ModelMeta,
+                        ModelParams=ModelParams,
+                        pipe_function_id=pipe_function_id,
+                        target_model_id=target_id,
+                        target_model_info=target_model_info,
+                    )
             form_payload = build_wrapper_model_form(
                 pipe_function_id=pipe_function_id,
                 function_owner_user_id=owner_user_id,
@@ -2609,6 +2994,9 @@ async def sync_wrapper_model_records(
                 target_model_info=target_model_info,
                 valves=valves,
             )
+            existing = await Models.get_model_by_id(form_payload["id"])
+            if existing and _record_has_meta_key(existing, "hidden"):
+                form_payload["meta"]["hidden"] = _record_meta_value(existing, "hidden")
             model_form = ModelForm(
                 id=form_payload["id"],
                 base_model_id=None,
@@ -2618,14 +3006,44 @@ async def sync_wrapper_model_records(
                 access_grants=form_payload["access_grants"],
                 is_active=True,
             )
-            existing = await Models.get_model_by_id(form_payload["id"])
             if existing:
                 if not _wrapper_model_record_matches_form(existing, model_form):
                     await Models.update_model_by_id(form_payload["id"], model_form)
             else:
                 await Models.insert_new_model(model_form, user_id=owner_user_id)
+            if hide_wrapped_target_models:
+                with suppress(Exception):
+                    await _hide_target_model_record(
+                        Models=Models,
+                        ModelForm=ModelForm,
+                        ModelMeta=ModelMeta,
+                        ModelParams=ModelParams,
+                        pipe_function_id=pipe_function_id,
+                        target_model=target_model,
+                        target_model_info=target_model_info,
+                        owner_user_id=owner_user_id,
+                    )
         except Exception:
+            if hide_wrapped_target_models and target_id:
+                with suppress(Exception):
+                    await _restore_target_model_hidden_record(
+                        Models=Models,
+                        ModelForm=ModelForm,
+                        ModelMeta=ModelMeta,
+                        ModelParams=ModelParams,
+                        pipe_function_id=pipe_function_id,
+                        target_model_id=target_id,
+                        target_model_info=target_model_info,
+                    )
             continue
+    await _deactivate_stale_wrapper_model_records(
+        Models=Models,
+        ModelForm=ModelForm,
+        ModelMeta=ModelMeta,
+        ModelParams=ModelParams,
+        pipe_function_id=pipe_function_id,
+        desired_wrapper_ids=desired_wrapper_ids,
+    )
 
 
 def _iter_model_cache_values(value: Any) -> Any:
@@ -5672,6 +6090,13 @@ class Pipe:
         exclude_model_patterns: str = Field(
             default="",
             description="Comma-separated shell-style patterns for target model id/name. Empty excludes nothing; applied after include, matches are not wrapped.",
+        )
+        hide_wrapped_target_models: bool = Field(
+            default=False,
+            description=(
+                "Automatically set meta.hidden=true on raw target models wrapped by this pipe so chat model pickers show compact wrappers instead. "
+                "Hidden target models remain available for admin/workspace base-model configuration."
+            ),
         )
         summary_model: str = Field(
             default="",
