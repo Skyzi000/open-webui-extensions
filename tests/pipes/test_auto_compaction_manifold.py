@@ -4236,6 +4236,36 @@ async def test_summary_generation_overrides_request_state_metadata(monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_summary_generation_does_not_emit_summary_start_before_route_resolution(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    events = []
+
+    async def resolve_core_chat_model_route(request, model_id):
+        raise RuntimeError("route failed")
+
+    async def on_summary_start():
+        events.append("started")
+
+    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+
+    with pytest.raises(RuntimeError, match="route failed"):
+        await mod._generate_summary_text(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={"chat_id": "chat-1"},
+            summary_model_id="target",
+            source_messages=[{"role": "user", "content": "old"}],
+            base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
+            on_summary_start=on_summary_start,
+        )
+
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_summary_generation_strips_request_response_format_without_overriding_model_params(
     monkeypatch,
     pipe_request,
@@ -8822,6 +8852,113 @@ async def test_pipe_does_not_compact_internal_summary_task(monkeypatch, pipe_req
 
 
 @pytest.mark.asyncio
+async def test_soft_prefetch_emits_status_and_embed_when_checkpoint_is_created(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    events = []
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    async def event_emitter(event):
+        events.append(event)
+
+    async def get_or_create_compaction_summary(*, on_summary_start=None, **kwargs):
+        assert on_summary_start is not None
+        await on_summary_start()
+        return mod.CompactionSummaryResult(
+            "prefetched summary",
+            checkpoint={"summary_text": "prefetched summary", "summary_meta": {}},
+        )
+
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+
+    assert (
+        await mod._prefetch_compaction_checkpoint(
+            request=pipe_request,
+            user=pipe_user,
+            user_id=pipe_user["id"],
+            chat_id=pipe_metadata["chat_id"],
+            metadata=pipe_metadata,
+            body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+            pipe_function_id="auto_compact",
+            summary_model_id="target",
+            source_messages=source_messages,
+            summary_tool_policy="fallback_on_tool_call",
+            historical_message_excerpt_bytes=1024,
+            historical_message_excerpt_count=3,
+            event_emitter=event_emitter,
+        )
+        is True
+    )
+
+    status_events = [event for event in events if event["type"] == "status"]
+    assert [event["data"]["action"] for event in status_events] == [
+        "auto_compaction_prefetching",
+        "auto_compaction_prefetched",
+    ]
+    assert status_events[0]["data"]["done"] is False
+    assert status_events[1]["data"]["done"] is True
+    embed_events = [event for event in events if event["type"] == "embeds"]
+    assert len(embed_events) == 1
+    assert "prefetched summary" in embed_events[0]["data"]["embeds"][0]
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_emits_done_status_when_checkpoint_creation_is_cancelled(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    events = []
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    async def event_emitter(event):
+        events.append(event)
+
+    async def get_or_create_compaction_summary(*, on_summary_start=None, **kwargs):
+        assert on_summary_start is not None
+        await on_summary_start()
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+
+    with pytest.raises(asyncio.CancelledError):
+        await mod._prefetch_compaction_checkpoint(
+            request=pipe_request,
+            user=pipe_user,
+            user_id=pipe_user["id"],
+            chat_id=pipe_metadata["chat_id"],
+            metadata=pipe_metadata,
+            body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+            pipe_function_id="auto_compact",
+            summary_model_id="target",
+            source_messages=source_messages,
+            summary_tool_policy="fallback_on_tool_call",
+            historical_message_excerpt_bytes=1024,
+            historical_message_excerpt_count=3,
+            event_emitter=event_emitter,
+        )
+
+    status_events = [event for event in events if event["type"] == "status"]
+    assert [event["data"]["action"] for event in status_events] == [
+        "auto_compaction_prefetching",
+        "auto_compaction_failed",
+    ]
+    assert status_events[1]["data"]["done"] is True
+    assert status_events[1]["data"]["error"] is True
+    assert [event for event in events if event["type"] == "embeds"] == []
+
+
+@pytest.mark.asyncio
 async def test_pipe_does_not_launch_completed_turn_soft_prefetch_for_internal_summary_task(
     monkeypatch, pipe_request, pipe_user
 ):
@@ -8908,7 +9045,8 @@ async def test_pipe_launches_soft_prefetch_below_hard_without_foreground_compact
 
     def start_soft_prefetch(**kwargs):
         assert "target_model_id" not in kwargs
-        captured["prefetch"] = copy.deepcopy(kwargs)
+        captured["prefetch"] = copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"})
+        captured["prefetch_event_emitter"] = kwargs.get("event_emitter")
         return True
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
@@ -8933,16 +9071,23 @@ async def test_pipe_launches_soft_prefetch_below_hard_without_foreground_compact
         ],
     }
 
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
     result = await pipe.pipe(
         body,
         __request__=pipe_request,
         __user__=pipe_user,
         __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
     )
 
     assert result == {"ok": True}
     assert captured["forward_body"]["messages"] == body["messages"]
     assert captured["prefetch"]["body"]["messages"] == body["messages"]
+    assert captured["prefetch_event_emitter"] is event_emitter
     assert callable(captured["on_complete"])
 
 
@@ -9038,6 +9183,7 @@ async def test_start_soft_prefetch_passes_selected_source_messages_to_task(monke
         source_messages,
         summary_meta,
         parent_checkpoint=None,
+        on_summary_start=None,
         summary_tool_policy,
         historical_message_excerpt_bytes,
         historical_message_excerpt_count,
@@ -9101,6 +9247,7 @@ async def test_soft_prefetch_uses_tool_aware_source_prefix(
         source_messages,
         summary_meta,
         parent_checkpoint=None,
+        on_summary_start=None,
         summary_tool_policy,
         historical_message_excerpt_bytes,
         historical_message_excerpt_count,
@@ -9219,7 +9366,12 @@ async def test_pipe_launches_completed_turn_soft_prefetch_for_non_tool_response(
     def start_soft_prefetch(**kwargs):
         assert "target_model_id" not in kwargs
         assert mod._soft_prefetch_source_messages(kwargs["body"])
-        calls.append(copy.deepcopy(kwargs))
+        calls.append(
+            {
+                **copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"}),
+                "event_emitter": kwargs.get("event_emitter"),
+            }
+        )
         return True
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
@@ -9243,9 +9395,21 @@ async def test_pipe_launches_completed_turn_soft_prefetch_for_non_tool_response(
         ],
     }
 
-    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
 
     assert len(calls) == 2
+    assert all(call.get("event_emitter") is event_emitter for call in calls)
     completed_messages = calls[-1]["body"]["messages"]
     assert completed_messages == [
         {"role": "user", "content": "old"},

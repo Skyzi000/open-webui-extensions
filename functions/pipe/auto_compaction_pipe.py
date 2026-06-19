@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.2.0
+version: 0.2.1
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -4873,6 +4873,7 @@ async def _generate_summary_text(
     source_messages: list[dict[str, Any]],
     base_body: dict[str, Any],
     pipe_function_id: str = PIPE_FUNCTION_ID,
+    on_summary_start: Callable[[], Awaitable[None]] | None = None,
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
 ) -> str:
     summary_metadata = build_summary_task_metadata(metadata)
@@ -4895,6 +4896,8 @@ async def _generate_summary_text(
     route = await _resolve_core_chat_model_route(inner_request, str(body.get("model") or ""))
     body["model"] = route.model_id
     await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
+    if on_summary_start is not None:
+        await on_summary_start()
     response = await generate_chat_completion(
         inner_request,
         body,
@@ -5179,6 +5182,7 @@ async def _get_or_create_compaction_summary(
     source_messages: list[dict[str, Any]],
     summary_meta: dict[str, Any],
     parent_checkpoint: dict[str, Any] | None = None,
+    on_summary_start: Callable[[], Awaitable[None]] | None = None,
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
@@ -5207,6 +5211,7 @@ async def _get_or_create_compaction_summary(
             source_messages=source,
             base_body=base_body,
             pipe_function_id=pipe_function_id,
+            on_summary_start=on_summary_start,
             summary_tool_policy=summary_tool_policy,
         )
 
@@ -5268,6 +5273,7 @@ async def _prefetch_compaction_checkpoint(
     summary_tool_policy: SummaryToolPolicy,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
+    event_emitter: Callable[[Any], Awaitable[None]] | None = None,
 ) -> bool:
     if not source_messages:
         return False
@@ -5278,21 +5284,67 @@ async def _prefetch_compaction_checkpoint(
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
     )
-    await _get_or_create_compaction_summary(
-        request=request,
-        user=user,
-        user_id=user_id,
-        chat_id=chat_id,
-        pipe_function_id=pipe_function_id,
-        metadata=metadata,
-        summary_model_id=summary_model_id,
-        base_body=body,
-        source_messages=source_messages,
-        summary_meta=summary_meta,
-        summary_tool_policy=summary_tool_policy,
-        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
-        historical_message_excerpt_count=historical_message_excerpt_count,
-    )
+
+    summary_started = False
+
+    async def emit_summary_start() -> None:
+        nonlocal summary_started
+        summary_started = True
+        await emit_compaction_status(
+            event_emitter,
+            action="prefetching",
+            description="Creating an auto-compaction checkpoint in the background",
+            done=False,
+        )
+
+    try:
+        summary = await _get_or_create_compaction_summary(
+            request=request,
+            user=user,
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_function_id=pipe_function_id,
+            metadata=metadata,
+            summary_model_id=summary_model_id,
+            base_body=body,
+            source_messages=source_messages,
+            summary_meta=summary_meta,
+            on_summary_start=emit_summary_start,
+            summary_tool_policy=summary_tool_policy,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+    except asyncio.CancelledError:
+        if summary_started:
+            await emit_compaction_status(
+                event_emitter,
+                action="failed",
+                description="Background auto-compaction checkpoint creation was cancelled",
+                done=True,
+                error=True,
+            )
+        raise
+    except Exception as exc:
+        if summary_started:
+            await emit_compaction_status(
+                event_emitter,
+                action="failed",
+                description=f"Failed to create background auto-compaction checkpoint: {exc}",
+                done=True,
+                error=True,
+            )
+        raise
+    if summary_started:
+        await emit_compaction_status(
+            event_emitter,
+            action="prefetched",
+            description="Auto-compaction checkpoint is ready",
+            done=True,
+        )
+        await emit_compaction_summary_embed(
+            event_emitter,
+            summary_text=str(summary),
+        )
     return True
 
 
@@ -5307,6 +5359,7 @@ def _start_soft_compaction_prefetch(
     summary_tool_policy: SummaryToolPolicy,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
+    event_emitter: Callable[[Any], Awaitable[None]] | None = None,
 ) -> bool:
     source_messages = _soft_prefetch_source_messages(body)
     if not source_messages:
@@ -5338,6 +5391,7 @@ def _start_soft_compaction_prefetch(
             summary_tool_policy=summary_tool_policy,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            event_emitter=event_emitter,
         ),
     )
 
@@ -6396,6 +6450,7 @@ class Pipe:
                 summary_tool_policy=self.valves.summary_tool_policy,
                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                event_emitter=__event_emitter__,
             )
 
         def launch_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
@@ -6424,6 +6479,7 @@ class Pipe:
                 summary_tool_policy=self.valves.summary_tool_policy,
                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                event_emitter=__event_emitter__,
             )
 
         attempt = 0
