@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.2.1
+version: 0.2.2
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -1796,14 +1796,16 @@ def build_checkpoint_row(
     }
 
 
-def select_longest_matching_parent(
+def select_longest_matching_checkpoint(
     rows: Iterable[dict[str, Any]],
     source_messages: list[dict[str, Any]],
+    *,
+    states: set[str] | None = None,
 ) -> dict[str, Any] | None:
     prefix_hashes: dict[int, str] = {}
     candidates = sorted(rows, key=lambda row: int(row.get("source_message_count") or 0), reverse=True)
     for row in candidates:
-        if row.get("state") != "ready":
+        if states is not None and row.get("state") not in states:
             continue
         count = int(row.get("source_message_count") or 0)
         if count <= 0 or count > len(source_messages):
@@ -1813,6 +1815,13 @@ def select_longest_matching_parent(
         if prefix_hashes[count] == row.get("source_hash"):
             return row
     return None
+
+
+def select_longest_matching_parent(
+    rows: Iterable[dict[str, Any]],
+    source_messages: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    return select_longest_matching_checkpoint(rows, source_messages, states={"ready"})
 
 
 _CHECKPOINT_CLAIM_COLUMN_DDL_TYPES = (("claim_token", "TEXT"), ("claim_expires_at", "BIGINT"))
@@ -2020,6 +2029,40 @@ class CheckpointStore:
             )
             rows = [dict(row) for row in result.mappings().all()]
         return select_longest_matching_parent(rows, source_messages)
+
+    async def find_longest_pending_parent(
+        self,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_function_id: str,
+        profile_hash: str,
+        source_messages: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not source_messages:
+            return None
+        now = int(time.time())
+        async with await self._context() as db:
+            result = await db.execute(
+                select(CHECKPOINT_TABLE)
+                .where(
+                    *self._identity_clauses(
+                        namespace=namespace,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                    ),
+                    CHECKPOINT_TABLE.c.state == "pending",
+                    CHECKPOINT_TABLE.c.claim_expires_at.is_not(None),
+                    CHECKPOINT_TABLE.c.claim_expires_at > now,
+                    CHECKPOINT_TABLE.c.source_message_count <= len(source_messages),
+                )
+                .order_by(CHECKPOINT_TABLE.c.source_message_count.desc())
+            )
+            rows = [dict(row) for row in result.mappings().all()]
+        return select_longest_matching_checkpoint(rows, source_messages, states={"pending"})
 
     async def claim_pending(self, row: dict[str, Any]) -> bool:
         async with await self._context() as db:
@@ -4952,6 +4995,31 @@ async def _compact_retry_tool_results(
             "Cannot compact tool history without a durable checkpoint identity",
             code="checkpoint_identity_missing",
         )
+    pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
+        request=request,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        source_messages=source_messages,
+    )
+    if pending_checkpoint is not None and not _checkpoint_matches_exact_source(pending_checkpoint, source_messages):
+        ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
+        if ready_checkpoint is not None:
+            message_cut = MessageCut(
+                preserved_system_message=copy.deepcopy(cut.preserved_system_message),
+                summarization_prefix=copy.deepcopy(cut.summarization_prefix),
+                tail_messages=copy.deepcopy(cut.tail_messages),
+                source_message_count=cut.source_message_count,
+            )
+            return (
+                replace_prefix_with_parent_checkpoint_and_delta(
+                    message_cut,
+                    ready_checkpoint,
+                    historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                    historical_message_excerpt_count=historical_message_excerpt_count,
+                ),
+                True,
+            )
     summary_meta = build_checkpoint_summary_meta(
         source_messages,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
@@ -5246,6 +5314,79 @@ async def _lookup_ready_checkpoint_for_source(
     )
 
 
+async def _lookup_pending_checkpoint_for_source_prefix(
+    *,
+    request: Any,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    source_messages: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not source_messages:
+        return None
+    await ensure_checkpoint_table_initialized(request=request)
+    store = CheckpointStore()
+    find_pending = getattr(store, "find_longest_pending_parent", None)
+    if not callable(find_pending):
+        return None
+    return await find_pending(
+        namespace=CHECKPOINT_NAMESPACE,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        profile_hash=compute_profile_hash(),
+        source_messages=source_messages,
+    )
+
+
+def _checkpoint_identity_from_row(row: dict[str, Any]) -> dict[str, str]:
+    return {
+        "namespace": str(row.get("namespace") or CHECKPOINT_NAMESPACE),
+        "user_id": str(row.get("user_id") or ""),
+        "chat_id": str(row.get("chat_id") or ""),
+        "pipe_function_id": str(row.get("pipe_function_id") or ""),
+        "profile_hash": str(row.get("profile_hash") or ""),
+        "source_hash": str(row.get("source_hash") or ""),
+    }
+
+
+def _checkpoint_matches_exact_source(row: dict[str, Any], source_messages: list[dict[str, Any]]) -> bool:
+    try:
+        source_message_count = int(row.get("source_message_count") or 0)
+    except Exception:
+        return False
+    return source_message_count == len(source_messages) and row.get("source_hash") == compute_source_hash(source_messages)
+
+
+async def _wait_for_pending_checkpoint_ready(row: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    if row.get("state") == "ready":
+        return row
+    identity = _checkpoint_identity_from_row(row)
+    if not all(identity.values()):
+        return None
+    store = CheckpointStore()
+    deadline = time.monotonic() + CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS
+    while True:
+        current = await store.lookup_any(**identity)
+        if current is None:
+            return None
+        if current.get("state") == "ready":
+            with suppress(Exception):
+                await store.touch(str(current["id"]))
+            return current
+        if current.get("state") != "pending":
+            return None
+        expires_at = current.get("claim_expires_at")
+        now = int(time.time())
+        if expires_at is None or int(expires_at) <= now:
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(CHECKPOINT_PENDING_POLL_SECONDS)
+
+
 def _soft_prefetch_source_messages(body: dict[str, Any]) -> list[dict[str, Any]] | None:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -5278,6 +5419,14 @@ async def _prefetch_compaction_checkpoint(
     if not source_messages:
         return False
     if not user_id or not _chat_id_supported(chat_id):
+        return False
+    if await _lookup_pending_checkpoint_for_source_prefix(
+        request=request,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        source_messages=source_messages,
+    ):
         return False
     summary_meta = build_checkpoint_summary_meta(
         source_messages,
@@ -6039,6 +6188,29 @@ async def _compact_body(
 
     if not user_id or not _chat_id_supported(chat_id):
         return body, False
+
+    pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
+        request=request,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        source_messages=cut.summarization_prefix,
+    )
+    if pending_checkpoint is not None and not _checkpoint_matches_exact_source(
+        pending_checkpoint,
+        cut.summarization_prefix,
+    ):
+        ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
+        if ready_checkpoint is not None:
+            compacted = _copy_body_preserving_metadata(body)
+            compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
+                cut,
+                ready_checkpoint,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
+            )
+            compacted.pop("previous_response_id", None)
+            return compacted, True
 
     summary_meta = build_checkpoint_summary_meta(
         cut.summarization_prefix,

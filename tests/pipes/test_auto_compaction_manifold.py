@@ -47,6 +47,13 @@ class ClaimCheckpointStore:
     async def find_longest_parent(self, **kwargs):
         return mod.select_longest_matching_parent(self.rows, kwargs["source_messages"])
 
+    async def find_longest_pending_parent(self, **kwargs):
+        return mod.select_longest_matching_checkpoint(
+            self.rows,
+            kwargs["source_messages"],
+            states={"pending"},
+        )
+
     async def claim_pending(self, row):
         if self._match(row["source_hash"]) is not None:
             return False
@@ -7110,6 +7117,158 @@ async def test_direct_tool_compaction_and_reusable_checkpoint_render_same_saved_
 
 
 @pytest.mark.asyncio
+async def test_hard_compaction_delegates_exact_pending_to_checkpoint_claim_wait(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    pending_row = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages),
+        source_message_count=len(source_messages),
+        summary_text="",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state="pending",
+        claim_token="claim-1",
+        claim_expires_at=9999999999,
+    )
+    captured = {}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def wait_for_pending_checkpoint_ready(row):
+        raise AssertionError("exact pending should use the existing checkpoint claim/wait path only")
+
+    async def get_or_create_compaction_summary(**kwargs):
+        captured["source_messages"] = kwargs["source_messages"]
+        return "exact pending summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([pending_row]))
+    monkeypatch.setattr(mod, "_wait_for_pending_checkpoint_ready", wait_for_pending_checkpoint_ready)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+
+    compacted, did_compact = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body={
+            "messages": [
+                *source_messages,
+                {"role": "user", "content": "active"},
+            ]
+        },
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+    )
+
+    assert did_compact is True
+    assert captured["source_messages"] == source_messages
+    assert "exact pending summary" in compacted["messages"][0]["content"]
+    assert compacted["messages"][1:] == [{"role": "user", "content": "active"}]
+
+
+@pytest.mark.asyncio
+async def test_tool_compaction_waits_for_pending_chain_prefix_before_foreground_summary(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active"}
+    old_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+    ]
+    latest_round = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+    ]
+    pending_source = [*history, active]
+    pending_row = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(pending_source),
+        source_message_count=len(pending_source),
+        summary_text="",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state="pending",
+        claim_token="claim-1",
+        claim_expires_at=9999999999,
+    )
+
+    class CompletingPendingStore(ClaimCheckpointStore):
+        async def lookup_any(self, **kwargs):
+            row = self._match(kwargs["source_hash"])
+            if row is not None and row.get("state") == "pending":
+                row.update(
+                    state="ready",
+                    summary_text="soft pending summary",
+                    summary_meta={},
+                    claim_token=None,
+                    claim_expires_at=None,
+                )
+            return dict(row) if row else None
+
+    store = CompletingPendingStore([pending_row])
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("hard compaction should wait for and reuse the pending soft summary first")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    body = {"messages": [*history, active, *old_round, *latest_round]}
+    compacted, did_compact = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+    )
+
+    assert did_compact is True
+    assert "soft pending summary" in compacted["messages"][0]["content"]
+    assert compacted["messages"][1:] == [*old_round, *latest_round]
+
+
+@pytest.mark.asyncio
 async def test_tool_loop_summary_extends_existing_history_parent_when_summary_fits(
     monkeypatch,
     pipe_request,
@@ -8906,6 +9065,76 @@ async def test_soft_prefetch_emits_status_and_embed_when_checkpoint_is_created(
     embed_events = [event for event in events if event["type"] == "embeds"]
     assert len(embed_events) == 1
     assert "prefetched summary" in embed_events[0]["data"]["embeds"][0]
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_skips_summary_generation_when_chain_prefix_is_pending(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    pending_source = [{"role": "user", "content": "active request"}]
+    later_source = [
+        *pending_source,
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+    ]
+    rows = [
+        mod.build_checkpoint_row(
+            namespace=mod.CHECKPOINT_NAMESPACE,
+            user_id=pipe_user["id"],
+            chat_id=pipe_metadata["chat_id"],
+            pipe_function_id="auto_compact",
+            profile_hash=mod.compute_profile_hash(),
+            source_hash=mod.compute_source_hash(pending_source),
+            source_message_count=len(pending_source),
+            summary_text="",
+            summary_meta={},
+            parent_checkpoint_id=None,
+            state="pending",
+            claim_token="claim-1",
+            claim_expires_at=9999999999,
+        )
+    ]
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def get_or_create_compaction_summary(**kwargs):
+        raise AssertionError("a newer soft prefetch must not start while a chain prefix summary is pending")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+
+    assert (
+        await mod._prefetch_compaction_checkpoint(
+            request=pipe_request,
+            user=pipe_user,
+            user_id=pipe_user["id"],
+            chat_id=pipe_metadata["chat_id"],
+            metadata=pipe_metadata,
+            body={"model": "target", "messages": later_source},
+            pipe_function_id="auto_compact",
+            summary_model_id="target",
+            source_messages=later_source,
+            summary_tool_policy="fallback_on_tool_call",
+            historical_message_excerpt_bytes=1024,
+            historical_message_excerpt_count=3,
+            event_emitter=event_emitter,
+        )
+        is False
+    )
+    assert events == []
 
 
 @pytest.mark.asyncio
