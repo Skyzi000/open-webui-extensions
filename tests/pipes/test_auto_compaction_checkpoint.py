@@ -306,6 +306,7 @@ def test_checkpoint_table_contract_names_and_columns():
         "source_hash",
         "summary_text",
         "summary_meta",
+        "summary_token_count",
         "state",
         "parent_checkpoint_id",
         "claim_token",
@@ -480,7 +481,16 @@ class ClaimStore:
                 return True
         return False
 
-    async def complete_pending(self, checkpoint_id, *, claim_token, summary_text, parent_checkpoint_id, now=None):
+    async def complete_pending(
+        self,
+        checkpoint_id,
+        *,
+        claim_token,
+        summary_text,
+        parent_checkpoint_id,
+        summary_token_count=None,
+        now=None,
+    ):
         for row in self.rows:
             if (
                 row.get("id") == checkpoint_id
@@ -491,6 +501,7 @@ class ClaimStore:
                     state="ready",
                     summary_text=summary_text,
                     parent_checkpoint_id=parent_checkpoint_id,
+                    summary_token_count=summary_token_count,
                     claim_token=None,
                     claim_expires_at=None,
                 )
@@ -574,8 +585,24 @@ def test_checkpoint_row_uses_stable_identity_and_contract_fields():
         parent_checkpoint_id=None,
         now=999,
     )
+    explicit_count = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+        source_message_count=12,
+        summary_text="counted summary",
+        summary_meta={},
+        summary_token_count=42,
+        parent_checkpoint_id=None,
+        now=123,
+    )
 
     assert same["id"] == row["id"]
+    assert explicit_count["id"] == row["id"]
+    assert explicit_count["summary_token_count"] == 42
     assert row == {
         "id": row["id"],
         "namespace": mod.CHECKPOINT_NAMESPACE,
@@ -588,6 +615,7 @@ def test_checkpoint_row_uses_stable_identity_and_contract_fields():
         "source_hash": "source",
         "summary_text": "summary",
         "summary_meta": {"has_multimodal": False},
+        "summary_token_count": None,
         "state": "ready",
         "parent_checkpoint_id": "parent-1",
         "claim_token": None,

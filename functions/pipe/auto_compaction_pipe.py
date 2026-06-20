@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.2.2
+version: 0.3.0
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -71,6 +71,21 @@ CHECKPOINT_CLAIM_LEASE_SECONDS = 90
 CHECKPOINT_CLAIM_HEARTBEAT_SECONDS = 30
 CHECKPOINT_PENDING_POLL_SECONDS = 0.25
 CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS = 300.0
+TOKEN_ESTIMATOR_VERSION = "message-canonical-json-v1"
+MESSAGE_TOKEN_OVERHEAD = 4
+REQUEST_TOKEN_OVERHEAD = 3
+MESSAGE_TOKEN_ESTIMATE_CACHE_MAX_ENTRIES = 8192
+MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES = 64 * 1024
+MESSAGE_TOKEN_HEURISTIC_BYTES_PER_TOKEN = 1
+BODY_TOKEN_EXTRA_KEYS = (
+    "tools",
+    "tool_choice",
+    "functions",
+    "function_call",
+    "response_format",
+    "parallel_tool_calls",
+)
+CHECKPOINT_APPLIED_HARD_GUARD_RATIO = 0.9
 INTERNAL_SUMMARY_TASK = "auto_compaction_summary"
 TEMP_CHAT_PREFIXES = ("local:", "channel:")
 SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
@@ -140,6 +155,7 @@ CHECKPOINT_TABLE = Table(
     Column("source_hash", Text, nullable=False),
     Column("summary_text", Text, nullable=False),
     Column("summary_meta", JSON, nullable=False),
+    Column("summary_token_count", Integer, nullable=True),
     Column("state", Text, nullable=False),
     Column("parent_checkpoint_id", Text, nullable=True),
     Column("claim_token", Text, nullable=True),
@@ -173,6 +189,7 @@ _SCHEMA_INIT_LOCKS: dict[Any, asyncio.Lock] = {}
 _GENERATION_LOCKS: dict[tuple[str, str, str, str, str, str], asyncio.Lock] = {}
 _SOFT_PREFETCH_TASKS: set[asyncio.Task] = set()
 _SOFT_PREFETCH_INFLIGHT_KEYS: set[tuple[str, str, str, str, str, str]] = set()
+_MESSAGE_TOKEN_ESTIMATE_CACHE: dict[tuple[str, str, str], int] = {}
 
 
 def get_generation_lock(key: tuple[str, str, str, str, str, str]) -> asyncio.Lock:
@@ -245,6 +262,7 @@ class ReusableCheckpointMatch:
     kind: str
     source_message_count: int
     source_kind: str = "message"
+    checkpoint: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -722,6 +740,350 @@ def compute_profile_hash(
             "summary_format_family": summary_format_family,
             "source_hash_family": source_hash_family,
         }
+    )
+
+
+def _configured_tiktoken_encoding_names(request: Any = None) -> list[str]:
+    names: list[str] = []
+    config = getattr(getattr(getattr(request, "app", None), "state", None), "config", None)
+    configured = getattr(config, "TIKTOKEN_ENCODING_NAME", None)
+    if configured:
+        names.append(str(configured))
+    try:
+        from open_webui import config as open_webui_config
+
+        fallback = getattr(open_webui_config, "TIKTOKEN_ENCODING_NAME", None)
+        if fallback:
+            names.append(str(fallback))
+    except Exception:
+        pass
+    names.append("cl100k_base")
+    return list(dict.fromkeys(names))
+
+
+def _get_tiktoken_encoder(request: Any = None) -> tuple[Any | None, str | None]:
+    try:
+        import tiktoken
+    except Exception:
+        return None, None
+
+    for encoding_name in _configured_tiktoken_encoding_names(request):
+        try:
+            return tiktoken.get_encoding(encoding_name), encoding_name
+        except Exception:
+            continue
+    return None, None
+
+
+def _message_token_cache_key(message: dict[str, Any], *, encoding_name: str) -> tuple[str, str, str]:
+    canonical = canonicalize_message_for_source_hash(message)
+    return (
+        TOKEN_ESTIMATOR_VERSION,
+        encoding_name,
+        _json_hash({"family": TOKEN_ESTIMATOR_VERSION, "message": canonical}),
+    )
+
+
+def _message_token_text(message: dict[str, Any]) -> str:
+    return json.dumps(
+        canonicalize_message_for_source_hash(message),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _remember_message_token_estimate(key: tuple[str, str, str], count: int) -> None:
+    if len(_MESSAGE_TOKEN_ESTIMATE_CACHE) >= MESSAGE_TOKEN_ESTIMATE_CACHE_MAX_ENTRIES:
+        with suppress(Exception):
+            _MESSAGE_TOKEN_ESTIMATE_CACHE.pop(next(iter(_MESSAGE_TOKEN_ESTIMATE_CACHE)))
+    _MESSAGE_TOKEN_ESTIMATE_CACHE[key] = int(count)
+
+
+def _estimate_large_text_tokens(text: str, *, overhead: int = MESSAGE_TOKEN_OVERHEAD) -> int:
+    byte_count = len(text.encode("utf-8", errors="ignore"))
+    return math.ceil(byte_count / MESSAGE_TOKEN_HEURISTIC_BYTES_PER_TOKEN) + int(overhead)
+
+
+def _encode_text_token_count(encoder: Any, text: str) -> int | None:
+    try:
+        return len(encoder.encode(text, disallowed_special=()))
+    except TypeError:
+        try:
+            return len(encoder.encode(text))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _estimate_text_tokens_with_encoder(
+    text: str,
+    *,
+    encoder: Any,
+    overhead: int = MESSAGE_TOKEN_OVERHEAD,
+) -> int | None:
+    if len(text.encode("utf-8", errors="ignore")) > MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES:
+        return _estimate_large_text_tokens(text, overhead=overhead)
+    count = _encode_text_token_count(encoder, text)
+    if count is None:
+        return None
+    return count + int(overhead)
+
+
+def _estimate_message_tokens_with_encoder(
+    message: dict[str, Any],
+    *,
+    encoder: Any,
+    encoding_name: str,
+) -> int | None:
+    key = _message_token_cache_key(message, encoding_name=encoding_name)
+    cached = _MESSAGE_TOKEN_ESTIMATE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    count = _estimate_text_tokens_with_encoder(
+        _message_token_text(message),
+        encoder=encoder,
+        overhead=MESSAGE_TOKEN_OVERHEAD,
+    )
+    if count is None:
+        return None
+    _remember_message_token_estimate(key, count)
+    return count
+
+
+def estimate_message_tokens(
+    message: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    if not isinstance(message, dict):
+        return None
+    resolved_encoder = encoder
+    resolved_encoding_name = encoding_name
+    if resolved_encoder is None:
+        resolved_encoder, resolved_encoding_name = _get_tiktoken_encoder(request)
+    if resolved_encoder is None:
+        return None
+    if not resolved_encoding_name:
+        resolved_encoding_name = str(getattr(resolved_encoder, "name", "unknown"))
+    return _estimate_message_tokens_with_encoder(
+        message,
+        encoder=resolved_encoder,
+        encoding_name=str(resolved_encoding_name),
+    )
+
+
+def estimate_messages_tokens(
+    messages: list[dict[str, Any]],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    if not isinstance(messages, list):
+        return None
+    resolved_encoder = encoder
+    resolved_encoding_name = encoding_name
+    if resolved_encoder is None:
+        resolved_encoder, resolved_encoding_name = _get_tiktoken_encoder(request)
+    if resolved_encoder is None:
+        return None
+    if not resolved_encoding_name:
+        resolved_encoding_name = str(getattr(resolved_encoder, "name", "unknown"))
+
+    total = REQUEST_TOKEN_OVERHEAD
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        count = _estimate_message_tokens_with_encoder(
+            message,
+            encoder=resolved_encoder,
+            encoding_name=str(resolved_encoding_name),
+        )
+        if count is None:
+            return None
+        total += count
+    return total
+
+
+def _body_token_extra_payload(body: dict[str, Any]) -> dict[str, Any]:
+    extra: dict[str, Any] = {}
+    for key in BODY_TOKEN_EXTRA_KEYS:
+        if key not in body:
+            continue
+        value = _canonicalize_general_value(body.get(key))
+        if _is_empty_canonical_value(value):
+            continue
+        extra[key] = value
+    return extra
+
+
+def _body_token_extra_text(body: dict[str, Any]) -> str:
+    extra = _body_token_extra_payload(body)
+    if not extra:
+        return ""
+    return json.dumps(
+        {"family": TOKEN_ESTIMATOR_VERSION, "body_extra": extra},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def estimate_body_tokens(
+    body: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    if not isinstance(body, dict):
+        return None
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    resolved_encoder = encoder
+    resolved_encoding_name = encoding_name
+    if resolved_encoder is None:
+        resolved_encoder, resolved_encoding_name = _get_tiktoken_encoder(request)
+    if resolved_encoder is None:
+        return None
+    if not resolved_encoding_name:
+        resolved_encoding_name = str(getattr(resolved_encoder, "name", "unknown"))
+
+    total = estimate_messages_tokens(
+        messages,
+        request=request,
+        encoder=resolved_encoder,
+        encoding_name=str(resolved_encoding_name),
+    )
+    if total is None:
+        return None
+    extra_text = _body_token_extra_text(body)
+    if extra_text:
+        extra_tokens = _estimate_text_tokens_with_encoder(
+            extra_text,
+            encoder=resolved_encoder,
+            overhead=MESSAGE_TOKEN_OVERHEAD,
+        )
+        if extra_tokens is None:
+            return None
+        total += extra_tokens
+    return total
+
+
+def estimate_body_extra_tokens(
+    body: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    if not isinstance(body, dict):
+        return None
+    extra_text = _body_token_extra_text(body)
+    if not extra_text:
+        return 0
+    resolved_encoder = encoder
+    resolved_encoding_name = encoding_name
+    if resolved_encoder is None:
+        resolved_encoder, resolved_encoding_name = _get_tiktoken_encoder(request)
+    if resolved_encoder is None:
+        return None
+    if not resolved_encoding_name:
+        resolved_encoding_name = str(getattr(resolved_encoder, "name", "unknown"))
+    return _estimate_text_tokens_with_encoder(
+        extra_text,
+        encoder=resolved_encoder,
+        overhead=MESSAGE_TOKEN_OVERHEAD,
+    )
+
+
+async def estimate_body_extra_tokens_async(
+    body: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    return await asyncio.to_thread(
+        estimate_body_extra_tokens,
+        body,
+        request=request,
+        encoder=encoder,
+        encoding_name=encoding_name,
+    )
+
+
+async def estimate_body_tokens_async(
+    body: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    return await asyncio.to_thread(
+        estimate_body_tokens,
+        body,
+        request=request,
+        encoder=encoder,
+        encoding_name=encoding_name,
+    )
+
+
+async def estimate_message_tokens_async(
+    message: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    return await asyncio.to_thread(
+        estimate_message_tokens,
+        message,
+        request=request,
+        encoder=encoder,
+        encoding_name=encoding_name,
+    )
+
+
+async def estimate_messages_tokens_async(
+    messages: list[dict[str, Any]],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    return await asyncio.to_thread(
+        estimate_messages_tokens,
+        messages,
+        request=request,
+        encoder=encoder,
+        encoding_name=encoding_name,
+    )
+
+
+async def _estimate_rendered_summary_message_tokens(
+    *,
+    request: Any,
+    summary_text: str,
+    summary_meta: dict[str, Any] | None,
+    historical_source_messages: list[dict[str, Any]] | None = None,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+) -> int | None:
+    return await estimate_message_tokens_async(
+        render_summary_message(
+            summary_text,
+            summary_meta,
+            historical_source_messages=historical_source_messages,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        ),
+        request=request,
     )
 
 
@@ -1761,6 +2123,7 @@ def build_checkpoint_row(
     summary_text: str,
     summary_meta: dict[str, Any] | None,
     parent_checkpoint_id: str | None,
+    summary_token_count: int | None = None,
     state: str = "ready",
     claim_token: str | None = None,
     claim_expires_at: int | None = None,
@@ -1786,6 +2149,7 @@ def build_checkpoint_row(
         "source_hash": source_hash,
         "summary_text": summary_text,
         "summary_meta": normalize_summary_meta(summary_meta),
+        "summary_token_count": summary_token_count,
         "state": state,
         "parent_checkpoint_id": parent_checkpoint_id,
         "claim_token": claim_token,
@@ -1824,7 +2188,11 @@ def select_longest_matching_parent(
     return select_longest_matching_checkpoint(rows, source_messages, states={"ready"})
 
 
-_CHECKPOINT_CLAIM_COLUMN_DDL_TYPES = (("claim_token", "TEXT"), ("claim_expires_at", "BIGINT"))
+_CHECKPOINT_COMPAT_COLUMN_DDL_TYPES = (
+    ("claim_token", "TEXT"),
+    ("claim_expires_at", "BIGINT"),
+    ("summary_token_count", "INTEGER"),
+)
 
 
 def _is_duplicate_schema_object_error(exc: Exception) -> bool:
@@ -1857,7 +2225,7 @@ def _initialize_checkpoint_schema(sync_conn: Any) -> None:
             CHECKPOINT_TABLE_NAME, schema=OPEN_WEBUI_DATABASE_SCHEMA
         )
     }
-    for column_name, column_ddl_type in _CHECKPOINT_CLAIM_COLUMN_DDL_TYPES:
+    for column_name, column_ddl_type in _CHECKPOINT_COMPAT_COLUMN_DDL_TYPES:
         if column_name in existing_columns:
             continue
         _execute_checkpoint_ddl_tolerating_duplicates(
@@ -2153,6 +2521,7 @@ class CheckpointStore:
         claim_token: str,
         summary_text: str,
         parent_checkpoint_id: str | None,
+        summary_token_count: int | None = None,
         now: int | None = None,
     ) -> dict[str, Any] | None:
         timestamp = int(time.time()) if now is None else int(now)
@@ -2169,6 +2538,7 @@ class CheckpointStore:
                         state="ready",
                         summary_text=summary_text,
                         parent_checkpoint_id=parent_checkpoint_id,
+                        summary_token_count=summary_token_count,
                         claim_token=None,
                         claim_expires_at=None,
                         updated_at=timestamp,
@@ -3466,12 +3836,6 @@ def choose_usage_signal(
         return usage
     if isinstance(persisted_usage, dict) and persisted_usage:
         return _normalize_usage(persisted_usage)
-    for message in reversed(messages or []):
-        if not isinstance(message, dict):
-            continue
-        usage = message.get("usage") or (message.get("info") or {}).get("usage")
-        if isinstance(usage, dict) and usage:
-            return _normalize_usage(usage)
     return None
 
 
@@ -4373,6 +4737,77 @@ def _usage_total(usage: dict[str, Any] | None) -> int | None:
     return None
 
 
+_USAGE_ANCHOR_SOURCE = Literal["request", "persisted"]
+
+
+def _latest_user_usage_anchor_delta(messages: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(messages, list) or not messages:
+        return None
+    latest = messages[-1]
+    if isinstance(latest, dict) and latest.get("role") == "user":
+        return [copy.deepcopy(latest)]
+    return None
+
+
+def _trailing_tool_usage_anchor_delta(messages: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(messages, list) or not messages:
+        return None
+    trailing_tools: list[dict[str, Any]] = []
+    index = len(messages) - 1
+    while index >= 0:
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            break
+        trailing_tools.append(copy.deepcopy(message))
+        index -= 1
+    if not trailing_tools or index < 0:
+        return None
+    anchor = messages[index]
+    if not isinstance(anchor, dict) or anchor.get("role") != "assistant":
+        return None
+    tool_call_ids = _tool_call_ids(anchor)
+    if not tool_call_ids:
+        return None
+    trailing_tools.reverse()
+    if any(message.get("tool_call_id") not in tool_call_ids for message in trailing_tools):
+        return None
+    return trailing_tools
+
+
+def _usage_anchor_delta_for_source(
+    messages: Any,
+    usage_source: _USAGE_ANCHOR_SOURCE | None,
+) -> list[dict[str, Any]] | None:
+    if usage_source == "request":
+        return _trailing_tool_usage_anchor_delta(messages)
+    if usage_source == "persisted":
+        return _latest_user_usage_anchor_delta(messages) or _trailing_tool_usage_anchor_delta(messages)
+    return None
+
+
+async def _estimate_next_input_tokens_from_usage_anchor(
+    *,
+    request: Any,
+    last_observed_total_tokens: int | None,
+    body: dict[str, Any],
+    usage_source: _USAGE_ANCHOR_SOURCE | None,
+) -> int | None:
+    if last_observed_total_tokens is None or not isinstance(body, dict):
+        return None
+    delta_messages = _usage_anchor_delta_for_source(body.get("messages"), usage_source)
+    if delta_messages is None:
+        return None
+    delta_tokens = await estimate_messages_tokens_async(delta_messages, request=request)
+    if delta_tokens is None:
+        return None
+    # Do not add current body extras here. Provider-reported usage for the
+    # anchor request already counted that request's tool/function/response
+    # schemas, and those extras are usually stable across adjacent turns. Adding
+    # the full current payload again would double-count large stable tool
+    # schemas and trigger avoidable prefetch/foreground compaction.
+    return int(last_observed_total_tokens) + int(delta_tokens)
+
+
 def _context_exhaustion_error_response(
     messages: Any,
 ) -> dict[str, Any]:
@@ -5210,11 +5645,17 @@ async def _get_or_create_checkpoint_summary(
                     if parent:
                         raise ParentCheckpointExtensionFailed(parent, exc) from exc
                     raise
+                summary_token_count = await _estimate_rendered_summary_message_tokens(
+                    request=request,
+                    summary_text=summary_text,
+                    summary_meta=summary_meta,
+                )
                 completed = await store.complete_pending(
                     checkpoint_id,
                     claim_token=claim_token,
                     summary_text=summary_text,
                     parent_checkpoint_id=parent.get("id") if parent else None,
+                    summary_token_count=summary_token_count,
                 )
                 if completed is not None:
                     return CompactionSummaryResult(completed["summary_text"], checkpoint=completed)
@@ -5656,6 +6097,7 @@ async def _body_reusable_checkpoint_match(
                 kind=kind,
                 source_message_count=int(checkpoint.get("source_message_count") or tool_cut.source_message_count),
                 source_kind="tool",
+                checkpoint=checkpoint,
             )
 
     if not cut.summarization_prefix:
@@ -5675,7 +6117,121 @@ async def _body_reusable_checkpoint_match(
             kind=kind,
             source_message_count=int(checkpoint.get("source_message_count") or cut.source_message_count),
             source_kind="message",
+            checkpoint=checkpoint,
         )
+    return None
+
+
+async def _summary_token_count_from_checkpoint(
+    *,
+    request: Any,
+    checkpoint: dict[str, Any],
+    historical_source_messages: list[dict[str, Any]] | None,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> int | None:
+    stored = checkpoint.get("summary_token_count")
+    if isinstance(stored, int) and stored >= 0:
+        return stored
+    if isinstance(stored, str) and stored.isdigit():
+        return int(stored)
+    return await estimate_message_tokens_async(
+        render_summary_message_from_checkpoint(
+            checkpoint,
+            historical_source_messages=historical_source_messages,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        ),
+        request=request,
+    )
+
+
+async def _estimate_checkpoint_applied_body_tokens(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    match: ReusableCheckpointMatch,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> int | None:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 2:
+        return None
+
+    candidates: list[tuple[MessageCut | ToolResultCompactionCut, list[dict[str, Any]]]] = []
+    tool_cut = select_tool_result_compaction_cut(messages)
+    if tool_cut is not None and tool_cut.summarization_prefix and match.source_kind == "tool":
+        candidates.append((tool_cut, tool_cut.summarization_prefix))
+
+    cut = select_safe_message_cut(messages)
+    if cut.summarization_prefix and match.source_kind == "message":
+        candidates.append((cut, cut.summarization_prefix))
+
+    if not candidates:
+        return None
+
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
+    profile_hash = compute_profile_hash()
+    store = CheckpointStore()
+
+    for candidate_cut, source_messages in candidates:
+        checkpoint = match.checkpoint
+        if checkpoint is None:
+            checkpoint_match = await _find_reusable_checkpoint_for_source(
+                store=store,
+                user_id=user_id,
+                chat_id=chat_id,
+                pipe_function_id=pipe_function_id,
+                profile_hash=profile_hash,
+                source_messages=source_messages,
+            )
+            checkpoint = checkpoint_match[1] if checkpoint_match is not None else None
+        if checkpoint is None:
+            continue
+
+        parent_count = int(checkpoint.get("source_message_count") or 0)
+        if parent_count <= 0 or parent_count > len(source_messages):
+            continue
+        if compute_source_hash(source_messages[:parent_count]) != checkpoint.get("source_hash"):
+            continue
+
+        if isinstance(candidate_cut, ToolResultCompactionCut):
+            message_cut = MessageCut(
+                preserved_system_message=copy.deepcopy(candidate_cut.preserved_system_message),
+                summarization_prefix=copy.deepcopy(candidate_cut.summarization_prefix),
+                tail_messages=copy.deepcopy(candidate_cut.tail_messages),
+                source_message_count=candidate_cut.source_message_count,
+            )
+        else:
+            message_cut = candidate_cut
+
+        summary_tokens = await _summary_token_count_from_checkpoint(
+            request=request,
+            checkpoint=checkpoint,
+            historical_source_messages=message_cut.summarization_prefix[:parent_count],
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+        if summary_tokens is None:
+            return None
+
+        estimate_source = []
+        if message_cut.preserved_system_message is not None:
+            estimate_source.append(message_cut.preserved_system_message)
+        estimate_source.extend(message_cut.summarization_prefix[parent_count:])
+        estimate_source.extend(message_cut.tail_messages)
+
+        remaining_body = _copy_body_preserving_metadata(body)
+        remaining_body["messages"] = estimate_source
+        remaining_body.pop("previous_response_id", None)
+        remaining_tokens = await estimate_body_tokens_async(remaining_body, request=request)
+        if remaining_tokens is None:
+            return None
+        return summary_tokens + remaining_tokens
     return None
 
 
@@ -5748,6 +6304,42 @@ async def _compact_body_with_reusable_checkpoint(
         return compacted, True
 
     raise RuntimeError("Reusable checkpoint match disappeared before compaction")
+
+
+async def _estimate_task_checkpoint_applied_body_tokens(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    match: ReusableCheckpointMatch,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> int | None:
+    source_body = _task_history_source_body_for_compaction(body, metadata) or body
+    compacted_source, compacted = await _compact_body_with_reusable_checkpoint(
+        request=request,
+        user=user,
+        metadata=metadata,
+        body=source_body,
+        pipe_function_id=pipe_function_id,
+        match=match,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+    if not compacted:
+        return None
+    rebuilt = await _rebuild_task_body_from_compacted_history(
+        request=request,
+        user=user,
+        base_body=body,
+        metadata=metadata,
+        compacted_history_messages=compacted_source["messages"],
+    )
+    if rebuilt is None:
+        return None
+    return await estimate_body_tokens_async(rebuilt, request=request)
 
 
 async def _model_dict_from_request(request: Any) -> dict[str, Any]:
@@ -6552,11 +7144,14 @@ class Pipe:
             wrapper_model_id=selected_wrapper_id,
         )
         persisted_usage = None
+        usage_source: _USAGE_ANCHOR_SOURCE | None = "request" if request_usage is not None else None
         if request_usage is None:
             persisted_usage = await lookup_persisted_usage(
                 str(chat_id) if chat_id else None,
                 str(message_id) if message_id else None,
             )
+            if persisted_usage is not None:
+                usage_source = "persisted"
         usage = choose_usage_signal(
             request=__request__,
             chat_id=str(chat_id) if chat_id else None,
@@ -6582,7 +7177,7 @@ class Pipe:
             target_model_for_limits,
             effective_trigger_total_tokens,
         )
-        soft_should_prefetch = (
+        usage_soft_should_prefetch = (
             supported_context
             and not is_summary_task
             and total_tokens is not None
@@ -6605,13 +7200,81 @@ class Pipe:
                     f"Failed to access auto-compaction checkpoints: {exc}",
                     code="checkpoint_unavailable",
                 )
-        should_compact = usage_should_compact or reusable_checkpoint_match is not None
-        reusable_checkpoint_only = (
-            reusable_checkpoint_match
-            if reusable_checkpoint_match is not None and not usage_should_compact
-            else None
+        estimated_total_tokens = None
+        checkpoint_applied_estimate = None
+        if supported_context and not usage_should_compact:
+            if reusable_checkpoint_match is not None:
+                if task_source_body is not None:
+                    checkpoint_applied_estimate = await _estimate_task_checkpoint_applied_body_tokens(
+                        request=__request__,
+                        user=user,
+                        metadata=metadata,
+                        body=inner,
+                        pipe_function_id=identity.pipe_function_id,
+                        match=reusable_checkpoint_match,
+                        historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                        historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                    )
+                else:
+                    checkpoint_applied_estimate = await _estimate_checkpoint_applied_body_tokens(
+                        request=__request__,
+                        user=user,
+                        metadata=metadata,
+                        body=checkpoint_lookup_body,
+                        pipe_function_id=identity.pipe_function_id,
+                        match=reusable_checkpoint_match,
+                        historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                        historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                    )
+            else:
+                if task_source_body is None and total_tokens is not None:
+                    estimated_total_tokens = await _estimate_next_input_tokens_from_usage_anchor(
+                        request=__request__,
+                        last_observed_total_tokens=total_tokens,
+                        body=checkpoint_lookup_body,
+                        usage_source=usage_source,
+                    )
+                if estimated_total_tokens is None and (total_tokens is None or task_source_body is None):
+                    estimated_total_tokens = await estimate_body_tokens_async(
+                        checkpoint_lookup_body,
+                        request=__request__,
+                    )
+        estimate_should_compact = (
+            supported_context
+            and estimated_total_tokens is not None
+            and estimated_total_tokens >= effective_trigger_total_tokens
         )
-        if soft_should_prefetch:
+        estimate_should_prefetch = (
+            supported_context
+            and not is_summary_task
+            and effective_soft_trigger_total_tokens is not None
+            and estimated_total_tokens is not None
+            and estimated_total_tokens >= effective_soft_trigger_total_tokens
+            and estimated_total_tokens < effective_trigger_total_tokens
+        )
+        checkpoint_applied_is_safe = (
+            checkpoint_applied_estimate is not None
+            and checkpoint_applied_estimate < effective_trigger_total_tokens * CHECKPOINT_APPLIED_HARD_GUARD_RATIO
+        )
+        checkpoint_applied_needs_foreground = (
+            checkpoint_applied_estimate is not None and not checkpoint_applied_is_safe
+        )
+        checkpoint_applied_unknown_needs_foreground = (
+            reusable_checkpoint_match is not None
+            and task_source_body is not None
+            and checkpoint_applied_estimate is None
+        )
+        hard_should_compact = (
+            usage_should_compact
+            or estimate_should_compact
+            or checkpoint_applied_needs_foreground
+            or checkpoint_applied_unknown_needs_foreground
+        )
+        should_compact = hard_should_compact or reusable_checkpoint_match is not None
+        reusable_checkpoint_only = None
+        if reusable_checkpoint_match is not None and not hard_should_compact:
+            reusable_checkpoint_only = reusable_checkpoint_match
+        if not hard_should_compact and (usage_soft_should_prefetch or estimate_should_prefetch):
             _start_soft_compaction_prefetch(
                 request=__request__,
                 user=user,
@@ -6661,8 +7324,10 @@ class Pipe:
             candidate = _copy_body_preserving_metadata(inner)
             if should_compact or compacted_once:
                 try:
+                    checkpoint_only_attempt = reusable_checkpoint_only is not None and not compacted_once
                     emit_progress_status = compacted_once or (
-                        usage_should_compact
+                        hard_should_compact
+                        and not checkpoint_only_attempt
                         and (reusable_checkpoint_match is None or reusable_checkpoint_match.kind != "exact")
                     )
                     if emit_progress_status:
