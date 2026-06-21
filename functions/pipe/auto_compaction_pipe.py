@@ -5255,9 +5255,26 @@ def _format_before_token_count(ctx: DisplayTokenContext) -> str:
     return _format_token_count(ctx.before, approximate=not is_provider_usage)
 
 
-def _format_token_suffix(ctx: DisplayTokenContext, *, after: int | None, compare_estimate: bool) -> str:
+def _format_token_suffix(
+    ctx: DisplayTokenContext,
+    *,
+    after: int | None,
+    compare_estimate: bool,
+    summary: int | None = None,
+) -> str:
     hard_limit = f"{ctx.hard_limit:,}"
     before_pct = None if ctx.pct_of_hard is None else _round_half_up_int(ctx.pct_of_hard)
+
+    if summary is not None:
+        summary_part = f"summary {_format_token_count(summary, approximate=True)} tokens"
+        if compare_estimate and ctx.usage is not None and ctx.estimate is not None:
+            estimate_part = f"tiktoken ≈{ctx.estimate:,}"
+            pct_part = f" · {before_pct}%" if before_pct is not None else ""
+            return f"(usage {ctx.usage:,} · {estimate_part} / {hard_limit}{pct_part} · {summary_part})"
+
+        before = _format_before_token_count(ctx)
+        pct_part = f" · {before_pct}%" if before_pct is not None and ctx.hard_limit > 0 else ""
+        return f"({before} / {hard_limit} tokens{pct_part} · {summary_part})"
 
     if compare_estimate and ctx.usage is not None and ctx.estimate is not None:
         estimate_part = f"tiktoken ≈{ctx.estimate:,}"
@@ -5286,6 +5303,7 @@ def _tokens_status_payload(
     *,
     after: int | None,
     compare_estimate: bool,
+    summary: int | None = None,
 ) -> dict[str, Any]:
     tokens: dict[str, Any] = {
         "before": ctx.before,
@@ -5294,7 +5312,9 @@ def _tokens_status_payload(
         "pct_of_hard": ctx.pct_of_hard,
         "usage_source": ctx.usage_source,
     }
-    if after is not None:
+    if summary is not None:
+        tokens["summary"] = summary
+    elif after is not None:
         tokens["after"] = after
     if compare_estimate and ctx.usage is not None:
         tokens["usage"] = ctx.usage
@@ -5309,8 +5329,9 @@ def _description_with_token_suffix(
     *,
     after: int | None = None,
     compare_estimate: bool = False,
+    summary: int | None = None,
 ) -> str:
-    return f"{description} {_format_token_suffix(ctx, after=after, compare_estimate=compare_estimate)}"
+    return f"{description} {_format_token_suffix(ctx, after=after, compare_estimate=compare_estimate, summary=summary)}"
 
 
 async def emit_compaction_status(
@@ -5991,6 +6012,8 @@ async def _prefetch_compaction_checkpoint(
     trigger_total_tokens: int | None = None,
     trigger_estimated_tokens: int | None = None,
     trigger_usage_source: str | None = None,
+    token_status_detail: Literal["before", "before_after"] = "before",
+    token_status_compare_estimate: bool = False,
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
 ) -> bool:
     if not source_messages:
@@ -6108,15 +6131,38 @@ async def _prefetch_compaction_checkpoint(
         raise
     if summary_started and event_emitter is not None:
         token_context = await display_token_context()
+        summary_tokens = None
+        if token_status_detail == "before_after":
+            checkpoint = getattr(summary, "checkpoint", None)
+            persisted = checkpoint.get("summary_token_count") if isinstance(checkpoint, dict) else None
+            if isinstance(persisted, int):
+                summary_tokens = persisted
+            if summary_tokens is None:
+                with suppress(Exception):
+                    summary_tokens = await _estimate_rendered_summary_message_tokens(
+                        request=request,
+                        summary_text=str(summary),
+                        summary_meta=summary_meta,
+                        historical_source_messages=source_messages,
+                        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                        historical_message_excerpt_count=historical_message_excerpt_count,
+                    )
         await emit_compaction_status(
             event_emitter,
             action="prefetched",
             description=_description_with_token_suffix(
                 "Auto-compaction checkpoint is ready",
                 token_context,
+                summary=summary_tokens,
+                compare_estimate=token_status_compare_estimate,
             ),
             done=True,
-            tokens=_tokens_status_payload(token_context, after=None, compare_estimate=False),
+            tokens=_tokens_status_payload(
+                token_context,
+                after=None,
+                compare_estimate=token_status_compare_estimate,
+                summary=summary_tokens,
+            ),
         )
         await emit_compaction_summary_embed(
             event_emitter,
@@ -6141,6 +6187,8 @@ def _start_soft_compaction_prefetch(
     trigger_total_tokens: int | None = None,
     trigger_estimated_tokens: int | None = None,
     trigger_usage_source: str | None = None,
+    token_status_detail: Literal["before", "before_after"] = "before",
+    token_status_compare_estimate: bool = False,
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
 ) -> bool:
     source_messages = _soft_prefetch_source_messages(body)
@@ -6178,6 +6226,8 @@ def _start_soft_compaction_prefetch(
             trigger_total_tokens=trigger_total_tokens,
             trigger_estimated_tokens=trigger_estimated_tokens,
             trigger_usage_source=trigger_usage_source,
+            token_status_detail=token_status_detail,
+            token_status_compare_estimate=token_status_compare_estimate,
             event_emitter=event_emitter,
         ),
     )
@@ -7563,6 +7613,8 @@ class Pipe:
                 trigger_total_tokens=total_tokens if usage_soft_should_prefetch else None,
                 trigger_estimated_tokens=estimated_total_tokens if estimate_should_prefetch else None,
                 trigger_usage_source=usage_source if usage_soft_should_prefetch else None,
+                token_status_detail=self.valves.token_status_detail,
+                token_status_compare_estimate=self.valves.token_status_compare_estimate,
                 event_emitter=__event_emitter__,
             )
 
@@ -7596,6 +7648,8 @@ class Pipe:
                 effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
                 trigger_total_tokens=completion_total_tokens,
                 trigger_usage_source="request",
+                token_status_detail=self.valves.token_status_detail,
+                token_status_compare_estimate=self.valves.token_status_compare_estimate,
                 event_emitter=__event_emitter__,
             )
 

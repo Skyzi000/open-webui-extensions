@@ -9621,6 +9621,40 @@ async def test_status_compare_estimate_and_before_after_combined(monkeypatch, pi
     assert compacted["tokens"]["estimate"] == 1280
 
 
+def test_format_token_suffix_summary_mode_distinguishes_summary_from_after():
+    ctx = mod.DisplayTokenContext(
+        before=850,
+        usage=None,
+        estimate=None,
+        hard_limit=1000,
+        soft_limit=800,
+        usage_source="estimate",
+        pct_of_hard=85.0,
+    )
+
+    assert (
+        mod._format_token_suffix(ctx, after=None, compare_estimate=False, summary=50)
+        == "(≈850 / 1,000 tokens · 85% · summary ≈50 tokens)"
+    )
+
+
+def test_format_token_suffix_summary_mode_with_compare_estimate():
+    ctx = mod.DisplayTokenContext(
+        before=850,
+        usage=850,
+        estimate=860,
+        hard_limit=1000,
+        soft_limit=800,
+        usage_source="request",
+        pct_of_hard=85.0,
+    )
+
+    assert (
+        mod._format_token_suffix(ctx, after=50, compare_estimate=True, summary=50)
+        == "(usage 850 · tiktoken ≈860 / 1,000 · 85% · summary ≈50 tokens)"
+    )
+
+
 @pytest.mark.asyncio
 async def test_status_always_mode_emits_pressure(monkeypatch, pipe_request, pipe_user, pipe_metadata):
     pipe = mod.Pipe()
@@ -9743,6 +9777,164 @@ async def test_status_prefetch_shows_trigger_tokens(monkeypatch, pipe_request, p
     assert prefetching["tokens"]["pct_of_hard"] == 85.0
     prefetched = status_events[1]["data"]
     assert prefetched["tokens"]["before"] == 850
+    assert "summary" not in prefetched["tokens"]
+    assert "summary" not in prefetched["description"].lower()
+
+
+@pytest.mark.asyncio
+async def test_status_prefetched_shows_summary_in_before_after_mode(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    events = []
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    async def event_emitter(event):
+        events.append(event)
+
+    async def get_or_create_compaction_summary(*, on_summary_start=None, **kwargs):
+        assert on_summary_start is not None
+        await on_summary_start()
+        return mod.CompactionSummaryResult(
+            "prefetched summary",
+            checkpoint={
+                "summary_text": "prefetched summary",
+                "summary_token_count": 50,
+                "summary_meta": {},
+            },
+        )
+
+    async def estimate_rendered_summary_message_tokens(**kwargs):
+        raise AssertionError("persisted summary_token_count should avoid fallback estimation")
+
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_rendered_summary_message_tokens",
+        estimate_rendered_summary_message_tokens,
+    )
+
+    assert (
+        await mod._prefetch_compaction_checkpoint(
+            request=pipe_request,
+            user=pipe_user,
+            user_id=pipe_user["id"],
+            chat_id=pipe_metadata["chat_id"],
+            metadata=pipe_metadata,
+            body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+            pipe_function_id="auto_compact",
+            summary_model_id="target",
+            source_messages=source_messages,
+            summary_tool_policy="fallback_on_tool_call",
+            historical_message_excerpt_bytes=1024,
+            historical_message_excerpt_count=3,
+            effective_trigger_total_tokens=1000,
+            effective_soft_trigger_total_tokens=800,
+            trigger_total_tokens=850,
+            trigger_usage_source="request",
+            token_status_detail="before_after",
+            event_emitter=event_emitter,
+        )
+        is True
+    )
+
+    status_events = _status_events(events)
+    assert [event["data"]["action"] for event in status_events] == [
+        "auto_compaction_prefetching",
+        "auto_compaction_prefetched",
+    ]
+    prefetching = status_events[0]["data"]
+    assert prefetching["tokens"]["before"] == 850
+    assert "after" not in prefetching["tokens"]
+    assert "→" not in prefetching["description"]
+    prefetched = status_events[1]["data"]
+    assert prefetched["tokens"]["before"] == 850
+    assert prefetched["tokens"]["summary"] == 50
+    assert isinstance(prefetched["tokens"]["summary"], int)
+    assert "after" not in prefetched["tokens"]
+    assert "→" not in prefetched["description"]
+    assert "summary" in prefetched["description"].lower()
+    assert "summary ≈50 tokens" in prefetched["description"]
+
+
+@pytest.mark.asyncio
+async def test_status_prefetched_estimates_summary_when_checkpoint_count_is_missing(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    events = []
+    estimate_calls = []
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    async def event_emitter(event):
+        events.append(event)
+
+    async def get_or_create_compaction_summary(*, on_summary_start=None, **kwargs):
+        assert on_summary_start is not None
+        await on_summary_start()
+        return mod.CompactionSummaryResult(
+            "fallback summary",
+            checkpoint={
+                "summary_text": "fallback summary",
+                "summary_token_count": None,
+                "summary_meta": {},
+            },
+        )
+
+    async def estimate_rendered_summary_message_tokens(**kwargs):
+        estimate_calls.append(kwargs)
+        return 37
+
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_rendered_summary_message_tokens",
+        estimate_rendered_summary_message_tokens,
+    )
+
+    assert (
+        await mod._prefetch_compaction_checkpoint(
+            request=pipe_request,
+            user=pipe_user,
+            user_id=pipe_user["id"],
+            chat_id=pipe_metadata["chat_id"],
+            metadata=pipe_metadata,
+            body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+            pipe_function_id="auto_compact",
+            summary_model_id="target",
+            source_messages=source_messages,
+            summary_tool_policy="fallback_on_tool_call",
+            historical_message_excerpt_bytes=1024,
+            historical_message_excerpt_count=3,
+            effective_trigger_total_tokens=1000,
+            effective_soft_trigger_total_tokens=800,
+            trigger_total_tokens=850,
+            trigger_usage_source="request",
+            token_status_detail="before_after",
+            event_emitter=event_emitter,
+        )
+        is True
+    )
+
+    assert len(estimate_calls) == 1
+    assert estimate_calls[0]["summary_text"] == "fallback summary"
+    assert estimate_calls[0]["historical_source_messages"] == source_messages
+    prefetched = _status_events(events)[1]["data"]
+    assert prefetched["tokens"]["summary"] == 37
+    assert "after" not in prefetched["tokens"]
+    assert "→" not in prefetched["description"]
+    assert "summary" in prefetched["description"].lower()
+    assert "summary ≈37 tokens" in prefetched["description"]
 
 
 @pytest.mark.asyncio
