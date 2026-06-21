@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.4.0
+version: 0.4.1
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -85,7 +85,6 @@ BODY_TOKEN_EXTRA_KEYS = (
     "response_format",
     "parallel_tool_calls",
 )
-CHECKPOINT_APPLIED_HARD_GUARD_RATIO = 0.9
 INTERNAL_SUMMARY_TASK = "auto_compaction_summary"
 TEMP_CHAT_PREFIXES = ("local:", "channel:")
 SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
@@ -7338,10 +7337,8 @@ class Pipe:
             description=(
                 "When true, show both the provider/Open WebUI usage total and the local "
                 "tiktoken estimate side by side so you can see the gap. Only shown when both "
-                "values are available. Because the inlet skips the local estimate once a hard "
-                "trigger fires (usage_should_compact), enabling this computes that estimate "
-                "even in the hard-triggered path purely for display (added cost only when a "
-                "hard compaction is already happening)."
+                "values are available. When the inlet cannot compute the candidate decision "
+                "estimate, enabling this computes a local estimate purely for display."
             ),
         )
 
@@ -7505,22 +7502,12 @@ class Pipe:
             effective_trigger_total_tokens = resolve_trigger_total_tokens(self.valves, target_model_for_limits)
         except ValueError as exc:
             return _error_response(str(exc), code="invalid_trigger_total_tokens_overrides")
-        usage_should_compact = (
-            supported_context and total_tokens is not None and total_tokens >= effective_trigger_total_tokens
-        )
         effective_soft_trigger_total_tokens = resolve_soft_trigger_total_tokens(
             self.valves,
             target_model_for_limits,
             effective_trigger_total_tokens,
         )
-        usage_soft_should_prefetch = (
-            supported_context
-            and not is_summary_task
-            and total_tokens is not None
-            and effective_soft_trigger_total_tokens is not None
-            and total_tokens >= effective_soft_trigger_total_tokens
-            and total_tokens < effective_trigger_total_tokens
-        )
+        # --- reusable checkpoint lookup precedes any token estimate ---
         reusable_checkpoint_match = None
         if supported_context:
             try:
@@ -7536,9 +7523,13 @@ class Pipe:
                     f"Failed to access auto-compaction checkpoints: {exc}",
                     code="checkpoint_unavailable",
                 )
-        estimated_total_tokens = None
+        # --- candidate-payload estimate: the decision basis ---
+        # total_tokens is an OBSERVATION of a past payload, not the size of the
+        # candidate we are about to send. Hard/soft decisions are driven by a
+        # candidate estimate (decision_total), never by raw observed usage.
         checkpoint_applied_estimate = None
-        if supported_context and not usage_should_compact:
+        estimated_total_tokens = None
+        if supported_context:
             if reusable_checkpoint_match is not None:
                 if task_source_body is not None:
                     checkpoint_applied_estimate = await _estimate_task_checkpoint_applied_body_tokens(
@@ -7563,35 +7554,41 @@ class Pipe:
                         historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                     )
             else:
-                if task_source_body is None and total_tokens is not None:
+                if total_tokens is not None:
                     estimated_total_tokens = await _estimate_next_input_tokens_from_usage_anchor(
                         request=__request__,
                         last_observed_total_tokens=total_tokens,
                         body=checkpoint_lookup_body,
                         usage_source=usage_source,
                     )
-                if estimated_total_tokens is None and (total_tokens is None or task_source_body is None):
+                if estimated_total_tokens is None:
                     estimated_total_tokens = await estimate_body_tokens_async(
                         checkpoint_lookup_body,
                         request=__request__,
                     )
+        # decision_total: checkpoint-applied estimate (the compacted body we
+        # would actually forward) takes priority over the usage-anchor / full-body
+        # estimate. It NEVER falls back to raw observed total_tokens.
+        if checkpoint_applied_estimate is not None:
+            decision_total = checkpoint_applied_estimate
+        elif estimated_total_tokens is not None:
+            decision_total = estimated_total_tokens
+        else:
+            decision_total = None
         compare_estimate_tokens = None
         if (
             supported_context
             and self.valves.token_status_compare_estimate
-            and usage_should_compact
-            and estimated_total_tokens is None
+            and decision_total is None
+            and total_tokens is not None
         ):
             with suppress(Exception):
                 compare_estimate_tokens = await estimate_body_tokens_async(
                     checkpoint_lookup_body,
                     request=__request__,
                 )
-        display_estimated_total_tokens = (
-            estimated_total_tokens if estimated_total_tokens is not None else checkpoint_applied_estimate
-        )
         display_token_context = _build_display_token_context(
-            estimated_total_tokens=display_estimated_total_tokens,
+            estimated_total_tokens=decision_total,
             total_tokens=total_tokens,
             effective_trigger_total_tokens=effective_trigger_total_tokens,
             effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
@@ -7599,36 +7596,28 @@ class Pipe:
         )
         display_token_context = _display_context_with_estimate(display_token_context, compare_estimate_tokens)
         compare_estimate_status = bool(self.valves.token_status_compare_estimate)
-        estimate_should_compact = (
-            supported_context
-            and estimated_total_tokens is not None
-            and estimated_total_tokens >= effective_trigger_total_tokens
-        )
-        estimate_should_prefetch = (
-            supported_context
-            and not is_summary_task
-            and effective_soft_trigger_total_tokens is not None
-            and estimated_total_tokens is not None
-            and estimated_total_tokens >= effective_soft_trigger_total_tokens
-            and estimated_total_tokens < effective_trigger_total_tokens
-        )
-        checkpoint_applied_is_safe = (
-            checkpoint_applied_estimate is not None
-            and checkpoint_applied_estimate < effective_trigger_total_tokens * CHECKPOINT_APPLIED_HARD_GUARD_RATIO
-        )
-        checkpoint_applied_needs_foreground = (
-            checkpoint_applied_estimate is not None and not checkpoint_applied_is_safe
-        )
+        # A reusable TASK checkpoint whose applied estimate cannot be computed
+        # cannot be confirmed safe, so foreground compaction is still required.
         checkpoint_applied_unknown_needs_foreground = (
             reusable_checkpoint_match is not None
             and task_source_body is not None
             and checkpoint_applied_estimate is None
         )
+        # hard/soft decisions look ONLY at decision_total (the candidate estimate).
         hard_should_compact = (
-            usage_should_compact
-            or estimate_should_compact
-            or checkpoint_applied_needs_foreground
-            or checkpoint_applied_unknown_needs_foreground
+            supported_context
+            and (
+                (decision_total is not None and decision_total >= effective_trigger_total_tokens)
+                or checkpoint_applied_unknown_needs_foreground
+            )
+        )
+        soft_should_prefetch = (
+            supported_context
+            and not is_summary_task
+            and effective_soft_trigger_total_tokens is not None
+            and decision_total is not None
+            and decision_total >= effective_soft_trigger_total_tokens
+            and decision_total < effective_trigger_total_tokens
         )
         should_compact = hard_should_compact or reusable_checkpoint_match is not None
         reusable_checkpoint_only = None
@@ -7654,7 +7643,7 @@ class Pipe:
                     compare_estimate=compare_estimate_status,
                 ),
             )
-        if not hard_should_compact and (usage_soft_should_prefetch or estimate_should_prefetch):
+        if not hard_should_compact and soft_should_prefetch:
             _start_soft_compaction_prefetch(
                 request=__request__,
                 user=user,
@@ -7667,9 +7656,7 @@ class Pipe:
                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                 effective_trigger_total_tokens=effective_trigger_total_tokens,
                 effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
-                trigger_total_tokens=total_tokens if usage_soft_should_prefetch else None,
-                trigger_estimated_tokens=estimated_total_tokens if estimate_should_prefetch else None,
-                trigger_usage_source=usage_source if usage_soft_should_prefetch else None,
+                trigger_estimated_tokens=decision_total,
                 token_status_detail=self.valves.token_status_detail,
                 token_status_compare_estimate=self.valves.token_status_compare_estimate,
                 event_emitter=__event_emitter__,
@@ -7678,10 +7665,14 @@ class Pipe:
         def launch_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
             if effective_soft_trigger_total_tokens is None:
                 return
-            completion_total_tokens = _usage_total(completion.get("usage")) or total_tokens
+            # Completed-turn prefetch is grounded ONLY in the just-completed
+            # response's own usage. No usage => no prefetch (never fall back to a
+            # previous turn's observed usage).
+            completion_total_tokens = _usage_total(completion.get("usage"))
+            if completion_total_tokens is None:
+                return
             if (
-                completion_total_tokens is None
-                or completion_total_tokens < effective_soft_trigger_total_tokens
+                completion_total_tokens < effective_soft_trigger_total_tokens
                 or completion_total_tokens >= effective_trigger_total_tokens
             ):
                 return

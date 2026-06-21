@@ -6882,7 +6882,7 @@ async def test_pipe_applies_parent_checkpoint_below_hard_usage_without_foregroun
 
 
 @pytest.mark.asyncio
-async def test_pipe_extends_parent_checkpoint_when_hard_observed_total_even_if_checkpoint_estimate_is_safe(
+async def test_pipe_applies_parent_checkpoint_when_hard_observed_total_but_checkpoint_estimate_safe(
     monkeypatch,
     pipe_request,
     pipe_user,
@@ -6890,7 +6890,6 @@ async def test_pipe_extends_parent_checkpoint_when_hard_observed_total_even_if_c
 ):
     captured = {}
     estimate_calls = []
-    summary_inputs = []
     parent_source = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
@@ -6925,11 +6924,16 @@ async def test_pipe_extends_parent_checkpoint_when_hard_observed_total_even_if_c
         estimate_calls.append(kwargs)
         return 40
 
-    existing_store = ClaimCheckpointStore([checkpoint])
+    class ParentCheckpointStore(ClaimCheckpointStore):
+        async def claim_pending(self, row):
+            raise AssertionError("safe checkpoint application must not create a foreground checkpoint")
+
+        async def touch(self, checkpoint_id, *, now=None):
+            captured["touched"] = checkpoint_id
+            return True
 
     async def generate_summary_text(**kwargs):
-        summary_inputs.append(kwargs["source_messages"])
-        return "fresh extended summary"
+        raise AssertionError("safe checkpoint application must not call the summary model")
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -6939,7 +6943,7 @@ async def test_pipe_extends_parent_checkpoint_when_hard_observed_total_even_if_c
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: existing_store)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ParentCheckpointStore([checkpoint]))
     monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens, raising=False)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
@@ -6969,24 +6973,17 @@ async def test_pipe_extends_parent_checkpoint_when_hard_observed_total_even_if_c
     )
 
     assert result == {"ok": True}
-    assert estimate_calls == []
-    assert len(summary_inputs) == 1
-    assert "existing parent summary" in summary_inputs[0][0]["content"]
-    assert summary_inputs[0][1:] == [*delta_messages]
+    assert len(estimate_calls) == 1
+    assert captured["touched"] == "checkpoint-1"
     forwarded = captured["forward_body"]
-    assert "fresh extended summary" in forwarded["messages"][0]["content"]
-    assert forwarded["messages"][1:] == [{"role": "user", "content": "active"}]
-    completed = existing_store.completed_rows[0]
-    assert completed["parent_checkpoint_id"] == "checkpoint-1"
-    assert completed["source_hash"] == mod.compute_source_hash([*parent_source, *delta_messages])
-    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
-        "auto_compaction_compacting",
-        "auto_compaction_compacted",
-    ]
+    assert "existing parent summary" in forwarded["messages"][0]["content"]
+    assert forwarded["messages"][1:] == [*delta_messages, {"role": "user", "content": "active"}]
+    assert parent_source[0] not in forwarded["messages"]
+    assert events == []
 
 
 @pytest.mark.asyncio
-async def test_pipe_extends_parent_checkpoint_when_checkpoint_applied_estimate_is_near_hard_guard(
+async def test_pipe_applies_parent_checkpoint_when_estimate_just_below_hard_no_foreground(
     monkeypatch,
     pipe_request,
     pipe_user,
@@ -7029,11 +7026,16 @@ async def test_pipe_extends_parent_checkpoint_when_checkpoint_applied_estimate_i
         estimate_calls.append(kwargs)
         return 95
 
-    existing_store = ClaimCheckpointStore([checkpoint])
+    class ParentCheckpointStore(ClaimCheckpointStore):
+        async def claim_pending(self, row):
+            raise AssertionError("safe checkpoint application must not create a foreground checkpoint")
+
+        async def touch(self, checkpoint_id, *, now=None):
+            captured["touched"] = checkpoint_id
+            return True
 
     async def generate_summary_text(**kwargs):
-        summary_inputs.append(kwargs["source_messages"])
-        return "fresh extended summary"
+        raise AssertionError("safe checkpoint application must not call the summary model")
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -7043,7 +7045,7 @@ async def test_pipe_extends_parent_checkpoint_when_checkpoint_applied_estimate_i
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: existing_store)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ParentCheckpointStore([checkpoint]))
     monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens, raising=False)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
@@ -7074,17 +7076,328 @@ async def test_pipe_extends_parent_checkpoint_when_checkpoint_applied_estimate_i
 
     assert result == {"ok": True}
     assert len(estimate_calls) == 1
-    assert len(summary_inputs) == 1
-    assert "existing parent summary" in summary_inputs[0][0]["content"]
-    assert summary_inputs[0][1:] == [*delta_messages]
+    assert captured["touched"] == "checkpoint-1"
     forwarded = captured["forward_body"]
-    assert "fresh extended summary" in forwarded["messages"][0]["content"]
-    assert forwarded["messages"][1:] == [{"role": "user", "content": "active"}]
-    assert existing_store.completed_rows[0]["parent_checkpoint_id"] == "checkpoint-1"
-    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
+    assert "existing parent summary" in forwarded["messages"][0]["content"]
+    assert forwarded["messages"][1:] == [*delta_messages, {"role": "user", "content": "active"}]
+    assert len(summary_inputs) == 0
+    assert events == []
+
+
+async def _run_parent_checkpoint_decision_case(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+    *,
+    persisted_total_tokens,
+    checkpoint_applied_estimate,
+    trigger_total_tokens,
+    soft_trigger_ratio,
+    foreground_summary_text=None,
+):
+    captured = {}
+    estimate_calls = []
+    summary_inputs = []
+    prefetch_calls = []
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    delta_messages = [
+        {"role": "user", "content": "middle"},
+        {"role": "assistant", "content": "middle answer"},
+    ]
+    checkpoint = {
+        "id": "checkpoint-1",
+        "state": "ready",
+        "source_message_count": len(parent_source),
+        "source_hash": mod.compute_source_hash(parent_source),
+        "summary_text": "existing parent summary",
+        "summary_meta": {},
+        "summary_token_count": 20,
+    }
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {
+            "total_tokens": persisted_total_tokens,
+            "input_tokens": persisted_total_tokens,
+            "output_tokens": 0,
+        }
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        estimate_calls.append(kwargs)
+        return checkpoint_applied_estimate
+
+    class ParentCheckpointStore(ClaimCheckpointStore):
+        async def claim_pending(self, row):
+            if foreground_summary_text is None:
+                raise AssertionError("safe checkpoint application must not create a foreground checkpoint")
+            return await super().claim_pending(row)
+
+        async def touch(self, checkpoint_id, *, now=None):
+            captured["touched"] = checkpoint_id
+            return True
+
+    existing_store = ParentCheckpointStore([checkpoint])
+
+    async def generate_summary_text(**kwargs):
+        if foreground_summary_text is None:
+            raise AssertionError("safe checkpoint application must not call the summary model")
+        summary_inputs.append(kwargs["source_messages"])
+        return foreground_summary_text
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        return {"ok": True}
+
+    def start_soft_prefetch(**kwargs):
+        stored = {
+            key: copy.deepcopy(value)
+            for key, value in kwargs.items()
+            if key not in {"event_emitter", "request", "user"}
+        }
+        stored["event_emitter"] = kwargs.get("event_emitter")
+        prefetch_calls.append(stored)
+        return True
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: existing_store)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens, raising=False)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = trigger_total_tokens
+    pipe.valves.soft_trigger_ratio = soft_trigger_ratio
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [
+                *parent_source,
+                *delta_messages,
+                {"role": "user", "content": "active"},
+            ],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    return {
+        "result": result,
+        "captured": captured,
+        "estimate_calls": estimate_calls,
+        "summary_inputs": summary_inputs,
+        "prefetch_calls": prefetch_calls,
+        "parent_source": parent_source,
+        "delta_messages": delta_messages,
+        "store": existing_store,
+        "events": events,
+    }
+
+
+@pytest.mark.asyncio
+async def test_pipe_skips_compaction_and_prefetch_when_checkpoint_estimate_below_soft(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    case = await _run_parent_checkpoint_decision_case(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        persisted_total_tokens=500,
+        checkpoint_applied_estimate=5,
+        trigger_total_tokens=100,
+        soft_trigger_ratio=0.5,
+    )
+
+    assert case["result"] == {"ok": True}
+    forwarded = case["captured"]["forward_body"]
+    assert "existing parent summary" in forwarded["messages"][0]["content"]
+    assert forwarded["messages"][1:] == [*case["delta_messages"], {"role": "user", "content": "active"}]
+    assert case["parent_source"][0] not in forwarded["messages"]
+    assert case["events"] == []
+    assert case["prefetch_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_skips_prefetch_when_checkpoint_estimate_below_soft_despite_high_usage(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    case = await _run_parent_checkpoint_decision_case(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        persisted_total_tokens=500,
+        checkpoint_applied_estimate=40,
+        trigger_total_tokens=1000,
+        soft_trigger_ratio=0.1,
+    )
+
+    assert case["result"] == {"ok": True}
+    forwarded = case["captured"]["forward_body"]
+    assert "existing parent summary" in forwarded["messages"][0]["content"]
+    assert forwarded["messages"][1:] == [*case["delta_messages"], {"role": "user", "content": "active"}]
+    assert case["prefetch_calls"] == []
+    assert case["events"] == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_prefetches_when_checkpoint_estimate_between_soft_and_hard(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    case = await _run_parent_checkpoint_decision_case(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        persisted_total_tokens=50,
+        checkpoint_applied_estimate=500,
+        trigger_total_tokens=1000,
+        soft_trigger_ratio=0.1,
+    )
+
+    assert case["result"] == {"ok": True}
+    assert case["summary_inputs"] == []
+    forwarded = case["captured"]["forward_body"]
+    assert "existing parent summary" in forwarded["messages"][0]["content"]
+    assert len(case["prefetch_calls"]) == 1
+    assert case["prefetch_calls"][0]["trigger_estimated_tokens"] == 500
+    assert "trigger_total_tokens" not in case["prefetch_calls"][0]
+
+
+@pytest.mark.asyncio
+async def test_pipe_compacts_foreground_when_checkpoint_estimate_at_or_above_hard(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    case = await _run_parent_checkpoint_decision_case(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        persisted_total_tokens=50,
+        checkpoint_applied_estimate=150,
+        trigger_total_tokens=100,
+        soft_trigger_ratio=0.1,
+        foreground_summary_text="fresh checkpoint summary",
+    )
+
+    assert case["result"] == {"ok": True}
+    assert len(case["summary_inputs"]) == 1
+    forwarded = case["captured"]["forward_body"]
+    assert "fresh checkpoint summary" in forwarded["messages"][0]["content"]
+    completed = case["store"].completed_rows[0]
+    assert completed["parent_checkpoint_id"] == "checkpoint-1"
+    assert [event["data"]["action"] for event in case["events"] if event["type"] == "status"] == [
         "auto_compaction_compacting",
         "auto_compaction_compacted",
     ]
+
+
+@pytest.mark.asyncio
+async def test_pipe_raw_usage_alone_does_not_trigger_compaction_without_candidate_estimate(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    captured = {}
+    prefetch_calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 500, "input_tokens": 500, "output_tokens": 0}
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return None
+
+    async def estimate_body_tokens_async(*args, **kwargs):
+        return 5
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("raw observed usage alone must not trigger foreground compaction")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        return {"ok": True}
+
+    def start_soft_prefetch(**kwargs):
+        prefetch_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.soft_trigger_ratio = 0.1
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"ok": True}
+    assert captured["forward_body"]["messages"] == body["messages"]
+    assert prefetch_calls == []
+    assert events == []
 
 
 def _install_threshold_decision_stubs(monkeypatch, captured, *, total_tokens):
@@ -7100,6 +7413,12 @@ def _install_threshold_decision_stubs(monkeypatch, captured, *, total_tokens):
     async def body_reusable_checkpoint_match(**kwargs):
         return None
 
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return total_tokens
+
+    async def estimate_body_tokens_async(*args, **kwargs):
+        return total_tokens
+
     async def get_or_create_checkpoint_summary(**kwargs):
         return "summary text"
 
@@ -7111,6 +7430,13 @@ def _install_threshold_decision_stubs(monkeypatch, captured, *, total_tokens):
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
     monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -7594,7 +7920,7 @@ async def test_pipe_uses_task_checkpoint_applied_estimate_for_reusable_checkpoin
 
     async def estimate_task_checkpoint_applied_body_tokens(**kwargs):
         captured["task_estimate_body"] = copy.deepcopy(kwargs["body"])
-        return 95
+        return 150
 
     async def estimate_checkpoint_applied_body_tokens(**kwargs):
         raise AssertionError("task reusable checkpoint guard must estimate the rebuilt task body")
@@ -8943,6 +9269,9 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_prior_checkpo
 
     existing_store = ClaimCheckpointStore([checkpoint])
 
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        return 250000
+
     async def generate_summary_text(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
         return "combined active summary"
@@ -8956,6 +9285,7 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_prior_checkpo
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: existing_store)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens, raising=False)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -9051,6 +9381,9 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_checkpoint_pa
 
     existing_store = ClaimCheckpointStore([checkpoint])
 
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        return 250000
+
     async def generate_summary_text(**kwargs):
         summary_inputs.append(kwargs["source_messages"])
         return "combined active summary"
@@ -9064,6 +9397,7 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_checkpoint_pa
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: existing_store)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens, raising=False)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -9490,6 +9824,15 @@ async def _run_token_status_pipe(
     async def lookup_pending_checkpoint_for_source_prefix(**kwargs):
         return None
 
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        if (
+            pipe is not None
+            and pipe.valves.token_status_compare_estimate
+            and (estimate_tokens is not None or estimate_sequence is not None)
+        ):
+            return None
+        return mod._usage_total(usage)
+
     async def estimate_body_tokens_async(body, **kwargs):
         estimate_calls.append(copy.deepcopy(body))
         if estimate_sequence is not None:
@@ -9517,6 +9860,12 @@ async def _run_token_status_pipe(
         mod,
         "_lookup_pending_checkpoint_for_source_prefix",
         lookup_pending_checkpoint_for_source_prefix,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
     )
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
     monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
@@ -9620,8 +9969,8 @@ async def test_status_compare_estimate_mode(monkeypatch, pipe_request, pipe_user
     assert "tiktoken" in compacting["description"]
     assert compacting["tokens"]["usage"] == 1250
     assert compacting["tokens"]["estimate"] == 1280
-    assert compacting["tokens"]["pct_of_hard"] == 125.0
-    assert "125%" in compacting["description"]
+    assert compacting["tokens"]["pct_of_hard"] == 128.0
+    assert "128%" in compacting["description"]
 
 
 @pytest.mark.asyncio
@@ -9992,6 +10341,9 @@ async def test_status_skipped_action_carries_tokens(monkeypatch, pipe_request, p
     async def lookup_pending_checkpoint_for_source_prefix(**kwargs):
         return None
 
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 1500
+
     async def compact_body(**kwargs):
         return kwargs["body"], False
 
@@ -10010,6 +10362,12 @@ async def test_status_skipped_action_carries_tokens(monkeypatch, pipe_request, p
         mod,
         "_lookup_pending_checkpoint_for_source_prefix",
         lookup_pending_checkpoint_for_source_prefix,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
     )
     monkeypatch.setattr(mod, "_compact_body", compact_body)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
@@ -10636,6 +10994,9 @@ async def test_pipe_launches_soft_prefetch_below_hard_without_foreground_compact
     async def reusable_checkpoint_match(**kwargs):
         return None
 
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 150
+
     async def generate_summary_text(**kwargs):
         raise AssertionError("soft prefetch must not synchronously generate summaries")
 
@@ -10654,6 +11015,12 @@ async def test_pipe_launches_soft_prefetch_below_hard_without_foreground_compact
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
@@ -11707,8 +12074,12 @@ async def test_pipe_launches_completed_turn_soft_prefetch_for_non_tool_response(
     async def reusable_checkpoint_match(**kwargs):
         return None
 
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 150
+
     async def forward_target(**kwargs):
         return {
+            "usage": {"total_tokens": 150, "prompt_tokens": 100, "completion_tokens": 50},
             "choices": [
                 {
                     "message": {"role": "assistant", "content": "answer"},
@@ -11732,6 +12103,12 @@ async def test_pipe_launches_completed_turn_soft_prefetch_for_non_tool_response(
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
 
@@ -11792,6 +12169,9 @@ async def test_pipe_skips_completed_turn_soft_prefetch_for_tool_call_response(
     async def reusable_checkpoint_match(**kwargs):
         return None
 
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 150
+
     async def forward_target(**kwargs):
         return {
             "choices": [
@@ -11816,6 +12196,12 @@ async def test_pipe_skips_completed_turn_soft_prefetch_for_tool_call_response(
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
 
@@ -11837,6 +12223,114 @@ async def test_pipe_skips_completed_turn_soft_prefetch_for_tool_call_response(
 
     assert len(calls) == 1
     assert calls[0]["body"]["messages"] == body["messages"]
+
+
+async def _run_completed_turn_prefetch_usage_case(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+    *,
+    response_usage=None,
+):
+    calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 10, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 10
+
+    async def forward_target(**kwargs):
+        response = {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "answer"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        if response_usage is not None:
+            response["usage"] = response_usage
+        return response
+
+    def start_soft_prefetch(**kwargs):
+        calls.append(copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"}))
+        return True
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_pipe_completed_turn_prefetch_requires_response_usage(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    calls = await _run_completed_turn_prefetch_usage_case(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+    )
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_completed_turn_prefetch_fires_from_response_usage(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    calls = await _run_completed_turn_prefetch_usage_case(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        response_usage={"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["trigger_total_tokens"] == 500
+    assert calls[0]["body"]["messages"][-2:] == [
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": ""},
+    ]
 
 
 @pytest.mark.asyncio
