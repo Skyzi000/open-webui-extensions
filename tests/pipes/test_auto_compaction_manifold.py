@@ -1629,20 +1629,52 @@ def test_message_token_estimates_are_cached_by_canonical_hash():
     assert len(encoder.calls) == 1
 
 
-def test_large_message_token_estimate_uses_heuristic_without_exact_encode():
-    class ExplodingEncoder:
-        def encode(self, text):
-            raise AssertionError("large messages must not be sent to exact tiktoken encode")
+def test_large_message_token_estimate_uses_sampling_for_large_text():
+    """Large messages (>64 KB) use 3-point sampling instead of full encode."""
 
-    message = {
-        "role": "user",
-        "content": "x" * (mod.MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES + 1),
-    }
+    call_log = []
 
-    count = mod.estimate_message_tokens(message, encoder=ExplodingEncoder(), encoding_name="unit-test")
+    class SamplingEncoder:
+        def encode(self, text, **kwargs):
+            call_log.append(len(text))
+            # 1 char = 1 token
+            return list(range(len(text)))
+
+    large_content = "a" * (mod.MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES + 10000)
+    message = {"role": "user", "content": large_content}
+
+    count = mod.estimate_message_tokens(
+        message, encoder=SamplingEncoder(), encoding_name="unit-test"
+    )
 
     assert isinstance(count, int)
-    assert count >= len(message["content"].encode("utf-8")) + mod.MESSAGE_TOKEN_OVERHEAD
+    # Encoder called exactly 3 times (head, middle, tail)
+    assert len(call_log) == 3
+    # Each sample within byte budget (allow small rounding slack)
+    for sample_size in call_log:
+        assert sample_size <= mod.MESSAGE_TOKEN_SAMPLE_MAX_BYTES + 100
+    # Result within +/-30 % of char count (1 char = 1 token for this encoder)
+    expected = len(large_content) + mod.MESSAGE_TOKEN_OVERHEAD
+    assert abs(count - expected) < expected * 0.3
+
+
+def test_large_message_token_estimate_sampling_handles_none_on_encode_failure():
+    """If the encoder fails on a sample, the estimate returns None."""
+
+    class FailingEncoder:
+        def encode(self, text, **kwargs):
+            raise TypeError("boom")
+
+    large_content = "x" * (mod.MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES + 100)
+    message = {"role": "user", "content": large_content}
+
+    count = mod.estimate_message_tokens(
+        message, encoder=FailingEncoder(), encoding_name="unit-test"
+    )
+
+    # _encode_text_token_count catches TypeError and returns None,
+    # which propagates through _estimate_large_text_tokens_sampling.
+    assert count is None
 
 
 def test_message_token_estimate_treats_special_token_strings_as_plain_text():

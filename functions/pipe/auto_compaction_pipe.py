@@ -76,7 +76,7 @@ MESSAGE_TOKEN_OVERHEAD = 4
 REQUEST_TOKEN_OVERHEAD = 3
 MESSAGE_TOKEN_ESTIMATE_CACHE_MAX_ENTRIES = 8192
 MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES = 64 * 1024
-MESSAGE_TOKEN_HEURISTIC_BYTES_PER_TOKEN = 1
+MESSAGE_TOKEN_SAMPLE_MAX_BYTES = 16 * 1024
 BODY_TOKEN_EXTRA_KEYS = (
     "tools",
     "tool_choice",
@@ -800,9 +800,64 @@ def _remember_message_token_estimate(key: tuple[str, str, str], count: int) -> N
     _MESSAGE_TOKEN_ESTIMATE_CACHE[key] = int(count)
 
 
-def _estimate_large_text_tokens(text: str, *, overhead: int = MESSAGE_TOKEN_OVERHEAD) -> int:
-    byte_count = len(text.encode("utf-8", errors="ignore"))
-    return math.ceil(byte_count / MESSAGE_TOKEN_HEURISTIC_BYTES_PER_TOKEN) + int(overhead)
+def _estimate_large_text_tokens_sampling(
+    text: str,
+    *,
+    encoder: Any,
+    overhead: int = MESSAGE_TOKEN_OVERHEAD,
+) -> int | None:
+    """Estimate token count for large text via 3-point sampling.
+
+    Samples head, middle, and tail regions (each up to
+    ``MESSAGE_TOKEN_SAMPLE_MAX_BYTES`` bytes), encodes them exactly
+    with the tiktoken encoder, and extrapolates the aggregate
+    bytes/tokens ratio to the full text.
+
+    Returns ``None`` if encoding fails for any sample.
+    """
+    total_bytes = len(text.encode("utf-8", errors="ignore"))
+    if total_bytes == 0:
+        return int(overhead)
+
+    total_chars = len(text)
+    if total_chars == 0:
+        return int(overhead)
+
+    # Approximate chars-per-sample to stay within the byte budget.
+    bytes_per_char = total_bytes / total_chars
+    sample_chars = max(1, int(MESSAGE_TOKEN_SAMPLE_MAX_BYTES / bytes_per_char))
+
+    # Three sampling regions: head, middle, tail.
+    regions = [
+        (0, min(sample_chars, total_chars)),
+        (
+            max(0, total_chars // 2 - sample_chars // 2),
+            min(total_chars // 2 + sample_chars // 2, total_chars),
+        ),
+        (max(0, total_chars - sample_chars), total_chars),
+    ]
+
+    total_sample_bytes = 0
+    total_sample_tokens = 0
+
+    for start, end in regions:
+        if end <= start:
+            continue
+        sample = text[start:end]
+        sample_bytes = len(sample.encode("utf-8", errors="ignore"))
+        if sample_bytes == 0:
+            continue
+        sample_tokens = _encode_text_token_count(encoder, sample)
+        if sample_tokens is None:
+            return None
+        total_sample_bytes += sample_bytes
+        total_sample_tokens += sample_tokens
+
+    if total_sample_bytes == 0 or total_sample_tokens == 0:
+        return int(overhead)
+
+    bytes_per_token = total_sample_bytes / total_sample_tokens
+    return math.ceil(total_bytes / bytes_per_token) + int(overhead)
 
 
 def _encode_text_token_count(encoder: Any, text: str) -> int | None:
@@ -824,7 +879,9 @@ def _estimate_text_tokens_with_encoder(
     overhead: int = MESSAGE_TOKEN_OVERHEAD,
 ) -> int | None:
     if len(text.encode("utf-8", errors="ignore")) > MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES:
-        return _estimate_large_text_tokens(text, overhead=overhead)
+        return _estimate_large_text_tokens_sampling(
+            text, encoder=encoder, overhead=overhead
+        )
     count = _encode_text_token_count(encoder, text)
     if count is None:
         return None
