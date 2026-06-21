@@ -9421,6 +9421,442 @@ async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_me
     ]
 
 
+def _status_events(events):
+    return [event for event in events if event["type"] == "status"]
+
+
+async def _run_token_status_pipe(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+    *,
+    usage=None,
+    estimate_tokens=None,
+    estimate_sequence=None,
+    pipe=None,
+    body=None,
+    trigger_total_tokens=1000,
+    forward_raises_once=False,
+):
+    captured = {"forward_bodies": []}
+    estimate_calls = []
+    events = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return usage
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def lookup_pending_checkpoint_for_source_prefix(**kwargs):
+        return None
+
+    async def estimate_body_tokens_async(body, **kwargs):
+        estimate_calls.append(copy.deepcopy(body))
+        if estimate_sequence is not None:
+            index = min(len(estimate_calls) - 1, len(estimate_sequence) - 1)
+            return estimate_sequence[index]
+        return estimate_tokens
+
+    async def get_or_create_compaction_summary(**kwargs):
+        return "status summary"
+
+    async def forward_target(**kwargs):
+        captured["forward_bodies"].append(copy.deepcopy(kwargs["body"]))
+        if forward_raises_once and len(captured["forward_bodies"]) == 1:
+            raise mod.RetryableContextOverflow("context")
+        return {"ok": True}
+
+    async def event_emitter(event):
+        events.append(event)
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        lookup_pending_checkpoint_for_source_prefix,
+    )
+    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = pipe or mod.Pipe()
+    pipe.valves.trigger_total_tokens = trigger_total_tokens
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = body or {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    return result, events, captured, estimate_calls
+
+
+@pytest.mark.asyncio
+async def test_status_shows_before_tokens_by_default(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    result, events, _captured, _estimate_calls = await _run_token_status_pipe(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        usage={"total_tokens": 1500, "input_tokens": 1500, "output_tokens": 0},
+        trigger_total_tokens=1000,
+    )
+
+    assert result == {"ok": True}
+    status_events = _status_events(events)
+    assert [event["data"]["action"] for event in status_events] == [
+        "auto_compaction_compacting",
+        "auto_compaction_compacted",
+    ]
+    compacting = status_events[0]["data"]
+    assert "1,500" in compacting["description"]
+    assert "· 150%" in compacting["description"]
+    assert compacting["tokens"]["before"] == 1500
+    assert compacting["tokens"]["hard_limit"] == 1000
+    assert compacting["tokens"]["pct_of_hard"] >= 100
+
+
+@pytest.mark.asyncio
+async def test_status_before_after_mode(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    pipe = mod.Pipe()
+    pipe.valves.token_status_detail = "before_after"
+
+    result, events, _captured, _estimate_calls = await _run_token_status_pipe(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        pipe=pipe,
+        usage={"total_tokens": 1500, "input_tokens": 1500, "output_tokens": 0},
+        estimate_sequence=[120],
+        trigger_total_tokens=1000,
+    )
+
+    assert result == {"ok": True}
+    compacted = _status_events(events)[1]["data"]
+    assert compacted["action"] == "auto_compaction_compacted"
+    assert "->" not in compacted["description"]
+    assert "→" in compacted["description"]
+    assert "120" in compacted["description"]
+    assert compacted["tokens"]["after"] == 120
+    assert compacted["tokens"]["after"] < compacted["tokens"]["before"]
+
+
+@pytest.mark.asyncio
+async def test_status_compare_estimate_mode(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    pipe = mod.Pipe()
+    pipe.valves.token_status_compare_estimate = True
+
+    result, events, _captured, estimate_calls = await _run_token_status_pipe(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        pipe=pipe,
+        usage={"total_tokens": 1250, "input_tokens": 1250, "output_tokens": 0},
+        estimate_tokens=1280,
+        trigger_total_tokens=1000,
+    )
+
+    assert result == {"ok": True}
+    assert len(estimate_calls) == 1
+    compacting = _status_events(events)[0]["data"]
+    assert "usage" in compacting["description"]
+    assert "tiktoken" in compacting["description"]
+    assert compacting["tokens"]["usage"] == 1250
+    assert compacting["tokens"]["estimate"] == 1280
+    assert compacting["tokens"]["pct_of_hard"] == 125.0
+    assert "125%" in compacting["description"]
+
+
+@pytest.mark.asyncio
+async def test_status_compare_estimate_and_before_after_combined(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    pipe = mod.Pipe()
+    pipe.valves.token_status_compare_estimate = True
+    pipe.valves.token_status_detail = "before_after"
+
+    result, events, _captured, estimate_calls = await _run_token_status_pipe(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        pipe=pipe,
+        usage={"total_tokens": 1250, "input_tokens": 1250, "output_tokens": 0},
+        estimate_sequence=[1280, 500],
+        trigger_total_tokens=1000,
+    )
+
+    assert result == {"ok": True}
+    compacted = _status_events(events)[-1]["data"]
+    assert compacted["action"] == "auto_compaction_compacted"
+    assert "usage" in compacted["description"]
+    assert "tiktoken" in compacted["description"]
+    assert "→" in compacted["description"]
+    assert "500" in compacted["description"]
+    assert compacted["tokens"]["after"] == 500
+    assert compacted["tokens"]["usage"] == 1250
+    assert compacted["tokens"]["estimate"] == 1280
+
+
+@pytest.mark.asyncio
+async def test_status_always_mode_emits_pressure(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    pipe = mod.Pipe()
+    pipe.valves.token_status_visibility = "always"
+
+    result, events, captured, _estimate_calls = await _run_token_status_pipe(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        pipe=pipe,
+        usage=None,
+        estimate_tokens=450,
+        trigger_total_tokens=1000,
+    )
+
+    assert result == {"ok": True}
+    assert captured["forward_bodies"][0]["messages"][0]["content"] == "old"
+    status_events = _status_events(events)
+    assert [event["data"]["action"] for event in status_events] == ["auto_compaction_status"]
+    assert status_events[0]["data"]["done"] is True
+    assert "450" in status_events[0]["data"]["description"]
+    assert status_events[0]["data"]["tokens"]["before"] == 450
+
+
+@pytest.mark.asyncio
+async def test_status_compaction_only_silent_below_threshold(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    result, events, _captured, _estimate_calls = await _run_token_status_pipe(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        usage=None,
+        estimate_tokens=450,
+        trigger_total_tokens=1000,
+    )
+
+    assert result == {"ok": True}
+    assert _status_events(events) == []
+
+
+@pytest.mark.asyncio
+async def test_status_unknown_tokens_render(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    result, events, captured, _estimate_calls = await _run_token_status_pipe(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        usage=None,
+        estimate_tokens=None,
+        trigger_total_tokens=1000,
+        forward_raises_once=True,
+    )
+
+    assert result == {"ok": True}
+    assert len(captured["forward_bodies"]) == 2
+    status_events = _status_events(events)
+    assert [event["data"]["action"] for event in status_events] == [
+        "auto_compaction_retry",
+        "auto_compaction_compacting",
+        "auto_compaction_compacted",
+    ]
+    assert "≈unknown" in status_events[0]["data"]["description"]
+    assert status_events[0]["data"]["tokens"]["before"] is None
+
+
+@pytest.mark.asyncio
+async def test_status_prefetch_shows_trigger_tokens(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    events = []
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    async def event_emitter(event):
+        events.append(event)
+
+    async def get_or_create_compaction_summary(*, on_summary_start=None, **kwargs):
+        assert on_summary_start is not None
+        await on_summary_start()
+        return mod.CompactionSummaryResult(
+            "prefetched summary",
+            checkpoint={"summary_text": "prefetched summary", "summary_meta": {}},
+        )
+
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+
+    assert (
+        await mod._prefetch_compaction_checkpoint(
+            request=pipe_request,
+            user=pipe_user,
+            user_id=pipe_user["id"],
+            chat_id=pipe_metadata["chat_id"],
+            metadata=pipe_metadata,
+            body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+            pipe_function_id="auto_compact",
+            summary_model_id="target",
+            source_messages=source_messages,
+            summary_tool_policy="fallback_on_tool_call",
+            historical_message_excerpt_bytes=1024,
+            historical_message_excerpt_count=3,
+            effective_trigger_total_tokens=1000,
+            effective_soft_trigger_total_tokens=800,
+            trigger_total_tokens=850,
+            trigger_usage_source="request",
+            event_emitter=event_emitter,
+        )
+        is True
+    )
+
+    status_events = [event for event in events if event["type"] == "status"]
+    assert [event["data"]["action"] for event in status_events] == [
+        "auto_compaction_prefetching",
+        "auto_compaction_prefetched",
+    ]
+    prefetching = status_events[0]["data"]
+    assert "850" in prefetching["description"]
+    assert prefetching["tokens"]["before"] == 850
+    assert prefetching["tokens"]["hard_limit"] == 1000
+    assert prefetching["tokens"]["pct_of_hard"] == 85.0
+    prefetched = status_events[1]["data"]
+    assert prefetched["tokens"]["before"] == 850
+
+
+@pytest.mark.asyncio
+async def test_status_skipped_action_carries_tokens(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 1000
+
+    captured = {"forward_bodies": []}
+    events = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 1500, "input_tokens": 1500, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def lookup_pending_checkpoint_for_source_prefix(**kwargs):
+        return None
+
+    async def compact_body(**kwargs):
+        return kwargs["body"], False
+
+    async def forward_target(**kwargs):
+        captured["forward_bodies"].append(copy.deepcopy(kwargs["body"]))
+        return {"ok": True}
+
+    async def event_emitter(event):
+        events.append(event)
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        lookup_pending_checkpoint_for_source_prefix,
+    )
+    monkeypatch.setattr(mod, "_compact_body", compact_body)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata, __event_emitter__=event_emitter)
+
+    assert result == {"ok": True}
+    status_events = _status_events(events)
+    assert status_events[-1]["data"]["action"] == "auto_compaction_skipped"
+    assert "Could not compact" in status_events[-1]["data"]["description"]
+    assert status_events[-1]["data"]["tokens"]["before"] == 1500
+    assert status_events[-1]["data"]["tokens"]["hard_limit"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_status_before_after_renders_when_after_estimate_fails(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    pipe = mod.Pipe()
+    pipe.valves.token_status_detail = "before_after"
+
+    result, events, _captured, _estimate_calls = await _run_token_status_pipe(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        pipe=pipe,
+        usage={"total_tokens": 1500, "input_tokens": 1500, "output_tokens": 0},
+        estimate_sequence=[None],
+        trigger_total_tokens=1000,
+    )
+
+    assert result == {"ok": True}
+    compacted = _status_events(events)[-1]["data"]
+    assert compacted["action"] == "auto_compaction_compacted"
+    assert "→" not in compacted["description"]
+    assert "after" not in compacted["tokens"]
+
+
+@pytest.mark.asyncio
+async def test_status_always_mode_plus_compaction_emits_both(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    pipe = mod.Pipe()
+    pipe.valves.token_status_visibility = "always"
+    pipe.valves.trigger_total_tokens = 1000
+
+    result, events, captured, _estimate_calls = await _run_token_status_pipe(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        pipe=pipe,
+        usage={"total_tokens": 1500, "input_tokens": 1500, "output_tokens": 0},
+        trigger_total_tokens=1000,
+    )
+
+    assert result == {"ok": True}
+    actions = [event["data"]["action"] for event in _status_events(events)]
+    assert actions[0] == "auto_compaction_status"
+    assert "auto_compaction_compacting" in actions
+    assert "auto_compaction_compacted" in actions
+    assert _status_events(events)[0]["data"]["tokens"]["before"] == 1500
+
+
 @pytest.mark.asyncio
 async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     monkeypatch,

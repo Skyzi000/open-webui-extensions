@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.3.0
+version: 0.4.0
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -5182,6 +5182,137 @@ def _append_summary_sse_value(value: str, parts: list[str]) -> bool:
     return saw_tool_call
 
 
+@dataclass(frozen=True)
+class DisplayTokenContext:
+    before: int | None
+    usage: int | None
+    estimate: int | None
+    hard_limit: int
+    soft_limit: int | None
+    usage_source: str | None
+    pct_of_hard: float | None
+
+
+def _build_display_token_context(
+    *,
+    estimated_total_tokens: int | None,
+    total_tokens: int | None,
+    effective_trigger_total_tokens: int,
+    effective_soft_trigger_total_tokens: int | None,
+    usage_source: str | None,
+) -> DisplayTokenContext:
+    before = None
+    display_usage_source = usage_source
+    if estimated_total_tokens is not None:
+        before = estimated_total_tokens
+        if total_tokens is None or estimated_total_tokens != total_tokens:
+            display_usage_source = "estimate"
+    elif total_tokens is not None:
+        before = total_tokens
+
+    pct_of_hard = None
+    if before is not None and effective_trigger_total_tokens > 0:
+        pct_of_hard = round(before / effective_trigger_total_tokens * 100, 1)
+
+    return DisplayTokenContext(
+        before=before,
+        usage=total_tokens,
+        estimate=estimated_total_tokens,
+        hard_limit=effective_trigger_total_tokens,
+        soft_limit=effective_soft_trigger_total_tokens,
+        usage_source=display_usage_source,
+        pct_of_hard=pct_of_hard,
+    )
+
+
+def _display_context_with_estimate(ctx: DisplayTokenContext, estimate: int | None) -> DisplayTokenContext:
+    if estimate is None or ctx.estimate is not None:
+        return ctx
+    return DisplayTokenContext(
+        before=ctx.before,
+        usage=ctx.usage,
+        estimate=estimate,
+        hard_limit=ctx.hard_limit,
+        soft_limit=ctx.soft_limit,
+        usage_source=ctx.usage_source,
+        pct_of_hard=ctx.pct_of_hard,
+    )
+
+
+def _round_half_up_int(value: float) -> int:
+    return int(math.floor(value + 0.5))
+
+
+def _format_token_count(value: int, *, approximate: bool) -> str:
+    prefix = "≈" if approximate else ""
+    return f"{prefix}{value:,}"
+
+
+def _format_before_token_count(ctx: DisplayTokenContext) -> str:
+    if ctx.before is None:
+        return "≈unknown"
+    is_provider_usage = ctx.usage_source in {"request", "persisted"} and ctx.usage == ctx.before
+    return _format_token_count(ctx.before, approximate=not is_provider_usage)
+
+
+def _format_token_suffix(ctx: DisplayTokenContext, *, after: int | None, compare_estimate: bool) -> str:
+    hard_limit = f"{ctx.hard_limit:,}"
+    before_pct = None if ctx.pct_of_hard is None else _round_half_up_int(ctx.pct_of_hard)
+
+    if compare_estimate and ctx.usage is not None and ctx.estimate is not None:
+        estimate_part = f"tiktoken ≈{ctx.estimate:,}"
+        pct_part = f" · {before_pct}%" if before_pct is not None else ""
+        if after is not None:
+            estimate_part += f" → {_format_token_count(after, approximate=True)}"
+            if ctx.hard_limit > 0:
+                pct_part += f" → {_round_half_up_int(after / ctx.hard_limit * 100)}%"
+        return f"(usage {ctx.usage:,} · {estimate_part} / {hard_limit}{pct_part})"
+
+    before = _format_before_token_count(ctx)
+    if after is not None:
+        after_count = _format_token_count(after, approximate=True)
+        if before_pct is None or ctx.hard_limit <= 0:
+            return f"({before} → {after_count} tokens)"
+        after_pct = _round_half_up_int(after / ctx.hard_limit * 100)
+        return f"({before} → {after_count} tokens · {before_pct}% → {after_pct}%)"
+
+    if before_pct is None:
+        return f"({before} / {hard_limit} tokens)"
+    return f"({before} / {hard_limit} tokens · {before_pct}%)"
+
+
+def _tokens_status_payload(
+    ctx: DisplayTokenContext,
+    *,
+    after: int | None,
+    compare_estimate: bool,
+) -> dict[str, Any]:
+    tokens: dict[str, Any] = {
+        "before": ctx.before,
+        "hard_limit": ctx.hard_limit,
+        "soft_limit": ctx.soft_limit,
+        "pct_of_hard": ctx.pct_of_hard,
+        "usage_source": ctx.usage_source,
+    }
+    if after is not None:
+        tokens["after"] = after
+    if compare_estimate and ctx.usage is not None:
+        tokens["usage"] = ctx.usage
+    if compare_estimate and ctx.estimate is not None:
+        tokens["estimate"] = ctx.estimate
+    return tokens
+
+
+def _description_with_token_suffix(
+    description: str,
+    ctx: DisplayTokenContext,
+    *,
+    after: int | None = None,
+    compare_estimate: bool = False,
+) -> str:
+    return f"{description} {_format_token_suffix(ctx, after=after, compare_estimate=compare_estimate)}"
+
+
 async def emit_compaction_status(
     event_emitter: Callable[[Any], Awaitable[None]] | None,
     *,
@@ -5855,6 +5986,11 @@ async def _prefetch_compaction_checkpoint(
     summary_tool_policy: SummaryToolPolicy,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
+    effective_trigger_total_tokens: int = 100000,
+    effective_soft_trigger_total_tokens: int | None = None,
+    trigger_total_tokens: int | None = None,
+    trigger_estimated_tokens: int | None = None,
+    trigger_usage_source: str | None = None,
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
 ) -> bool:
     if not source_messages:
@@ -5876,15 +6012,51 @@ async def _prefetch_compaction_checkpoint(
     )
 
     summary_started = False
+    prefetch_display_context: DisplayTokenContext | None = None
+    prefetch_display_context_ready = False
+
+    async def display_token_context() -> DisplayTokenContext:
+        nonlocal prefetch_display_context, prefetch_display_context_ready
+        if not prefetch_display_context_ready:
+            estimated = trigger_estimated_tokens
+            total = trigger_total_tokens
+            usage_src = trigger_usage_source
+            if estimated is None and total is None:
+                with suppress(Exception):
+                    LOG.debug(
+                        "auto-compaction prefetch: no trigger token value available, "
+                        "falling back to fresh body estimate (user_id=%s chat_id=%s)",
+                        user_id,
+                        chat_id,
+                    )
+                    estimated = await estimate_body_tokens_async(body, request=request)
+                usage_src = "estimate" if estimated is not None else None
+            prefetch_display_context = _build_display_token_context(
+                estimated_total_tokens=estimated,
+                total_tokens=total,
+                effective_trigger_total_tokens=effective_trigger_total_tokens,
+                effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+                usage_source=usage_src,
+            )
+            prefetch_display_context_ready = True
+        assert prefetch_display_context is not None
+        return prefetch_display_context
 
     async def emit_summary_start() -> None:
         nonlocal summary_started
         summary_started = True
+        if event_emitter is None:
+            return
+        token_context = await display_token_context()
         await emit_compaction_status(
             event_emitter,
             action="prefetching",
-            description="Creating an auto-compaction checkpoint in the background",
+            description=_description_with_token_suffix(
+                "Creating an auto-compaction checkpoint in the background",
+                token_context,
+            ),
             done=False,
+            tokens=_tokens_status_payload(token_context, after=None, compare_estimate=False),
         )
 
     try:
@@ -5905,31 +6077,46 @@ async def _prefetch_compaction_checkpoint(
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
     except asyncio.CancelledError:
-        if summary_started:
+        if summary_started and event_emitter is not None:
+            token_context = await display_token_context()
             await emit_compaction_status(
                 event_emitter,
                 action="failed",
-                description="Background auto-compaction checkpoint creation was cancelled",
+                description=_description_with_token_suffix(
+                    "Background auto-compaction checkpoint creation was cancelled",
+                    token_context,
+                ),
                 done=True,
                 error=True,
+                tokens=_tokens_status_payload(token_context, after=None, compare_estimate=False),
             )
         raise
     except Exception as exc:
-        if summary_started:
+        if summary_started and event_emitter is not None:
+            token_context = await display_token_context()
             await emit_compaction_status(
                 event_emitter,
                 action="failed",
-                description=f"Failed to create background auto-compaction checkpoint: {exc}",
+                description=_description_with_token_suffix(
+                    f"Failed to create background auto-compaction checkpoint: {exc}",
+                    token_context,
+                ),
                 done=True,
                 error=True,
+                tokens=_tokens_status_payload(token_context, after=None, compare_estimate=False),
             )
         raise
-    if summary_started:
+    if summary_started and event_emitter is not None:
+        token_context = await display_token_context()
         await emit_compaction_status(
             event_emitter,
             action="prefetched",
-            description="Auto-compaction checkpoint is ready",
+            description=_description_with_token_suffix(
+                "Auto-compaction checkpoint is ready",
+                token_context,
+            ),
             done=True,
+            tokens=_tokens_status_payload(token_context, after=None, compare_estimate=False),
         )
         await emit_compaction_summary_embed(
             event_emitter,
@@ -5949,6 +6136,11 @@ def _start_soft_compaction_prefetch(
     summary_tool_policy: SummaryToolPolicy,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
+    effective_trigger_total_tokens: int = 100000,
+    effective_soft_trigger_total_tokens: int | None = None,
+    trigger_total_tokens: int | None = None,
+    trigger_estimated_tokens: int | None = None,
+    trigger_usage_source: str | None = None,
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
 ) -> bool:
     source_messages = _soft_prefetch_source_messages(body)
@@ -5981,6 +6173,11 @@ def _start_soft_compaction_prefetch(
             summary_tool_policy=summary_tool_policy,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            effective_trigger_total_tokens=effective_trigger_total_tokens,
+            effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+            trigger_total_tokens=trigger_total_tokens,
+            trigger_estimated_tokens=trigger_estimated_tokens,
+            trigger_usage_source=trigger_usage_source,
             event_emitter=event_emitter,
         ),
     )
@@ -7008,6 +7205,38 @@ class Pipe:
             ge=0,
             description="Maximum number of recent historical user-message excerpts saved in new checkpoints and inserted into compacted context. Set 0 to disable excerpts.",
         )
+        token_status_visibility: Literal["compaction_only", "always"] = Field(
+            default="compaction_only",
+            description=(
+                "When to emit token-count status. 'compaction_only' (default) emits token "
+                "info only on existing compaction lifecycle events (compacting/compacted/"
+                "skipped/retry/prefetching/prefetched/failed), keeping normal requests silent. "
+                "'always' additionally emits one token-pressure status per normal request "
+                "(action auto_compaction_status) so you can watch context fill up before "
+                "compaction triggers. Has no effect on compaction decisions, only display."
+            ),
+        )
+        token_status_detail: Literal["before", "before_after"] = Field(
+            default="before",
+            description=(
+                "Token detail shown on compaction events. 'before' (default) shows the "
+                "pre-compaction count only, using values already computed for thresholding "
+                "(zero added cost). 'before_after' also shows the post-compaction count on "
+                "'compacted' events by running estimate_body_tokens_async once on the "
+                "compacted body (one extra estimate per foreground compaction)."
+            ),
+        )
+        token_status_compare_estimate: bool = Field(
+            default=False,
+            description=(
+                "When true, show both the provider/Open WebUI usage total and the local "
+                "tiktoken estimate side by side so you can see the gap. Only shown when both "
+                "values are available. Because the inlet skips the local estimate once a hard "
+                "trigger fires (usage_should_compact), enabling this computes that estimate "
+                "even in the hard-triggered path purely for display (added cost only when a "
+                "hard compaction is already happening)."
+            ),
+        )
 
         @field_validator("trigger_total_tokens_overrides_json")
         @classmethod
@@ -7239,6 +7468,30 @@ class Pipe:
                         checkpoint_lookup_body,
                         request=__request__,
                     )
+        compare_estimate_tokens = None
+        if (
+            supported_context
+            and self.valves.token_status_compare_estimate
+            and usage_should_compact
+            and estimated_total_tokens is None
+        ):
+            with suppress(Exception):
+                compare_estimate_tokens = await estimate_body_tokens_async(
+                    checkpoint_lookup_body,
+                    request=__request__,
+                )
+        display_estimated_total_tokens = (
+            estimated_total_tokens if estimated_total_tokens is not None else checkpoint_applied_estimate
+        )
+        display_token_context = _build_display_token_context(
+            estimated_total_tokens=display_estimated_total_tokens,
+            total_tokens=total_tokens,
+            effective_trigger_total_tokens=effective_trigger_total_tokens,
+            effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+            usage_source=usage_source,
+        )
+        display_token_context = _display_context_with_estimate(display_token_context, compare_estimate_tokens)
+        compare_estimate_status = bool(self.valves.token_status_compare_estimate)
         estimate_should_compact = (
             supported_context
             and estimated_total_tokens is not None
@@ -7274,6 +7527,26 @@ class Pipe:
         reusable_checkpoint_only = None
         if reusable_checkpoint_match is not None and not hard_should_compact:
             reusable_checkpoint_only = reusable_checkpoint_match
+        if (
+            self.valves.token_status_visibility == "always"
+            and not is_summary_task
+            and display_token_context.before is not None
+        ):
+            await emit_compaction_status(
+                __event_emitter__,
+                action="status",
+                description=_description_with_token_suffix(
+                    "Context pressure",
+                    display_token_context,
+                    compare_estimate=compare_estimate_status,
+                ),
+                done=True,
+                tokens=_tokens_status_payload(
+                    display_token_context,
+                    after=None,
+                    compare_estimate=compare_estimate_status,
+                ),
+            )
         if not hard_should_compact and (usage_soft_should_prefetch or estimate_should_prefetch):
             _start_soft_compaction_prefetch(
                 request=__request__,
@@ -7285,6 +7558,11 @@ class Pipe:
                 summary_tool_policy=self.valves.summary_tool_policy,
                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                effective_trigger_total_tokens=effective_trigger_total_tokens,
+                effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+                trigger_total_tokens=total_tokens if usage_soft_should_prefetch else None,
+                trigger_estimated_tokens=estimated_total_tokens if estimate_should_prefetch else None,
+                trigger_usage_source=usage_source if usage_soft_should_prefetch else None,
                 event_emitter=__event_emitter__,
             )
 
@@ -7314,6 +7592,10 @@ class Pipe:
                 summary_tool_policy=self.valves.summary_tool_policy,
                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                effective_trigger_total_tokens=effective_trigger_total_tokens,
+                effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+                trigger_total_tokens=completion_total_tokens,
+                trigger_usage_source="request",
                 event_emitter=__event_emitter__,
             )
 
@@ -7334,8 +7616,17 @@ class Pipe:
                         await emit_compaction_status(
                             __event_emitter__,
                             action="compacting",
-                            description="Compacting chat history before forwarding to the target model",
+                            description=_description_with_token_suffix(
+                                "Compacting chat history before forwarding to the target model",
+                                display_token_context,
+                                compare_estimate=compare_estimate_status,
+                            ),
                             done=False,
+                            tokens=_tokens_status_payload(
+                                display_token_context,
+                                after=None,
+                                compare_estimate=compare_estimate_status,
+                            ),
                         )
                     if reusable_checkpoint_only is not None and not compacted_once:
                         if task_source_body is not None:
@@ -7390,11 +7681,25 @@ class Pipe:
                     compacted_once = compacted_once or compacted
                     if emit_progress_status:
                         if compacted:
+                            after_tokens = None
+                            if self.valves.token_status_detail == "before_after":
+                                with suppress(Exception):
+                                    after_tokens = await estimate_body_tokens_async(candidate, request=__request__)
                             await emit_compaction_status(
                                 __event_emitter__,
                                 action="compacted",
-                                description="Compacted chat history is ready for the target model",
+                                description=_description_with_token_suffix(
+                                    "Compacted chat history is ready for the target model",
+                                    display_token_context,
+                                    after=after_tokens,
+                                    compare_estimate=compare_estimate_status,
+                                ),
                                 done=True,
+                                tokens=_tokens_status_payload(
+                                    display_token_context,
+                                    after=after_tokens,
+                                    compare_estimate=compare_estimate_status,
+                                ),
                             )
                             summary_text = extract_compaction_summary_text_from_messages(candidate.get("messages"))
                             await emit_compaction_summary_embed(
@@ -7405,25 +7710,52 @@ class Pipe:
                             await emit_compaction_status(
                                 __event_emitter__,
                                 action="skipped",
-                                description="Could not compact chat history safely; forwarding unchanged",
+                                description=_description_with_token_suffix(
+                                    "Could not compact chat history safely; forwarding unchanged",
+                                    display_token_context,
+                                    compare_estimate=compare_estimate_status,
+                                ),
                                 done=True,
+                                tokens=_tokens_status_payload(
+                                    display_token_context,
+                                    after=None,
+                                    compare_estimate=compare_estimate_status,
+                                ),
                             )
                 except UnsupportedCompactionInput as exc:
                     await emit_compaction_status(
                         __event_emitter__,
                         action="failed",
-                        description=str(exc),
+                        description=_description_with_token_suffix(
+                            str(exc),
+                            display_token_context,
+                            compare_estimate=compare_estimate_status,
+                        ),
                         done=True,
                         error=True,
+                        tokens=_tokens_status_payload(
+                            display_token_context,
+                            after=None,
+                            compare_estimate=compare_estimate_status,
+                        ),
                     )
                     return _error_response(str(exc), code=exc.code)
                 except Exception as exc:
                     await emit_compaction_status(
                         __event_emitter__,
                         action="failed",
-                        description=f"Failed to compact chat history: {exc}",
+                        description=_description_with_token_suffix(
+                            f"Failed to compact chat history: {exc}",
+                            display_token_context,
+                            compare_estimate=compare_estimate_status,
+                        ),
                         done=True,
                         error=True,
+                        tokens=_tokens_status_payload(
+                            display_token_context,
+                            after=None,
+                            compare_estimate=compare_estimate_status,
+                        ),
                     )
                     return _error_response(f"Failed to compact chat history: {exc}", code="summary_failed")
 
@@ -7462,16 +7794,34 @@ class Pipe:
                     await emit_compaction_status(
                         __event_emitter__,
                         action="failed",
-                        description=error_response["error"]["message"],
+                        description=_description_with_token_suffix(
+                            error_response["error"]["message"],
+                            display_token_context,
+                            compare_estimate=compare_estimate_status,
+                        ),
                         done=True,
                         error=True,
+                        tokens=_tokens_status_payload(
+                            display_token_context,
+                            after=None,
+                            compare_estimate=compare_estimate_status,
+                        ),
                     )
                     return error_response
                 await emit_compaction_status(
                     __event_emitter__,
                     action="retry",
-                    description="Target context window was exceeded before output; compacting and retrying",
+                    description=_description_with_token_suffix(
+                        "Target context window was exceeded before output; compacting and retrying",
+                        display_token_context,
+                        compare_estimate=compare_estimate_status,
+                    ),
                     done=False,
+                    tokens=_tokens_status_payload(
+                        display_token_context,
+                        after=None,
+                        compare_estimate=compare_estimate_status,
+                    ),
                 )
                 should_compact = True
                 compacted_once = True
