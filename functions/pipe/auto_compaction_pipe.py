@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.0
+version: 0.5.1
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -893,7 +893,7 @@ def _soft_prefetch_inflight_source_hash(
     if not isinstance(files, list):
         return compute_source_hash(source_messages)
     fingerprint = _stable_file_fingerprint(
-        [item for item in files if isinstance(item, dict) and item.get("type") != "image"]
+        [item for item in files if isinstance(item, dict) and not _is_image_file_item(item)]
     )
     return compute_summary_source_hash(source_messages, fingerprint)
 
@@ -924,7 +924,7 @@ def _make_prefix_file_fingerprint_resolver(
                 item
                 for item in metadata_files
                 if isinstance(item, dict)
-                and item.get("type") != "image"
+                and not _is_image_file_item(item)
                 and item.get("id") in prefix_ids
             ]
             result = _stable_file_fingerprint(items) or None
@@ -4482,6 +4482,22 @@ def _sse_data_chunk(data: str) -> str:
     return "".join(f"data: {line}\n" for line in lines) + "\n"
 
 
+def _immediate_response_is_error(response: Any) -> bool:
+    if isinstance(response, dict):
+        return bool(response.get("error"))
+    if isinstance(response, (JSONResponse, PlainTextResponse)):
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int) and status_code >= 400:
+            return True
+        parsed = _json_from_response(response)
+        if isinstance(parsed, dict):
+            return bool(parsed.get("error"))
+        if isinstance(parsed, list):
+            return False
+        return isinstance(response, PlainTextResponse)
+    return False
+
+
 def _response_to_sse_chunk(response: Response) -> str:
     text = _response_body_text(response)
     parsed = _json_from_response(response)
@@ -4788,25 +4804,16 @@ def first_chunk_is_retryable_context_error(chunk: bytes | str) -> bool:
     return bool(error_source is not None and is_retryable_context_error(error_source, status_code=400))
 
 
-def _stream_payload_has_user_visible_output(payload: dict[str, Any]) -> bool:
-    if payload.get("error"):
-        return False
-    payload_type = payload.get("type")
-    if isinstance(payload_type, str) and payload_type.startswith("response.") and payload_type.endswith(".delta"):
-        return True
-    choices = payload.get("choices")
-    if isinstance(choices, list) and choices:
-        delta = choices[0].get("delta") or {}
-        if any(delta.get(key) for key in ("content", "reasoning_content", "tool_calls")):
-            return True
-    return False
-
-
 def _stream_payload_is_responses_pre_output_control_event(payload: dict[str, Any]) -> bool:
     if _stream_payload_error_source(payload) is not None:
         return False
     payload_type = payload.get("type")
-    if payload_type in {"response.created", "response.in_progress"}:
+    if payload_type in {
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
+    }:
         return True
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -4843,13 +4850,6 @@ def _stream_chunk_is_empty(chunk: bytes | str) -> bool:
 
 def _sse_values_include_unstructured_output(values: Iterable[str]) -> bool:
     return any(value != "" for value in values)
-
-
-def chunk_has_user_visible_output(chunk: bytes | str) -> bool:
-    for payload in extract_sse_json_events(chunk):
-        if _stream_payload_has_user_visible_output(payload):
-            return True
-    return False
 
 
 def _request_bypass_system_prompt(request: Any) -> bool:
@@ -4925,7 +4925,10 @@ async def prepare_streaming_response(
             raise RetryableContextOverflow(str(response.get("error")))
         if restore:
             restore()
-        return StreamingResponse(iter([f"data: {json.dumps(response)}\n\n"]), media_type="text/event-stream")
+        streaming_response = StreamingResponse(iter([f"data: {json.dumps(response)}\n\n"]), media_type="text/event-stream")
+        if _immediate_response_is_error(response):
+            setattr(streaming_response, "_auto_compact_immediate_error", True)
+        return streaming_response
 
     if isinstance(response, (JSONResponse, PlainTextResponse)):
         if is_retryable_context_error(response):
@@ -4934,7 +4937,10 @@ async def prepare_streaming_response(
             raise RetryableContextOverflow(_response_body_text(response))
         if restore:
             restore()
-        return StreamingResponse(iter([_response_to_sse_chunk(response)]), media_type="text/event-stream")
+        streaming_response = StreamingResponse(iter([_response_to_sse_chunk(response)]), media_type="text/event-stream")
+        if _immediate_response_is_error(response):
+            setattr(streaming_response, "_auto_compact_immediate_error", True)
+        return streaming_response
 
     if not isinstance(response, StreamingResponse):
         if restore:
@@ -5294,12 +5300,21 @@ def _summary_tool_call_error() -> SummaryToolCallError:
     return SummaryToolCallError("Summary model returned a tool call instead of text content")
 
 
+def _is_image_file_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") == "image":
+        return True
+    content_type = item.get("content_type")
+    return isinstance(content_type, str) and content_type.startswith("image/")
+
+
 def _extract_non_image_file_ids(files_value: Any) -> set[str]:
     ids: set[str] = set()
     if not isinstance(files_value, list):
         return ids
     for item in files_value:
-        if not isinstance(item, dict) or item.get("type") == "image":
+        if not isinstance(item, dict) or _is_image_file_item(item):
             continue
         file_id = item.get("id")
         if isinstance(file_id, str) and file_id:
@@ -5358,7 +5373,7 @@ def _classify_files_for_target(
             return list(metadata_files)
         retained_files: list[Any] = []
         for file_item in metadata_files:
-            if not isinstance(file_item, dict) or file_item.get("type") == "image":
+            if not isinstance(file_item, dict) or _is_image_file_item(file_item):
                 retained_files.append(file_item)
                 continue
             file_id = file_item.get("id")
@@ -5382,7 +5397,7 @@ def _classify_files_for_target(
 
     retained_files: list[Any] = []
     for file_item in metadata_files:
-        if not isinstance(file_item, dict) or file_item.get("type") == "image":
+        if not isinstance(file_item, dict) or _is_image_file_item(file_item):
             retained_files.append(file_item)
             continue
         file_id = file_item.get("id")
@@ -5578,7 +5593,7 @@ async def _prepare_summary_file_context(
         prefix_files = [
             file_item
             for file_item in metadata_files
-            if isinstance(file_item, dict) and file_item.get("type") != "image" and file_item.get("id") in prefix_ids
+            if isinstance(file_item, dict) and not _is_image_file_item(file_item) and file_item.get("id") in prefix_ids
         ]
         if not prefix_files:
             return None
@@ -5631,7 +5646,7 @@ async def _inject_target_file_context(
         body_metadata.pop("sources", None)
     if not isinstance(metadata_files, list) or not metadata_files:
         return body
-    non_image = [file_item for file_item in metadata_files if isinstance(file_item, dict) and file_item.get("type") != "image"]
+    non_image = [file_item for file_item in metadata_files if isinstance(file_item, dict) and not _is_image_file_item(file_item)]
     if not non_image:
         return body
 
@@ -5656,7 +5671,7 @@ async def _inject_target_file_context(
         return body
 
     retained_non_image = [
-        file_item for file_item in retained_files if isinstance(file_item, dict) and file_item.get("type") != "image"
+        file_item for file_item in retained_files if isinstance(file_item, dict) and not _is_image_file_item(file_item)
     ]
     if not retained_non_image:
         return body
@@ -8864,7 +8879,8 @@ class Pipe:
                     if effective_soft_trigger_total_tokens is not None and not is_summary_task:
                         streaming_kwargs["on_complete"] = launch_completed_turn_soft_prefetch
                     streaming_response = await _forward_streaming_target(**streaming_kwargs)
-                    await _emit_source_events(__event_emitter__, candidate_source_events)
+                    if not getattr(streaming_response, "_auto_compact_immediate_error", False):
+                        await _emit_source_events(__event_emitter__, candidate_source_events)
                     return streaming_response
                 response = await _forward_non_streaming_target(
                     request=__request__,

@@ -6586,6 +6586,209 @@ async def test_pipe_non_streaming_error_does_not_merge_or_emit_manual_rag_source
 
 
 @pytest.mark.asyncio
+async def test_pipe_streaming_immediate_error_does_not_emit_manual_file_sources(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+    emitted = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def inject_target_file_context(
+        *,
+        body,
+        metadata_files,
+        request,
+        user,
+        event_emitter,
+        file_context_enabled=True,
+        emit_source_events=True,
+        **kwargs,
+    ):
+        injected = copy.deepcopy(body)
+        injected.setdefault("metadata", {})["sources"] = copy.deepcopy(sources)
+        return injected
+
+    async def call_target_completion(**kwargs):
+        return {"error": {"message": "provider failed", "code": "provider_error"}}
+
+    async def event_emitter(event):
+        emitted.append(copy.deepcopy(event))
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_call_target_completion", call_target_completion)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __event_emitter__=event_emitter,
+    )
+
+    assert isinstance(result, StreamingResponse)
+    _ = [chunk async for chunk in result.body_iterator]
+    assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_streaming_plaintext_non_json_error_does_not_emit_manual_file_sources(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+    emitted = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def inject_target_file_context(
+        *,
+        body,
+        metadata_files,
+        request,
+        user,
+        event_emitter,
+        file_context_enabled=True,
+        emit_source_events=True,
+        **kwargs,
+    ):
+        injected = copy.deepcopy(body)
+        injected.setdefault("metadata", {})["sources"] = copy.deepcopy(sources)
+        return injected
+
+    async def call_target_completion(**kwargs):
+        return PlainTextResponse("upstream connect error", status_code=200)
+
+    async def event_emitter(event):
+        emitted.append(copy.deepcopy(event))
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_call_target_completion", call_target_completion)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __event_emitter__=event_emitter,
+    )
+
+    assert isinstance(result, StreamingResponse)
+    _ = [chunk async for chunk in result.body_iterator]
+    assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_streaming_immediate_success_dict_emits_manual_file_sources(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+    emitted = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def inject_target_file_context(
+        *,
+        body,
+        metadata_files,
+        request,
+        user,
+        event_emitter,
+        file_context_enabled=True,
+        emit_source_events=True,
+        **kwargs,
+    ):
+        injected = copy.deepcopy(body)
+        injected.setdefault("metadata", {})["sources"] = copy.deepcopy(sources)
+        return injected
+
+    async def call_target_completion(**kwargs):
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    async def event_emitter(event):
+        emitted.append(copy.deepcopy(event))
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_call_target_completion", call_target_completion)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __event_emitter__=event_emitter,
+    )
+
+    assert isinstance(result, StreamingResponse)
+    assert [event["data"]["source"]["id"] for event in emitted] == ["file-1"]
+
+
+@pytest.mark.asyncio
 async def test_pipe_skips_file_context_injection_for_query_generation_task(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
@@ -6748,6 +6951,54 @@ async def test_inject_target_file_context_skips_manual_rag_when_reentry_guard_ac
     # Pruning of absorbed prefix files still applied even when skipping RAG.
     retained = result["metadata"]["files"]
     assert [file["id"] for file in retained] == ["current-file"]
+
+
+@pytest.mark.asyncio
+async def test_inject_target_file_context_treats_content_type_images_as_images(
+    monkeypatch, pipe_request
+):
+    captured = {"handler_calls": 0}
+
+    async def chat_completion_files_handler(request, rag_body, extra_params, user):
+        captured["handler_calls"] += 1
+        return rag_body, {"sources": []}
+
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.chat_completion_files_handler = chat_completion_files_handler
+    middleware_module.apply_source_context_to_messages = lambda *args, **kwargs: args[1]
+    misc_module = types.ModuleType("open_webui.utils.misc")
+    misc_module.get_last_user_message = lambda messages: ""
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", misc_module)
+
+    image_file = {
+        "id": "image-file",
+        "content_type": "image/png",
+        "name": "image.png",
+        "url": "https://example.test/image.png",
+    }
+    body = {
+        "model": "target",
+        "messages": [{"role": "user", "content": "describe image"}],
+        "metadata": {"files": [image_file]},
+    }
+
+    result = await mod._inject_target_file_context(
+        request=pipe_request,
+        user={"id": "user-1"},
+        body=body,
+        chat_id="chat-1",
+        current_message_id="message-1",
+        compaction_prefix_count=0,
+        metadata_files=[image_file],
+        metadata_user_message={"files": [image_file]},
+        event_emitter=None,
+        file_context_enabled=True,
+        emit_source_events=False,
+    )
+
+    assert captured["handler_calls"] == 0
+    assert result["metadata"]["files"] == [image_file]
 
 
 @pytest.mark.asyncio
