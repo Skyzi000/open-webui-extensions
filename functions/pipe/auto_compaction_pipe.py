@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.4.1
+version: 0.5.0
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -114,6 +114,13 @@ MISSING_CORE_REQUEST = object()
 TARGET_MODEL_RECORD_UNKNOWN = object()
 AUTO_COMPACTION_TARGET_HIDDEN_META_KEY = "auto_compaction_target_hidden_by"
 TARGET_MODEL_VISIBILITY_LOCKS: dict[str, asyncio.Lock] = {}
+# request.state flag set while AutoCompact is mid target file-context injection
+# (chat_completion_files_handler). When Core re-enters the wrapper via
+# generate_queries (TASK_MODEL pointing at this wrapper), the flag short-
+# circuits the reentrant injection so manual RAG is skipped fail-closed.
+AUTO_COMPACT_FILE_CONTEXT_INJECTION_STATE_KEY = "_auto_compact_target_file_context_injecting"
+PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY = "_auto_compact_prefix_file_fingerprint_resolver_cache"
+PREFIX_FILE_FINGERPRINT_FAMILY = "prefix-file-fingerprint-v1"
 LOG = logging.getLogger(__name__)
 COMPACTION_SUMMARY_EMBED_MARKER = "<!--auto-compaction-summary-embed:v1-->"
 SUMMARY_PROMPT = (
@@ -126,6 +133,9 @@ SUMMARY_PROMPT = (
     "- Open questions, unresolved failures, and clear next steps\n\n"
     "If the input contains an existing <auto_compaction_context>, merge that prior checkpoint with the following newer messages. "
     "Do not discard earlier checkpoint information merely because it is summarized.\n\n"
+    "If <attached_file_contents> is provided, use it only as supporting context for files attached to messages in this "
+    "checkpoint source. Preserve durable file facts, names, identifiers, and relevant excerpts needed to continue, "
+    "but do not invent file contents or treat attached files outside the checkpoint source as summarized.\n\n"
     "Do not invent facts. Do not introduce new instructions. Do not include irrelevant transcript detail. "
     "Be concise, structured, and focused on continuity.\n\n"
     "The preceding messages are the exact checkpoint source to summarize. "
@@ -501,6 +511,56 @@ _FILE_METADATA_TRANSIENT_KEYS = {
 _TRANSIENT_SOURCE_KEYS = {
     "distances",
 }
+_PREFIX_FILE_ATTACHMENT_IDENTITY_KEYS = {
+    "checksum",
+    "collection_name",
+    "collection_names",
+    "content_type",
+    "file",
+    "file_hash",
+    "file_id",
+    "filename",
+    "hash",
+    "id",
+    "legacy",
+    "mime_type",
+    "name",
+    "revision",
+    "sha256",
+    "type",
+    "updated_at",
+    "version",
+}
+_PREFIX_EMBEDDED_FILE_IDENTITY_KEYS = {
+    "checksum",
+    "collection_name",
+    "collection_names",
+    "content_type",
+    "file_hash",
+    "file_id",
+    "filename",
+    "hash",
+    "id",
+    "legacy",
+    "meta",
+    "metadata",
+    "mime_type",
+    "name",
+    "revision",
+    "sha256",
+    "type",
+    "updated_at",
+    "version",
+}
+_PREFIX_FILE_METADATA_TRANSIENT_KEYS = _FILE_METADATA_TRANSIENT_KEYS - {"updated_at"}
+_PREFIX_FILE_METADATA_BODY_KEYS = {
+    "body",
+    "content",
+    "context",
+    "docs",
+    "document",
+    "documents",
+}
 _FILE_CONTENT_PART_TYPES = {
     "file",
     "input_file",
@@ -723,6 +783,219 @@ def compute_source_hash(messages: list[dict[str, Any]]) -> str:
             "messages": canonicalize_messages_for_source_hash(messages),
         }
     )
+
+
+def compute_summary_source_hash(
+    messages: list[dict[str, Any]],
+    prefix_file_fingerprint: str | None = None,
+) -> str:
+    # When no prefix files were absorbed (or the DB chain could not be loaded)
+    # the fingerprint is empty, so the identity intentionally collapses to the
+    # canonical message hash. This keeps existing checkpoints reusable and
+    # avoids a family bump.
+    if not prefix_file_fingerprint:
+        return compute_source_hash(messages)
+    return _json_hash(
+        {
+            "family": SOURCE_HASH_FAMILY,
+            "messages": canonicalize_messages_for_source_hash(messages),
+            "prefix_file_fingerprint": prefix_file_fingerprint,
+        }
+    )
+
+
+def _canonicalize_prefix_file_metadata_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key in _PREFIX_FILE_METADATA_TRANSIENT_KEYS or key in _PREFIX_FILE_METADATA_BODY_KEYS:
+                continue
+            item = _canonicalize_prefix_file_metadata_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out_list = []
+        for item in value:
+            canonical_item = _canonicalize_prefix_file_metadata_value(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out_list.append(canonical_item)
+        return out_list
+    return value
+
+
+def _canonicalize_prefix_embedded_file_identity(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key not in _PREFIX_EMBEDDED_FILE_IDENTITY_KEYS:
+                continue
+            item = _canonicalize_prefix_file_metadata_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out_list = []
+        for item in value:
+            canonical_item = _canonicalize_prefix_embedded_file_identity(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out_list.append(canonical_item)
+        return out_list
+    return _canonicalize_prefix_file_metadata_value(value)
+
+
+def _canonicalize_prefix_file_attachment_identity(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key not in _PREFIX_FILE_ATTACHMENT_IDENTITY_KEYS:
+                continue
+            if key == "file":
+                item = _canonicalize_prefix_embedded_file_identity(value[key])
+            else:
+                item = _canonicalize_prefix_file_metadata_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out_list = []
+        for item in value:
+            canonical_item = _canonicalize_prefix_file_attachment_identity(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out_list.append(canonical_item)
+        return out_list
+    return _canonicalize_prefix_file_metadata_value(value)
+
+
+def _stable_file_fingerprint(file_items: list[dict[str, Any]]) -> str:
+    if not file_items:
+        return ""
+    canonical = [
+        _canonicalize_prefix_file_attachment_identity(item)
+        for item in file_items
+        if isinstance(item, dict)
+    ]
+    canonical = [item for item in canonical if not _is_empty_canonical_value(item)]
+    if not canonical:
+        return ""
+    ordered = sorted(canonical, key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False))
+    return _json_hash({"family": PREFIX_FILE_FINGERPRINT_FAMILY, "files": ordered})
+
+
+def _soft_prefetch_inflight_source_hash(
+    source_messages: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> str:
+    files = metadata.get("files")
+    if not isinstance(files, list):
+        return compute_source_hash(source_messages)
+    fingerprint = _stable_file_fingerprint(
+        [item for item in files if isinstance(item, dict) and item.get("type") != "image"]
+    )
+    return compute_summary_source_hash(source_messages, fingerprint)
+
+
+def _make_prefix_file_fingerprint_resolver(
+    db_chain: list[dict[str, Any]] | None,
+    metadata_files: Any,
+) -> Callable[[int], str | None]:
+    # Fingerprints cover all non-image prefix files in DB-chain positions
+    # [0, count). Using the full prefix range (rather than the delta
+    # [parent_count, compaction_prefix_count)) keeps the hash basis identical
+    # for a checkpoint and any of its potential children, so parent matching
+    # and parent validation use the same fingerprint the stored row was built
+    # with. The set is order-independent because _classify_files_for_summary
+    # returns a set and the summary file context only depends on which files
+    # are present in the prefix, not their positional order.
+    cache: dict[int, str | None] = {}
+
+    def resolve(count: int) -> str | None:
+        cached = cache.get(count, False)
+        if cached is not False:
+            return cached
+        prefix_ids = _classify_files_for_summary(db_chain, count, 0)
+        if not prefix_ids:
+            result: str | None = None
+        else:
+            items = [
+                item
+                for item in metadata_files
+                if isinstance(item, dict)
+                and item.get("type") != "image"
+                and item.get("id") in prefix_ids
+            ]
+            result = _stable_file_fingerprint(items) or None
+        cache[count] = result
+        return result
+
+    return resolve
+
+
+async def _build_prefix_file_fingerprint_resolver(
+    request: Any,
+    metadata: dict[str, Any],
+) -> Callable[[int], str | None] | None:
+    metadata_files = metadata.get("files")
+    if not isinstance(metadata_files, list) or not metadata_files:
+        return None
+    chat_id = str(metadata.get("chat_id") or "")
+    current_message_id = str(metadata.get("user_message_id") or metadata.get("message_id") or "")
+    cache_key = (chat_id, current_message_id)
+    # Cache the resolver on request.state so multiple checkpoint operations in
+    # the same request share one DB-chain load. Different (chat_id, message_id)
+    # pairs get independent resolvers.
+    request_state = getattr(request, "state", None)
+    if request_state is not None:
+        cache = getattr(request_state, PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY, None)
+        if cache is None:
+            cache = {}
+            with suppress(Exception):
+                setattr(request_state, PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY, cache)
+        elif cache_key in cache:
+            return cache[cache_key]
+    else:
+        cache = None
+    try:
+        db_chain = await _load_chat_message_chain(request, chat_id, current_message_id)
+    except Exception:
+        LOG.exception("Failed to load chat message chain for prefix file fingerprint")
+        return None
+    if not db_chain:
+        return None
+    resolver = _make_prefix_file_fingerprint_resolver(db_chain, metadata_files)
+    if cache is not None:
+        with suppress(Exception):
+            cache[cache_key] = resolver
+    return resolver
+
+
+def _request_file_context_injection_active(request_state: Any) -> bool:
+    try:
+        return getattr(request_state, AUTO_COMPACT_FILE_CONTEXT_INJECTION_STATE_KEY, False) is True
+    except Exception:
+        return False
+
+
+def _set_request_file_context_injection_active(request_state: Any, active: bool) -> None:
+    if request_state is None:
+        return
+    with suppress(Exception):
+        setattr(request_state, AUTO_COMPACT_FILE_CONTEXT_INJECTION_STATE_KEY, bool(active))
+
+
+def _resolve_fingerprint(
+    resolver: Callable[[int], str | None] | None,
+    count: int,
+) -> str | None:
+    if resolver is None:
+        return None
+    try:
+        return resolver(count)
+    except Exception:
+        return None
 
 
 def compute_profile_hash(
@@ -2104,6 +2377,7 @@ def replace_prefix_with_parent_checkpoint_and_delta(
     cut: MessageCut,
     parent: dict[str, Any],
     *,
+    prefix_file_fingerprint: str | None = None,
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
 ) -> list[dict[str, Any]]:
@@ -2113,7 +2387,7 @@ def replace_prefix_with_parent_checkpoint_and_delta(
             "Parent checkpoint cannot be applied safely because its source boundary is invalid",
             code="unsafe_checkpoint_parent",
         )
-    if compute_source_hash(cut.summarization_prefix[:parent_count]) != parent.get("source_hash"):
+    if compute_summary_source_hash(cut.summarization_prefix[:parent_count], prefix_file_fingerprint) != parent.get("source_hash"):
         raise UnsupportedCompactionInput(
             "Parent checkpoint cannot be applied safely because its source hash no longer matches",
             code="unsafe_checkpoint_parent",
@@ -2221,6 +2495,7 @@ def select_longest_matching_checkpoint(
     source_messages: list[dict[str, Any]],
     *,
     states: set[str] | None = None,
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
 ) -> dict[str, Any] | None:
     prefix_hashes: dict[int, str] = {}
     candidates = sorted(rows, key=lambda row: int(row.get("source_message_count") or 0), reverse=True)
@@ -2231,7 +2506,12 @@ def select_longest_matching_checkpoint(
         if count <= 0 or count > len(source_messages):
             continue
         if count not in prefix_hashes:
-            prefix_hashes[count] = compute_source_hash(source_messages[:count])
+            fingerprint = (
+                prefix_file_fingerprint_resolver(count)
+                if prefix_file_fingerprint_resolver is not None
+                else None
+            )
+            prefix_hashes[count] = compute_summary_source_hash(source_messages[:count], fingerprint)
         if prefix_hashes[count] == row.get("source_hash"):
             return row
     return None
@@ -2240,8 +2520,15 @@ def select_longest_matching_checkpoint(
 def select_longest_matching_parent(
     rows: Iterable[dict[str, Any]],
     source_messages: list[dict[str, Any]],
+    *,
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
 ) -> dict[str, Any] | None:
-    return select_longest_matching_checkpoint(rows, source_messages, states={"ready"})
+    return select_longest_matching_checkpoint(
+        rows,
+        source_messages,
+        states={"ready"},
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+    )
 
 
 _CHECKPOINT_COMPAT_COLUMN_DDL_TYPES = (
@@ -2432,6 +2719,7 @@ class CheckpointStore:
         pipe_function_id: str,
         profile_hash: str,
         source_messages: list[dict[str, Any]],
+        prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
     ) -> dict[str, Any] | None:
         if not source_messages:
             return None
@@ -2452,7 +2740,11 @@ class CheckpointStore:
                 .order_by(CHECKPOINT_TABLE.c.source_message_count.desc())
             )
             rows = [dict(row) for row in result.mappings().all()]
-        return select_longest_matching_parent(rows, source_messages)
+        return select_longest_matching_parent(
+            rows,
+            source_messages,
+            prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        )
 
     async def find_longest_pending_parent(
         self,
@@ -2463,6 +2755,7 @@ class CheckpointStore:
         pipe_function_id: str,
         profile_hash: str,
         source_messages: list[dict[str, Any]],
+        prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
     ) -> dict[str, Any] | None:
         if not source_messages:
             return None
@@ -2486,7 +2779,12 @@ class CheckpointStore:
                 .order_by(CHECKPOINT_TABLE.c.source_message_count.desc())
             )
             rows = [dict(row) for row in result.mappings().all()]
-        return select_longest_matching_checkpoint(rows, source_messages, states={"pending"})
+        return select_longest_matching_checkpoint(
+            rows,
+            source_messages,
+            states={"pending"},
+            prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        )
 
     async def claim_pending(self, row: dict[str, Any]) -> bool:
         async with await self._context() as db:
@@ -3035,6 +3333,11 @@ def build_wrapper_model_form(
         "pipe_function_id": pipe_function_id,
         "target_model_id": target_id,
     }
+    wrapper_capabilities = meta.get("capabilities")
+    if not isinstance(wrapper_capabilities, dict):
+        wrapper_capabilities = {}
+        meta["capabilities"] = wrapper_capabilities
+    wrapper_capabilities["file_context"] = False
     return {
         "id": wrapper_id,
         "user_id": function_owner_user_id,
@@ -4991,6 +5294,415 @@ def _summary_tool_call_error() -> SummaryToolCallError:
     return SummaryToolCallError("Summary model returned a tool call instead of text content")
 
 
+def _extract_non_image_file_ids(files_value: Any) -> set[str]:
+    ids: set[str] = set()
+    if not isinstance(files_value, list):
+        return ids
+    for item in files_value:
+        if not isinstance(item, dict) or item.get("type") == "image":
+            continue
+        file_id = item.get("id")
+        if isinstance(file_id, str) and file_id:
+            ids.add(file_id)
+    return ids
+
+
+async def _load_chat_message_chain(
+    request: Any,
+    chat_id: str | None,
+    current_message_id: str | None,
+) -> list[dict[str, Any]] | None:
+    if not chat_id or not current_message_id:
+        return None
+    try:
+        from open_webui.models.chats import Chats
+        from open_webui.utils.misc import get_message_list
+        from open_webui.utils.middleware import process_messages_with_output
+
+        messages_map = await Chats.get_messages_map_by_chat_id(chat_id)
+        if not isinstance(messages_map, dict) or not messages_map:
+            return None
+        if current_message_id not in messages_map:
+            return None
+        chain = get_message_list(messages_map, current_message_id)
+        # Expand assistant-with-output messages to align positional indices
+        # with the body.messages the pipe receives (Core runs
+        # process_messages_with_output before the pipe). reasoning_format
+        # does not change message COUNT (only reasoning content formatting),
+        # so None is safe for positional alignment.
+        return process_messages_with_output(chain)
+    except Exception:
+        return None
+
+
+def _classify_files_for_target(
+    db_chain: list[dict[str, Any]] | None,
+    compaction_prefix_count: int,
+    metadata_user_message: Any,
+    metadata_files: Any,
+) -> list[Any]:
+    """Return retained files for target forward injection using only DB-chain positions."""
+    if not isinstance(metadata_files, list):
+        return metadata_files
+
+    current_file_ids: set[str] = set()
+    if isinstance(metadata_user_message, dict):
+        current_file_ids |= _extract_non_image_file_ids(metadata_user_message.get("files"))
+
+    if not db_chain:
+        # No compaction (prefix_count==0) means the target sees the full
+        # conversation — ALL files are relevant.  Only when compaction
+        # happened but the DB is unavailable do we conservatively keep
+        # just the current-turn files.
+        if compaction_prefix_count == 0:
+            return list(metadata_files)
+        retained_files: list[Any] = []
+        for file_item in metadata_files:
+            if not isinstance(file_item, dict) or file_item.get("type") == "image":
+                retained_files.append(file_item)
+                continue
+            file_id = file_item.get("id")
+            if not isinstance(file_id, str) or not file_id:
+                retained_files.append(file_item)
+                continue
+            if file_id in current_file_ids:
+                retained_files.append(file_item)
+        return retained_files
+
+    retained_ids: set[str] = set(current_file_ids)
+    for index in range(compaction_prefix_count, len(db_chain)):
+        message = db_chain[index]
+        if isinstance(message, dict):
+            retained_ids |= _extract_non_image_file_ids(message.get("files"))
+
+    all_db_file_ids: set[str] = set()
+    for message in db_chain:
+        if isinstance(message, dict):
+            all_db_file_ids |= _extract_non_image_file_ids(message.get("files"))
+
+    retained_files: list[Any] = []
+    for file_item in metadata_files:
+        if not isinstance(file_item, dict) or file_item.get("type") == "image":
+            retained_files.append(file_item)
+            continue
+        file_id = file_item.get("id")
+        if not isinstance(file_id, str) or not file_id:
+            retained_files.append(file_item)
+            continue
+        if file_id in retained_ids or file_id not in all_db_file_ids:
+            retained_files.append(file_item)
+    return retained_files
+
+
+def _classify_files_for_summary(
+    db_chain: list[dict[str, Any]] | None,
+    compaction_prefix_count: int,
+    parent_source_message_count: int,
+) -> set[str]:
+    """Return prefix file ids for summary context, excluding parent-checkpoint absorbed messages."""
+    if not db_chain:
+        return set()
+    prefix_ids: set[str] = set()
+    for index in range(parent_source_message_count, compaction_prefix_count):
+        if index < len(db_chain):
+            message = db_chain[index]
+            if isinstance(message, dict):
+                prefix_ids |= _extract_non_image_file_ids(message.get("files"))
+    return prefix_ids
+
+
+async def _noop_event_emitter(_event: Any) -> None:
+    pass
+
+
+async def _emit_source_events(
+    event_emitter: Callable[[Any], Awaitable[None]] | None,
+    sources: Any,
+) -> None:
+    if event_emitter is None or not isinstance(sources, list):
+        return
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        source_info = source.get("source", {})
+        if not isinstance(source_info, dict):
+            continue
+        if not (source_info.get("name", "") or source_info.get("id", "")):
+            continue
+        await event_emitter({"type": "source", "data": source})
+
+
+def _displayable_sources(sources: Any) -> list[dict[str, Any]]:
+    if not isinstance(sources, list):
+        return []
+    displayable = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        source_info = source.get("source", {})
+        if not isinstance(source_info, dict):
+            continue
+        if not (source_info.get("name", "") or source_info.get("id", "")):
+            continue
+        displayable.append(source)
+    return displayable
+
+
+def _merge_source_events_into_response(response: Any, sources: Any) -> Any:
+    # Core merges RAG sources into the non-streaming HTTP response body via
+    # merge_events_into_response (events carry {"sources": [...]}).  The wrapper
+    # disables Core's pre-pipe RAG, so the manual injection sources must be
+    # merged here for API / non-event-emitter callers to retain citations.
+    # Mirror Core semantics: existing response keys win over merged events.
+    if not isinstance(response, dict):
+        return response
+    displayable = _displayable_sources(sources)
+    if not displayable:
+        return response
+    if "sources" in response:
+        return response
+    return {"sources": displayable, **response}
+
+
+def _format_summary_file_context(sources: Any) -> str | None:
+    if not isinstance(sources, list) or not sources:
+        return None
+
+    lines = ["<attached_file_contents>"]
+    emitted = 0
+    for source_index, source in enumerate(sources, start=1):
+        if not isinstance(source, dict):
+            continue
+        source_info = source.get("source") if isinstance(source.get("source"), dict) else {}
+        documents = source.get("document")
+        if not isinstance(documents, list):
+            documents = source.get("documents")
+        if not isinstance(documents, list):
+            documents = []
+        metadatas = source.get("metadata") if isinstance(source.get("metadata"), list) else []
+        source_id = source_info.get("id") or source_info.get("source")
+        source_name = source_info.get("name") or source_info.get("filename") or source_id or f"source-{source_index}"
+        for document_index, document in enumerate(documents, start=1):
+            if document is None:
+                continue
+            metadata = metadatas[document_index - 1] if document_index - 1 < len(metadatas) else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            file_id = metadata.get("source") or metadata.get("file_id") or source_id or f"source-{source_index}"
+            file_name = metadata.get("name") or metadata.get("filename") or source_name
+            lines.append(
+                f'<file index="{emitted + 1}" source_index="{_xml_attr(source_index)}" '
+                f'document_index="{_xml_attr(document_index)}" id="{_xml_attr(file_id)}" '
+                f'name="{_xml_attr(file_name)}">{_xml_cdata(document)}</file>'
+            )
+            emitted += 1
+    if emitted == 0:
+        return None
+    lines.append("</attached_file_contents>")
+    return "\n".join(lines)
+
+
+async def _generate_summary_file_context(
+    *,
+    request: Any,
+    user: Any,
+    prefix_files: list[Any],
+) -> str | None:
+    try:
+        from open_webui.retrieval.utils import get_sources_from_items
+
+        state = getattr(getattr(request, "app", None), "state", None)
+        config = getattr(state, "config", None)
+        embedding_function = getattr(state, "EMBEDDING_FUNCTION", None)
+        reranking_function = getattr(state, "RERANKING_FUNCTION", None)
+        user_model = coerce_open_webui_user(user)
+
+        def embed(query: str, prefix: str) -> Any:
+            if embedding_function is None:
+                return None
+            return embedding_function(query, prefix=prefix, user=user_model)
+
+        rerank = None
+        if reranking_function is not None:
+            rerank = lambda query, documents: reranking_function(query, documents, user=user_model)
+
+        sources = await get_sources_from_items(
+            request=request,
+            items=prefix_files,
+            queries=[""],
+            embedding_function=embed,
+            k=getattr(config, "TOP_K", 5),
+            reranking_function=rerank,
+            k_reranker=getattr(config, "TOP_K_RERANKER", 5),
+            r=getattr(config, "RELEVANCE_THRESHOLD", 0.0),
+            hybrid_bm25_weight=getattr(config, "HYBRID_BM25_WEIGHT", 0.5),
+            hybrid_search=getattr(config, "ENABLE_RAG_HYBRID_SEARCH", False),
+            full_context=True,
+            user=user_model,
+        )
+        return _format_summary_file_context(sources)
+    except Exception:
+        LOG.exception("Failed to generate summary file context")
+        return None
+
+
+async def _prepare_summary_file_context(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    compaction_prefix_count: int,
+    parent_source_message_count: int,
+    file_context_enabled: bool = True,
+) -> str | None:
+    if not file_context_enabled:
+        return None
+    try:
+        metadata_files = metadata.get("files")
+        if not isinstance(metadata_files, list) or not metadata_files:
+            return None
+        chat_id = str(metadata.get("chat_id") or "")
+        current_message_id = str(metadata.get("user_message_id") or metadata.get("message_id") or "")
+        db_chain = await _load_chat_message_chain(request, chat_id, current_message_id)
+        if db_chain is None:
+            return None
+
+        prefix_ids = _classify_files_for_summary(
+            db_chain=db_chain,
+            compaction_prefix_count=compaction_prefix_count,
+            parent_source_message_count=parent_source_message_count,
+        )
+        if not prefix_ids:
+            return None
+
+        prefix_files = [
+            file_item
+            for file_item in metadata_files
+            if isinstance(file_item, dict) and file_item.get("type") != "image" and file_item.get("id") in prefix_ids
+        ]
+        if not prefix_files:
+            return None
+        return await _generate_summary_file_context(request=request, user=user, prefix_files=prefix_files)
+    except Exception:
+        LOG.exception("Failed to prepare summary file context")
+        return None
+
+
+def _target_model_supports_file_context(models: dict[str, Any], target_model_id: str) -> bool:
+    """Check if the TARGET model (not wrapper) has file_context enabled.
+    When the target itself disables file_context, the pipe must not
+    inject file content either — the user/admin explicitly opted out."""
+    target = models.get(target_model_id)
+    if not isinstance(target, dict):
+        return True  # unknown model → default to enabled (safe)
+
+    capability_maps: list[Any] = [target.get("capabilities")]
+    top_meta = target.get("meta")
+    if isinstance(top_meta, dict):
+        capability_maps.append(top_meta.get("capabilities"))
+    info = target.get("info")
+    if isinstance(info, dict):
+        info_meta = info.get("meta")
+        if isinstance(info_meta, dict):
+            capability_maps.append(info_meta.get("capabilities"))
+
+    for capabilities in capability_maps:
+        if isinstance(capabilities, dict) and capabilities.get("file_context") is False:
+            return False
+    return True
+
+
+async def _inject_target_file_context(
+    *,
+    request: Any,
+    user: Any,
+    body: dict[str, Any],
+    chat_id: str | None,
+    current_message_id: str | None,
+    compaction_prefix_count: int,
+    metadata_files: Any,
+    metadata_user_message: Any,
+    event_emitter: Callable[[Any], Awaitable[None]] | None,
+    file_context_enabled: bool = True,
+    emit_source_events: bool = True,
+) -> dict[str, Any]:
+    body_metadata = body.get("metadata")
+    if isinstance(body_metadata, dict):
+        body_metadata.pop("sources", None)
+    if not isinstance(metadata_files, list) or not metadata_files:
+        return body
+    non_image = [file_item for file_item in metadata_files if isinstance(file_item, dict) and file_item.get("type") != "image"]
+    if not non_image:
+        return body
+
+    db_chain = await _load_chat_message_chain(request, chat_id, current_message_id)
+    retained_files = _classify_files_for_target(
+        db_chain=db_chain,
+        compaction_prefix_count=compaction_prefix_count,
+        metadata_user_message=metadata_user_message,
+        metadata_files=metadata_files,
+    )
+    # Always update body metadata files to retained-only so downstream pipes/functions
+    # don't receive absorbed prefix files even if target RAG is disabled.
+    body_metadata = body.get("metadata")
+    if isinstance(body_metadata, dict):
+        body_metadata["files"] = retained_files
+        body_metadata.pop("sources", None)
+
+    if not file_context_enabled:
+        return body  # target opted out of file context — skip RAG injection
+
+    if not retained_files:
+        return body
+
+    retained_non_image = [
+        file_item for file_item in retained_files if isinstance(file_item, dict) and file_item.get("type") != "image"
+    ]
+    if not retained_non_image:
+        return body
+
+    request_state = getattr(request, "state", None)
+    if _request_file_context_injection_active(request_state):
+        # Same request re-entered injection (e.g. generate_queries routed the
+        # task model back into this wrapper). Skip manual RAG fail-closed so we
+        # never recurse into chat_completion_files_handler again; the retained
+        # metadata files pruning above still applies.
+        return body
+    _set_request_file_context_injection_active(request_state, True)
+    try:
+        try:
+            from open_webui.utils.middleware import apply_source_context_to_messages, chat_completion_files_handler
+            from open_webui.utils.misc import get_last_user_message
+
+            rag_body = {
+                **body,
+                "metadata": {
+                    **(body.get("metadata") if isinstance(body.get("metadata"), dict) else {}),
+                    "files": retained_non_image,
+                },
+            }
+            extra_params = {"__event_emitter__": event_emitter or _noop_event_emitter}
+            _, flags = await chat_completion_files_handler(request, rag_body, extra_params, coerce_open_webui_user(user))
+            sources = flags.get("sources", []) if isinstance(flags, dict) else []
+            if sources:
+                messages = body.get("messages") or []
+                last_user_msg = get_last_user_message(messages) or ""
+                body["messages"] = await apply_source_context_to_messages(request, messages, sources, last_user_msg)
+                # Propagate sources to body metadata and event_emitter, matching
+                # Core's behaviour so UI citation/source display and downstream
+                # consumers work the same as non-AutoCompact file-context.
+                body_metadata = body.get("metadata")
+                if isinstance(body_metadata, dict):
+                    body_metadata["sources"] = sources[:]
+                if emit_source_events:
+                    await _emit_source_events(event_emitter, sources)
+        except Exception:
+            LOG.exception("Failed to inject target file context")
+    finally:
+        _set_request_file_context_injection_active(request_state, False)
+    return body
+
+
 def _choice_has_tool_call(choice: Any) -> bool:
     if not isinstance(choice, dict):
         return False
@@ -5524,8 +6236,11 @@ def strip_summary_tools_for_retry(body: dict[str, Any]) -> None:
         body.pop(key, None)
 
 
-def build_summary_request_message() -> dict[str, str]:
-    return {"role": "user", "content": SUMMARY_PROMPT}
+def build_summary_request_message(prefix_file_context: str | None = None) -> dict[str, str]:
+    content = SUMMARY_PROMPT
+    if prefix_file_context:
+        content = f"{prefix_file_context}\n\n{SUMMARY_PROMPT}"
+    return {"role": "user", "content": content}
 
 
 def build_summary_completion_body(
@@ -5536,11 +6251,13 @@ def build_summary_completion_body(
     metadata: dict[str, Any],
     pipe_function_id: str = PIPE_FUNCTION_ID,
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
+    prefix_file_context: str | None = None,
 ) -> dict[str, Any]:
     body = _copy_body_preserving_metadata(base_body)
     body["model"] = _resolve_summary_model_for_call(summary_model_id, pipe_function_id=pipe_function_id)
-    body["messages"] = [*copy.deepcopy(source_messages), build_summary_request_message()]
+    body["messages"] = [*copy.deepcopy(source_messages), build_summary_request_message(prefix_file_context)]
     body["metadata"] = build_summary_task_metadata(metadata)
+    body["metadata"].pop("files", None)
     body.pop("previous_response_id", None)
     body.pop("response_format", None)
     strip_summary_inherited_response_controls(body)
@@ -5561,8 +6278,12 @@ async def _generate_summary_text(
     pipe_function_id: str = PIPE_FUNCTION_ID,
     on_summary_start: Callable[[], Awaitable[None]] | None = None,
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
+    compaction_prefix_count: int = 0,
+    parent_source_message_count: int = 0,
+    file_context_enabled: bool = True,
 ) -> str:
     summary_metadata = build_summary_task_metadata(metadata)
+    summary_metadata.pop("files", None)
     inner_request = RequestStateProxy(
         request,
         bypass_filter=True,
@@ -5571,6 +6292,14 @@ async def _generate_summary_text(
     )
     from open_webui.utils.chat import generate_chat_completion
 
+    prefix_file_context = await _prepare_summary_file_context(
+        request=request,
+        user=user,
+        metadata=metadata,
+        compaction_prefix_count=compaction_prefix_count,
+        parent_source_message_count=parent_source_message_count,
+        file_context_enabled=file_context_enabled,
+    )
     body = build_summary_completion_body(
         base_body,
         summary_model_id=summary_model_id,
@@ -5578,6 +6307,7 @@ async def _generate_summary_text(
         metadata=metadata,
         pipe_function_id=pipe_function_id,
         summary_tool_policy=summary_tool_policy,
+        prefix_file_context=prefix_file_context,
     )
     route = await _resolve_core_chat_model_route(inner_request, str(body.get("model") or ""))
     body["model"] = route.model_id
@@ -5625,10 +6355,11 @@ async def _compact_retry_tool_results(
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
-) -> tuple[list[dict[str, Any]], bool]:
+    file_context_enabled: bool = True,
+) -> tuple[list[dict[str, Any]], bool, int]:
     cut = select_tool_result_compaction_cut(messages)
     if cut is None:
-        return messages, False
+        return messages, False, 0
 
     source_messages = copy.deepcopy(cut.summarization_prefix)
     chat_id = str(metadata.get("chat_id") or "")
@@ -5638,14 +6369,21 @@ async def _compact_retry_tool_results(
             "Cannot compact tool history without a durable checkpoint identity",
             code="checkpoint_identity_missing",
         )
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    source_identity_fingerprint = _resolve_fingerprint(prefix_file_fingerprint_resolver, len(source_messages))
     pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
         request=request,
         user_id=user_id,
         chat_id=chat_id,
         pipe_function_id=pipe_function_id,
         source_messages=source_messages,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
     )
-    if pending_checkpoint is not None and not _checkpoint_matches_exact_source(pending_checkpoint, source_messages):
+    if pending_checkpoint is not None and not _checkpoint_matches_exact_source(
+        pending_checkpoint,
+        source_messages,
+        prefix_file_fingerprint=source_identity_fingerprint,
+    ):
         ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
         if ready_checkpoint is not None:
             message_cut = MessageCut(
@@ -5658,10 +6396,15 @@ async def _compact_retry_tool_results(
                 replace_prefix_with_parent_checkpoint_and_delta(
                     message_cut,
                     ready_checkpoint,
+                    prefix_file_fingerprint=_resolve_fingerprint(
+                        prefix_file_fingerprint_resolver,
+                        int(ready_checkpoint.get("source_message_count") or 0),
+                    ),
                     historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                     historical_message_excerpt_count=historical_message_excerpt_count,
                 ),
                 True,
+                int(ready_checkpoint.get("source_message_count") or 0),
             )
     summary_meta = build_checkpoint_summary_meta(
         source_messages,
@@ -5684,6 +6427,7 @@ async def _compact_retry_tool_results(
             summary_tool_policy=summary_tool_policy,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            file_context_enabled=file_context_enabled,
         )
     except Exception as exc:
         if isinstance(exc, ParentCheckpointExtensionFailed) and (
@@ -5713,7 +6457,7 @@ async def _compact_retry_tool_results(
         )
     )
     compacted.extend(copy.deepcopy(cut.tail_messages))
-    return compacted, True
+    return compacted, True, len(source_messages)
 
 
 async def _heartbeat_checkpoint_claim(store: Any, checkpoint_id: str, claim_token: str) -> None:
@@ -5791,9 +6535,11 @@ async def _get_or_create_checkpoint_summary(
     summary_meta: dict[str, Any],
     summary_factory: Callable[[dict[str, Any] | None], Awaitable[str]],
     parent_checkpoint: dict[str, Any] | None = None,
+    prefix_file_fingerprint: str | None = None,
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
 ) -> str:
     profile_hash = compute_profile_hash()
-    source_hash = compute_source_hash(source_messages)
+    source_hash = compute_summary_source_hash(source_messages, prefix_file_fingerprint)
     summary_meta = normalize_summary_meta(summary_meta)
     identity = {
         "namespace": CHECKPOINT_NAMESPACE,
@@ -5827,10 +6573,15 @@ async def _get_or_create_checkpoint_summary(
             try:
                 if parent_checkpoint is not None:
                     parent_count = int(parent_checkpoint.get("source_message_count") or 0)
+                    parent_fingerprint = (
+                        prefix_file_fingerprint_resolver(parent_count)
+                        if prefix_file_fingerprint_resolver is not None
+                        else None
+                    )
                     if (
                         parent_count <= 0
                         or parent_count > len(source_messages)
-                        or compute_source_hash(source_messages[:parent_count])
+                        or compute_summary_source_hash(source_messages[:parent_count], parent_fingerprint)
                         != parent_checkpoint.get("source_hash")
                     ):
                         raise UnsupportedCompactionInput(
@@ -5846,6 +6597,7 @@ async def _get_or_create_checkpoint_summary(
                         pipe_function_id=pipe_function_id,
                         profile_hash=profile_hash,
                         source_messages=source_messages,
+                        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
                     )
                 try:
                     summary_text = await summary_factory(parent)
@@ -5903,10 +6655,12 @@ async def _get_or_create_compaction_summary(
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+    file_context_enabled: bool = True,
 ) -> str:
     summary_source_prefix = copy.deepcopy(source_messages)
 
     async def summary_factory(parent: dict[str, Any] | None) -> str:
+        parent_count = 0
         if parent:
             parent_count = int(parent.get("source_message_count") or 0)
             source = [
@@ -5930,7 +6684,17 @@ async def _get_or_create_compaction_summary(
             pipe_function_id=pipe_function_id,
             on_summary_start=on_summary_start,
             summary_tool_policy=summary_tool_policy,
+            compaction_prefix_count=len(summary_source_prefix),
+            parent_source_message_count=parent_count,
+            file_context_enabled=file_context_enabled,
         )
+
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    identity_fingerprint = (
+        prefix_file_fingerprint_resolver(len(source_messages))
+        if prefix_file_fingerprint_resolver is not None
+        else None
+    )
 
     return await _get_or_create_checkpoint_summary(
         request=request,
@@ -5941,6 +6705,8 @@ async def _get_or_create_compaction_summary(
         summary_meta=summary_meta,
         summary_factory=summary_factory,
         parent_checkpoint=parent_checkpoint,
+        prefix_file_fingerprint=identity_fingerprint,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
     )
 
 
@@ -5951,6 +6717,7 @@ async def _lookup_ready_checkpoint_for_source(
     chat_id: str,
     pipe_function_id: str,
     source_messages: list[dict[str, Any]],
+    prefix_file_fingerprint: str | None = None,
 ) -> dict[str, Any] | None:
     await ensure_checkpoint_table_initialized(request=request)
     return await CheckpointStore().lookup_ready(
@@ -5959,7 +6726,7 @@ async def _lookup_ready_checkpoint_for_source(
         chat_id=chat_id,
         pipe_function_id=pipe_function_id,
         profile_hash=compute_profile_hash(),
-        source_hash=compute_source_hash(source_messages),
+        source_hash=compute_summary_source_hash(source_messages, prefix_file_fingerprint),
     )
 
 
@@ -5970,6 +6737,7 @@ async def _lookup_pending_checkpoint_for_source_prefix(
     chat_id: str,
     pipe_function_id: str,
     source_messages: list[dict[str, Any]],
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
 ) -> dict[str, Any] | None:
     if not source_messages:
         return None
@@ -5985,6 +6753,7 @@ async def _lookup_pending_checkpoint_for_source_prefix(
         pipe_function_id=pipe_function_id,
         profile_hash=compute_profile_hash(),
         source_messages=source_messages,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
     )
 
 
@@ -5999,12 +6768,20 @@ def _checkpoint_identity_from_row(row: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _checkpoint_matches_exact_source(row: dict[str, Any], source_messages: list[dict[str, Any]]) -> bool:
+def _checkpoint_matches_exact_source(
+    row: dict[str, Any],
+    source_messages: list[dict[str, Any]],
+    *,
+    prefix_file_fingerprint: str | None = None,
+) -> bool:
     try:
         source_message_count = int(row.get("source_message_count") or 0)
     except Exception:
         return False
-    return source_message_count == len(source_messages) and row.get("source_hash") == compute_source_hash(source_messages)
+    return (
+        source_message_count == len(source_messages)
+        and row.get("source_hash") == compute_summary_source_hash(source_messages, prefix_file_fingerprint)
+    )
 
 
 async def _wait_for_pending_checkpoint_ready(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -6071,17 +6848,20 @@ async def _prefetch_compaction_checkpoint(
     token_status_detail: Literal["before", "before_after"] = "before",
     token_status_compare_estimate: bool = False,
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
+    file_context_enabled: bool = True,
 ) -> bool:
     if not source_messages:
         return False
     if not user_id or not _chat_id_supported(chat_id):
         return False
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
     if await _lookup_pending_checkpoint_for_source_prefix(
         request=request,
         user_id=user_id,
         chat_id=chat_id,
         pipe_function_id=pipe_function_id,
         source_messages=source_messages,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
     ):
         return False
     summary_meta = build_checkpoint_summary_meta(
@@ -6154,6 +6934,7 @@ async def _prefetch_compaction_checkpoint(
             summary_tool_policy=summary_tool_policy,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            file_context_enabled=file_context_enabled,
         )
     except asyncio.CancelledError:
         if summary_started and event_emitter is not None:
@@ -6246,6 +7027,7 @@ def _start_soft_compaction_prefetch(
     token_status_detail: Literal["before", "before_after"] = "before",
     token_status_compare_estimate: bool = False,
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
+    file_context_enabled: bool = True,
 ) -> bool:
     source_messages = _soft_prefetch_source_messages(body)
     if not source_messages:
@@ -6260,7 +7042,7 @@ def _start_soft_compaction_prefetch(
         chat_id,
         pipe_function_id,
         compute_profile_hash(),
-        compute_source_hash(source_messages),
+        _soft_prefetch_inflight_source_hash(source_messages, metadata),
     )
     return _launch_soft_prefetch_task(
         key,
@@ -6285,6 +7067,7 @@ def _start_soft_compaction_prefetch(
             token_status_detail=token_status_detail,
             token_status_compare_estimate=token_status_compare_estimate,
             event_emitter=event_emitter,
+            file_context_enabled=file_context_enabled,
         ),
     )
 
@@ -6333,8 +7116,10 @@ async def _find_reusable_checkpoint_for_source(
     pipe_function_id: str,
     profile_hash: str,
     source_messages: list[dict[str, Any]],
+    prefix_file_fingerprint: str | None = None,
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
-    source_hash = compute_source_hash(source_messages)
+    source_hash = compute_summary_source_hash(source_messages, prefix_file_fingerprint)
     existing = await store.lookup_ready(
         namespace=CHECKPOINT_NAMESPACE,
         user_id=user_id,
@@ -6353,6 +7138,7 @@ async def _find_reusable_checkpoint_for_source(
         pipe_function_id=pipe_function_id,
         profile_hash=profile_hash,
         source_messages=source_messages,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
     )
     if parent is not None:
         return "parent", parent
@@ -6384,8 +7170,14 @@ async def _body_reusable_checkpoint_match(
     profile_hash = compute_profile_hash()
     await ensure_checkpoint_table_initialized(request=request)
     store = CheckpointStore()
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
 
     if tool_cut is not None and tool_cut.summarization_prefix:
+        tool_identity_fingerprint = (
+            prefix_file_fingerprint_resolver(len(tool_cut.summarization_prefix))
+            if prefix_file_fingerprint_resolver is not None
+            else None
+        )
         tool_match = await _find_reusable_checkpoint_for_source(
             store=store,
             user_id=user_id,
@@ -6393,6 +7185,8 @@ async def _body_reusable_checkpoint_match(
             pipe_function_id=pipe_function_id,
             profile_hash=profile_hash,
             source_messages=tool_cut.summarization_prefix,
+            prefix_file_fingerprint=tool_identity_fingerprint,
+            prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
         )
         if tool_match is not None:
             kind, checkpoint = tool_match
@@ -6406,6 +7200,11 @@ async def _body_reusable_checkpoint_match(
     if not cut.summarization_prefix:
         return None
 
+    message_identity_fingerprint = (
+        prefix_file_fingerprint_resolver(len(cut.summarization_prefix))
+        if prefix_file_fingerprint_resolver is not None
+        else None
+    )
     message_match = await _find_reusable_checkpoint_for_source(
         store=store,
         user_id=user_id,
@@ -6413,6 +7212,8 @@ async def _body_reusable_checkpoint_match(
         pipe_function_id=pipe_function_id,
         profile_hash=profile_hash,
         source_messages=cut.summarization_prefix,
+        prefix_file_fingerprint=message_identity_fingerprint,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
     )
     if message_match is not None:
         kind, checkpoint = message_match
@@ -6459,6 +7260,7 @@ async def _estimate_checkpoint_applied_body_tokens(
     match: ReusableCheckpointMatch,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
+    file_context_enabled: bool = True,
 ) -> int | None:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -6480,10 +7282,16 @@ async def _estimate_checkpoint_applied_body_tokens(
     user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
     profile_hash = compute_profile_hash()
     store = CheckpointStore()
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
 
     for candidate_cut, source_messages in candidates:
         checkpoint = match.checkpoint
         if checkpoint is None:
+            identity_fingerprint = (
+                prefix_file_fingerprint_resolver(len(source_messages))
+                if prefix_file_fingerprint_resolver is not None
+                else None
+            )
             checkpoint_match = await _find_reusable_checkpoint_for_source(
                 store=store,
                 user_id=user_id,
@@ -6491,6 +7299,8 @@ async def _estimate_checkpoint_applied_body_tokens(
                 pipe_function_id=pipe_function_id,
                 profile_hash=profile_hash,
                 source_messages=source_messages,
+                prefix_file_fingerprint=identity_fingerprint,
+                prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
             )
             checkpoint = checkpoint_match[1] if checkpoint_match is not None else None
         if checkpoint is None:
@@ -6499,7 +7309,12 @@ async def _estimate_checkpoint_applied_body_tokens(
         parent_count = int(checkpoint.get("source_message_count") or 0)
         if parent_count <= 0 or parent_count > len(source_messages):
             continue
-        if compute_source_hash(source_messages[:parent_count]) != checkpoint.get("source_hash"):
+        parent_fingerprint = (
+            prefix_file_fingerprint_resolver(parent_count)
+            if prefix_file_fingerprint_resolver is not None
+            else None
+        )
+        if compute_summary_source_hash(source_messages[:parent_count], parent_fingerprint) != checkpoint.get("source_hash"):
             continue
 
         if isinstance(candidate_cut, ToolResultCompactionCut):
@@ -6531,6 +7346,23 @@ async def _estimate_checkpoint_applied_body_tokens(
         remaining_body = _copy_body_preserving_metadata(body)
         remaining_body["messages"] = estimate_source
         remaining_body.pop("previous_response_id", None)
+        # Reflect retained file context in the estimate so the threshold decision
+        # accounts for what the target will actually receive after compaction.
+        if file_context_enabled:
+            metadata_files = (body.get("metadata") or {}).get("files") if isinstance(body.get("metadata"), dict) else None
+            remaining_body = await _inject_target_file_context(
+                request=request,
+                user=user,
+                body=remaining_body,
+                chat_id=chat_id or None,
+                current_message_id=str(metadata.get("user_message_id") or metadata.get("message_id") or "") or None,
+                compaction_prefix_count=parent_count,
+                metadata_files=metadata_files,
+                metadata_user_message=metadata.get("user_message"),
+                event_emitter=None,
+                file_context_enabled=True,
+                emit_source_events=False,
+            )
         remaining_tokens = await estimate_body_tokens_async(remaining_body, request=request)
         if remaining_tokens is None:
             return None
@@ -6548,15 +7380,16 @@ async def _compact_body_with_reusable_checkpoint(
     match: ReusableCheckpointMatch,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
-) -> tuple[dict[str, Any], bool]:
+    file_context_enabled: bool = True,
+) -> tuple[dict[str, Any], bool, int]:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
-        return body, False
+        return body, False, 0
 
     chat_id = str(metadata.get("chat_id") or "")
     user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
     if not user_id or not _chat_id_supported(chat_id):
-        return body, False
+        return body, False, 0
 
     candidates: list[tuple[str, MessageCut | ToolResultCompactionCut, list[dict[str, Any]]]] = []
     tool_cut = select_tool_result_compaction_cut(messages)
@@ -6570,8 +7403,14 @@ async def _compact_body_with_reusable_checkpoint(
     await ensure_checkpoint_table_initialized(request=request)
     store = CheckpointStore()
     profile_hash = compute_profile_hash()
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
 
     for _kind, candidate_cut, source_messages in candidates:
+        identity_fingerprint = (
+            prefix_file_fingerprint_resolver(len(source_messages))
+            if prefix_file_fingerprint_resolver is not None
+            else None
+        )
         checkpoint_match = await _find_reusable_checkpoint_for_source(
             store=store,
             user_id=user_id,
@@ -6579,6 +7418,8 @@ async def _compact_body_with_reusable_checkpoint(
             pipe_function_id=pipe_function_id,
             profile_hash=profile_hash,
             source_messages=source_messages,
+            prefix_file_fingerprint=identity_fingerprint,
+            prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
         )
         if checkpoint_match is None:
             continue
@@ -6600,11 +7441,15 @@ async def _compact_body_with_reusable_checkpoint(
         compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
             message_cut,
             checkpoint,
+            prefix_file_fingerprint=_resolve_fingerprint(
+                prefix_file_fingerprint_resolver,
+                int(checkpoint.get("source_message_count") or 0),
+            ),
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
         compacted.pop("previous_response_id", None)
-        return compacted, True
+        return compacted, True, int(checkpoint.get("source_message_count") or match.source_message_count or 0)
 
     raise RuntimeError("Reusable checkpoint match disappeared before compaction")
 
@@ -6619,9 +7464,10 @@ async def _estimate_task_checkpoint_applied_body_tokens(
     match: ReusableCheckpointMatch,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
+    file_context_enabled: bool = True,
 ) -> int | None:
     source_body = _task_history_source_body_for_compaction(body, metadata) or body
-    compacted_source, compacted = await _compact_body_with_reusable_checkpoint(
+    compacted_source, compacted, compaction_prefix_count = await _compact_body_with_reusable_checkpoint(
         request=request,
         user=user,
         metadata=metadata,
@@ -6630,6 +7476,7 @@ async def _estimate_task_checkpoint_applied_body_tokens(
         match=match,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
+        file_context_enabled=file_context_enabled,
     )
     if not compacted:
         return None
@@ -6642,6 +7489,20 @@ async def _estimate_task_checkpoint_applied_body_tokens(
     )
     if rebuilt is None:
         return None
+    if file_context_enabled:
+        rebuilt = await _inject_target_file_context(
+            request=request,
+            user=user,
+            body=rebuilt,
+            chat_id=str(metadata.get("chat_id") or "") or None,
+            current_message_id=str(metadata.get("user_message_id") or metadata.get("message_id") or "") or None,
+            compaction_prefix_count=compaction_prefix_count,
+            metadata_files=(rebuilt.get("metadata") or {}).get("files") if isinstance(rebuilt.get("metadata"), dict) else None,
+            metadata_user_message=metadata.get("user_message"),
+            event_emitter=None,
+            file_context_enabled=True,
+            emit_source_events=False,
+        )
     return await estimate_body_tokens_async(rebuilt, request=request)
 
 
@@ -6822,11 +7683,14 @@ async def _call_target_completion(
     body: dict[str, Any],
 ) -> Any:
     bypass_system_prompt = _request_bypass_system_prompt(request)
-    inner_request = RequestStateProxy(
-        request,
-        bypass_filter=True,
-        bypass_system_prompt=bypass_system_prompt,
-    )
+    state_overrides: dict[str, Any] = {
+        "bypass_filter": True,
+        "bypass_system_prompt": bypass_system_prompt,
+    }
+    body_metadata = body.get("metadata")
+    if isinstance(body_metadata, dict):
+        state_overrides["metadata"] = body_metadata
+    inner_request = RequestStateProxy(request, **state_overrides)
     try:
         from open_webui.utils.chat import generate_chat_completion
 
@@ -6992,10 +7856,11 @@ async def _compact_body(
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
-) -> tuple[dict[str, Any], bool]:
+    file_context_enabled: bool = True,
+) -> tuple[dict[str, Any], bool, int]:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
-        return body, False
+        return body, False, 0
 
     tool_cut = select_tool_result_compaction_cut(messages)
     cut = select_safe_message_cut(messages)
@@ -7003,8 +7868,9 @@ async def _compact_body(
     user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
 
     if tool_cut is not None:
+        tool_compaction_prefix_count = 0
         try:
-            compacted_messages, did_compact_tools = await _compact_retry_tool_results(
+            compacted_messages, did_compact_tools, tool_compaction_prefix_count = await _compact_retry_tool_results(
                 request=request,
                 user=user,
                 metadata=metadata,
@@ -7013,6 +7879,7 @@ async def _compact_body(
                 base_body=body,
                 messages=messages,
                 summary_tool_policy=summary_tool_policy,
+                file_context_enabled=file_context_enabled,
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
             )
@@ -7045,6 +7912,7 @@ async def _compact_body(
                 summary_tool_policy=summary_tool_policy,
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
+                file_context_enabled=file_context_enabled,
             )
             history_checkpoint = await _lookup_ready_checkpoint_for_source(
                 request=request,
@@ -7052,10 +7920,14 @@ async def _compact_body(
                 chat_id=chat_id,
                 pipe_function_id=pipe_function_id,
                 source_messages=cut.summarization_prefix,
+                prefix_file_fingerprint=_resolve_fingerprint(
+                    await _build_prefix_file_fingerprint_resolver(request, metadata),
+                    len(cut.summarization_prefix),
+                ),
             )
             if history_checkpoint is None:
                 raise RuntimeError("History checkpoint was not available after creation")
-            compacted_messages, did_compact_tools = await _compact_retry_tool_results(
+            compacted_messages, did_compact_tools, tool_compaction_prefix_count = await _compact_retry_tool_results(
                 request=request,
                 user=user,
                 metadata=metadata,
@@ -7064,6 +7936,7 @@ async def _compact_body(
                 base_body=body,
                 messages=messages,
                 parent_checkpoint=history_checkpoint,
+                file_context_enabled=file_context_enabled,
                 summary_tool_policy=summary_tool_policy,
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
@@ -7072,28 +7945,34 @@ async def _compact_body(
             compacted = _copy_body_preserving_metadata(body)
             compacted["messages"] = compacted_messages
             compacted.pop("previous_response_id", None)
-            return compacted, True
+            return compacted, True, tool_compaction_prefix_count
 
     if not cut.summarization_prefix:
-        return body, False
+        return body, False, 0
 
     latest_user = next((m for m in reversed(cut.tail_messages) if m.get("role") == "user"), None)
     if latest_user is None:
         raise UnsupportedCompactionInput("Cannot compact safely without retaining the active latest user message")
 
     if not user_id or not _chat_id_supported(chat_id):
-        return body, False
+        return body, False, 0
 
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    prefix_identity_fingerprint = _resolve_fingerprint(
+        prefix_file_fingerprint_resolver, len(cut.summarization_prefix)
+    )
     pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
         request=request,
         user_id=user_id,
         chat_id=chat_id,
         pipe_function_id=pipe_function_id,
         source_messages=cut.summarization_prefix,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
     )
     if pending_checkpoint is not None and not _checkpoint_matches_exact_source(
         pending_checkpoint,
         cut.summarization_prefix,
+        prefix_file_fingerprint=prefix_identity_fingerprint,
     ):
         ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
         if ready_checkpoint is not None:
@@ -7101,11 +7980,15 @@ async def _compact_body(
             compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
                 cut,
                 ready_checkpoint,
+                prefix_file_fingerprint=_resolve_fingerprint(
+                    prefix_file_fingerprint_resolver,
+                    int(ready_checkpoint.get("source_message_count") or 0),
+                ),
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
             )
             compacted.pop("previous_response_id", None)
-            return compacted, True
+            return compacted, True, int(ready_checkpoint.get("source_message_count") or 0)
 
     summary_meta = build_checkpoint_summary_meta(
         cut.summarization_prefix,
@@ -7114,6 +7997,7 @@ async def _compact_body(
     )
 
     compacted = _copy_body_preserving_metadata(body)
+    compaction_prefix_count_for_return: int
     try:
         summary_text = await _get_or_create_compaction_summary(
             request=request,
@@ -7129,6 +8013,7 @@ async def _compact_body(
             summary_tool_policy=summary_tool_policy,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            file_context_enabled=file_context_enabled,
         )
         compacted["messages"] = replace_prefix_with_summary(
             messages,
@@ -7138,15 +8023,21 @@ async def _compact_body(
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
+        compaction_prefix_count_for_return = len(cut.summarization_prefix)
     except ParentCheckpointExtensionFailed as exc:
         compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
             cut,
             exc.parent,
+            prefix_file_fingerprint=_resolve_fingerprint(
+                prefix_file_fingerprint_resolver,
+                int(exc.parent.get("source_message_count") or 0),
+            ),
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
+        compaction_prefix_count_for_return = int(exc.parent.get("source_message_count") or 0)
     compacted.pop("previous_response_id", None)
-    return compacted, True
+    return compacted, True, compaction_prefix_count_for_return
 
 
 async def _compact_task_body_with_reusable_checkpoint(
@@ -7159,11 +8050,12 @@ async def _compact_task_body_with_reusable_checkpoint(
     match: ReusableCheckpointMatch,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
-) -> tuple[dict[str, Any], bool]:
+    file_context_enabled: bool = True,
+) -> tuple[dict[str, Any], bool, int]:
     source_body = _task_history_source_body_for_compaction(body, metadata)
     if source_body is None:
-        return body, False
-    compacted_source, compacted = await _compact_body_with_reusable_checkpoint(
+        return body, False, 0
+    compacted_source, compacted, compaction_prefix_count = await _compact_body_with_reusable_checkpoint(
         request=request,
         user=user,
         metadata=metadata,
@@ -7174,7 +8066,7 @@ async def _compact_task_body_with_reusable_checkpoint(
         historical_message_excerpt_count=historical_message_excerpt_count,
     )
     if not compacted:
-        return body, False
+        return body, False, 0
     rebuilt = await _rebuild_task_body_from_compacted_history(
         request=request,
         user=user,
@@ -7184,7 +8076,7 @@ async def _compact_task_body_with_reusable_checkpoint(
     )
     if rebuilt is None:
         raise RuntimeError("Task prompt could not be rebuilt from compacted history")
-    return rebuilt, True
+    return rebuilt, True, compaction_prefix_count
 
 
 async def _compact_task_body(
@@ -7199,11 +8091,12 @@ async def _compact_task_body(
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
     summary_tool_policy: SummaryToolPolicy,
-) -> tuple[dict[str, Any], bool]:
+    file_context_enabled: bool = True,
+) -> tuple[dict[str, Any], bool, int]:
     source_body = _task_history_source_body_for_compaction(body, metadata)
     if source_body is None:
-        return body, False
-    compacted_source, compacted = await _compact_body(
+        return body, False, 0
+    compacted_source, compacted, compaction_prefix_count = await _compact_body(
         request=request,
         user=user,
         metadata=metadata,
@@ -7213,10 +8106,11 @@ async def _compact_task_body(
         summary_model_id=summary_model_id,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
+        file_context_enabled=file_context_enabled,
         summary_tool_policy=summary_tool_policy,
     )
     if not compacted:
-        return body, False
+        return body, False, 0
     rebuilt = await _rebuild_task_body_from_compacted_history(
         request=request,
         user=user,
@@ -7226,7 +8120,7 @@ async def _compact_task_body(
     )
     if rebuilt is None:
         raise RuntimeError("Task prompt could not be rebuilt from compacted history")
-    return rebuilt, True
+    return rebuilt, True, compaction_prefix_count
 
 
 class Pipe:
@@ -7461,14 +8355,82 @@ class Pipe:
         if is_streaming and self.valves.force_include_usage:
             inner = inject_stream_usage_options(inner, force_include_usage=True)
 
-        is_summary_task = _normalized_task_name(metadata.get("task")) == INTERNAL_SUMMARY_TASK
+        task_name = _normalized_task_name(metadata.get("task"))
+        is_summary_task = task_name == INTERNAL_SUMMARY_TASK
+        # query_generation runs Core generate_queries, which may route the task
+        # model back into this wrapper (TASK_MODEL pointing here). Injecting
+        # target file context then would recurse via chat_completion_files_handler.
+        is_query_generation_task = task_name == TASKS.QUERY_GENERATION.value
         supported_context = _chat_id_supported(chat_id) and not is_summary_task
         task_source_body = (
             _task_history_source_body_for_compaction(inner, metadata)
             if supported_context and self.valves.compact_task_prompts_from_task_body
             else None
         )
-        checkpoint_lookup_body = task_source_body if task_source_body is not None else inner
+        checkpoint_lookup_body = task_source_body if task_source_body is not None else _copy_body_preserving_metadata(inner)
+        estimate_lookup_body = checkpoint_lookup_body
+        # Token decisions must reflect the body actually forwarded to the target.
+        # For task-prompt compaction that is the rebuilt provider prompt (inner),
+        # NOT the raw task history — even when the target opted out of file
+        # context.  Checkpoint lookup / source hash keep using the clean
+        # checkpoint_lookup_body (raw task history).
+        if task_source_body is not None:
+            estimate_lookup_body = inner
+
+        # Inject file context into inner BEFORE token estimation so the
+        # estimate reflects the actual forwarded payload (wrapper disables
+        # Core's pre-pipe RAG).  Checkpoint lookup / source hashes keep using
+        # checkpoint_lookup_body (clean, pre-RAG); estimate_lookup_body carries
+        # the injected payload.  inner is used directly when no compaction
+        # occurs.  When compaction runs, clean messages are restored for
+        # the compaction cut, then re-injected with the correct prefix count.
+        target_file_context_enabled = _target_model_supports_file_context(models, identity.target_model_id)
+        reusable_checkpoint_match = None
+        if supported_context:
+            try:
+                reusable_checkpoint_match = await _body_reusable_checkpoint_match(
+                    request=__request__,
+                    user=user,
+                    metadata=metadata,
+                    body=checkpoint_lookup_body,
+                    pipe_function_id=identity.pipe_function_id,
+                )
+            except Exception as exc:
+                return _error_response(
+                    f"Failed to access auto-compaction checkpoints: {exc}",
+                    code="checkpoint_unavailable",
+                )
+        pre_rag_messages: list[dict[str, Any]] | None = None
+        pre_injected_file_context_sources = None
+        if (
+            not is_summary_task
+            and not is_query_generation_task
+            and target_file_context_enabled
+            and reusable_checkpoint_match is None
+        ):
+            target_user_message_id_for_inject = str(metadata.get("user_message_id") or message_id or "") or None
+            pre_rag_messages = copy.deepcopy(inner.get("messages") if isinstance(inner.get("messages"), list) else [])
+            inner = await _inject_target_file_context(
+                request=__request__,
+                user=user,
+                body=inner,
+                chat_id=str(chat_id) if chat_id else None,
+                current_message_id=target_user_message_id_for_inject,
+                compaction_prefix_count=0,
+                metadata_files=metadata.get("files"),
+                metadata_user_message=metadata.get("user_message"),
+                event_emitter=None,
+                file_context_enabled=target_file_context_enabled,
+                emit_source_events=False,
+            )
+            inner_metadata = inner.get("metadata")
+            if isinstance(inner_metadata, dict):
+                pre_injected_file_context_sources = inner_metadata.get("sources")
+            # Token decisions use the injected provider body so file context is
+            # included.  For task-prompt compaction the target still receives the
+            # rebuilt provider prompt, so inner (not the raw task history) is the
+            # correct estimate basis.
+            estimate_lookup_body = inner
 
         request_usage = get_request_scoped_usage(
             request=__request__,
@@ -7507,22 +8469,6 @@ class Pipe:
             target_model_for_limits,
             effective_trigger_total_tokens,
         )
-        # --- reusable checkpoint lookup precedes any token estimate ---
-        reusable_checkpoint_match = None
-        if supported_context:
-            try:
-                reusable_checkpoint_match = await _body_reusable_checkpoint_match(
-                    request=__request__,
-                    user=user,
-                    metadata=metadata,
-                    body=checkpoint_lookup_body,
-                    pipe_function_id=identity.pipe_function_id,
-                )
-            except Exception as exc:
-                return _error_response(
-                    f"Failed to access auto-compaction checkpoints: {exc}",
-                    code="checkpoint_unavailable",
-                )
         # --- candidate-payload estimate: the decision basis ---
         # total_tokens is an OBSERVATION of a past payload, not the size of the
         # candidate we are about to send. Hard/soft decisions are driven by a
@@ -7541,6 +8487,7 @@ class Pipe:
                         match=reusable_checkpoint_match,
                         historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                         historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                        file_context_enabled=target_file_context_enabled,
                     )
                 else:
                     checkpoint_applied_estimate = await _estimate_checkpoint_applied_body_tokens(
@@ -7552,18 +8499,19 @@ class Pipe:
                         match=reusable_checkpoint_match,
                         historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                         historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                        file_context_enabled=target_file_context_enabled,
                     )
             else:
                 if total_tokens is not None:
                     estimated_total_tokens = await _estimate_next_input_tokens_from_usage_anchor(
                         request=__request__,
                         last_observed_total_tokens=total_tokens,
-                        body=checkpoint_lookup_body,
+                        body=estimate_lookup_body,
                         usage_source=usage_source,
                     )
                 if estimated_total_tokens is None:
                     estimated_total_tokens = await estimate_body_tokens_async(
-                        checkpoint_lookup_body,
+                        estimate_lookup_body,
                         request=__request__,
                     )
         # decision_total: checkpoint-applied estimate (the compacted body we
@@ -7584,7 +8532,7 @@ class Pipe:
         ):
             with suppress(Exception):
                 compare_estimate_tokens = await estimate_body_tokens_async(
-                    checkpoint_lookup_body,
+                    estimate_lookup_body,
                     request=__request__,
                 )
         display_token_context = _build_display_token_context(
@@ -7660,6 +8608,7 @@ class Pipe:
                 token_status_detail=self.valves.token_status_detail,
                 token_status_compare_estimate=self.valves.token_status_compare_estimate,
                 event_emitter=__event_emitter__,
+                file_context_enabled=target_file_context_enabled,
             )
 
         def launch_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
@@ -7699,13 +8648,21 @@ class Pipe:
                 token_status_detail=self.valves.token_status_detail,
                 token_status_compare_estimate=self.valves.token_status_compare_estimate,
                 event_emitter=__event_emitter__,
+                file_context_enabled=target_file_context_enabled,
             )
 
         attempt = 0
         compacted_once = False
+        compaction_prefix_count = 0
         while attempt < MAX_CONTEXT_RETRY_ATTEMPTS:
             attempt += 1
             candidate = _copy_body_preserving_metadata(inner)
+            # Restore pre-RAG clean messages for compaction so the cut is
+            # computed on original content, not RAG-inflated text.
+            if pre_rag_messages is not None and (should_compact or compacted_once):
+                candidate["messages"] = copy.deepcopy(pre_rag_messages)
+            compaction_prefix_count = 0
+            candidate_source_events = None
             if should_compact or compacted_once:
                 try:
                     checkpoint_only_attempt = reusable_checkpoint_only is not None and not compacted_once
@@ -7732,7 +8689,7 @@ class Pipe:
                         )
                     if reusable_checkpoint_only is not None and not compacted_once:
                         if task_source_body is not None:
-                            candidate, compacted = await _compact_task_body_with_reusable_checkpoint(
+                            candidate, compacted, compaction_prefix_count = await _compact_task_body_with_reusable_checkpoint(
                                 request=__request__,
                                 user=user,
                                 metadata=metadata,
@@ -7741,9 +8698,10 @@ class Pipe:
                                 match=reusable_checkpoint_only,
                                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                                file_context_enabled=target_file_context_enabled,
                             )
                         else:
-                            candidate, compacted = await _compact_body_with_reusable_checkpoint(
+                            candidate, compacted, compaction_prefix_count = await _compact_body_with_reusable_checkpoint(
                                 request=__request__,
                                 user=user,
                                 metadata=metadata,
@@ -7752,10 +8710,11 @@ class Pipe:
                                 match=reusable_checkpoint_only,
                                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                                file_context_enabled=target_file_context_enabled,
                             )
                     else:
                         if task_source_body is not None:
-                            candidate, compacted = await _compact_task_body(
+                            candidate, compacted, compaction_prefix_count = await _compact_task_body(
                                 request=__request__,
                                 user=user,
                                 metadata=metadata,
@@ -7766,9 +8725,10 @@ class Pipe:
                                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                                 summary_tool_policy=self.valves.summary_tool_policy,
+                                file_context_enabled=target_file_context_enabled,
                             )
                         else:
-                            candidate, compacted = await _compact_body(
+                            candidate, compacted, compaction_prefix_count = await _compact_body(
                                 request=__request__,
                                 user=user,
                                 metadata=metadata,
@@ -7779,8 +8739,31 @@ class Pipe:
                                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                                 summary_tool_policy=self.valves.summary_tool_policy,
+                                file_context_enabled=target_file_context_enabled,
                             )
                     compacted_once = compacted_once or compacted
+                    if (
+                        not is_summary_task
+                        and not is_query_generation_task
+                        and (should_compact or compacted_once)
+                    ):
+                        target_user_message_id = str(metadata.get("user_message_id") or message_id or "") or None
+                        candidate = await _inject_target_file_context(
+                            request=__request__,
+                            user=user,
+                            body=candidate,
+                            chat_id=str(chat_id) if chat_id else None,
+                            current_message_id=target_user_message_id,
+                            compaction_prefix_count=compaction_prefix_count,
+                            metadata_files=metadata.get("files"),
+                            metadata_user_message=metadata.get("user_message"),
+                            event_emitter=None,
+                            file_context_enabled=target_file_context_enabled,
+                            emit_source_events=False,
+                        )
+                        candidate_metadata = candidate.get("metadata")
+                        if isinstance(candidate_metadata, dict):
+                            candidate_source_events = candidate_metadata.get("sources")
                     if emit_progress_status:
                         if compacted:
                             after_tokens = None
@@ -7861,6 +8844,13 @@ class Pipe:
                     )
                     return _error_response(f"Failed to compact chat history: {exc}", code="summary_failed")
 
+            # When no compaction happened, candidate inherited inner's pre-injected
+            # file context.  Defer source events until the target forward succeeds,
+            # and emit only the sources our own injection produced (never inherited
+            # metadata sources from upstream processing).
+            if not is_summary_task and not (should_compact or compacted_once):
+                candidate_source_events = pre_injected_file_context_sources
+
             try:
                 if is_streaming:
                     streaming_kwargs = {
@@ -7873,12 +8863,18 @@ class Pipe:
                     }
                     if effective_soft_trigger_total_tokens is not None and not is_summary_task:
                         streaming_kwargs["on_complete"] = launch_completed_turn_soft_prefetch
-                    return await _forward_streaming_target(**streaming_kwargs)
+                    streaming_response = await _forward_streaming_target(**streaming_kwargs)
+                    await _emit_source_events(__event_emitter__, candidate_source_events)
+                    return streaming_response
                 response = await _forward_non_streaming_target(
                     request=__request__,
                     user=user,
                     body=candidate,
                 )
+                if isinstance(response, dict) and response.get("error"):
+                    return response
+                await _emit_source_events(__event_emitter__, candidate_source_events)
+                response = _merge_source_events_into_response(response, candidate_source_events)
                 assistant_message = None if is_summary_task else _assistant_message_for_completed_prefetch(response)
                 if assistant_message is not None:
                     launch_completed_turn_soft_prefetch(

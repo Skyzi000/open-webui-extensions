@@ -1265,7 +1265,7 @@ async def test_compact_body_extends_from_parent_summary_plus_delta(monkeypatch):
         ],
     }
 
-    compacted, did_compact = await mod._compact_body(
+    compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
         request=SimpleNamespace(state=SimpleNamespace()),
         user={"id": "user-1"},
         metadata={"chat_id": "chat-1"},
@@ -1331,7 +1331,7 @@ async def test_compact_body_uses_raw_summary_source_but_canonical_checkpoint_has
         ],
     }
 
-    compacted, did_compact = await mod._compact_body(
+    compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
         request=SimpleNamespace(state=SimpleNamespace()),
         user={"id": "user-1"},
         metadata={"chat_id": "chat-1"},
@@ -1387,7 +1387,7 @@ async def test_compact_body_uses_parent_checkpoint_delta_when_extension_summary_
         ],
     }
 
-    compacted, did_compact = await mod._compact_body(
+    compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
         request=SimpleNamespace(state=SimpleNamespace()),
         user={"id": "user-1"},
         metadata={"chat_id": "chat-1"},
@@ -1412,6 +1412,340 @@ async def test_compact_body_uses_parent_checkpoint_delta_when_extension_summary_
     ]
     assert store.completed_rows == []
     assert [row["id"] for row in store.rows] == [parent["id"]]
+
+
+def test_compute_summary_source_hash_collapses_to_source_hash_without_fingerprint():
+    messages = [{"role": "user", "content": "hello"}]
+
+    assert mod.compute_summary_source_hash(messages, None) == mod.compute_source_hash(messages)
+    assert mod.compute_summary_source_hash(messages, "") == mod.compute_source_hash(messages)
+    fingerprinted = mod.compute_summary_source_hash(messages, "sha256:abc")
+    assert fingerprinted != mod.compute_source_hash(messages)
+
+
+def test_stable_file_fingerprint_ignores_transient_metadata():
+    stable = [
+        {
+            "id": "file-1",
+            "type": "file",
+            "name": "report.pdf",
+            "status": "processing",
+            "progress": {"phase": "extracting"},
+            "size": 999,
+        }
+    ]
+    changed_transient = [
+        {
+            "id": "file-1",
+            "type": "file",
+            "name": "report.pdf",
+            "status": "uploaded",
+            "progress": {"phase": "done"},
+            "size": 123,
+        }
+    ]
+
+    assert mod._stable_file_fingerprint(stable) == mod._stable_file_fingerprint(changed_transient)
+
+
+def test_stable_file_fingerprint_detects_content_hash_change():
+    a = [{"id": "file-1", "type": "file", "name": "a.pdf", "file": {"id": "file-1", "hash": "abc"}}]
+    b = [{"id": "file-1", "type": "file", "name": "a.pdf", "file": {"id": "file-1", "hash": "def"}}]
+
+    assert mod._stable_file_fingerprint(a) != mod._stable_file_fingerprint(b)
+
+
+def test_stable_file_fingerprint_ignores_file_bodies_and_docs():
+    stable = [
+        {
+            "id": "file-1",
+            "type": "file",
+            "name": "a.pdf",
+            "content": "large extracted body A",
+            "context": "large RAG context A",
+            "docs": [{"content": "chunk A"}],
+            "file": {
+                "id": "file-1",
+                "hash": "abc",
+                "context": "embedded RAG context A",
+                "data": {"content": "embedded body A"},
+                "metadata": {
+                    "content": "metadata body A",
+                    "context": "metadata RAG context A",
+                    "docs": [{"content": "metadata chunk A"}],
+                    "data": {"content": "metadata embedded body A"},
+                },
+            },
+        }
+    ]
+    changed_body = copy.deepcopy(stable)
+    changed_body[0]["content"] = "large extracted body B"
+    changed_body[0]["context"] = "large RAG context B"
+    changed_body[0]["docs"] = [{"content": "chunk B"}]
+    changed_body[0]["file"]["context"] = "embedded RAG context B"
+    changed_body[0]["file"]["data"]["content"] = "embedded body B"
+    changed_body[0]["file"]["metadata"]["content"] = "metadata body B"
+    changed_body[0]["file"]["metadata"]["context"] = "metadata RAG context B"
+    changed_body[0]["file"]["metadata"]["docs"] = [{"content": "metadata chunk B"}]
+    changed_body[0]["file"]["metadata"]["data"]["content"] = "metadata embedded body B"
+
+    assert mod._stable_file_fingerprint(stable) == mod._stable_file_fingerprint(changed_body)
+
+
+def test_replace_prefix_accepts_parent_checkpoint_with_prefix_file_fingerprint():
+    messages = [
+        {"role": "user", "content": "old with file"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    cut = mod.select_safe_message_cut(messages)
+    fingerprint = "sha256:prefix-files-a"
+    parent = mod.build_checkpoint_row(
+        namespace="ns",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash=mod.compute_summary_source_hash(cut.summarization_prefix, fingerprint),
+        source_message_count=len(cut.summarization_prefix),
+        summary_text="Parent summary with file context",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    compacted = mod.replace_prefix_with_parent_checkpoint_and_delta(
+        cut,
+        parent,
+        prefix_file_fingerprint=fingerprint,
+        historical_message_excerpt_count=0,
+    )
+
+    assert "Parent summary with file context" in compacted[0]["content"]
+    assert compacted[-1] == {"role": "user", "content": "active"}
+
+
+@pytest.mark.asyncio
+async def test_compact_body_parent_extension_fallback_uses_prefix_file_fingerprint(monkeypatch):
+    messages = [
+        {"role": "user", "content": "old with file"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    metadata_files = [{"id": "file-a", "type": "file", "name": "a.pdf", "file": {"hash": "aaa"}}]
+    metadata = {"chat_id": "chat-1", "user_message_id": "msg-1", "files": metadata_files}
+    db_chain = [
+        {"role": "user", "content": "old with file", "files": [{"id": "file-a", "type": "file"}]},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    cut = mod.select_safe_message_cut(messages)
+    fingerprint = mod._stable_file_fingerprint(metadata_files)
+    parent = mod.build_checkpoint_row(
+        namespace="ns",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash=mod.compute_summary_source_hash(cut.summarization_prefix, fingerprint),
+        source_message_count=len(cut.summarization_prefix),
+        summary_text="Parent fallback summary with file context",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    async def fake_load_chain(request, chat_id, message_id):
+        return db_chain
+
+    async def fake_get_or_create_summary(**kwargs):
+        raise mod.ParentCheckpointExtensionFailed(parent, RuntimeError("extension failed"))
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", fake_load_chain)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", fake_get_or_create_summary)
+
+    compacted, did_compact, prefix_count = await mod._compact_body(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata=metadata,
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="summary",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=0,
+    )
+
+    assert did_compact is True
+    assert prefix_count == len(cut.summarization_prefix)
+    assert "Parent fallback summary with file context" in compacted["messages"][0]["content"]
+
+
+def test_soft_prefetch_inflight_source_hash_separates_file_identities():
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    first_metadata = {"files": [{"id": "file-a", "type": "file", "name": "a.pdf", "file": {"hash": "aaa"}}]}
+    second_metadata = {"files": [{"id": "file-a", "type": "file", "name": "a.pdf", "file": {"hash": "bbb"}}]}
+
+    assert mod._soft_prefetch_inflight_source_hash(source_messages, first_metadata) != mod._soft_prefetch_inflight_source_hash(source_messages, second_metadata)
+
+
+@pytest.mark.asyncio
+async def test_prefetch_pending_lookup_uses_prefix_file_fingerprint_resolver(monkeypatch):
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    db_chain = [
+        {"role": "user", "content": "old", "files": [{"id": "file-a", "type": "file"}]},
+        {"role": "assistant", "content": "answer"},
+    ]
+    metadata = {
+        "chat_id": "chat-1",
+        "_auto_compaction_processed_db_chain": db_chain,
+        "files": [{"id": "file-a", "type": "file", "name": "a.pdf", "file": {"hash": "aaa"}}],
+    }
+    captured: dict[str, object] = {}
+
+    async def fake_load_chain(request, chat_id, message_id):
+        return db_chain
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", fake_load_chain)
+
+    async def fake_lookup_pending(**kwargs):
+        resolver = kwargs.get("prefix_file_fingerprint_resolver")
+        captured["resolver"] = resolver
+        captured["fingerprint"] = resolver(len(source_messages)) if resolver is not None else None
+        return {"id": "pending-1"}
+
+    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", fake_lookup_pending)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata=metadata,
+        body={"messages": source_messages},
+        pipe_function_id="auto_compact",
+        summary_model_id="summary-model",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+    )
+
+    assert result is False
+    assert callable(captured["resolver"])
+    assert captured["fingerprint"] == mod._stable_file_fingerprint(metadata["files"])
+
+
+def test_prefix_file_fingerprint_resolver_covers_only_absorbed_prefix_range():
+    # Files live in the DB chain (production layout), not in body.messages.
+    db_chain = [
+        {"role": "user", "content": "m1", "files": [{"id": "prefix-file", "type": "file"}]},
+        {"role": "assistant", "content": "m2"},
+        {"role": "user", "content": "m3", "files": [{"id": "current-file", "type": "file"}]},
+    ]
+    metadata_files = [
+        {"id": "prefix-file", "type": "file", "name": "p.txt"},
+        {"id": "current-file", "type": "file", "name": "c.txt"},
+    ]
+    resolver = mod._make_prefix_file_fingerprint_resolver(db_chain, metadata_files)
+
+    fp_prefix = resolver(2)
+    assert fp_prefix is not None
+    assert resolver(1) == fp_prefix
+    assert resolver(0) is None
+    # A current-turn/retained file outside the absorbed prefix range does not
+    # change the prefix fingerprint, so it cannot alter the checkpoint key.
+    metadata_files_without_current = [metadata_files[0]]
+    resolver_without_current = mod._make_prefix_file_fingerprint_resolver(db_chain, metadata_files_without_current)
+    assert resolver_without_current(2) == fp_prefix
+
+
+@pytest.mark.asyncio
+async def test_different_prefix_file_fingerprint_does_not_reuse_checkpoint(monkeypatch):
+    # In production, attachments live in metadata.files / DB chain rather than
+    # body.messages, so identical source text with different absorbed prefix
+    # files must NOT reuse the same checkpoint summary.
+    source_messages = [{"role": "user", "content": "same text"}]
+    store = ClaimStore()
+    factory_calls = []
+
+    async def summary_factory(parent):
+        factory_calls.append(parent)
+        return "generated summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    first = await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        summary_meta={},
+        summary_factory=summary_factory,
+        prefix_file_fingerprint="sha256:prefix-files-a",
+    )
+    second = await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        summary_meta={},
+        summary_factory=summary_factory,
+        prefix_file_fingerprint="sha256:prefix-files-b",
+    )
+
+    assert len(factory_calls) == 2
+    assert first.checkpoint["source_hash"] != second.checkpoint["source_hash"]
+    assert len(store.completed_rows) == 2
+    assert store.completed_rows[0]["id"] != store.completed_rows[1]["id"]
+
+
+@pytest.mark.asyncio
+async def test_same_prefix_file_fingerprint_reuses_checkpoint(monkeypatch):
+    source_messages = [{"role": "user", "content": "same text"}]
+    store = ClaimStore()
+    factory_calls = []
+
+    async def summary_factory(parent):
+        factory_calls.append(parent)
+        return "generated summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    first = await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        summary_meta={},
+        summary_factory=summary_factory,
+        prefix_file_fingerprint="sha256:prefix-files-a",
+    )
+    second = await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        summary_meta={},
+        summary_factory=summary_factory,
+        prefix_file_fingerprint="sha256:prefix-files-a",
+    )
+
+    assert len(factory_calls) == 1
+    assert first == second
+    assert len(store.completed_rows) == 1
 
 
 def test_checkpoint_ddl_tolerates_only_duplicate_object_errors():

@@ -124,6 +124,10 @@ def install_fake_open_webui_user_model(monkeypatch):
     return FakeUserModel
 
 
+def _file(file_id, *, file_type="file"):
+    return {"id": file_id, "type": file_type, "name": f"{file_id}.txt"}
+
+
 class FakeModelMeta(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -1899,6 +1903,67 @@ async def test_checkpoint_applied_estimate_batches_delta_tail_token_estimation(m
     ]
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_applied_estimate_includes_retained_file_context(monkeypatch, pipe_request, pipe_user):
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    delta_messages = [{"role": "user", "content": "middle"}]
+    tail_messages = [{"role": "user", "content": "active"}]
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(parent_source),
+        source_message_count=len(parent_source),
+        summary_text="existing parent summary",
+        summary_meta={},
+        summary_token_count=20,
+        parent_checkpoint_id=None,
+        now=123,
+    )
+    captured = {}
+
+    async def inject_target_file_context(**kwargs):
+        captured["prefix_count"] = kwargs["compaction_prefix_count"]
+        captured["metadata_files"] = copy.deepcopy(kwargs["metadata_files"])
+        body = copy.deepcopy(kwargs["body"])
+        body["messages"][-1]["content"] += "\nFILE_CONTEXT"
+        return body
+
+    async def estimate_body_tokens_async(body, **kwargs):
+        captured["estimate_body"] = copy.deepcopy(body)
+        return 33
+
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
+
+    count = await mod._estimate_checkpoint_applied_body_tokens(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1", "files": [_file("retained")], "user_message": {"files": [_file("retained")]}},
+        body={"metadata": {"files": [_file("retained")]}, "messages": [*parent_source, *delta_messages, *tail_messages]},
+        pipe_function_id="auto_compact",
+        match=mod.ReusableCheckpointMatch(
+            kind="parent",
+            source_message_count=len(parent_source),
+            source_kind="message",
+            checkpoint=checkpoint,
+        ),
+        historical_message_excerpt_bytes=0,
+        historical_message_excerpt_count=0,
+        file_context_enabled=True,
+    )
+
+    assert count == 53
+    assert captured["prefix_count"] == len(parent_source)
+    assert captured["metadata_files"] == [_file("retained")]
+    assert captured["estimate_body"]["messages"] == [*delta_messages, {"role": "user", "content": "active\nFILE_CONTEXT"}]
+
+
 def test_include_exclude_patterns_match_id_and_name_and_deduplicate_targets():
     valves = mod.Pipe.Valves(
         include_model_patterns="*gpt*,Anthropic*",
@@ -2130,6 +2195,279 @@ def test_wrapper_model_form_inherits_target_meta_used_by_core_middleware():
     }
 
 
+def test_target_model_supports_file_context_respects_top_level_opt_out():
+    models = {
+        "target": {
+            "id": "target",
+            "capabilities": {"file_context": False},
+            "info": {"meta": {"capabilities": {"file_context": True}}},
+        }
+    }
+
+    assert mod._target_model_supports_file_context(models, "target") is False
+
+
+def test_wrapper_model_form_disables_core_file_context_for_wrapper():
+    target = {
+        "id": "target-with-file-context",
+        "name": "Target With File Context",
+        "info": {
+            "meta": {
+                "capabilities": {
+                    "file_context": True,
+                    "vision": True,
+                },
+            },
+        },
+    }
+
+    form = mod.build_wrapper_model_form(
+        pipe_function_id="auto_compact",
+        function_owner_user_id="function-owner",
+        target_model=target,
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert form["meta"]["capabilities"]["file_context"] is False
+    assert form["meta"]["capabilities"]["vision"] is True
+
+
+def test_classify_target_no_compaction_all_retained():
+    metadata_files = [_file("old"), _file("current")]
+    db_chain = [
+        {"id": "m1", "role": "user", "files": [_file("old")]},
+        {"id": "m2", "role": "user", "files": [_file("current")]},
+    ]
+
+    retained = mod._classify_files_for_target(
+        db_chain=db_chain,
+        compaction_prefix_count=0,
+        metadata_user_message={"files": [_file("current")]},
+        metadata_files=metadata_files,
+    )
+
+    assert retained == metadata_files
+
+
+def test_classify_target_foreground_compaction():
+    metadata_files = [_file("absorbed"), _file("also-absorbed"), _file("current")]
+    db_chain = [
+        {"id": "m1", "role": "user", "files": [_file("absorbed")]},
+        {"id": "m2", "role": "assistant", "files": [_file("also-absorbed")]},
+        {"id": "m3", "role": "user", "files": [_file("current")]},
+    ]
+
+    retained = mod._classify_files_for_target(
+        db_chain=db_chain,
+        compaction_prefix_count=2,
+        metadata_user_message={"files": [_file("current")]},
+        metadata_files=metadata_files,
+    )
+
+    assert retained == [_file("current")]
+
+
+def test_classify_target_checkpoint_reuse():
+    metadata_files = [_file("parent"), _file("delta"), _file("tail")]
+    db_chain = [
+        {"id": "m1", "role": "user", "files": [_file("parent")]},
+        {"id": "m2", "role": "assistant"},
+        {"id": "m3", "role": "user", "files": [_file("delta")]},
+        {"id": "m4", "role": "assistant", "files": [_file("tail")]},
+    ]
+
+    retained = mod._classify_files_for_target(
+        db_chain=db_chain,
+        compaction_prefix_count=2,
+        metadata_user_message={"files": [_file("delta")]},
+        metadata_files=metadata_files,
+    )
+
+    assert retained == [_file("delta"), _file("tail")]
+
+
+def test_classify_target_tool_result_compaction_no_whole_messages_absorbed():
+    metadata_files = [_file("history"), _file("current")]
+    db_chain = [
+        {"id": "m1", "role": "user", "files": [_file("history")]},
+        {"id": "m2", "role": "user", "files": [_file("current")]},
+    ]
+
+    retained = mod._classify_files_for_target(
+        db_chain=db_chain,
+        compaction_prefix_count=0,
+        metadata_user_message={"files": [_file("current")]},
+        metadata_files=metadata_files,
+    )
+
+    assert retained == metadata_files
+
+
+def test_classify_target_db_unavailable_keeps_current_only():
+    metadata_files = [_file("absorbed"), _file("current"), _file("knowledge")]
+
+    retained = mod._classify_files_for_target(
+        db_chain=None,
+        compaction_prefix_count=2,
+        metadata_user_message={"files": [_file("current")]},
+        metadata_files=metadata_files,
+    )
+
+    assert retained == [_file("current")]
+
+
+def test_classify_target_db_unavailable_retains_unidentifiable():
+    unidentified = {"type": "file", "name": "unknown.txt"}
+    retained = mod._classify_files_for_target(
+        db_chain=None,
+        compaction_prefix_count=2,
+        metadata_user_message={"files": [_file("current")]},
+        metadata_files=[_file("absorbed"), unidentified, _file("current")],
+    )
+
+    assert retained == [unidentified, _file("current")]
+
+
+def test_classify_target_images_always_retained():
+    image = _file("absorbed-image", file_type="image")
+    retained = mod._classify_files_for_target(
+        db_chain=[{"id": "m1", "role": "user", "files": [_file("absorbed"), image]}],
+        compaction_prefix_count=1,
+        metadata_user_message={},
+        metadata_files=[_file("absorbed"), image],
+    )
+
+    assert retained == [image]
+
+
+def test_classify_target_unidentifiable_retained():
+    unidentified = {"type": "file", "name": "unknown.txt"}
+
+    retained = mod._classify_files_for_target(
+        db_chain=[{"id": "m1", "role": "user", "files": [_file("absorbed")]}],
+        compaction_prefix_count=1,
+        metadata_user_message={},
+        metadata_files=[_file("absorbed"), unidentified],
+    )
+
+    assert retained == [unidentified]
+
+
+def test_classify_target_chat_level_knowledge_retained():
+    knowledge = _file("knowledge")
+
+    retained = mod._classify_files_for_target(
+        db_chain=[{"id": "m1", "role": "user", "files": [_file("absorbed")]}],
+        compaction_prefix_count=1,
+        metadata_user_message={},
+        metadata_files=[_file("absorbed"), knowledge],
+    )
+
+    assert retained == [knowledge]
+
+
+def test_classify_target_with_tool_call_expansion_in_prefix():
+    """DB chain assistant-with-output expands via process_messages_with_output.
+    compaction_prefix_count counts expanded messages, so the DB chain must be
+    expanded too for positional alignment. A delta user message between the
+    expanded assistant block and the current message is the critical test —
+    without expansion its file would be silently dropped."""
+    from open_webui.utils.middleware import process_messages_with_output
+
+    assistant_with_output = {
+        "id": "a1",
+        "role": "assistant",
+        "content": "",
+        "output": [
+            {"type": "function_call", "call_id": "c1", "name": "search", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "result"}]},
+            {"type": "message", "content": [{"type": "output_text", "text": "done"}]},
+        ],
+    }
+    # Unexpanded DB chain: 4 messages
+    db_chain_raw = [
+        {"id": "u1", "role": "user", "files": [_file("prefix-file")]},
+        assistant_with_output,
+        {"id": "u2", "role": "user", "files": [_file("delta-file")]},
+        {"id": "u3", "role": "user", "files": [_file("current-file")]},
+    ]
+    # Expanded: process_messages_with_output produces 6 messages
+    # [u1, assistant(tool_calls), tool(result), assistant(final), u2(delta), u3(current)]
+    expanded = process_messages_with_output(db_chain_raw)
+    assert len(expanded) == 6, f"Expected 6 expanded messages, got {len(expanded)}"
+
+    # compaction_prefix_count=4 (absorb u1 + expanded assistant block)
+    # Retained: range(4, 6) = [u2(delta), u3(current)]
+    retained = mod._classify_files_for_target(
+        db_chain=expanded,
+        compaction_prefix_count=4,
+        metadata_user_message={"files": [_file("current-file")]},
+        metadata_files=[_file("prefix-file"), _file("delta-file"), _file("current-file")],
+    )
+
+    # delta-file AND current-file retained; prefix-file dropped
+    assert retained == [_file("delta-file"), _file("current-file")]
+
+
+@pytest.mark.asyncio
+async def test_load_chat_message_chain_expands_assistant_with_output(monkeypatch):
+    """Guards the process_messages_with_output call inside _load_chat_message_chain.
+    Without expansion, positional indices would misalign when assistant messages
+    have output (tool calls)."""
+    assistant_with_output = {
+        "id": "a1",
+        "role": "assistant",
+        "content": "",
+        "output": [
+            {"type": "function_call", "call_id": "c1", "name": "search", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "result"}]},
+            {"type": "message", "content": [{"type": "output_text", "text": "done"}]},
+        ],
+    }
+    messages_map = {
+        "u1": {"id": "u1", "parentId": None, "role": "user", "content": "hi", "files": []},
+        "a1": {"id": "a1", "parentId": "u1", **assistant_with_output},
+        "u2": {"id": "u2", "parentId": "a1", "role": "user", "content": "bye", "files": []},
+    }
+
+    class FakeChats:
+        @staticmethod
+        async def get_messages_map_by_chat_id(chat_id):
+            return messages_map
+
+    chats_module = types.ModuleType("open_webui.models.chats")
+    chats_module.Chats = FakeChats
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
+
+    chain = await mod._load_chat_message_chain(
+        request=None,
+        chat_id="chat-1",
+        current_message_id="u2",
+    )
+
+    # Unexpanded would be 3 messages; expanded is 5.
+    assert chain is not None
+    assert len(chain) == 5, f"Expected 5 expanded messages, got {len(chain)}"
+
+
+def test_classify_summary_skips_parent_absorbed():
+    db_chain = [
+        {"id": "m1", "role": "user", "files": [_file("parent-1")]},
+        {"id": "m2", "role": "assistant", "files": [_file("parent-2")]},
+        {"id": "m3", "role": "user", "files": [_file("delta-1")]},
+        {"id": "m4", "role": "assistant", "files": [_file("delta-2")]},
+        {"id": "m5", "role": "user", "files": [_file("tail")]},
+    ]
+
+    prefix_ids = mod._classify_files_for_summary(
+        db_chain=db_chain,
+        compaction_prefix_count=4,
+        parent_source_message_count=2,
+    )
+
+    assert prefix_ids == {"delta-1", "delta-2"}
+
+
 def test_wrapper_model_form_inherits_top_level_display_metadata_without_wrapper_description():
     target = {
         "id": "provider-target",
@@ -2149,7 +2487,7 @@ def test_wrapper_model_form_inherits_top_level_display_metadata_without_wrapper_
 
     assert form["meta"]["description"] == "Provider target description"
     assert form["meta"]["profile_image_url"] == "https://example.com/provider.png"
-    assert form["meta"]["capabilities"] == {"vision": True}
+    assert form["meta"]["capabilities"] == {"vision": True, "file_context": False}
     assert form["meta"]["tags"] == [{"name": "provider"}, {"name": "custom"}]
     assert form["meta"]["auto_compaction"] == {
         "pipe_function_id": "auto_compact",
@@ -2355,7 +2693,7 @@ async def test_wrapper_sync_uses_target_model_record_params_for_wrapper_record(m
     inserted = calls["insert"][0][1]
     assert inserted.id == wrapper_id
     assert inserted.params.payload == {"function_calling": "native", "stream_response": True}
-    assert inserted.meta.payload["capabilities"] == {"builtin_tools": False}
+    assert inserted.meta.payload["capabilities"] == {"builtin_tools": False, "file_context": False}
 
 
 @pytest.mark.asyncio
@@ -2430,7 +2768,7 @@ async def test_wrapper_sync_ignores_non_dict_top_level_provider_capabilities(mon
     assert inserted.id == wrapper_id
     assert meta["description"] == "Provider target description"
     assert meta["profile_image_url"] == "https://example.com/provider.png"
-    assert "capabilities" not in meta
+    assert meta["capabilities"] == {"file_context": False}
     assert calls["update"] == []
 
 
@@ -2566,6 +2904,7 @@ async def test_wrapper_sync_skips_update_when_existing_record_matches(monkeypatc
                         "pipe_function_id": "auto_compact",
                         "target_model_id": "same-target",
                     },
+                    "capabilities": {"file_context": False},
                 },
                 "access_grants": [
                     {
@@ -4485,6 +4824,32 @@ def test_summary_task_metadata_removes_tool_and_arena_state():
     assert "selected_model_id" not in summary_metadata
 
 
+def test_build_summary_completion_body_appends_prefix_file_context_to_user_message_and_drops_files():
+    body = mod.build_summary_completion_body(
+        {
+            "model": "target",
+            "messages": [{"role": "user", "content": "old"}],
+            "metadata": {"files": [_file("source")]},
+            "previous_response_id": "response-1",
+            "response_format": {"type": "json_object"},
+        },
+        summary_model_id="summary",
+        source_messages=[{"role": "user", "content": "source"}],
+        metadata={"chat_id": "chat-1", "files": [_file("source")]},
+        prefix_file_context="<attached_file_contents>source context</attached_file_contents>",
+    )
+
+    assert body["messages"][:-1] == [{"role": "user", "content": "source"}]
+    assert body["messages"][-1]["role"] == "user"
+    assert body["messages"][-1]["content"].startswith(
+        "<attached_file_contents>source context</attached_file_contents>\n\n"
+    )
+    assert "AUTO-COMPACTION CHECKPOINT SUMMARY" in body["messages"][-1]["content"]
+    assert "files" not in body["metadata"]
+    assert "previous_response_id" not in body
+    assert "response_format" not in body
+
+
 @pytest.mark.asyncio
 async def test_summary_task_metadata_drops_unpickleable_core_values():
     future = asyncio.get_running_loop().create_future()
@@ -4500,6 +4865,50 @@ async def test_summary_task_metadata_drops_unpickleable_core_values():
     assert summary_metadata["params"] == {"function_calling": "native"}
     assert "mcp_clients" not in summary_metadata
     assert summary_metadata["task"] == mod.INTERNAL_SUMMARY_TASK
+
+
+@pytest.mark.asyncio
+async def test_target_completion_uses_forward_body_metadata_for_request_state(monkeypatch, pipe_request, pipe_user):
+    captured = {}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["state_metadata"] = copy.deepcopy(request.state.metadata)
+        captured["form_metadata"] = copy.deepcopy(form_data["metadata"])
+        captured["bypass_filter"] = bypass_filter
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    original_files = [{"id": "absorbed", "type": "file", "name": "old.pdf"}]
+    retained_files = [{"id": "retained", "type": "file", "name": "current.pdf"}]
+    pipe_request.state.metadata = {
+        "chat_id": "chat-1",
+        "message_id": "message-1",
+        "files": original_files,
+        "sources": [{"source": {"id": "stale"}}],
+    }
+    pipe_request.app.state.MODELS = {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+    body = {
+        "model": "target",
+        "metadata": {
+            "chat_id": "chat-1",
+            "message_id": "message-1",
+            "files": retained_files,
+        },
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    response = await mod._call_target_completion(request=pipe_request, user=pipe_user, body=body)
+
+    assert response == {"choices": [{"message": {"content": "ok"}}]}
+    assert captured["state_metadata"] == captured["form_metadata"]
+    assert captured["state_metadata"]["files"] == retained_files
+    assert "sources" not in captured["state_metadata"]
+    assert captured["bypass_filter"] is True
+    assert pipe_request.state.metadata["files"] == original_files
+    assert pipe_request.state.metadata["sources"] == [{"source": {"id": "stale"}}]
 
 
 @pytest.mark.asyncio
@@ -5103,7 +5512,7 @@ async def test_tool_history_compaction_summarizes_before_latest_tool_round_and_p
     monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
 
     original_tool = {"role": "tool", "tool_call_id": "call-1", "content": {"value": 42}}
-    compacted, did_compact = await mod._compact_retry_tool_results(
+    compacted, did_compact, _tool_prefix_count = await mod._compact_retry_tool_results(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -5220,7 +5629,7 @@ async def test_tool_history_compaction_always_extends_available_parent_checkpoin
     ]
     messages = [*history, active, *latest_round]
 
-    compacted, did_compact = await mod._compact_retry_tool_results(
+    compacted, did_compact, _tool_prefix_count = await mod._compact_retry_tool_results(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -5287,7 +5696,7 @@ async def test_tool_history_parent_handoff_uses_parent_checkpoint_saved_excerpts
         {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
     ]
 
-    compacted, did_compact = await mod._compact_retry_tool_results(
+    compacted, did_compact, _tool_prefix_count = await mod._compact_retry_tool_results(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -5339,7 +5748,7 @@ async def test_tool_history_compaction_summarizes_all_but_latest_sequential_tool
         {"role": "tool", "tool_call_id": "call-2", "content": "fetched body"},
     ]
 
-    compacted, did_compact = await mod._compact_retry_tool_results(
+    compacted, did_compact, _tool_prefix_count = await mod._compact_retry_tool_results(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -5840,6 +6249,505 @@ async def test_pipe_forwards_below_threshold_to_decoded_target_with_metadata(mon
     assert captured["forward_body"]["stream_options"]["include_usage"] is True
     assert captured["forward_body"]["messages"] == body["messages"]
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_injects_file_context_for_persisted_chat(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+    install_fake_open_webui_user_model(monkeypatch)
+    captured = {"target_file_calls": [], "source_events": [], "forward_attempts": 0}
+    rows = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 10, "output_tokens": 0}
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        captured["estimate_body"] = copy.deepcopy(kwargs["body"])
+        return 10
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        captured["checkpoint_lookup_body"] = copy.deepcopy(kwargs["body"])
+        return None
+
+    async def generate_summary_file_context(*, request, user, prefix_files):
+        captured["summary_prefix_files"] = copy.deepcopy(prefix_files)
+        ids = ",".join(file["id"] for file in prefix_files)
+        return f"<attached_file_contents>SUMMARY_CONTEXT:{ids}</attached_file_contents>"
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["summary_body"] = copy.deepcopy(form_data)
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    async def forward_target(**kwargs):
+        captured["forward_attempts"] += 1
+        captured["target_body"] = copy.deepcopy(kwargs["body"])
+        if captured["forward_attempts"] == 1:
+            raise mod.RetryableContextOverflow("too large before output")
+        return {"ok": True}
+
+    async def chat_completion_files_handler(request, rag_body, extra_params, user):
+        captured["target_files"] = copy.deepcopy(rag_body["metadata"]["files"])
+        captured["target_file_calls"].append(copy.deepcopy(rag_body["metadata"]["files"]))
+        return rag_body, {
+            "sources": [
+                {
+                    "source": {"id": file["id"], "name": file["name"]},
+                    "document": [f"context for {file['id']}"],
+                    "metadata": [{"source": file["id"]}],
+                }
+                for file in rag_body["metadata"]["files"]
+            ]
+        }
+
+    async def apply_source_context_to_messages(request, messages, sources, last_user_msg):
+        captured["target_last_user"] = last_user_msg
+        ids = ",".join(source["source"]["id"] for source in sources)
+        updated = copy.deepcopy(messages)
+        updated[-1]["content"] = f"{updated[-1]['content']}\nTARGET_CONTEXT:{ids}"
+        return updated
+
+    def get_message_list(messages_map, message_id):
+        result = []
+        current = messages_map.get(message_id)
+        while current is not None:
+            result.append(current)
+            parent_id = current.get("parentId")
+            current = messages_map.get(parent_id) if parent_id else None
+        result.reverse()
+        return result
+
+    def get_last_user_message(messages):
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                return message.get("content") or ""
+        return ""
+
+    db_messages = {
+        "db-1": {
+            "id": "db-1",
+            "parentId": None,
+            "role": "user",
+            "content": "same text",
+            "files": [_file("absorbed-file")],
+        },
+        "db-2": {
+            "id": "db-2",
+            "parentId": "db-1",
+            "role": "assistant",
+            "content": "old answer",
+        },
+        "message-1": {
+            "id": "message-1",
+            "parentId": "db-2",
+            "role": "user",
+            "content": "same text",
+            "files": [_file("current-file")],
+        },
+    }
+
+    class FakeChats:
+        @staticmethod
+        async def get_messages_map_by_chat_id(chat_id):
+            assert chat_id == pipe_metadata["chat_id"]
+            return db_messages
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.chat_completion_files_handler = chat_completion_files_handler
+    middleware_module.apply_source_context_to_messages = apply_source_context_to_messages
+    # _load_chat_message_chain calls process_messages_with_output to align DB chain
+    # with expanded body.messages. Provide an identity passthrough for the test.
+    middleware_module.process_messages_with_output = lambda messages, reasoning_format=None: messages
+    misc_module = types.ModuleType("open_webui.utils.misc")
+    misc_module.get_message_list = get_message_list
+    misc_module.get_last_user_message = get_last_user_message
+    chats_module = types.ModuleType("open_webui.models.chats")
+    chats_module.Chats = FakeChats
+
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", misc_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context, raising=False)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    metadata_files = [_file("absorbed-file"), _file("current-file"), _file("knowledge-file")]
+    metadata = {
+        **pipe_metadata,
+        "files": metadata_files,
+        "user_message": {"files": [_file("current-file")]},
+    }
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "same text"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "same text"},
+        ],
+    }
+
+    async def event_emitter(event):
+        if isinstance(event, dict) and event.get("type") == "source":
+            captured["source_events"].append(copy.deepcopy(event))
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"ok": True}
+    assert captured["forward_attempts"] == 2
+    assert captured["checkpoint_lookup_body"]["messages"][-1]["content"] == "same text"
+    assert "TARGET_CONTEXT:absorbed-file,current-file,knowledge-file" in captured["estimate_body"]["messages"][-1]["content"]
+    assert captured["summary_prefix_files"] == [_file("absorbed-file")]
+    assert "SUMMARY_CONTEXT:absorbed-file" in captured["summary_body"]["messages"][-1]["content"]
+    assert "files" not in captured["summary_body"]["metadata"]
+    assert captured["target_file_calls"] == [
+        [_file("absorbed-file"), _file("current-file"), _file("knowledge-file")],
+        [_file("current-file"), _file("knowledge-file")],
+    ]
+    assert captured["target_files"] == [_file("current-file"), _file("knowledge-file")]
+    assert [event["data"]["source"]["id"] for event in captured["source_events"]] == [
+        "current-file",
+        "knowledge-file",
+    ]
+    assert "TARGET_CONTEXT:current-file,knowledge-file" in captured["target_body"]["messages"][-1]["content"]
+    assert "absorbed-file" not in captured["target_body"]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_non_streaming_merges_manual_rag_sources_into_response(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def inject_target_file_context(
+        *,
+        body,
+        metadata_files,
+        request,
+        user,
+        event_emitter,
+        file_context_enabled=True,
+        emit_source_events=True,
+        **kwargs,
+    ):
+        injected = copy.deepcopy(body)
+        injected.setdefault("metadata", {})["sources"] = copy.deepcopy(sources)
+        return injected
+
+    async def forward_target(**kwargs):
+        return {
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "target",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __event_emitter__=None,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert result["sources"] == sources
+
+
+@pytest.mark.asyncio
+async def test_pipe_non_streaming_error_does_not_merge_or_emit_manual_rag_sources(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+    emitted = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def inject_target_file_context(
+        *,
+        body,
+        metadata_files,
+        request,
+        user,
+        event_emitter,
+        file_context_enabled=True,
+        emit_source_events=True,
+        **kwargs,
+    ):
+        injected = copy.deepcopy(body)
+        injected.setdefault("metadata", {})["sources"] = copy.deepcopy(sources)
+        return injected
+
+    async def forward_target(**kwargs):
+        return {"error": {"message": "provider failed", "code": "provider_error"}}
+
+    async def event_emitter(event):
+        emitted.append(copy.deepcopy(event))
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __event_emitter__=event_emitter,
+    )
+
+    assert result == {"error": {"message": "provider failed", "code": "provider_error"}}
+    assert "sources" not in result
+    assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_skips_file_context_injection_for_query_generation_task(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    # TASK_MODEL may point at the AutoCompact wrapper; Core generate_queries
+    # then re-enters Pipe.pipe with task=QUERY_GENERATION. The wrapper must NOT
+    # inject target file context (which would recurse via
+    # chat_completion_files_handler), and must forward normally.
+    install_fake_open_webui_user_model(monkeypatch)
+    captured = {"handler_calls": 0, "forward_body": None}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 10, "output_tokens": 0}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        return {"ok": True}
+
+    async def chat_completion_files_handler(request, rag_body, extra_params, user):
+        captured["handler_calls"] += 1
+        return rag_body, {"sources": []}
+
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.chat_completion_files_handler = chat_completion_files_handler
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    metadata = {
+        **pipe_metadata,
+        "task": mod.TASKS.QUERY_GENERATION.value,
+        "files": [_file("prefix-file"), _file("current-file")],
+        "user_message": {"files": [_file("current-file")]},
+    }
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [{"role": "user", "content": "generate queries"}],
+    }
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=metadata,
+        __event_emitter__=None,
+    )
+
+    assert result == {"ok": True}
+    assert captured["handler_calls"] == 0
+    assert captured["forward_body"]["messages"] == body["messages"]
+
+
+@pytest.mark.asyncio
+async def test_inject_target_file_context_skips_manual_rag_when_reentry_guard_active(
+    monkeypatch, pipe_request
+):
+    # When the same request re-enters _inject_target_file_context while the
+    # injection guard is already active (generate_queries reentry), manual RAG
+    # via chat_completion_files_handler must be skipped fail-closed. Metadata
+    # files pruning still applies.
+    captured = {"handler_calls": 0}
+
+    async def chat_completion_files_handler(request, rag_body, extra_params, user):
+        captured["handler_calls"] += 1
+        return rag_body, {"sources": []}
+
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.chat_completion_files_handler = chat_completion_files_handler
+    middleware_module.apply_source_context_to_messages = lambda *args, **kwargs: args[1]
+    misc_module = types.ModuleType("open_webui.utils.misc")
+    misc_module.get_last_user_message = lambda messages: ""
+    chats_module = types.ModuleType("open_webui.models.chats")
+
+    class FakeChats:
+        @staticmethod
+        async def get_messages_map_by_chat_id(chat_id):
+            return {
+                "msg-1": {
+                    "id": "msg-1",
+                    "parentId": None,
+                    "role": "user",
+                    "content": "x",
+                    "files": [_file("absorbed-file")],
+                },
+                "msg-2": {"id": "msg-2", "parentId": "msg-1", "role": "assistant", "content": "y"},
+                "message-1": {
+                    "id": "message-1",
+                    "parentId": "msg-2",
+                    "role": "user",
+                    "content": "active",
+                },
+            }
+
+    chats_module.Chats = FakeChats
+
+    def get_message_list(messages_map, message_id):
+        result = []
+        current = messages_map.get(message_id)
+        while current is not None:
+            result.append(current)
+            parent_id = current.get("parentId")
+            current = messages_map.get(parent_id) if parent_id else None
+        result.reverse()
+        return result
+
+    misc_module.get_message_list = get_message_list
+    middleware_module.process_messages_with_output = lambda messages, reasoning_format=None: messages
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", misc_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
+
+    metadata_files = [_file("absorbed-file"), _file("current-file")]
+    body = {
+        "model": "target",
+        "messages": [
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "y"},
+            {"role": "user", "content": "active"},
+        ],
+        "metadata": {"files": metadata_files},
+    }
+
+    mod._set_request_file_context_injection_active(pipe_request.state, True)
+    result = await mod._inject_target_file_context(
+        request=pipe_request,
+        user={"id": "user-1"},
+        body=body,
+        chat_id="chat-1",
+        current_message_id="message-1",
+        compaction_prefix_count=2,
+        metadata_files=metadata_files,
+        metadata_user_message={"files": [_file("current-file")]},
+        event_emitter=None,
+        file_context_enabled=True,
+        emit_source_events=False,
+    )
+
+    assert captured["handler_calls"] == 0
+    # Guard flag must be left untouched (caller owns it in this scenario).
+    assert mod._request_file_context_injection_active(pipe_request.state) is True
+    # Pruning of absorbed prefix files still applied even when skipping RAG.
+    retained = result["metadata"]["files"]
+    assert [file["id"] for file in retained] == ["current-file"]
 
 
 @pytest.mark.asyncio
@@ -7741,6 +8649,78 @@ async def test_pipe_does_not_rebuild_task_prompt_from_task_body_by_default(
 
 
 @pytest.mark.asyncio
+async def test_task_prompt_estimate_uses_provider_body_when_file_context_disabled(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target", "capabilities": {"file_context": False}}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 8, "output_tokens": 2}
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        captured["checkpoint_lookup_body"] = copy.deepcopy(kwargs["body"])
+        return None
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        captured["estimate_body"] = copy.deepcopy(kwargs["body"])
+        return 10
+
+    async def inject_target_file_context(**kwargs):
+        raise AssertionError("target file_context=false must not inject file context")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_estimate_next_input_tokens_from_usage_anchor", estimate_next_input_tokens_from_usage_anchor, raising=False)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.compact_task_prompts_from_task_body = True
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [{"role": "user", "content": "FILTERED TASK PROMPT"}],
+    }
+    metadata = {
+        **pipe_metadata,
+        "task": mod.TASKS.TAGS_GENERATION.value,
+        "task_body": {
+            "model": wrapper_id,
+            "chat_id": pipe_metadata["chat_id"],
+            "messages": [
+                {"role": "user", "content": "raw task input"},
+                {"role": "assistant", "content": "raw task answer"},
+                {"role": "user", "content": "active task input"},
+            ],
+        },
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+
+    assert result == {"ok": True}
+    assert captured["checkpoint_lookup_body"]["messages"] == metadata["task_body"]["messages"]
+    assert captured["estimate_body"]["messages"] == body["messages"]
+    assert captured["forward_body"]["messages"] == body["messages"]
+
+
+@pytest.mark.asyncio
 async def test_pipe_rebuilds_open_webui_task_prompt_with_reusable_checkpoint(
     monkeypatch,
     pipe_request,
@@ -7862,7 +8842,7 @@ async def test_task_checkpoint_applied_estimate_uses_rebuilt_provider_body(monke
 
     async def compact_body_with_reusable_checkpoint(**kwargs):
         captured["source_body"] = copy.deepcopy(kwargs["body"])
-        return copy.deepcopy(compacted_source), True
+        return copy.deepcopy(compacted_source), True, 1
 
     async def rebuild_task_body_from_compacted_history(**kwargs):
         captured["rebuilt_history"] = copy.deepcopy(kwargs["compacted_history_messages"])
@@ -7929,7 +8909,7 @@ async def test_pipe_uses_task_checkpoint_applied_estimate_for_reusable_checkpoin
         captured["foreground_compaction"] = True
         compacted = copy.deepcopy(kwargs["body"])
         compacted["messages"] = [{"role": "user", "content": "foreground task summary"}]
-        return compacted, True
+        return compacted, True, 2
 
     async def forward_target(**kwargs):
         captured["forward_body"] = copy.deepcopy(kwargs["body"])
@@ -8146,7 +9126,7 @@ async def test_direct_tool_compaction_and_reusable_checkpoint_render_same_saved_
     monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
-    direct_body, direct_did_compact = await mod._compact_body(
+    direct_body, direct_did_compact, direct_prefix_count = await mod._compact_body(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -8157,7 +9137,7 @@ async def test_direct_tool_compaction_and_reusable_checkpoint_render_same_saved_
         historical_message_excerpt_bytes=64,
         historical_message_excerpt_count=1,
     )
-    reusable_body, reusable_did_compact = await mod._compact_body_with_reusable_checkpoint(
+    reusable_body, reusable_did_compact, reusable_prefix_count = await mod._compact_body_with_reusable_checkpoint(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -8174,6 +9154,7 @@ async def test_direct_tool_compaction_and_reusable_checkpoint_render_same_saved_
 
     assert direct_did_compact is True
     assert reusable_did_compact is True
+    assert direct_prefix_count == reusable_prefix_count == len(tool_source)
     assert len(summary_inputs) == 1
     assert len(rows) == 1
     stored = rows[0]["summary_meta"]["historical_user_messages"]
@@ -8228,7 +9209,7 @@ async def test_hard_compaction_delegates_exact_pending_to_checkpoint_claim_wait(
     monkeypatch.setattr(mod, "_wait_for_pending_checkpoint_ready", wait_for_pending_checkpoint_ready)
     monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
 
-    compacted, did_compact = await mod._compact_body(
+    compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -8321,7 +9302,7 @@ async def test_tool_compaction_waits_for_pending_chain_prefix_before_foreground_
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     body = {"messages": [*history, active, *old_round, *latest_round]}
-    compacted, did_compact = await mod._compact_body(
+    compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -8385,7 +9366,7 @@ async def test_tool_loop_summary_extends_existing_history_parent_when_summary_fi
         ],
     }
 
-    compacted, did_compact = await mod._compact_body(
+    compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -8941,7 +9922,7 @@ async def test_pipe_falls_back_to_history_checkpoint_when_existing_tool_parent_r
         ],
     }
 
-    compacted, did_compact = await mod._compact_body(
+    compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -9032,7 +10013,7 @@ async def test_history_fallback_does_not_reselect_failed_longer_tool_parent(
 
     body = {"messages": [*tool_source, *latest_round]}
 
-    compacted, did_compact = await mod._compact_body(
+    compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -9187,7 +10168,7 @@ async def test_tool_loop_checkpoints_extend_previous_tool_checkpoint_without_his
             *round_2,
         ],
     }
-    first_compacted, first_did_compact = await mod._compact_body(
+    first_compacted, first_did_compact, _first_prefix_count = await mod._compact_body(
         request=pipe_request,
         user=pipe_user,
         metadata=metadata,
@@ -9206,7 +10187,7 @@ async def test_tool_loop_checkpoints_extend_previous_tool_checkpoint_without_his
             *round_3,
         ],
     }
-    second_compacted, second_did_compact = await mod._compact_body(
+    second_compacted, second_did_compact, _second_prefix_count = await mod._compact_body(
         request=pipe_request,
         user=pipe_user,
         metadata=metadata,
@@ -9762,7 +10743,7 @@ async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_me
         },
         original_tool,
     ]
-    compacted, did_compact = await mod._compact_retry_tool_results(
+    compacted, did_compact, _tool_prefix_count = await mod._compact_retry_tool_results(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -10345,7 +11326,7 @@ async def test_status_skipped_action_carries_tokens(monkeypatch, pipe_request, p
         return 1500
 
     async def compact_body(**kwargs):
-        return kwargs["body"], False
+        return kwargs["body"], False, 0
 
     async def forward_target(**kwargs):
         captured["forward_bodies"].append(copy.deepcopy(kwargs["body"]))
@@ -11893,21 +12874,8 @@ async def test_start_soft_prefetch_passes_selected_source_messages_to_task(monke
 
     async def get_or_create_compaction_summary(
         *,
-        request,
-        user,
-        user_id,
-        chat_id,
-        pipe_function_id,
-        metadata,
-        summary_model_id,
-        base_body,
         source_messages,
-        summary_meta,
-        parent_checkpoint=None,
-        on_summary_start=None,
-        summary_tool_policy,
-        historical_message_excerpt_bytes,
-        historical_message_excerpt_count,
+        **kwargs,
     ):
         launched["source_messages"] = copy.deepcopy(source_messages)
         return "summary"
@@ -11957,21 +12925,8 @@ async def test_soft_prefetch_uses_tool_aware_source_prefix(
 
     async def get_or_create_compaction_summary(
         *,
-        request,
-        user,
-        user_id,
-        chat_id,
-        pipe_function_id,
-        metadata,
-        summary_model_id,
-        base_body,
         source_messages,
-        summary_meta,
-        parent_checkpoint=None,
-        on_summary_start=None,
-        summary_tool_policy,
-        historical_message_excerpt_bytes,
-        historical_message_excerpt_count,
+        **kwargs,
     ):
         captured["source_messages"] = copy.deepcopy(source_messages)
         return "summary"
