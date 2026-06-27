@@ -1701,6 +1701,298 @@ async def test_prefetch_pending_lookup_uses_prefix_file_fingerprint_resolver(mon
     assert captured["fingerprint"] == mod._stable_file_fingerprint(metadata["files"])
 
 
+@pytest.mark.asyncio
+async def test_prefetch_skips_child_checkpoint_when_ready_parent_estimate_is_below_soft(monkeypatch):
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    delta_messages = [
+        {"role": "user", "content": "middle"},
+        {"role": "assistant", "content": "middle answer"},
+    ]
+    source_messages = [*parent_source, *delta_messages]
+    parent_checkpoint = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="ready parent summary",
+    )
+    parent_checkpoint["claim_token"] = None
+    parent_checkpoint["claim_expires_at"] = None
+    store = ClaimStore([parent_checkpoint])
+    estimate_calls = []
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        estimate_calls.append(kwargs)
+        return 40
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("ready parent below soft should make child checkpoint generation redundant")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata={"chat_id": "chat-1", "message_id": "message-1"},
+        body={"messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="summary-model",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_trigger_total_tokens=1000,
+        effective_soft_trigger_total_tokens=100,
+        trigger_estimated_tokens=500,
+    )
+
+    assert result is False
+    assert len(estimate_calls) == 1
+    assert store.claimed_rows == []
+
+
+@pytest.mark.asyncio
+async def test_prefetch_rechecks_parent_after_claim_before_generating_child(monkeypatch):
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    delta_messages = [
+        {"role": "user", "content": "middle"},
+        {"role": "assistant", "content": "middle answer"},
+    ]
+    source_messages = [*parent_source, *delta_messages]
+    parent_checkpoint = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="late parent summary",
+    )
+    parent_checkpoint["claim_token"] = None
+    parent_checkpoint["claim_expires_at"] = None
+
+    class ParentAppearsAfterPrecheckStore(ClaimStore):
+        def __init__(self):
+            super().__init__([])
+            self.parent_lookup_count = 0
+
+        async def find_longest_parent(self, **kwargs):
+            self.parent_lookup_count += 1
+            if self.parent_lookup_count == 1:
+                return None
+            if not any(row.get("id") == parent_checkpoint["id"] for row in self.rows):
+                self.rows.append(dict(parent_checkpoint))
+            return mod.select_longest_matching_parent(self.rows, kwargs["source_messages"])
+
+    store = ParentAppearsAfterPrecheckStore()
+    estimate_calls = []
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        estimate_calls.append(kwargs)
+        return 40
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("late parent below soft should be rechecked before generating a child summary")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata={"chat_id": "chat-1", "message_id": "message-1"},
+        body={"messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="summary-model",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_trigger_total_tokens=1000,
+        effective_soft_trigger_total_tokens=100,
+        trigger_estimated_tokens=500,
+    )
+
+    assert result is False
+    assert len(estimate_calls) == 1
+    assert len(store.claimed_rows) == 1
+    assert store.released == [store.claimed_rows[0]["id"]]
+    assert store.completed_rows == []
+
+
+@pytest.mark.asyncio
+async def test_prefetch_does_not_skip_tool_prefix_for_mismatched_message_exact_checkpoint(monkeypatch):
+    messages = [
+        {"role": "user", "content": "older request"},
+        {"role": "assistant", "content": "older answer"},
+        {"role": "user", "content": "active request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search"}}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function", "function": {"name": "fetch"}}],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+    ]
+    tool_cut = mod.select_tool_result_compaction_cut(messages)
+    message_cut = mod.select_safe_message_cut(messages)
+    assert tool_cut is not None
+    assert len(tool_cut.summarization_prefix) > len(message_cut.summarization_prefix)
+    source_messages = tool_cut.summarization_prefix
+    message_exact_checkpoint = make_checkpoint_row(
+        message_cut.summarization_prefix,
+        state="ready",
+        summary_text="short message checkpoint",
+    )
+    message_exact_checkpoint["claim_token"] = None
+    message_exact_checkpoint["claim_expires_at"] = None
+    store = ClaimStore()
+    summary_calls = []
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return mod.ReusableCheckpointMatch(
+            kind="exact",
+            source_message_count=len(message_cut.summarization_prefix),
+            source_kind="message",
+            checkpoint=message_exact_checkpoint,
+        )
+
+    async def generate_summary_text(**kwargs):
+        summary_calls.append(kwargs)
+        return "generated tool prefix summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata={"chat_id": "chat-1", "message_id": "message-1"},
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+        summary_model_id="summary-model",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_trigger_total_tokens=1000,
+        effective_soft_trigger_total_tokens=100,
+        trigger_estimated_tokens=500,
+    )
+
+    assert result is True
+    assert len(summary_calls) == 1
+    assert summary_calls[0]["source_messages"] == source_messages
+    assert len(store.claimed_rows) == 1
+    assert len(store.completed_rows) == 1
+    assert store.completed_rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
+
+
+@pytest.mark.asyncio
+async def test_prefetch_uses_task_estimate_body_for_parent_below_soft_guard(monkeypatch):
+    parent_source = [
+        {"role": "user", "content": "old task input"},
+        {"role": "assistant", "content": "old task answer"},
+    ]
+    delta_messages = [
+        {"role": "user", "content": "middle task input"},
+        {"role": "assistant", "content": "middle task answer"},
+    ]
+    active = {"role": "user", "content": "active task input"}
+    source_messages = [*parent_source, *delta_messages]
+    parent_checkpoint = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="ready task parent summary",
+    )
+    parent_checkpoint["claim_token"] = None
+    parent_checkpoint["claim_expires_at"] = None
+    store = ClaimStore([parent_checkpoint])
+    raw_source_body = {"model": "target", "messages": [*source_messages, active]}
+    task_estimate_body = {
+        "model": "target",
+        "messages": [{"role": "user", "content": "Task:\nold task input\nmiddle task input\nactive task input"}],
+    }
+    metadata = {
+        "chat_id": "chat-1",
+        "message_id": "message-1",
+        "task": mod.TASKS.TAGS_GENERATION.value,
+        "task_body": {
+            "model": "target",
+            "chat_id": "chat-1",
+            "messages": [*source_messages, active],
+        },
+    }
+    task_estimate_calls = []
+    summary_calls = []
+
+    async def estimate_task_checkpoint_applied_body_tokens(**kwargs):
+        task_estimate_calls.append(copy.deepcopy(kwargs))
+        assert kwargs["body"]["messages"] == task_estimate_body["messages"]
+        return 150
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        raise AssertionError("task prefetch guard must not use the raw history body estimate")
+
+    async def generate_summary_text(**kwargs):
+        summary_calls.append(kwargs)
+        return "generated task child summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_task_checkpoint_applied_body_tokens",
+        estimate_task_checkpoint_applied_body_tokens,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata=metadata,
+        body=raw_source_body,
+        task_estimate_body=task_estimate_body,
+        pipe_function_id="auto_compact",
+        summary_model_id="summary-model",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_trigger_total_tokens=1000,
+        effective_soft_trigger_total_tokens=100,
+        trigger_estimated_tokens=500,
+    )
+
+    assert result is True
+    assert len(task_estimate_calls) == 2
+    assert len(summary_calls) == 1
+    assert len(store.claimed_rows) == 1
+    assert len(store.completed_rows) == 1
+
+
 def test_prefix_file_fingerprint_resolver_covers_only_absorbed_prefix_range():
     # Files live in the DB chain (production layout), not in body.messages.
     db_chain = [

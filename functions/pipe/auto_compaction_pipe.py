@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.2
+version: 0.5.3
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -394,6 +394,10 @@ class ParentCheckpointExtensionFailed(Exception):
         super().__init__(str(original))
         self.parent = parent
         self.original = original
+
+
+class _CheckpointGenerationSkipped(Exception):
+    """Raised after a pending claim when a later-ready checkpoint makes generation redundant."""
 
 
 def _json_hash(payload: Any) -> str:
@@ -6567,6 +6571,7 @@ async def _get_or_create_checkpoint_summary(
     summary_meta: dict[str, Any],
     summary_factory: Callable[[dict[str, Any] | None], Awaitable[str]],
     parent_checkpoint: dict[str, Any] | None = None,
+    parent_checkpoint_guard: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     prefix_file_fingerprint: str | None = None,
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
 ) -> str:
@@ -6631,6 +6636,8 @@ async def _get_or_create_checkpoint_summary(
                         source_messages=source_messages,
                         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
                     )
+                if parent is not None and parent_checkpoint_guard is not None:
+                    await parent_checkpoint_guard(parent)
                 try:
                     summary_text = await summary_factory(parent)
                 except SummaryFileContextUnavailable:
@@ -6685,6 +6692,7 @@ async def _get_or_create_compaction_summary(
     source_messages: list[dict[str, Any]],
     summary_meta: dict[str, Any],
     parent_checkpoint: dict[str, Any] | None = None,
+    parent_checkpoint_guard: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     on_summary_start: Callable[[], Awaitable[None]] | None = None,
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
@@ -6739,6 +6747,7 @@ async def _get_or_create_compaction_summary(
         summary_meta=summary_meta,
         summary_factory=summary_factory,
         parent_checkpoint=parent_checkpoint,
+        parent_checkpoint_guard=parent_checkpoint_guard,
         prefix_file_fingerprint=identity_fingerprint,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
     )
@@ -6883,6 +6892,7 @@ async def _prefetch_compaction_checkpoint(
     token_status_compare_estimate: bool = False,
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
     file_context_enabled: bool = True,
+    task_estimate_body: dict[str, Any] | None = None,
 ) -> bool:
     if not source_messages:
         return False
@@ -6904,9 +6914,96 @@ async def _prefetch_compaction_checkpoint(
         historical_message_excerpt_count=historical_message_excerpt_count,
     )
 
+    source_kind = "message"
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        tool_cut = select_tool_result_compaction_cut(messages)
+        if tool_cut is not None and tool_cut.summarization_prefix == source_messages:
+            source_kind = "tool"
+
+    def reusable_match_covers_prefetch_source(match: ReusableCheckpointMatch) -> bool:
+        if match.checkpoint is None or match.source_kind != source_kind:
+            return False
+        checkpoint_count = int(match.checkpoint.get("source_message_count") or match.source_message_count or 0)
+        if checkpoint_count <= 0 or checkpoint_count > len(source_messages):
+            return False
+        if match.kind == "exact" and checkpoint_count != len(source_messages):
+            return False
+        checkpoint_fingerprint = (
+            prefix_file_fingerprint_resolver(checkpoint_count)
+            if prefix_file_fingerprint_resolver is not None
+            else None
+        )
+        return (
+            compute_summary_source_hash(source_messages[:checkpoint_count], checkpoint_fingerprint)
+            == match.checkpoint.get("source_hash")
+        )
+
+    task_metadata_body = _task_body_from_metadata(metadata)
+
+    async def estimate_prefetch_checkpoint_applied_tokens(match: ReusableCheckpointMatch) -> int | None:
+        if task_estimate_body is not None:
+            return await _estimate_task_checkpoint_applied_body_tokens(
+                request=request,
+                user=user,
+                metadata=metadata,
+                body=task_estimate_body,
+                pipe_function_id=pipe_function_id,
+                match=match,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
+                file_context_enabled=file_context_enabled,
+            )
+        if task_metadata_body is not None:
+            return None
+        return await _estimate_checkpoint_applied_body_tokens(
+            request=request,
+            user=user,
+            metadata=metadata,
+            body=body,
+            pipe_function_id=pipe_function_id,
+            match=match,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+            file_context_enabled=file_context_enabled,
+        )
+
+    reusable_checkpoint_match = await _body_reusable_checkpoint_match(
+        request=request,
+        user=user,
+        metadata=metadata,
+        body=body,
+        pipe_function_id=pipe_function_id,
+    )
+    if reusable_checkpoint_match is not None and reusable_match_covers_prefetch_source(reusable_checkpoint_match):
+        if reusable_checkpoint_match.kind == "exact":
+            return False
+        checkpoint_applied_estimate = await estimate_prefetch_checkpoint_applied_tokens(reusable_checkpoint_match)
+        if (
+            effective_soft_trigger_total_tokens is not None
+            and checkpoint_applied_estimate is not None
+            and checkpoint_applied_estimate < effective_soft_trigger_total_tokens
+        ):
+            return False
+
     summary_started = False
     prefetch_display_context: DisplayTokenContext | None = None
     prefetch_display_context_ready = False
+
+    async def skip_child_generation_if_parent_below_soft(parent: dict[str, Any]) -> None:
+        if effective_soft_trigger_total_tokens is None:
+            return
+        parent_count = int(parent.get("source_message_count") or 0)
+        checkpoint_applied_estimate = await estimate_prefetch_checkpoint_applied_tokens(
+            ReusableCheckpointMatch(
+                kind="parent",
+                source_message_count=parent_count,
+                source_kind=source_kind,
+                checkpoint=parent,
+            )
+        )
+        if checkpoint_applied_estimate is not None and checkpoint_applied_estimate < effective_soft_trigger_total_tokens:
+            raise _CheckpointGenerationSkipped()
 
     async def display_token_context() -> DisplayTokenContext:
         nonlocal prefetch_display_context, prefetch_display_context_ready
@@ -6964,12 +7061,15 @@ async def _prefetch_compaction_checkpoint(
             base_body=body,
             source_messages=source_messages,
             summary_meta=summary_meta,
+            parent_checkpoint_guard=skip_child_generation_if_parent_below_soft,
             on_summary_start=emit_summary_start,
             summary_tool_policy=summary_tool_policy,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
             file_context_enabled=file_context_enabled,
         )
+    except _CheckpointGenerationSkipped:
+        return False
     except asyncio.CancelledError:
         if summary_started and event_emitter is not None:
             token_context = await display_token_context()
@@ -7062,6 +7162,7 @@ def _start_soft_compaction_prefetch(
     token_status_compare_estimate: bool = False,
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
     file_context_enabled: bool = True,
+    task_estimate_body: dict[str, Any] | None = None,
 ) -> bool:
     source_messages = _soft_prefetch_source_messages(body)
     if not source_messages:
@@ -7102,6 +7203,9 @@ def _start_soft_compaction_prefetch(
             token_status_compare_estimate=token_status_compare_estimate,
             event_emitter=event_emitter,
             file_context_enabled=file_context_enabled,
+            task_estimate_body=(
+                _copy_body_preserving_metadata(task_estimate_body) if task_estimate_body is not None else None
+            ),
         ),
     )
 
@@ -7500,11 +7604,15 @@ async def _estimate_task_checkpoint_applied_body_tokens(
     historical_message_excerpt_count: int,
     file_context_enabled: bool = True,
 ) -> int | None:
-    source_body = _task_history_source_body_for_compaction(body, metadata) or body
+    task_metadata = metadata
+    body_metadata = body.get("metadata")
+    if isinstance(body_metadata, dict) and _task_body_from_metadata(body_metadata) is not None:
+        task_metadata = body_metadata
+    source_body = _task_history_source_body_for_compaction(body, task_metadata) or body
     compacted_source, compacted, compaction_prefix_count = await _compact_body_with_reusable_checkpoint(
         request=request,
         user=user,
-        metadata=metadata,
+        metadata=task_metadata,
         body=source_body,
         pipe_function_id=pipe_function_id,
         match=match,
@@ -7518,7 +7626,7 @@ async def _estimate_task_checkpoint_applied_body_tokens(
         request=request,
         user=user,
         base_body=body,
-        metadata=metadata,
+        metadata=task_metadata,
         compacted_history_messages=compacted_source["messages"],
     )
     if rebuilt is None:
@@ -7528,11 +7636,11 @@ async def _estimate_task_checkpoint_applied_body_tokens(
             request=request,
             user=user,
             body=rebuilt,
-            chat_id=str(metadata.get("chat_id") or "") or None,
-            current_message_id=str(metadata.get("user_message_id") or metadata.get("message_id") or "") or None,
+            chat_id=str(task_metadata.get("chat_id") or "") or None,
+            current_message_id=str(task_metadata.get("user_message_id") or task_metadata.get("message_id") or "") or None,
             compaction_prefix_count=compaction_prefix_count,
             metadata_files=(rebuilt.get("metadata") or {}).get("files") if isinstance(rebuilt.get("metadata"), dict) else None,
-            metadata_user_message=metadata.get("user_message"),
+            metadata_user_message=task_metadata.get("user_message"),
             event_emitter=None,
             file_context_enabled=True,
             emit_source_events=False,
@@ -8509,32 +8617,35 @@ class Pipe:
         # candidate estimate (decision_total), never by raw observed usage.
         checkpoint_applied_estimate = None
         estimated_total_tokens = None
+
+        async def estimate_reusable_checkpoint_match(match: ReusableCheckpointMatch) -> int | None:
+            if task_source_body is not None:
+                return await _estimate_task_checkpoint_applied_body_tokens(
+                    request=__request__,
+                    user=user,
+                    metadata=metadata,
+                    body=inner,
+                    pipe_function_id=identity.pipe_function_id,
+                    match=match,
+                    historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                    historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                    file_context_enabled=target_file_context_enabled,
+                )
+            return await _estimate_checkpoint_applied_body_tokens(
+                request=__request__,
+                user=user,
+                metadata=metadata,
+                body=checkpoint_lookup_body,
+                pipe_function_id=identity.pipe_function_id,
+                match=match,
+                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                file_context_enabled=target_file_context_enabled,
+            )
+
         if supported_context:
             if reusable_checkpoint_match is not None:
-                if task_source_body is not None:
-                    checkpoint_applied_estimate = await _estimate_task_checkpoint_applied_body_tokens(
-                        request=__request__,
-                        user=user,
-                        metadata=metadata,
-                        body=inner,
-                        pipe_function_id=identity.pipe_function_id,
-                        match=reusable_checkpoint_match,
-                        historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
-                        historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
-                        file_context_enabled=target_file_context_enabled,
-                    )
-                else:
-                    checkpoint_applied_estimate = await _estimate_checkpoint_applied_body_tokens(
-                        request=__request__,
-                        user=user,
-                        metadata=metadata,
-                        body=checkpoint_lookup_body,
-                        pipe_function_id=identity.pipe_function_id,
-                        match=reusable_checkpoint_match,
-                        historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
-                        historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
-                        file_context_enabled=target_file_context_enabled,
-                    )
+                checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(reusable_checkpoint_match)
             else:
                 if total_tokens is not None:
                     estimated_total_tokens = await _estimate_next_input_tokens_from_usage_anchor(
@@ -8557,6 +8668,62 @@ class Pipe:
             decision_total = estimated_total_tokens
         else:
             decision_total = None
+
+        def compute_threshold_decisions() -> tuple[bool, bool, bool]:
+            # A reusable TASK checkpoint whose applied estimate cannot be computed
+            # cannot be confirmed safe, so foreground compaction is still required.
+            checkpoint_applied_unknown_needs_foreground = (
+                reusable_checkpoint_match is not None
+                and task_source_body is not None
+                and checkpoint_applied_estimate is None
+            )
+            # hard/soft decisions look ONLY at decision_total (the candidate estimate).
+            hard = (
+                supported_context
+                and (
+                    (decision_total is not None and decision_total >= effective_trigger_total_tokens)
+                    or checkpoint_applied_unknown_needs_foreground
+                )
+            )
+            soft = (
+                supported_context
+                and not is_summary_task
+                and effective_soft_trigger_total_tokens is not None
+                and decision_total is not None
+                and decision_total >= effective_soft_trigger_total_tokens
+                and decision_total < effective_trigger_total_tokens
+            )
+            should = hard or reusable_checkpoint_match is not None
+            return hard, soft, should
+
+        hard_should_compact, soft_should_prefetch, should_compact = compute_threshold_decisions()
+        if supported_context and reusable_checkpoint_match is None and (hard_should_compact or soft_should_prefetch):
+            try:
+                late_checkpoint_match = await _body_reusable_checkpoint_match(
+                    request=__request__,
+                    user=user,
+                    metadata=metadata,
+                    body=checkpoint_lookup_body,
+                    pipe_function_id=identity.pipe_function_id,
+                )
+            except Exception as exc:
+                if not hard_should_compact and soft_should_prefetch:
+                    late_checkpoint_match = None
+                    soft_should_prefetch = False
+                else:
+                    return _error_response(
+                        f"Failed to access auto-compaction checkpoints: {exc}",
+                        code="checkpoint_unavailable",
+                    )
+            if late_checkpoint_match is not None:
+                reusable_checkpoint_match = late_checkpoint_match
+                checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(late_checkpoint_match)
+                # Once a checkpoint is reusable, the checkpoint-applied payload is
+                # the only candidate that matters. If that estimate is unavailable,
+                # do not fall back to the raw estimate that caused this late check.
+                decision_total = checkpoint_applied_estimate
+                hard_should_compact, soft_should_prefetch, should_compact = compute_threshold_decisions()
+
         compare_estimate_tokens = None
         if (
             supported_context
@@ -8578,29 +8745,6 @@ class Pipe:
         )
         display_token_context = _display_context_with_estimate(display_token_context, compare_estimate_tokens)
         compare_estimate_status = bool(self.valves.token_status_compare_estimate)
-        # A reusable TASK checkpoint whose applied estimate cannot be computed
-        # cannot be confirmed safe, so foreground compaction is still required.
-        checkpoint_applied_unknown_needs_foreground = (
-            reusable_checkpoint_match is not None
-            and task_source_body is not None
-            and checkpoint_applied_estimate is None
-        )
-        # hard/soft decisions look ONLY at decision_total (the candidate estimate).
-        hard_should_compact = (
-            supported_context
-            and (
-                (decision_total is not None and decision_total >= effective_trigger_total_tokens)
-                or checkpoint_applied_unknown_needs_foreground
-            )
-        )
-        soft_should_prefetch = (
-            supported_context
-            and not is_summary_task
-            and effective_soft_trigger_total_tokens is not None
-            and decision_total is not None
-            and decision_total >= effective_soft_trigger_total_tokens
-            and decision_total < effective_trigger_total_tokens
-        )
         should_compact = hard_should_compact or reusable_checkpoint_match is not None
         reusable_checkpoint_only = None
         if reusable_checkpoint_match is not None and not hard_should_compact:
@@ -8626,26 +8770,55 @@ class Pipe:
                 ),
             )
         if not hard_should_compact and soft_should_prefetch:
-            _start_soft_compaction_prefetch(
-                request=__request__,
-                user=user,
-                metadata=metadata,
-                body=checkpoint_lookup_body,
-                pipe_function_id=identity.pipe_function_id,
-                summary_model_id=summary_model_id,
-                summary_tool_policy=self.valves.summary_tool_policy,
-                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
-                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
-                effective_trigger_total_tokens=effective_trigger_total_tokens,
-                effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
-                trigger_estimated_tokens=decision_total,
-                token_status_detail=self.valves.token_status_detail,
-                token_status_compare_estimate=self.valves.token_status_compare_estimate,
-                event_emitter=__event_emitter__,
-                file_context_enabled=target_file_context_enabled,
-            )
+            if reusable_checkpoint_match is None or reusable_checkpoint_match.kind == "parent":
+                try:
+                    late_checkpoint_match = await _body_reusable_checkpoint_match(
+                        request=__request__,
+                        user=user,
+                        metadata=metadata,
+                        body=checkpoint_lookup_body,
+                        pipe_function_id=identity.pipe_function_id,
+                    )
+                except Exception as exc:
+                    late_checkpoint_match = None
+                    soft_should_prefetch = False
+                if late_checkpoint_match is not None:
+                    late_checkpoint_is_better = (
+                        reusable_checkpoint_match is None
+                        or late_checkpoint_match.kind == "exact"
+                        or late_checkpoint_match.source_message_count > reusable_checkpoint_match.source_message_count
+                    )
+                    if late_checkpoint_is_better:
+                        reusable_checkpoint_match = late_checkpoint_match
+                        checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(late_checkpoint_match)
+                        decision_total = checkpoint_applied_estimate
+                        hard_should_compact, soft_should_prefetch, should_compact = compute_threshold_decisions()
+                        should_compact = hard_should_compact or reusable_checkpoint_match is not None
+                        reusable_checkpoint_only = None
+                        if reusable_checkpoint_match is not None and not hard_should_compact:
+                            reusable_checkpoint_only = reusable_checkpoint_match
+            if not hard_should_compact and soft_should_prefetch:
+                _start_soft_compaction_prefetch(
+                    request=__request__,
+                    user=user,
+                    metadata=metadata,
+                    body=checkpoint_lookup_body,
+                    pipe_function_id=identity.pipe_function_id,
+                    summary_model_id=summary_model_id,
+                    summary_tool_policy=self.valves.summary_tool_policy,
+                    historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                    historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                    effective_trigger_total_tokens=effective_trigger_total_tokens,
+                    effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+                    trigger_estimated_tokens=decision_total,
+                    token_status_detail=self.valves.token_status_detail,
+                    token_status_compare_estimate=self.valves.token_status_compare_estimate,
+                    event_emitter=__event_emitter__,
+                    file_context_enabled=target_file_context_enabled,
+                    task_estimate_body=inner if task_source_body is not None else None,
+                )
 
-        def launch_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
+        async def launch_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
             if effective_soft_trigger_total_tokens is None:
                 return
             # Completed-turn prefetch is grounded ONLY in the just-completed
@@ -8665,6 +8838,17 @@ class Pipe:
             completed_body = _completed_turn_prefetch_body(checkpoint_lookup_body, assistant_message)
             if completed_body is None:
                 return
+            completed_task_estimate_body = None
+            if task_source_body is not None:
+                completed_messages = completed_body.get("messages")
+                if isinstance(completed_messages, list):
+                    completed_task_estimate_body = await _rebuild_task_body_from_compacted_history(
+                        request=__request__,
+                        user=user,
+                        base_body=inner,
+                        metadata=metadata,
+                        compacted_history_messages=completed_messages,
+                    )
             _start_soft_compaction_prefetch(
                 request=__request__,
                 user=user,
@@ -8683,7 +8867,22 @@ class Pipe:
                 token_status_compare_estimate=self.valves.token_status_compare_estimate,
                 event_emitter=__event_emitter__,
                 file_context_enabled=target_file_context_enabled,
+                task_estimate_body=completed_task_estimate_body,
             )
+
+        def schedule_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
+            task = asyncio.create_task(launch_completed_turn_soft_prefetch(completion))
+
+            def observe_result(done: asyncio.Task[Any]) -> None:
+                with suppress(asyncio.CancelledError):
+                    exc = done.exception()
+                    if isinstance(exc, BaseException):
+                        LOG.exception(
+                            "Completed-turn soft compaction prefetch failed",
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
+
+            task.add_done_callback(observe_result)
 
         attempt = 0
         compacted_once = False
@@ -8896,7 +9095,7 @@ class Pipe:
                         "wrapper_model_id": selected_wrapper_id,
                     }
                     if effective_soft_trigger_total_tokens is not None and not is_summary_task:
-                        streaming_kwargs["on_complete"] = launch_completed_turn_soft_prefetch
+                        streaming_kwargs["on_complete"] = schedule_completed_turn_soft_prefetch
                     streaming_response = await _forward_streaming_target(**streaming_kwargs)
                     if not getattr(streaming_response, "_auto_compact_immediate_error", False):
                         await _emit_source_events(__event_emitter__, candidate_source_events)
@@ -8912,7 +9111,7 @@ class Pipe:
                 response = _merge_source_events_into_response(response, candidate_source_events)
                 assistant_message = None if is_summary_task else _assistant_message_for_completed_prefetch(response)
                 if assistant_message is not None:
-                    launch_completed_turn_soft_prefetch(
+                    await launch_completed_turn_soft_prefetch(
                         {
                             "assistant_message": assistant_message,
                             "usage": response.get("usage") if isinstance(response, dict) else None,
