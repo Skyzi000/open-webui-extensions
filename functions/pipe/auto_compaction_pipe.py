@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.1
+version: 0.5.2
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -375,6 +375,16 @@ class UnsupportedCompactionInput(Exception):
     def __init__(self, message: str, *, code: str = "unsafe_compaction_input"):
         super().__init__(message)
         self.code = code
+
+
+class SummaryFileContextUnavailable(UnsupportedCompactionInput):
+    """Raised when absorbed prefix files cannot be included in a checkpoint summary."""
+
+    def __init__(
+        self,
+        message: str = "Attached file context could not be loaded for the compaction summary",
+    ):
+        super().__init__(message, code="file_context_unavailable")
 
 
 class ParentCheckpointExtensionFailed(Exception):
@@ -5494,15 +5504,18 @@ def _format_summary_file_context(sources: Any) -> str | None:
             documents = source.get("documents")
         if not isinstance(documents, list):
             documents = []
-        metadatas = source.get("metadata") if isinstance(source.get("metadata"), list) else []
+        metadata_values = source.get("metadata")
+        metadatas: list[Any] = metadata_values if isinstance(metadata_values, list) else []
         source_id = source_info.get("id") or source_info.get("source")
         source_name = source_info.get("name") or source_info.get("filename") or source_id or f"source-{source_index}"
         for document_index, document in enumerate(documents, start=1):
             if document is None:
                 continue
-            metadata = metadatas[document_index - 1] if document_index - 1 < len(metadatas) else {}
-            if not isinstance(metadata, dict):
-                metadata = {}
+            metadata: dict[str, Any] = {}
+            if document_index - 1 < len(metadatas):
+                candidate_metadata = metadatas[document_index - 1]
+                if isinstance(candidate_metadata, dict):
+                    metadata = candidate_metadata
             file_id = metadata.get("source") or metadata.get("file_id") or source_id or f"source-{source_index}"
             file_name = metadata.get("name") or metadata.get("filename") or source_name
             lines.append(
@@ -5556,9 +5569,11 @@ async def _generate_summary_file_context(
             user=user_model,
         )
         return _format_summary_file_context(sources)
-    except Exception:
+    except SummaryFileContextUnavailable:
+        raise
+    except Exception as exc:
         LOG.exception("Failed to generate summary file context")
-        return None
+        raise SummaryFileContextUnavailable() from exc
 
 
 async def _prepare_summary_file_context(
@@ -5598,9 +5613,11 @@ async def _prepare_summary_file_context(
         if not prefix_files:
             return None
         return await _generate_summary_file_context(request=request, user=user, prefix_files=prefix_files)
-    except Exception:
+    except SummaryFileContextUnavailable:
+        raise
+    except Exception as exc:
         LOG.exception("Failed to prepare summary file context")
-        return None
+        raise SummaryFileContextUnavailable() from exc
 
 
 def _target_model_supports_file_context(models: dict[str, Any], target_model_id: str) -> bool:
@@ -6616,6 +6633,8 @@ async def _get_or_create_checkpoint_summary(
                     )
                 try:
                     summary_text = await summary_factory(parent)
+                except SummaryFileContextUnavailable:
+                    raise
                 except Exception as exc:
                     if parent:
                         raise ParentCheckpointExtensionFailed(parent, exc) from exc

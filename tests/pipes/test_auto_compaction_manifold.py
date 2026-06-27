@@ -4851,6 +4851,92 @@ def test_build_summary_completion_body_appends_prefix_file_context_to_user_messa
 
 
 @pytest.mark.asyncio
+async def test_prepare_summary_file_context_fails_closed_when_prefix_file_context_is_unavailable(
+    monkeypatch, pipe_request, pipe_user
+):
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        assert chat_id == "chat-1"
+        assert current_message_id == "message-1"
+        return [
+            {"role": "user", "content": "old", "files": [_file("absorbed-file")]},
+            {"role": "user", "content": "current"},
+        ]
+
+    async def generate_summary_file_context(*, request, user, prefix_files):
+        assert prefix_files == [_file("absorbed-file")]
+        raise mod.SummaryFileContextUnavailable("summary file context unavailable")
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context)
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await mod._prepare_summary_file_context(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={
+                "chat_id": "chat-1",
+                "user_message_id": "message-1",
+                "files": [_file("absorbed-file")],
+            },
+            compaction_prefix_count=1,
+            parent_source_message_count=0,
+            file_context_enabled=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_generate_summary_file_context_accepts_core_best_effort_partial_sources(
+    monkeypatch, pipe_request, pipe_user
+):
+    install_fake_open_webui_user_model(monkeypatch)
+
+    async def get_sources_from_items(**kwargs):
+        assert [file["id"] for file in kwargs["items"]] == ["file-a", "file-b"]
+        return [
+            {
+                "source": {"id": "file-a", "name": "file-a.txt"},
+                "document": ["context for file-a"],
+                "metadata": [{"source": "file-a"}],
+            }
+        ]
+
+    retrieval_module = types.ModuleType("open_webui.retrieval.utils")
+    setattr(retrieval_module, "get_sources_from_items", get_sources_from_items)
+    monkeypatch.setitem(sys.modules, "open_webui.retrieval.utils", retrieval_module)
+
+    context = await mod._generate_summary_file_context(
+        request=pipe_request,
+        user=pipe_user,
+        prefix_files=[_file("file-a"), _file("file-b")],
+    )
+
+    assert context is not None
+    assert "context for file-a" in context
+    assert "file-b" not in context
+
+
+@pytest.mark.asyncio
+async def test_generate_summary_file_context_fails_closed_when_core_helper_raises(
+    monkeypatch, pipe_request, pipe_user
+):
+    install_fake_open_webui_user_model(monkeypatch)
+
+    async def get_sources_from_items(**kwargs):
+        raise RuntimeError("retrieval unavailable")
+
+    retrieval_module = types.ModuleType("open_webui.retrieval.utils")
+    setattr(retrieval_module, "get_sources_from_items", get_sources_from_items)
+    monkeypatch.setitem(sys.modules, "open_webui.retrieval.utils", retrieval_module)
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await mod._generate_summary_file_context(
+            request=pipe_request,
+            user=pipe_user,
+            prefix_files=[_file("file-a")],
+        )
+
+
+@pytest.mark.asyncio
 async def test_summary_task_metadata_drops_unpickleable_core_values():
     future = asyncio.get_running_loop().create_future()
     metadata = {
@@ -11622,6 +11708,81 @@ async def test_status_skipped_action_carries_tokens(monkeypatch, pipe_request, p
     assert "Could not compact" in status_events[-1]["data"]["description"]
     assert status_events[-1]["data"]["tokens"]["before"] == 1500
     assert status_events[-1]["data"]["tokens"]["hard_limit"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_summary_file_context_unavailable_stops_before_target_forward(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 1000
+    captured = {"forward_called": False}
+    events = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 1500, "input_tokens": 1500, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def lookup_pending_checkpoint_for_source_prefix(**kwargs):
+        return None
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 1500
+
+    async def compact_body(**kwargs):
+        raise mod.SummaryFileContextUnavailable("attached file context unavailable")
+
+    async def forward_target(**kwargs):
+        captured["forward_called"] = True
+        return {"ok": True}
+
+    async def event_emitter(event):
+        events.append(event)
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", lookup_pending_checkpoint_for_source_prefix)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_compact_body", compact_body)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "active"},
+            ],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
+
+    assert result["error"]["code"] == "file_context_unavailable"
+    assert "attached file context unavailable" in result["error"]["message"]
+    assert captured["forward_called"] is False
+    status_events = _status_events(events)
+    assert status_events[-1]["data"]["action"] == "auto_compaction_failed"
 
 
 @pytest.mark.asyncio

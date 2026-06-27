@@ -1203,6 +1203,65 @@ async def test_parent_checkpoint_failure_releases_claim_and_does_not_resubmit_ra
 
 
 @pytest.mark.asyncio
+async def test_summary_file_context_unavailable_releases_claim_without_ready_checkpoint(monkeypatch):
+    store = ClaimStore()
+    calls = []
+
+    async def summary_factory(candidate_parent):
+        calls.append(candidate_parent)
+        raise mod.SummaryFileContextUnavailable("summary file context unavailable")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await run_get_or_create(
+            [{"role": "user", "content": "old"}],
+            summary_factory,
+        )
+
+    assert calls == [None]
+    assert store.completed_rows == []
+    assert store.released == [store.claimed_rows[0]["id"]]
+    assert store.rows == []
+
+
+@pytest.mark.asyncio
+async def test_summary_file_context_unavailable_bypasses_parent_extension_fallback(monkeypatch):
+    parent_source = [{"role": "user", "content": "old"}]
+    parent = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="parent summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([parent])
+    calls = []
+
+    async def summary_factory(candidate_parent):
+        calls.append(candidate_parent)
+        raise mod.SummaryFileContextUnavailable("summary file context unavailable")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await run_get_or_create(
+            [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "new"},
+            ],
+            summary_factory,
+        )
+
+    assert len(calls) == 1
+    assert store.completed_rows == []
+    assert store.released == [store.claimed_rows[0]["id"]]
+    assert [row["id"] for row in store.rows] == [parent["id"]]
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_store_claim_conflict_returns_false():
     from sqlalchemy.exc import IntegrityError
 
