@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.5
+version: 0.5.6
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -8569,6 +8569,16 @@ class Pipe:
         # the compaction cut, then re-injected with the correct prefix count.
         target_file_context_enabled = _target_model_supports_file_context(models, identity.target_model_id)
         reusable_checkpoint_match = None
+        # checkpoint_lookup_unavailable: set when the initial checkpoint lookup
+        # failed because the DB was unavailable. We do NOT fail closed here:
+        # for a request that turns out to be within limits we forward unchanged
+        # (no checkpoint, no prefetch); we fail closed later (R3) only when
+        # compaction is actually required to stay under the model limit. The
+        # exception object is retained so the fail-closed branch reproduces the
+        # exact current error message ("Failed to access auto-compaction
+        # checkpoints: {exc}").
+        checkpoint_lookup_unavailable = False
+        checkpoint_lookup_error: Exception | None = None
         if supported_context:
             try:
                 reusable_checkpoint_match = await _body_reusable_checkpoint_match(
@@ -8579,9 +8589,14 @@ class Pipe:
                     pipe_function_id=identity.pipe_function_id,
                 )
             except Exception as exc:
-                return _error_response(
-                    f"Failed to access auto-compaction checkpoints: {exc}",
-                    code="checkpoint_unavailable",
+                checkpoint_lookup_unavailable = True
+                checkpoint_lookup_error = exc
+                LOG.warning(
+                    "Auto-compaction checkpoint lookup failed (chat_id=%s); "
+                    "request will be forwarded unchanged if within limits, "
+                    "fail closed if compaction is required",
+                    chat_id,
+                    exc_info=True,
                 )
         pre_rag_messages: list[dict[str, Any]] | None = None
         pre_injected_file_context_sources = None
@@ -8738,7 +8753,32 @@ class Pipe:
             return hard, soft, should
 
         hard_should_compact, soft_should_prefetch, should_compact = compute_threshold_decisions()
-        if supported_context and reusable_checkpoint_match is None and (hard_should_compact or soft_should_prefetch):
+        if checkpoint_lookup_unavailable:
+            # Fail closed unless we can positively confirm the candidate is
+            # safely under the hard limit. hard_should_compact already encodes
+            # "compaction required", but decision_total can be None (encoder
+            # unavailable) — in that case hard is False yet we still must not
+            # forward, because we cannot confirm the request is under limit.
+            if (
+                hard_should_compact
+                or decision_total is None
+                or decision_total >= effective_trigger_total_tokens
+            ):
+                return _error_response(
+                    f"Failed to access auto-compaction checkpoints: {checkpoint_lookup_error}",
+                    code="checkpoint_unavailable",
+                )
+            # DB down + confirmed below the hard limit: forward unchanged.
+            # Disable prefetch; R4 guards skip the late rechecks (which would
+            # just hit the DB again). No checkpoint is created (R5): the
+            # compaction block only runs when should_compact is True.
+            soft_should_prefetch = False
+        if (
+            supported_context
+            and not checkpoint_lookup_unavailable
+            and reusable_checkpoint_match is None
+            and (hard_should_compact or soft_should_prefetch)
+        ):
             try:
                 late_checkpoint_match = await _body_reusable_checkpoint_match(
                     request=__request__,
@@ -8810,7 +8850,7 @@ class Pipe:
                     compare_estimate=compare_estimate_status,
                 ),
             )
-        if not hard_should_compact and soft_should_prefetch:
+        if not hard_should_compact and soft_should_prefetch and not checkpoint_lookup_unavailable:
             if reusable_checkpoint_match is None or reusable_checkpoint_match.kind == "parent":
                 try:
                     late_checkpoint_match = await _body_reusable_checkpoint_match(
@@ -9139,7 +9179,11 @@ class Pipe:
                         "message_id": str(message_id) if message_id else None,
                         "wrapper_model_id": selected_wrapper_id,
                     }
-                    if effective_soft_trigger_total_tokens is not None and not is_summary_task:
+                    if (
+                        effective_soft_trigger_total_tokens is not None
+                        and not is_summary_task
+                        and not checkpoint_lookup_unavailable
+                    ):
                         streaming_kwargs["on_complete"] = schedule_completed_turn_soft_prefetch
                     streaming_response = await _forward_streaming_target(**streaming_kwargs)
                     if not getattr(streaming_response, "_auto_compact_immediate_error", False):
@@ -9155,7 +9199,7 @@ class Pipe:
                 await _emit_source_events(__event_emitter__, candidate_source_events)
                 response = _merge_source_events_into_response(response, candidate_source_events)
                 assistant_message = None if is_summary_task else _assistant_message_for_completed_prefetch(response)
-                if assistant_message is not None:
+                if assistant_message is not None and not checkpoint_lookup_unavailable:
                     await launch_completed_turn_soft_prefetch(
                         {
                             "assistant_message": assistant_message,
@@ -9164,6 +9208,18 @@ class Pipe:
                     )
                 return response
             except RetryableContextOverflow:
+                if checkpoint_lookup_unavailable:
+                    # The request was forwarded under the limit because the
+                    # initial checkpoint lookup failed, but the target overflow
+                    # proves compaction is actually required. The checkpoint DB
+                    # was already known unavailable, so re-entering the
+                    # compaction block would either fail with summary_failed or
+                    # silently create a checkpoint if the DB recovered
+                    # mid-request. Fail closed with the original lookup error.
+                    return _error_response(
+                        f"Failed to access auto-compaction checkpoints: {checkpoint_lookup_error}",
+                        code="checkpoint_unavailable",
+                    )
                 if not supported_context or attempt >= MAX_CONTEXT_RETRY_ATTEMPTS:
                     error_response = _context_exhaustion_error_response(
                         candidate.get("messages"),

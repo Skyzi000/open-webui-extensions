@@ -9995,12 +9995,16 @@ async def test_task_soft_prefetch_passes_rebuilt_prompt_for_checkpoint_estimates
 
 
 @pytest.mark.asyncio
-async def test_pipe_does_not_forward_raw_history_when_checkpoint_lookup_fails(
+async def test_pipe_forwards_unchanged_when_checkpoint_lookup_fails_and_request_under_limit(
     monkeypatch,
     pipe_request,
     pipe_user,
     pipe_metadata,
 ):
+    # T1a: DB down on initial lookup + below hard limit (and below soft window)
+    # forwards unchanged. No prefetch, no compaction, streaming on_complete unset.
+    captured = {}
+
     async def validate_target_access(**kwargs):
         return None
 
@@ -10013,13 +10017,322 @@ async def test_pipe_does_not_forward_raw_history_when_checkpoint_lookup_fails(
     async def initialize_fails(**kwargs):
         raise RuntimeError("checkpoint db down")
 
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 10
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("must not compact when DB is down and request is within limits")
+
+    def start_soft_prefetch(**kwargs):
+        raise AssertionError("must not prefetch when checkpoint lookup is unavailable")
+
     async def forward_target(**kwargs):
-        raise AssertionError("raw history must not be forwarded when checkpoint lookup fails")
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        captured["on_complete"] = kwargs.get("on_complete")
+        return {"ok": True}
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.soft_trigger_ratio = 0.5
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+
+    result = await pipe.pipe(
+        {"model": wrapper_id, "stream": True, "messages": messages},
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result == {"ok": True}
+    assert captured["forward_body"]["messages"] == messages
+    # R7 (streaming): completed-turn soft prefetch must not be scheduled.
+    assert captured["on_complete"] is None
+
+
+@pytest.mark.asyncio
+async def test_pipe_fails_closed_when_checkpoint_lookup_fails_and_hard_compaction_required(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    # T1b/T5: DB down + hard compaction required (decision_total >= trigger)
+    # fails closed with checkpoint_unavailable; target is never forwarded.
+    forward_calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 250000, "input_tokens": 250000, "output_tokens": 0}
+
+    async def initialize_fails(**kwargs):
+        raise RuntimeError("checkpoint db down")
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 250000
+
+    async def forward_target(**kwargs):
+        forward_calls.append(copy.deepcopy(kwargs["body"]))
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 200
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "active"},
+            ],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["error"]["code"] == "checkpoint_unavailable"
+    assert "checkpoint db down" in result["error"]["message"]
+    assert forward_calls == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_forwards_unchanged_when_checkpoint_lookup_fails_and_request_in_soft_window(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    # T2: DB down + soft window (soft <= decision_total < hard). soft prefetch
+    # is disabled (R3/R4); the request is forwarded unchanged with no prefetch.
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 75, "input_tokens": 70, "output_tokens": 5}
+
+    async def initialize_fails(**kwargs):
+        raise RuntimeError("checkpoint db down")
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        # 50 (soft) <= 75 < 100 (hard): soft window.
+        return 75
+
+    def start_soft_prefetch(**kwargs):
+        raise AssertionError("must not prefetch when checkpoint lookup is unavailable")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        captured["on_complete"] = kwargs.get("on_complete")
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.soft_trigger_ratio = 0.5
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+
+    result = await pipe.pipe(
+        {"model": wrapper_id, "stream": True, "messages": messages},
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result == {"ok": True}
+    assert captured["forward_body"]["messages"] == messages
+    assert captured["on_complete"] is None
+
+
+@pytest.mark.asyncio
+async def test_pipe_db_down_lookup_creates_no_checkpoint_and_skips_completed_turn_prefetch_non_streaming(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    # T3 (non-streaming): DB down + below limit. No checkpoint is created (R5),
+    # no completed-turn soft prefetch is launched (R7 non-streaming). The
+    # response carries an assistant message with usage in the soft window so
+    # that, absent the R7 skip, the completed-turn prefetch would fire.
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 8, "output_tokens": 2}
+
+    async def initialize_fails(**kwargs):
+        raise RuntimeError("checkpoint db down")
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 10
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("must not compact when DB is down (no checkpoint created)")
+
+    def start_soft_prefetch(**kwargs):
+        raise AssertionError(
+            "must not start soft prefetch (pre-forward or completed-turn) when DB is down"
+        )
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        # Usage in the soft window so completed-turn prefetch would otherwise fire.
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "answer"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"total_tokens": 75, "input_tokens": 70, "output_tokens": 5},
+        }
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.soft_trigger_ratio = 0.5
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+
+    result = await pipe.pipe(
+        {"model": wrapper_id, "stream": False, "messages": messages},
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert isinstance(result, dict)
+    assert result.get("choices") is not None
+    assert captured["forward_body"]["messages"] == messages
+
+
+@pytest.mark.asyncio
+async def test_pipe_fails_closed_when_checkpoint_lookup_fails_and_decision_total_is_none(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    # T6: DB down + estimator cannot produce a token count (decision_total is
+    # None). We cannot confirm the request is under limit, so fail closed.
+    forward_calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 8, "output_tokens": 2}
+
+    async def initialize_fails(**kwargs):
+        raise RuntimeError("checkpoint db down")
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return None
+
+    async def estimate_body_tokens_async(body, **kwargs):
+        return None
+
+    async def forward_target(**kwargs):
+        forward_calls.append(copy.deepcopy(kwargs["body"]))
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -10041,6 +10354,87 @@ async def test_pipe_does_not_forward_raw_history_when_checkpoint_lookup_fails(
         __metadata__=pipe_metadata,
     )
 
+    assert result["error"]["code"] == "checkpoint_unavailable"
+    assert "checkpoint db down" in result["error"]["message"]
+    assert forward_calls == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_fails_closed_on_overflow_retry_when_checkpoint_lookup_was_unavailable(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    # DB-down on the initial lookup, but the request is confirmed under the hard
+    # limit, so it is forwarded unchanged. The target then reports a context
+    # overflow (RetryableContextOverflow), which proves compaction is actually
+    # required. Since the checkpoint DB was already known unavailable, the retry
+    # must fail closed with checkpoint_unavailable using the ORIGINAL lookup
+    # error — NOT attempt compaction (which would surface summary_failed or
+    # create a checkpoint if the DB recovered mid-request).
+    forward_attempts = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 8, "output_tokens": 2}
+
+    async def initialize_fails(**kwargs):
+        raise RuntimeError("checkpoint db down")
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        # Below the hard limit so the request is forwarded unchanged.
+        return 10
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("must not attempt compaction when checkpoint lookup was unavailable")
+
+    def start_soft_prefetch(**kwargs):
+        raise AssertionError("must not prefetch when checkpoint lookup is unavailable")
+
+    async def forward_target(**kwargs):
+        forward_attempts.append(copy.deepcopy(kwargs["body"]))
+        raise mod.RetryableContextOverflow("target context window exceeded before output")
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.soft_trigger_ratio = 0.5
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+
+    result = await pipe.pipe(
+        {"model": wrapper_id, "stream": True, "messages": messages},
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    # The request was forwarded once (proving the under-limit path ran), but the
+    # overflow retry must NOT re-enter compaction.
+    assert len(forward_attempts) == 1
     assert result["error"]["code"] == "checkpoint_unavailable"
     assert "checkpoint db down" in result["error"]["message"]
 
