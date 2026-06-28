@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.3
+version: 0.5.4
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -127,20 +127,21 @@ SUMMARY_PROMPT = (
     "You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY for an Open WebUI chat. "
     "Create a concise handoff summary for a future model call that will continue the same chat.\n\n"
     "Preserve:\n"
-    "- Current progress and durable decisions already made\n"
+    "- Session goal, original request, current progress, and durable decisions already made\n"
     "- User preferences, constraints, and standing requirements that remain relevant\n"
     "- Tool results, external facts, errors, identifiers, URLs, file names, commands, values, and examples needed to continue\n"
-    "- Open questions, unresolved failures, and clear next steps\n\n"
+    "- Open questions, unknowns, unresolved failures, and clear next steps\n\n"
     "If the input contains an existing <auto_compaction_context>, merge that prior checkpoint with the following newer messages. "
     "Do not discard earlier checkpoint information merely because it is summarized.\n\n"
     "If <attached_file_contents> is provided, use it only as supporting context for files attached to messages in this "
     "checkpoint source. Preserve durable file facts, names, identifiers, and relevant excerpts needed to continue, "
     "but do not invent file contents or treat attached files outside the checkpoint source as summarized.\n\n"
-    "Do not invent facts. Do not introduce new instructions. Do not include irrelevant transcript detail. "
+    "Do not invent facts or treat unknowns as facts. Do not introduce new instructions. "
+    "Do not include internal reasoning, private system instructions, or irrelevant transcript detail. "
     "Be concise, structured, and focused on continuity.\n\n"
     "The preceding messages are the exact checkpoint source to summarize. "
     "Messages after this checkpoint source may be retained raw separately; do not infer omitted active requests.\n\n"
-    "Output only the checkpoint summary body. Do not continue the conversation. "
+    "Output only reusable continuity facts; do not mention this summarization/checkpointing task. Do not continue the conversation. "
     "Do not call tools. Do not ask follow-up questions."
 )
 
