@@ -5551,6 +5551,122 @@ async def test_summary_generation_uses_handoff_checkpoint_prompt(monkeypatch, pi
     assert "Do not call tools" in prompt
 
 
+def test_resolve_summary_prompt_returns_builtin_for_empty_or_whitespace():
+    assert mod.resolve_summary_prompt(None) is mod.SUMMARY_PROMPT
+    assert mod.resolve_summary_prompt("") is mod.SUMMARY_PROMPT
+    assert mod.resolve_summary_prompt("   \n\t ") is mod.SUMMARY_PROMPT
+
+
+def test_resolve_summary_prompt_returns_stripped_custom_prompt():
+    custom = "CUSTOM HANDOFF PROMPT: be terse."
+    assert mod.resolve_summary_prompt(custom) == custom
+    assert mod.resolve_summary_prompt("  \n" + custom + "\n  ") == custom
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_uses_custom_summary_prompt(monkeypatch, pipe_request, pipe_user):
+    captured = {}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["messages"] = form_data["messages"]
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    custom_prompt = "DISTINCTIVE CUSTOM MARKER 7c4f-9a21: rewrite the handoff in haiku form."
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        source_messages=[{"role": "user", "content": "old"}],
+        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
+        summary_prompt=custom_prompt,
+    )
+
+    assert result == "summary"
+    assert captured["messages"][0] == {"role": "user", "content": "old"}
+    assert captured["messages"][-1] == {"role": "user", "content": custom_prompt}
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_falls_back_to_builtin_prompt_when_summary_prompt_empty(
+    monkeypatch, pipe_request, pipe_user
+):
+    captured = {}
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["messages"] = form_data["messages"]
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    base_body = {"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]}
+
+    for blank in ("", "   \n\t "):
+        captured.clear()
+        await mod._generate_summary_text(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={"chat_id": "chat-1"},
+            summary_model_id="target",
+            source_messages=[{"role": "user", "content": "old"}],
+            base_body=base_body,
+            summary_prompt=blank,
+        )
+        assert captured["messages"][-1]["content"] is mod.SUMMARY_PROMPT
+
+
+def test_build_summary_request_message_prepends_file_context_to_custom_summary_prompt():
+    prefix = "<attached_file_contents>ctx</attached_file_contents>"
+    custom = "CUSTOM PROMPT: keep it short."
+
+    message = mod.build_summary_request_message(prefix, summary_prompt=custom)
+
+    assert message == {"role": "user", "content": f"{prefix}\n\n{custom}"}
+
+
+def test_build_summary_completion_body_uses_custom_summary_prompt_in_final_message():
+    custom = "DISTINCTIVE SUMMARY OVERRIDE 1a2b-3c4d."
+    body = mod.build_summary_completion_body(
+        {"model": "target", "messages": [{"role": "user", "content": "old"}], "metadata": {}},
+        summary_model_id="summary",
+        source_messages=[{"role": "user", "content": "source"}],
+        metadata={"chat_id": "chat-1"},
+        summary_prompt=custom,
+    )
+
+    assert body["messages"][:-1] == [{"role": "user", "content": "source"}]
+    assert body["messages"][-1] == {"role": "user", "content": custom}
+
+
+def test_summary_prompt_does_not_affect_checkpoint_profile_hash_or_identity():
+    # compute_profile_hash intentionally ignores summary_prompt entirely (**_),
+    # so changing it can never re-identify or invalidate a ready checkpoint.
+    baseline = mod.compute_profile_hash()
+    assert mod.compute_profile_hash(summary_prompt="") == baseline
+    assert mod.compute_profile_hash(summary_prompt="anything-at-all") == baseline
+    assert mod.compute_profile_hash(summary_prompt=" " * 16) == baseline
+
+    # The Valve itself must not be a hash input either: two Valve sets that
+    # differ ONLY in summary_prompt must yield identical profile hashes.
+    valves_default = mod.Pipe.Valves()
+    valves_custom = mod.Pipe.Valves()
+    valves_custom.summary_prompt = "totally different prompt"
+    assert valves_default.summary_prompt == mod.SUMMARY_PROMPT
+    assert valves_custom.summary_prompt == "totally different prompt"
+    assert baseline == mod.compute_profile_hash(
+        schema_family=mod.CHECKPOINT_TABLE_NAME,
+        summary_format_family=mod.SUMMARY_FORMAT_FAMILY,
+        source_hash_family=mod.SOURCE_HASH_FAMILY,
+    )
+
+
 @pytest.mark.asyncio
 async def test_summary_generation_passes_open_webui_user_model_to_inner_completion(
     monkeypatch,

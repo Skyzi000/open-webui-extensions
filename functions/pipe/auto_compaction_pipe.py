@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.4
+version: 0.5.5
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -144,6 +144,11 @@ SUMMARY_PROMPT = (
     "Output only reusable continuity facts; do not mention this summarization/checkpointing task. Do not continue the conversation. "
     "Do not call tools. Do not ask follow-up questions."
 )
+
+
+def resolve_summary_prompt(summary_prompt: str | None = None) -> str:
+    text = str(summary_prompt or "").strip()
+    return text or SUMMARY_PROMPT
 
 try:
     from open_webui.internal.db import DATABASE_SCHEMA as OPEN_WEBUI_DATABASE_SCHEMA
@@ -6273,10 +6278,14 @@ def strip_summary_tools_for_retry(body: dict[str, Any]) -> None:
         body.pop(key, None)
 
 
-def build_summary_request_message(prefix_file_context: str | None = None) -> dict[str, str]:
-    content = SUMMARY_PROMPT
+def build_summary_request_message(
+    prefix_file_context: str | None = None,
+    *,
+    summary_prompt: str | None = None,
+) -> dict[str, str]:
+    content = resolve_summary_prompt(summary_prompt)
     if prefix_file_context:
-        content = f"{prefix_file_context}\n\n{SUMMARY_PROMPT}"
+        content = f"{prefix_file_context}\n\n{content}"
     return {"role": "user", "content": content}
 
 
@@ -6289,10 +6298,14 @@ def build_summary_completion_body(
     pipe_function_id: str = PIPE_FUNCTION_ID,
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
     prefix_file_context: str | None = None,
+    summary_prompt: str | None = None,
 ) -> dict[str, Any]:
     body = _copy_body_preserving_metadata(base_body)
     body["model"] = _resolve_summary_model_for_call(summary_model_id, pipe_function_id=pipe_function_id)
-    body["messages"] = [*copy.deepcopy(source_messages), build_summary_request_message(prefix_file_context)]
+    body["messages"] = [
+        *copy.deepcopy(source_messages),
+        build_summary_request_message(prefix_file_context, summary_prompt=summary_prompt),
+    ]
     body["metadata"] = build_summary_task_metadata(metadata)
     body["metadata"].pop("files", None)
     body.pop("previous_response_id", None)
@@ -6318,6 +6331,7 @@ async def _generate_summary_text(
     compaction_prefix_count: int = 0,
     parent_source_message_count: int = 0,
     file_context_enabled: bool = True,
+    summary_prompt: str | None = None,
 ) -> str:
     summary_metadata = build_summary_task_metadata(metadata)
     summary_metadata.pop("files", None)
@@ -6345,6 +6359,7 @@ async def _generate_summary_text(
         pipe_function_id=pipe_function_id,
         summary_tool_policy=summary_tool_policy,
         prefix_file_context=prefix_file_context,
+        summary_prompt=summary_prompt,
     )
     route = await _resolve_core_chat_model_route(inner_request, str(body.get("model") or ""))
     body["model"] = route.model_id
@@ -6393,6 +6408,7 @@ async def _compact_retry_tool_results(
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
     file_context_enabled: bool = True,
+    summary_prompt: str | None = None,
 ) -> tuple[list[dict[str, Any]], bool, int]:
     cut = select_tool_result_compaction_cut(messages)
     if cut is None:
@@ -6465,6 +6481,7 @@ async def _compact_retry_tool_results(
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
             file_context_enabled=file_context_enabled,
+            summary_prompt=summary_prompt,
         )
     except Exception as exc:
         if isinstance(exc, ParentCheckpointExtensionFailed) and (
@@ -6699,6 +6716,7 @@ async def _get_or_create_compaction_summary(
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
     file_context_enabled: bool = True,
+    summary_prompt: str | None = None,
 ) -> str:
     summary_source_prefix = copy.deepcopy(source_messages)
 
@@ -6730,6 +6748,7 @@ async def _get_or_create_compaction_summary(
             compaction_prefix_count=len(summary_source_prefix),
             parent_source_message_count=parent_count,
             file_context_enabled=file_context_enabled,
+            summary_prompt=summary_prompt,
         )
 
     prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
@@ -6894,6 +6913,7 @@ async def _prefetch_compaction_checkpoint(
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
     file_context_enabled: bool = True,
     task_estimate_body: dict[str, Any] | None = None,
+    summary_prompt: str | None = None,
 ) -> bool:
     if not source_messages:
         return False
@@ -7068,6 +7088,7 @@ async def _prefetch_compaction_checkpoint(
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
             file_context_enabled=file_context_enabled,
+            summary_prompt=summary_prompt,
         )
     except _CheckpointGenerationSkipped:
         return False
@@ -7164,6 +7185,7 @@ def _start_soft_compaction_prefetch(
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
     file_context_enabled: bool = True,
     task_estimate_body: dict[str, Any] | None = None,
+    summary_prompt: str | None = None,
 ) -> bool:
     source_messages = _soft_prefetch_source_messages(body)
     if not source_messages:
@@ -7207,6 +7229,7 @@ def _start_soft_compaction_prefetch(
             task_estimate_body=(
                 _copy_body_preserving_metadata(task_estimate_body) if task_estimate_body is not None else None
             ),
+            summary_prompt=summary_prompt,
         ),
     )
 
@@ -8000,6 +8023,7 @@ async def _compact_body(
     historical_message_excerpt_count: int,
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
     file_context_enabled: bool = True,
+    summary_prompt: str | None = None,
 ) -> tuple[dict[str, Any], bool, int]:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -8025,6 +8049,7 @@ async def _compact_body(
                 file_context_enabled=file_context_enabled,
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
+                summary_prompt=summary_prompt,
             )
         except UnsupportedCompactionInput as exc:
             if exc.code != "latest_tool_result_too_large":
@@ -8056,6 +8081,7 @@ async def _compact_body(
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
                 file_context_enabled=file_context_enabled,
+                summary_prompt=summary_prompt,
             )
             history_checkpoint = await _lookup_ready_checkpoint_for_source(
                 request=request,
@@ -8083,6 +8109,7 @@ async def _compact_body(
                 summary_tool_policy=summary_tool_policy,
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
+                summary_prompt=summary_prompt,
             )
         if did_compact_tools:
             compacted = _copy_body_preserving_metadata(body)
@@ -8157,6 +8184,7 @@ async def _compact_body(
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
             file_context_enabled=file_context_enabled,
+            summary_prompt=summary_prompt,
         )
         compacted["messages"] = replace_prefix_with_summary(
             messages,
@@ -8235,6 +8263,7 @@ async def _compact_task_body(
     historical_message_excerpt_count: int,
     summary_tool_policy: SummaryToolPolicy,
     file_context_enabled: bool = True,
+    summary_prompt: str | None = None,
 ) -> tuple[dict[str, Any], bool, int]:
     source_body = _task_history_source_body_for_compaction(body, metadata)
     if source_body is None:
@@ -8251,6 +8280,7 @@ async def _compact_task_body(
         historical_message_excerpt_count=historical_message_excerpt_count,
         file_context_enabled=file_context_enabled,
         summary_tool_policy=summary_tool_policy,
+        summary_prompt=summary_prompt,
     )
     if not compacted:
         return body, False, 0
@@ -8336,6 +8366,16 @@ class Pipe:
                 "Recommended default fallback_on_tool_call keeps tool definitions on the first request to preserve "
                 "provider-visible shape and maximize prompt-cache reuse opportunities, then retries without tools only if the summary model emits a tool call. "
                 "always_strip removes tools before the first request. error_on_tool_call keeps tools and fails on tool calls."
+            ),
+        )
+        summary_prompt: str = Field(
+            default=SUMMARY_PROMPT,
+            description=(
+                "Admin-editable auto-compaction checkpoint summary prompt sent to the summary model. "
+                "Leave empty or whitespace-only to fall back to the built-in prompt. This value is applied ONLY when "
+                "generating NEW checkpoint summaries; existing durable checkpoints are always reused as-is regardless of "
+                "prompt changes, so editing it never invalidates or re-identifies ready checkpoints. When file context "
+                "is prepended for prefix files, it is prepended to the effective prompt."
             ),
         )
         historical_message_excerpt_bytes: int = Field(
@@ -8807,6 +8847,7 @@ class Pipe:
                     pipe_function_id=identity.pipe_function_id,
                     summary_model_id=summary_model_id,
                     summary_tool_policy=self.valves.summary_tool_policy,
+                    summary_prompt=self.valves.summary_prompt,
                     historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                     historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                     effective_trigger_total_tokens=effective_trigger_total_tokens,
@@ -8858,6 +8899,7 @@ class Pipe:
                 pipe_function_id=identity.pipe_function_id,
                 summary_model_id=summary_model_id,
                 summary_tool_policy=self.valves.summary_tool_policy,
+                summary_prompt=self.valves.summary_prompt,
                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                 effective_trigger_total_tokens=effective_trigger_total_tokens,
@@ -8959,6 +9001,7 @@ class Pipe:
                                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                                 summary_tool_policy=self.valves.summary_tool_policy,
+                                summary_prompt=self.valves.summary_prompt,
                                 file_context_enabled=target_file_context_enabled,
                             )
                         else:
@@ -8973,6 +9016,7 @@ class Pipe:
                                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                                 summary_tool_policy=self.valves.summary_tool_policy,
+                                summary_prompt=self.valves.summary_prompt,
                                 file_context_enabled=target_file_context_enabled,
                             )
                     compacted_once = compacted_once or compacted
