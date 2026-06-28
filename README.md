@@ -6,7 +6,7 @@ A collection of tools and filters for Open WebUI.
 
 ## 🌟 Highlights
 
-**[Sub Agent Tool](tools/sub_agent.py)** ([openwebui.com](https://openwebui.com/posts/sub_agent_7bfeb0b7)) - **#1 most upvoted** on openwebui.com with **7,500+ downloads**! Featured in Open WebUI's official [Community Newsletter, January 28th 2026](https://openwebui.com/blog/newsletter-january-28-2026) as one of "This Week's Most Useful".
+**[Sub Agent Tool](tools/sub_agent.py)** ([openwebui.com](https://openwebui.com/posts/sub_agent_7bfeb0b7)) - **#1 most upvoted** on openwebui.com with **14,000+ downloads**! Featured in Open WebUI's official [Community Newsletter, January 28th 2026](https://openwebui.com/blog/newsletter-january-28-2026) as one of "This Week's Most Useful".
 
 Delegate tool-heavy tasks to sub-agents running in isolated contexts, keeping your main conversation clean and efficient. Fully leverages Open WebUI v0.7+ built-in tools (web search, memory, knowledge bases, etc.).
 

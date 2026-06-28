@@ -4,7 +4,7 @@
 
 ## 🌟 ハイライト
 
-**[Sub Agent Tool](tools/sub_agent.py)** ([openwebui.com](https://openwebui.com/posts/sub_agent_7bfeb0b7)) - openwebui.com で **Upvote数1位**、ダウンロード数 **7,500+** を達成！ Open WebUI 公式の [Community Newsletter, January 28th 2026](https://openwebui.com/blog/newsletter-january-28-2026) で "This Week's Most Useful" ツールの1つとして紹介されました。
+**[Sub Agent Tool](tools/sub_agent.py)** ([openwebui.com](https://openwebui.com/posts/sub_agent_7bfeb0b7)) - openwebui.com で **Upvote数1位**、ダウンロード数 **1.4万+** を達成！ Open WebUI 公式の [Community Newsletter, January 28th 2026](https://openwebui.com/blog/newsletter-january-28-2026) で "This Week's Most Useful" ツールの1つとして紹介されました。
 
 ツール呼び出しが多いタスクをサブエージェントに委譲し、メインの会話コンテキストをクリーンに保つツールです。Open WebUI v0.7 以降のビルトインツール（Web検索、メモリ、ナレッジベース等）を最大限に活用できます。
 

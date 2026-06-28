@@ -1,239 +1,92 @@
 # AGENTS.md
 
-## Global Communication Rules
+## Repository Map
 
-- Always answer the user in Japanese.
-- Instructions intended for the AI (including this document and the return
-  values of `Tools` methods) must remain in English, even though user-facing
-  replies are in Japanese.
+- `src/owui_ext/` - source for generated plugin releases (Tools, Filters, Pipes, Actions); `shared/` holds inlined helpers.
+- `tools/`, `functions/` - installable Open WebUI extensions; some are generated outputs.
+- `open_webui_plugins_builder/` - local release-builder package.
+- `tests/` - extension tests plus builder tests.
+- `references/open-webui/`, `graphiti/` - upstream core and Graphiti submodules.
 
-## Repository Structure
+## Generated Release Outputs
 
-This repository contains Open WebUI extensions, with some components managed as Git submodules.
+- Never edit generated outputs directly. Edit source under `src/owui_ext/` and rebuild the corresponding output.
+- Bump plugin header versions when installable extension behavior changes, including standalone files.
+- For builder commands, target lists, inliner constraints, version-bump gates, smoke tests, and pre-commit details, read `.agents/skills/open-webui-plugin-release-builder/SKILL.md`.
 
-### Submodules
+## Setup, Tests, and Core Compatibility
 
-- `graphiti/` - Graphiti memory system extensions (separate repository)
-- `references/open-webui/` - Reference submodule
+- Use `uv`; do not assume system `pip` exists.
+- Install dev/test deps with `uv sync --extra test --group dev`.
+- Run the full suite with `uv run pytest -v --tb=short`; do not pass only `tests/` unless intentionally skipping builder tests.
+- Before adding a Tool, Filter, Pipe, or Action, read at least one existing same-type implementation in this repo first.
+- Inspect `references/open-webui/` before implementing behavior that depends on Open WebUI internals; never guess undocumented behavior.
+- If current upstream behavior matters, update or explicitly verify the submodule commit first, then add/update tests for the contract.
+- Do not invent constraints the Open WebUI core does not impose; track upstream changes in `references/open-webui/` and follow them when necessary.
 
-### Working With Open WebUI Core
+## Valves and UserValves
 
-1. The upstream Open WebUI core lives in the `references` submodule. Before
-   consulting or copying code, update the submodule to the latest commit so you
-   rely on current behavior.
-2. Implement features only after inspecting the actual core and related
-   libraries; never guess about undocumented behavior.
-3. When adapting snippets, keep them consistent with the upstream style and
-   ensure any dependencies are mirrored locally.
-4. Before implementing a new Filter/Tool/Action, inspect at least one existing
-   implementation of the same type in this repository (and in
-   `references/open-webui` if needed) so you follow established patterns and
-   edge-case handling.
+### CRITICAL: Never Rename Released Valve Fields
 
-## Commit Message Rules
+- Once a `Valves` or `UserValves` field name has appeared on `main`, renaming it is immediately breaking: Open WebUI persists saved settings by field name and provides no migration path. Add new fields with defaults instead.
 
-### Important: Check Submodule Commit Style First
+### Schema Rules
 
-Before committing to a submodule, **always check the existing commit history** using:
+- Declare nested `Valves` and `UserValves` subclasses inheriting `BaseModel`; set `self.valves = self.Valves()` in `__init__` for admin defaults.
+- `Valves` are instance/admin knobs; `UserValves` are per-user preferences.
+- Fetch user valves with `self.UserValves.model_validate((__user__ or {}).get("valves", {}))`.
+- Treat `__user__["valves"]` as a Pydantic model; dict indexing returns defaults and silently ignores user-set values.
+- Use `Literal[...]` for dropdown choices and `bool` for switches; Open WebUI generates UI controls from the Pydantic schema.
+- Document each `Field` and end each nested Valve class with `pass`. For multi-select, use documented comma-separated strings since Open WebUI has no native multi-select widget.
 
-```bash
-git log -5 --format=medium
-```
+## Tool Implementation Rules
 
-Each submodule may have its own commit message style. Follow the existing pattern.
+- Keep AI-facing docs (AGENTS.md, SKILL.md), Tool docstrings, and Tool return values in English for token efficiency.
+- Put Tool-call guidance in method docstrings, not class docstrings; Open WebUI does not surface class docstrings to the model.
+- Every public method on `class Tools` is AI-callable. Expose only methods the AI should invoke; keep helpers at module scope because underscore names are still exposed.
+- Public Tool docstrings must guide an autonomous AI caller, not a human.
+- Do not document injected params such as `__user__`, `__request__`, `__event_emitter__`, or `__metadata__`.
+- Write each `:param name:` description on one line; continuation lines are dropped by Open WebUI's parser. Do not use Google-style `Args:` blocks.
+- Avoid raw `dict`, `Dict`, and `list[dict]` public parameter schemas; use Pydantic `BaseModel` types for structured objects/lists.
+- Validate AI-provided arguments defensively and return concise actionable errors instead of uncaught exceptions.
+- Never add silent fallbacks that hide unrecoverable failures or speculate about unhandled paths; only fall back when degradation is clearly justified, otherwise return a clear actionable error.
+- Keep Tool return payloads small: include only data needed for the next AI action.
+- Run `python scripts/lint_tools_class.py` when changing Tool public APIs.
 
-### Graphiti Submodule Style
+## Filter Implementation Rules
 
-Uses **Conventional Commits** format:
+- Usually do not set `self.toggle`; set `self.toggle = True` only for filters that need chat-UI temporary activation.
+- When `toggle = True`, do not re-check it inside `inlet`/`outlet`; if either runs, the toggle is already enabled.
+- inlet/outlet must be deterministic, safe on missing metadata, and must not mutate caller-owned body/metadata unless tested.
+- Keep injected prompt/metadata additions minimal and stable across calls for prompt caching and debugging.
 
-```text
-type(scope): short description
+## Scalability and Distributed Deployment
 
-Optional detailed description explaining what and why.
-- Bullet points for multiple changes
-- Keep each point concise
-```
+### CRITICAL: No Instance Variables for Cross-Worker State
 
-**Types:**
+- Instance variables (`self._cache`, `self._lock`, etc.) are per-worker only and NOT shared across workers or instances; never use them for state that must be consistent in multi-worker deployments.
+- For cross-worker coordination (dedup, locking, caching), use Redis via Open WebUI's `REDIS_URL` / `WEBSOCKET_REDIS_URL` with `redis.asyncio`; follow the established pattern in `functions/filter/inlet_title_generator.py` and `graphiti/functions/filter/graphiti_memory.py` (SETNX with TTL, in-memory fallback for single-instance).
+- Never block the event loop with synchronous I/O or CPU-heavy work; at thousands-of-users scale one blocking call degrades everyone. Use async APIs for I/O, executors for CPU-bound work, and background tasks for long-running operations.
+- `asyncio.Lock()` only synchronizes within a single worker process; use Redis SETNX with TTL for distributed dedup/locking.
 
-- `feat` - New feature
-- `fix` - Bug fix
-- `chore` - Maintenance (version updates, dependencies, etc.)
-- `docs` - Documentation only
-- `refactor` - Code refactoring without feature changes
-- `test` - Adding or updating tests
+## Test Placement
 
-**Scopes:**
+- Add/update tests near the affected area: `tests/tools/`, `tests/filters/`, `tests/graphiti/`, or `open_webui_plugins_builder/tests/`.
+- For generated extensions, test installable generated outputs but edit source under `src/owui_ext/`.
+- For Open WebUI compatibility, prefer tests importing real core modules from `references/open-webui/backend` over mock-only tests.
+- Do not skip or xfail failing tests unless the reason is documented and unrelated to your change.
 
-- `filter` - Filter components
-- `tools` - Tools components
-- `pipeline` - Pipeline components
-- `action` - Action components
+## Commit Messages
 
-**Examples:**
+- Use English Conventional Commits in this repo and submodules.
+- Write why the change was made, not what changed; the diff already shows the what.
+- For large or mixed commits, use `feat` when the primary strategic change adds capability even if follow-up fixes are included.
+- Before committing in a submodule, inspect recent history with `git log -5 --format=medium` and follow that submodule's style.
 
-```text
-feat(tools): add get_recent_episodes method for chronological episode retrieval
+## Final Checklist
 
-- Add get_recent_episodes() method with limit/offset pagination
-- Sort episodes by created_at in descending order (newest first)
-- Optimize database queries to fetch only offset+limit episodes
-- Update version to 0.3
-```
-
-```text
-fix(filter): Fix null pointer exception in D3.js graph tick handler
-
-Add null checks before calling getBBox() on text nodes in the force
-simulation tick event.
-```
-
-### Root Repository Style
-
-Uses **Conventional Commits** format with English descriptions.
-
-## Development Guidelines
-
-### General Principles
-
-1. **Version Management**
-   - Update version numbers when adding features or fixing bugs
-   - Follow semantic versioning principles
-
-2. **Before Committing**
-   - Verify changes work correctly
-   - Check for linting errors
-   - Review the commit message style of the target repository/submodule
-
-### Valves vs UserValves
-
-Applies to Tools, Filters, and Pipes.
-
-- Follow the official pattern: declare both classes as nested subclasses of the
-  Filter/Tools/Pipe you are implementing, inherit from `BaseModel`, and always
-  call `self.valves = self.Valves()` inside `__init__` for admin-controlled
-  defaults.
-- `Valves` describe instance-wide knobs (API keys, DB backends, semaphore limits,
-  etc.) and may include fields like `priority` for filter ordering. `UserValves`
-  expose only per-user preferences (feature toggles, language choices, etc.).
-- Fetch user valves via
-  `self.UserValves.model_validate((__user__ or {}).get("valves", {}))` so that
-  raw dict payloads from Open WebUI are validated, missing fields fall
-  back to defaults, and you avoid sharing mutable state.
-- Treat the object stored under `__user__["valves"]` as a Pydantic model, not a
-  dict; access attributes (`__user__["valves"].test_user_valve`) or cast with
-  `dict(__user__["valves"])` if you truly need a mapping. Indexing into it as if
-  it were a dict returns defaults and ignores user-set values.
-- Keep the schemas disjoint and document each `Field` carefully so the UI can
-  generate appropriate controls (e.g., `Literal[...]` for dropdowns, `bool` for
-  switches). Always include `pass` at the end of each class as recommended in
-  the core documentation.
-- The current UI does not expose true multi-select widgets, so when you need
-  multiple choices, accept comma-separated strings (e.g., `"choiceA,choiceB"`)
-  and document that input format for users.
-
-### Tool Implementation
-
-#### General Guidelines
-
-- Assume every public method you add will be called by the AI. Provide precise
-  docstrings that describe the purpose, parameters, expected argument formats,
-  possible errors, and example correction strategies.
-- Tools are never invoked directly by humans; the AI alone decides when to
-  call them and assembles the arguments, so design signatures and validation
-  with that autonomous caller in mind.
-- Expose only callable methods; keep helpers outside of the `Tools` class so the
-  AI cannot invoke unsupported operations (method names starting with `_` are
-  not an exception).
-
-#### CRITICAL: No Helper Methods in Tools Class
-
-**NEVER define helper methods inside the Tools class, regardless of naming.**
-
-The underscore prefix (`_method`) does NOT hide methods from AI. All methods
-inside the Tools class are exposed to AI, which causes:
-
-- Context pollution (AI sees unnecessary methods)
-- AI may mistakenly call internal methods and fail
-
-❌ BAD:
-
-```python
-class Tools:
-    def _helper(self):  # AI CAN invoke this!
-        ...
-```
-
-✅ GOOD:
-
-```python
-def helper(valves, ...):  # Outside class - AI cannot invoke
-    ...
-
-class Tools:
-    ...
-```
-
-#### Documentation for AI Users
-
-- Target audience is AI, running in Docker on OpenWebUI
-- AI only sees method docstrings (not class docstrings) and return values
-- Include all critical information in method docstrings
-- Use Field descriptions to clarify data format requirements
-- Do NOT document system-injected parameters (`__user__`, `__event_emitter__`,
-  etc.) in docstrings—AI cannot pass them, will be confused, and wastes context
-
-#### Docstring and Schema Constraints
-
-Open WebUI's `parse_docstring()` uses a single-line regex
-(`re.compile(r':param (\w+):\s*(.+)')`) to extract `:param` descriptions.
-**Only the first line of each `:param` is captured**; continuation lines are
-silently discarded. This means critical information (field names, format
-examples, usage warnings) on subsequent lines will never reach the LLM.
-
-- **Always write `:param` descriptions as a single line.** If the description
-  is too long, move the details into the method-level docstring (before the
-  first `:param`) which is captured in full.
-- **For `list[dict]` parameters where items have expected keys**, define a
-  Pydantic `BaseModel` subclass outside the `Tools` class and use it as the
-  item type (e.g., `list[MyItem]`). `list[dict]` generates
-  `items: {"type": "object", "additionalProperties": true}` with no
-  `properties`, so the LLM must guess field names from the description alone —
-  which may itself be truncated by the single-line parser above.
-
-#### Input Validation
-
-- Validate inputs defensively. On invalid arguments, never raise exceptions;
-  instead, return structured guidance that tells the AI exactly which field to
-  fix and how.
-
-#### Return Payload Budget
-
-- Limit every return payload (success or error) to just the data the AI needs
-  for its next action so Tool calls do not waste context window space.
-
-#### Error Handling
-
-- Do not implement fallbacks without clear necessity
-- Return clear, actionable error messages
-- Provide specific information for AI to understand and address issues
-- Anticipate malformed payloads, missing context, or external failures and
-  handle them without crashing or raising exceptions.
-- When rejecting a request, respond with actionable remediation steps (e.g.,
-  "Provide `conversation_id`" or "Retry after refreshing credentials").
-- Log or surface enough context in the return payload so the AI can decide
-  whether to retry, adjust arguments, or abort.
-- Keep return payloads concise; include only the information the AI needs to
-  correct its inputs so the context window is not wasted.
-
-### Filter Implementation
-
-#### Toggle Mechanics
-
-- Usually, do NOT set `self.toggle` at all (no True or False needed)
-- Only set `self.toggle = True` for filters that need temporary activation via
-  the chat UI (e.g., filters you want to enable/disable per conversation)
-- When `toggle = True`, a toggle button appears in the UI; when the user enables
-  it, both `inlet` and `outlet` run; when disabled, neither runs
-- Do not re-check `self.toggle` inside `inlet`/`outlet`; if either function
-  runs, the toggle is already ON
+1. Confirm whether edited files are generated outputs or source files.
+2. If generated outputs may be affected, follow the release-builder skill.
+3. Run relevant tests or explain exactly why they could not be run.
+4. Check `git status --short` and review the diff for accidental submodule, generated-file, cache, lockfile, registry URL, or secret changes.
+5. Report changed paths and real verification results in the user's language.
