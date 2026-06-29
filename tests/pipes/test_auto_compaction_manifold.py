@@ -14927,6 +14927,184 @@ async def test_streaming_completion_observer_skips_tool_call_completion():
     assert observed == []
 
 
+# ---------------------------------------------------------------------------
+# summary_model dropdown options
+# ---------------------------------------------------------------------------
+
+
+def _teardown_summary_model_cache():
+    mod._LATEST_MODELS_CACHE.clear()
+
+
+def test_build_summary_model_options_has_no_empty_default_option():
+    assert mod.build_summary_model_options({}) == []
+
+
+def test_build_summary_model_options_excludes_wrapper_and_arena():
+    models = {
+        "gpt-4o": {"id": "gpt-4o", "name": "GPT-4o"},
+        "auto_compact.gpt-4o": {
+            "id": "auto_compact.gpt-4o",
+            "name": "Auto Compact GPT-4o",
+        },
+        "arena-model": {"id": "arena-model", "name": "Arena", "arena": True},
+        "claude-sonnet": {"id": "claude-sonnet", "name": "Claude Sonnet"},
+    }
+    options = mod.build_summary_model_options(models, pipe_function_id="auto_compact")
+    values = [opt["value"] for opt in options]
+    assert "gpt-4o" in values
+    assert "claude-sonnet" in values
+    assert "auto_compact.gpt-4o" not in values
+    assert "arena-model" not in values
+
+
+def test_build_summary_model_options_excludes_wrapper_based_models():
+    models = {
+        "custom-wrapper": {
+            "id": "custom-wrapper",
+            "name": "Custom Wrapper",
+            "info": {"base_model_id": "auto_compact.gpt-4o"},
+        },
+        "real-model": {"id": "real-model", "name": "Real Model"},
+    }
+    options = mod.build_summary_model_options(models, pipe_function_id="auto_compact")
+    values = [opt["value"] for opt in options]
+    assert "real-model" in values
+    assert "custom-wrapper" not in values
+
+
+def test_build_summary_model_options_sorted_by_model_id():
+    models = {
+        "z-model": {"id": "z-model", "name": "Z Model"},
+        "a-model": {"id": "a-model", "name": "A Model"},
+    }
+    options = mod.build_summary_model_options(models, pipe_function_id="auto_compact")
+    assert options[0]["value"] == "a-model"
+    assert options[1]["value"] == "z-model"
+
+
+def test_build_summary_model_options_label_format():
+    models = {
+        "gpt-4o": {"id": "gpt-4o", "name": "GPT-4o"},
+        "no-name": {"id": "no-name"},
+    }
+    options = mod.build_summary_model_options(models, pipe_function_id="auto_compact")
+    by_value = {opt["value"]: opt["label"] for opt in options}
+    assert by_value["gpt-4o"] == "GPT-4o (gpt-4o)"
+    assert by_value["no-name"] == "no-name"
+
+
+def test_update_latest_models_cache_snapshots_models_first_duplicate_wins():
+    _teardown_summary_model_cache()
+    models = [
+        {"id": "gpt-4o", "name": "GPT-4o Override"},
+        {"id": "claude", "name": "Claude"},
+        {"id": "gpt-4o", "name": "GPT-4o Base"},
+        {"not-a-dict"},
+    ]
+    mod.update_latest_models_cache(models)
+    assert set(mod._LATEST_MODELS_CACHE.keys()) == {"gpt-4o", "claude"}
+    assert mod._LATEST_MODELS_CACHE["gpt-4o"]["name"] == "GPT-4o Override"
+    _teardown_summary_model_cache()
+
+
+def test_update_latest_models_cache_clears_on_update():
+    _teardown_summary_model_cache()
+    mod.update_latest_models_cache([{"id": "a", "name": "A"}])
+    assert "a" in mod._LATEST_MODELS_CACHE
+    mod.update_latest_models_cache([{"id": "b", "name": "B"}])
+    assert "a" not in mod._LATEST_MODELS_CACHE
+    assert "b" in mod._LATEST_MODELS_CACHE
+    _teardown_summary_model_cache()
+
+
+def test_update_latest_models_cache_ignores_empty():
+    _teardown_summary_model_cache()
+    mod.update_latest_models_cache([{"id": "a", "name": "A"}])
+    assert "a" in mod._LATEST_MODELS_CACHE
+    mod.update_latest_models_cache([])
+    assert "a" in mod._LATEST_MODELS_CACHE  # empty input does not wipe
+    _teardown_summary_model_cache()
+
+
+def test_get_summary_model_options_excludes_wrappers_for_non_default_function_id(monkeypatch):
+    """When loaded as function_<custom_id>, wrapper models for that id must be excluded."""
+    _teardown_summary_model_cache()
+    models = {
+        "gpt-4o": {"id": "gpt-4o", "name": "GPT-4o"},
+        "custom_pipe.gpt-4o": {
+            "id": "custom_pipe.gpt-4o",
+            "name": "Custom Pipe GPT-4o",
+        },
+        "auto_compact.claude": {
+            "id": "auto_compact.claude",
+            "name": "Auto Compact Claude",
+        },
+    }
+    mod.update_latest_models_cache(list(models.values()))
+    monkeypatch.setattr(mod, "_iter_cache_models_from_state", lambda state: list(models.values()))
+    monkeypatch.setitem(sys.modules, "open_webui.main", types.SimpleNamespace(app=types.SimpleNamespace(state=object())))
+
+    monkeypatch.setattr(mod.Pipe.Valves, "__module__", "function_custom_pipe")
+    options = mod.Pipe.Valves.get_summary_model_options()
+    values = [opt["value"] for opt in options]
+    assert "gpt-4o" in values
+    assert "custom_pipe.gpt-4o" not in values
+    # default-id wrappers are NOT this instance's own, so they remain visible
+    assert "auto_compact.claude" in values
+    _teardown_summary_model_cache()
+
+
+def test_refresh_latest_models_cache_from_app_state_replaces_stale_populated_cache(monkeypatch):
+    """Schema-time refresh should repair a stale non-empty pipes() snapshot."""
+    _teardown_summary_model_cache()
+    mod.update_latest_models_cache([{"id": "base-only", "name": "Base Only"}])
+
+    fake_models = [
+        {"id": "custom-preset", "name": "Custom Preset"},
+        {"id": "base-only", "name": "Base Override"},
+        {"id": "base-only", "name": "Base Provider"},
+    ]
+
+    def _fake_iter(state):
+        return fake_models
+
+    monkeypatch.setattr(mod, "_iter_cache_models_from_state", _fake_iter)
+    monkeypatch.setitem(sys.modules, "open_webui.main", types.SimpleNamespace(app=types.SimpleNamespace(state=object())))
+
+    mod.refresh_latest_models_cache_from_app_state()
+    assert set(mod._LATEST_MODELS_CACHE.keys()) == {"custom-preset", "base-only"}
+    assert mod._LATEST_MODELS_CACHE["base-only"]["name"] == "Base Override"
+    _teardown_summary_model_cache()
+
+
+def test_refresh_latest_models_cache_from_app_state_keeps_existing_on_empty_state(monkeypatch):
+    _teardown_summary_model_cache()
+    mod.update_latest_models_cache([{"id": "existing", "name": "Existing"}])
+
+    monkeypatch.setattr(mod, "_iter_cache_models_from_state", lambda state: [])
+    monkeypatch.setitem(sys.modules, "open_webui.main", types.SimpleNamespace(app=types.SimpleNamespace(state=object())))
+
+    mod.refresh_latest_models_cache_from_app_state()
+    assert set(mod._LATEST_MODELS_CACHE.keys()) == {"existing"}
+    _teardown_summary_model_cache()
+
+
+def test_refresh_latest_models_cache_from_app_state_silent_on_failure(monkeypatch):
+    _teardown_summary_model_cache()
+
+    def _raise_import_error(*args, **kwargs):
+        raise ImportError("no app")
+
+    monkeypatch.setattr(mod, "_iter_cache_models_from_state", _raise_import_error)
+    monkeypatch.setitem(sys.modules, "open_webui.main", types.SimpleNamespace(app=types.SimpleNamespace(state=object())))
+
+    # Should not raise
+    mod.refresh_latest_models_cache_from_app_state()
+    assert len(mod._LATEST_MODELS_CACHE) == 0
+    _teardown_summary_model_cache()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error_chunk",

@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.6
+version: 0.5.7
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -205,6 +205,10 @@ _GENERATION_LOCKS: dict[tuple[str, str, str, str, str, str], asyncio.Lock] = {}
 _SOFT_PREFETCH_TASKS: set[asyncio.Task] = set()
 _SOFT_PREFETCH_INFLIGHT_KEYS: set[tuple[str, str, str, str, str, str]] = set()
 _MESSAGE_TOKEN_ESTIMATE_CACHE: dict[tuple[str, str, str], int] = {}
+# Module-level snapshot of the latest model dict seen during pipe()/pipes()
+# processing. Populated opportunistically so the Valves dropdown for
+# summary_model can list real models without request access at schema time.
+_LATEST_MODELS_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def get_generation_lock(key: tuple[str, str, str, str, str, str]) -> asyncio.Lock:
@@ -3117,6 +3121,58 @@ def filter_target_models(models: Iterable[dict[str, Any]], valves: Any, *, pipe_
         seen.add(model_id)
         targets.append(model)
     return targets
+
+
+def update_latest_models_cache(models: Iterable[dict[str, Any]]) -> None:
+    """Snapshot the latest model dict for Valves dropdown population."""
+    snapshot: dict[str, dict[str, Any]] = {}
+    for raw in models:
+        if not isinstance(raw, dict):
+            continue
+        mid = _model_id(raw)
+        if mid and mid not in snapshot:
+            snapshot[mid] = raw
+    if snapshot:
+        _LATEST_MODELS_CACHE.clear()
+        _LATEST_MODELS_CACHE.update(snapshot)
+
+
+def refresh_latest_models_cache_from_app_state() -> None:
+    """Refresh the dropdown model snapshot from Core's current app.state registries.
+
+    Narrowly scoped: reads exclusively from _iter_cache_models_from_state(app.state)
+    and performs no provider fetch, DB lookup, or async wait. If Core state is not
+    importable or has no models yet, keep the existing snapshot unchanged.
+    """
+    try:
+        from open_webui.main import app
+
+        models = _iter_cache_models_from_state(app.state)
+    except Exception:
+        return
+    update_latest_models_cache(models)
+
+
+def build_summary_model_options(
+    models: dict[str, dict[str, Any]],
+    *,
+    pipe_function_id: str = PIPE_FUNCTION_ID,
+) -> list[dict[str, str]]:
+    """Build dropdown options for summary_model, excluding wrapper and arena models."""
+    options: list[dict[str, str]] = []
+    for mid, model in sorted(models.items()):
+        if not isinstance(model, dict):
+            continue
+        if is_generated_wrapper_model_id(mid, pipe_function_id=pipe_function_id):
+            continue
+        if _is_based_on_generated_wrapper(model, pipe_function_id=pipe_function_id):
+            continue
+        if _is_arena_model(model):
+            continue
+        name = str(model.get("name") or mid)
+        label = f"{name} ({mid})" if name != mid else mid
+        options.append({"value": mid, "label": label})
+    return options
 
 
 def _grant_to_dict(grant: Any) -> dict[str, Any] | None:
@@ -8322,7 +8378,19 @@ class Pipe:
         )
         summary_model: str = Field(
             default="",
-            description="Optional Open WebUI model for summarization. Recommended empty: use the same underlying target model this wrapper calls, preserving quality and prompt-cache reuse for cost efficiency.",
+            description=(
+                "Optional Open WebUI model for summarization. Recommended default: use the same "
+                "underlying target model this wrapper calls, preserving quality and prompt-cache "
+                "reuse for cost efficiency. When a summary model is selected, per-user access "
+                "to that model is not checked; ensure it is acceptable for all users who can "
+                "reach any wrapped target."
+            ),
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": "get_summary_model_options",
+                }
+            },
         )
         trigger_total_tokens: int = Field(
             default=100000,
@@ -8425,6 +8493,14 @@ class Pipe:
             parse_trigger_total_tokens_overrides(value)
             return value
 
+        @classmethod
+        def get_summary_model_options(cls) -> list[dict[str, str]]:
+            pipe_function_id = pipe_function_id_from_module_name(getattr(cls, "__module__", None))
+            refresh_latest_models_cache_from_app_state()
+            return build_summary_model_options(
+                _LATEST_MODELS_CACHE, pipe_function_id=pipe_function_id
+            )
+
         pass
 
     def __init__(self):
@@ -8453,6 +8529,7 @@ class Pipe:
                 initial_provider_caches=initial_provider_caches,
             )
         targets = filter_target_models(model_candidates, self.valves, pipe_function_id=pipe_function_id)
+        update_latest_models_cache(model_candidates)
         await sync_wrapper_model_records(pipe_function_id=pipe_function_id, target_models=targets, valves=self.valves)
 
         entries: list[dict[str, str]] = []
@@ -8514,6 +8591,7 @@ class Pipe:
             return _error_response("Model not found", code="model_access_denied")
 
         models = await _model_dict_from_request(__request__)
+        update_latest_models_cache(models.values())
         try:
             summary_model_id = validate_summary_model_id(self.valves.summary_model, identity.target_model_id, models)
         except ValueError as exc:
