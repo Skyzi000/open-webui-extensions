@@ -99,6 +99,24 @@ def dummy_request():
     )
 
 
+def stub_open_webui_config_get(
+    monkeypatch,
+    *,
+    tool_server_connections=None,
+    terminal_server_connections=None,
+):
+    from open_webui.models.config import Config
+
+    async def fake_get(key, default=None):
+        if key == "tool_server.connections":
+            return tool_server_connections if tool_server_connections is not None else default
+        if key == "terminal_server.connections":
+            return terminal_server_connections if terminal_server_connections is not None else default
+        return default
+
+    monkeypatch.setattr(Config, "get", staticmethod(fake_get))
+
+
 @pytest.mark.asyncio
 async def test_sub_agent_execute_tool_call_terminal_tuple_and_event():
     events = []
@@ -322,21 +340,22 @@ async def test_sub_agent_resolve_mcp_tools_supports_oauth_2_1_static(monkeypatch
     monkeypatch.setitem(sys.modules, "open_webui.utils.mcp.client", fake_mcp_client_module)
     monkeypatch.setattr(utils_package, "mcp", fake_mcp_package, raising=False)
 
+    connections = [
+        {
+            "type": "mcp",
+            "url": "https://mcp.example.com",
+            "auth_type": "oauth_2.1_static",
+            "headers": {"X-Test": "1"},
+            "config": {"enable": True},
+            "info": {"id": "suite:ctx7"},
+        }
+    ]
+    stub_open_webui_config_get(monkeypatch, tool_server_connections=connections)
+
     request = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
-                config=SimpleNamespace(
-                    TOOL_SERVER_CONNECTIONS=[
-                        {
-                            "type": "mcp",
-                            "url": "https://mcp.example.com",
-                            "auth_type": "oauth_2.1_static",
-                            "headers": {"X-Test": "1"},
-                            "config": {"enable": True},
-                            "info": {"id": "suite:ctx7"},
-                        }
-                    ],
-                ),
+                config=SimpleNamespace(TOOL_SERVER_CONNECTIONS=[]),
                 oauth_client_manager=FakeOAuthClientManager(),
             )
         )
@@ -436,22 +455,23 @@ async def test_resolve_mcp_tools_supports_legacy_tool_server_access(
     monkeypatch.setitem(sys.modules, "open_webui.utils.mcp.client", fake_mcp_client_module)
     monkeypatch.setattr(utils_package, "mcp", fake_mcp_package, raising=False)
 
+    connections = [
+        {
+            "type": "mcp",
+            "url": "https://mcp.example.com",
+            "auth_type": "bearer",
+            "key": "legacy-token",
+            "headers": {"X-Test": "1"},
+            "config": {"enable": True},
+            "info": {"id": "suite:ctx7"},
+        }
+    ]
+    stub_open_webui_config_get(monkeypatch, tool_server_connections=connections)
+
     request = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
-                config=SimpleNamespace(
-                    TOOL_SERVER_CONNECTIONS=[
-                        {
-                            "type": "mcp",
-                            "url": "https://mcp.example.com",
-                            "auth_type": "bearer",
-                            "key": "legacy-token",
-                            "headers": {"X-Test": "1"},
-                            "config": {"enable": True},
-                            "info": {"id": "suite:ctx7"},
-                        }
-                    ],
-                ),
+                config=SimpleNamespace(TOOL_SERVER_CONNECTIONS=[]),
             )
         )
     )
@@ -480,6 +500,88 @@ async def test_resolve_mcp_tools_supports_legacy_tool_server_access(
 
     await tool_module.cleanup_mcp_clients(mcp_clients)
     assert disconnected == [True]
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_resolve_mcp_tools_falls_back_to_legacy_config(
+    monkeypatch, dummy_request
+):
+    from types import ModuleType
+
+    import open_webui
+    import open_webui.utils.access_control as ow_ac
+
+    connected = []
+
+    class FakeMCPClient:
+        async def connect(self, url: str, headers=None):
+            connected.append({"url": url, "headers": headers})
+
+        async def list_tool_specs(self):
+            return [
+                {
+                    "name": "lookup_docs",
+                    "description": "Lookup docs",
+                    "parameters": {"properties": {"query": {"type": "string"}}},
+                }
+            ]
+
+    async def fake_has_connection_access(user, connection, user_group_ids=None):
+        return True
+
+    stub_open_webui_config_get(monkeypatch, tool_server_connections=None)
+    monkeypatch.setattr(ow_ac, "has_connection_access", fake_has_connection_access)
+
+    utils_package = open_webui.utils
+    fake_misc_module = ModuleType("open_webui.utils.misc")
+    fake_misc_module.is_string_allowed = lambda value, allowlist: True
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", fake_misc_module)
+    monkeypatch.setattr(utils_package, "misc", fake_misc_module, raising=False)
+
+    fake_headers_module = ModuleType("open_webui.utils.headers")
+    fake_headers_module.include_user_info_headers = lambda headers, user: headers
+    monkeypatch.setitem(sys.modules, "open_webui.utils.headers", fake_headers_module)
+    monkeypatch.setattr(utils_package, "headers", fake_headers_module, raising=False)
+
+    fake_mcp_package = ModuleType("open_webui.utils.mcp")
+    fake_mcp_client_module = ModuleType("open_webui.utils.mcp.client")
+    fake_mcp_client_module.MCPClient = FakeMCPClient
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp", fake_mcp_package)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp.client", fake_mcp_client_module)
+    monkeypatch.setattr(utils_package, "mcp", fake_mcp_package, raising=False)
+
+    dummy_request.app.state.config.TOOL_SERVER_CONNECTIONS = [
+        {
+            "type": "mcp",
+            "url": "https://legacy-mcp.example.com",
+            "auth_type": "bearer",
+            "key": "legacy-token",
+            "headers": {"X-Test": "1"},
+            "config": {"enable": True},
+            "info": {"id": "legacy"},
+        }
+    ]
+
+    tools_dict, clients = await sub_agent.resolve_mcp_tools(
+        request=dummy_request,
+        user=SimpleNamespace(id="u1", role="user"),
+        mcp_tool_ids=["server:mcp:legacy"],
+        extra_params={},
+        metadata={},
+        debug=False,
+    )
+
+    assert connected == [
+        {
+            "url": "https://legacy-mcp.example.com",
+            "headers": {
+                "Authorization": "Bearer legacy-token",
+                "X-Test": "1",
+            },
+        }
+    ]
+    assert "legacy_lookup_docs" in tools_dict
+    assert "legacy" in clients
 
 
 @pytest.mark.asyncio
@@ -1405,22 +1507,25 @@ async def test_parallel_tools_run_tools_parallel_resolves_mcp_tools(
     monkeypatch.setitem(sys.modules, "open_webui.utils.mcp.client", fake_mcp_client_module)
     monkeypatch.setattr(utils_package, "mcp", fake_mcp_package, raising=False)
 
+    connections = [
+        {
+            "type": "mcp",
+            "url": "https://mcp.example.com",
+            "auth_type": "bearer",
+            "key": "mcp-token",
+            "headers": {"X-Test": "1"},
+            "config": {"enable": True},
+            "info": {"id": "suite:ctx7"},
+        }
+    ]
+    stub_open_webui_config_get(monkeypatch, tool_server_connections=connections)
+
     request = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
                 config=SimpleNamespace(
                     TERMINAL_SERVER_CONNECTIONS=[],
-                    TOOL_SERVER_CONNECTIONS=[
-                        {
-                            "type": "mcp",
-                            "url": "https://mcp.example.com",
-                            "auth_type": "bearer",
-                            "key": "mcp-token",
-                            "headers": {"X-Test": "1"},
-                            "config": {"enable": True},
-                            "info": {"id": "suite:ctx7"},
-                        }
-                    ],
+                    TOOL_SERVER_CONNECTIONS=[],
                 ),
             )
         )
@@ -1720,7 +1825,7 @@ async def test_sub_agent_mcp_resolution_uses_core_tool_server_headers(
         raising=False,
     )
 
-    dummy_request.app.state.config.TOOL_SERVER_CONNECTIONS = [
+    connections = [
         {
             "type": "mcp",
             "url": "https://mcp.example.com",
@@ -1730,6 +1835,8 @@ async def test_sub_agent_mcp_resolution_uses_core_tool_server_headers(
             "headers": {"X-Template": "{{USER_EMAIL}}"},
         }
     ]
+    dummy_request.app.state.config.TOOL_SERVER_CONNECTIONS = connections
+    stub_open_webui_config_get(monkeypatch, tool_server_connections=connections)
     metadata = {"chat_id": "chat-1", "message_id": "msg-1"}
     extra_params = {"__metadata__": metadata, "__oauth_token__": {"access_token": "system"}}
     user = SimpleNamespace(id="u1", email="u1@example.com", role="user")
@@ -1801,7 +1908,7 @@ async def test_sub_agent_mcp_resolution_rejects_invalid_core_tool_server_headers
         raising=False,
     )
 
-    dummy_request.app.state.config.TOOL_SERVER_CONNECTIONS = [
+    connections = [
         {
             "type": "mcp",
             "url": "https://mcp.example.com",
@@ -1811,6 +1918,8 @@ async def test_sub_agent_mcp_resolution_rejects_invalid_core_tool_server_headers
             "config": {"enable": True},
         }
     ]
+    dummy_request.app.state.config.TOOL_SERVER_CONNECTIONS = connections
+    stub_open_webui_config_get(monkeypatch, tool_server_connections=connections)
 
     tools_dict, clients = await sub_agent.resolve_mcp_tools(
         request=dummy_request,
@@ -2336,3 +2445,9 @@ def test_builtin_knowledge_category_includes_list_knowledge(module_name, module)
 @pytest.mark.parametrize("tool_name", ["grep_knowledge_files", "kb_exec"])
 def test_builtin_knowledge_category_includes_v096_knowledge_tools(module_name, module, tool_name):
     assert tool_name in module.BUILTIN_TOOL_CATEGORIES["knowledge"], module_name
+
+
+@pytest.mark.parametrize(("module_name", "module"), BUILTIN_KNOWLEDGE_MODULES)
+@pytest.mark.parametrize("tool_name", ["list_memory_paths", "read_memory_path", "update_memory"])
+def test_builtin_memory_category_includes_v010_memory_tools(module_name, module, tool_name):
+    assert tool_name in module.BUILTIN_TOOL_CATEGORIES["memory"], module_name

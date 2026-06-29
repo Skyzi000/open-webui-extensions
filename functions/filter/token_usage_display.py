@@ -3,7 +3,7 @@ title: Token Usage Display
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Displays token usage from LLM response payload with automatic stream_options.include_usage injection. Shows usage percentage against model context window (fetched from LiteLLM or fallback). Display threshold configurable per user (default: show when ≥50%).
-version: 0.5.3
+version: 0.5.4
 license: MIT
 """
 
@@ -40,8 +40,38 @@ def _short_error_text(text: str, limit: int = 160) -> str:
     return t[: limit - 3] + "..."
 
 
-def _collect_known_prefix_ids(request: Any) -> set[str]:
+def _add_prefix_ids_from_api_configs(prefix_ids: set[str], api_configs: Any) -> None:
+    if not isinstance(api_configs, dict):
+        return
+
+    for value in api_configs.values():
+        if not isinstance(value, dict):
+            continue
+        prefix_id = value.get("prefix_id")
+        if isinstance(prefix_id, str) and prefix_id:
+            prefix_ids.add(prefix_id)
+
+
+async def _collect_known_prefix_ids(request: Any) -> set[str]:
     prefix_ids: set[str] = set()
+
+    try:
+        from open_webui.models.config import Config
+
+        config_values = await Config.get_many(
+            "openai.api_configs",
+            "ollama.api_configs",
+        )
+        if isinstance(config_values, dict):
+            _add_prefix_ids_from_api_configs(
+                prefix_ids, config_values.get("openai.api_configs")
+            )
+            _add_prefix_ids_from_api_configs(
+                prefix_ids, config_values.get("ollama.api_configs")
+            )
+    except Exception:
+        pass
+
     if request is None:
         return prefix_ids
 
@@ -51,20 +81,12 @@ def _collect_known_prefix_ids(request: Any) -> set[str]:
         return prefix_ids
 
     for attr in ("OPENAI_API_CONFIGS", "OLLAMA_API_CONFIGS"):
-        api_configs = getattr(config, attr, None)
-        if not isinstance(api_configs, dict):
-            continue
-        for value in api_configs.values():
-            if not isinstance(value, dict):
-                continue
-            prefix_id = value.get("prefix_id")
-            if isinstance(prefix_id, str) and prefix_id:
-                prefix_ids.add(prefix_id)
+        _add_prefix_ids_from_api_configs(prefix_ids, getattr(config, attr, None))
 
     return prefix_ids
 
 
-def _strip_open_webui_prefix_id(*, model: str, request: Any) -> str:
+async def _strip_open_webui_prefix_id(*, model: str, request: Any) -> str:
     """Strip Open WebUI connection Prefix ID exactly.
 
     Open WebUI applies Prefix ID as: '{prefix_id}.{model_id}'.
@@ -74,7 +96,7 @@ def _strip_open_webui_prefix_id(*, model: str, request: Any) -> str:
     if not isinstance(model, str) or not model:
         return ""
 
-    for prefix_id in _collect_known_prefix_ids(request):
+    for prefix_id in await _collect_known_prefix_ids(request):
         prefix = f"{prefix_id}."
         if model.startswith(prefix):
             return model[len(prefix) :]
@@ -254,7 +276,7 @@ def _parse_model_max_input_tokens_overrides(text: str) -> dict[str, int]:
     return mapping
 
 
-def _fallback_max_input_tokens_for_model(*, valves: Any, model: str, request: Any) -> int:
+async def _fallback_max_input_tokens_for_model(*, valves: Any, model: str, request: Any) -> int:
     """Return fallback max_input_tokens for a model.
 
     Priority:
@@ -275,7 +297,7 @@ def _fallback_max_input_tokens_for_model(*, valves: Any, model: str, request: An
 
     stripped = ""
     if isinstance(model, str) and model:
-        stripped = _strip_open_webui_prefix_id(model=model, request=request)
+        stripped = await _strip_open_webui_prefix_id(model=model, request=request)
     if stripped and stripped in overrides:
         return overrides[stripped]
 
@@ -435,7 +457,7 @@ class Filter:
         threshold = int(user_valves.display_threshold_percent)
 
         if max_input_tokens is None or max_input_tokens <= 0:
-            max_input_tokens = _fallback_max_input_tokens_for_model(
+            max_input_tokens = await _fallback_max_input_tokens_for_model(
                 valves=self.valves, model=model_text, request=__request__
             )
 
@@ -477,7 +499,7 @@ class Filter:
         model_candidates: list[str] = []
         if isinstance(model, str) and model:
             model_candidates.append(model)
-            stripped = _strip_open_webui_prefix_id(model=model, request=request)
+            stripped = await _strip_open_webui_prefix_id(model=model, request=request)
             if stripped and stripped != model:
                 model_candidates.append(stripped)
 

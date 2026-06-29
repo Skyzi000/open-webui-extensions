@@ -1,3 +1,6 @@
+import sys
+import types
+
 import pytest
 
 import httpx
@@ -85,6 +88,28 @@ def _make_request_with_prefix_ids(prefix_ids: list[str]):
     }
     req.app.state.config.OLLAMA_API_CONFIGS = {}
     return req
+
+
+def _install_open_webui_config(monkeypatch, *, openai_configs=None, ollama_configs=None):
+    class _Config:
+        @staticmethod
+        async def get_many(*keys: str):
+            values = {
+                "openai.api_configs": openai_configs or {},
+                "ollama.api_configs": ollama_configs or {},
+            }
+            return {key: values[key] for key in keys if key in values}
+
+    open_webui_module = types.ModuleType("open_webui")
+    models_module = types.ModuleType("open_webui.models")
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = _Config
+    open_webui_module.models = models_module
+    models_module.config = config_module
+
+    monkeypatch.setitem(sys.modules, "open_webui", open_webui_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
 
 
 @pytest.mark.asyncio
@@ -221,6 +246,35 @@ async def test_fallback_model_override_applies_to_stripped_name(emitter, events,
         __event_emitter__=emitter,
         __user__={"valves": {"enabled": True, "display_threshold_percent": 50}},
         __request__=request,
+    )
+
+    status = next(e for e in events if e.get("type") == "status")
+    desc = status["data"]["description"]
+    assert "Tokens: 120,000 / 200,000" in desc
+    assert "(60.0%)" in desc
+
+
+@pytest.mark.asyncio
+async def test_fallback_model_override_strips_prefix_from_open_webui_config(
+    monkeypatch, emitter, events
+):
+    _install_open_webui_config(
+        monkeypatch,
+        openai_configs={"0": {"prefix_id": "LiteLLM"}},
+        ollama_configs={},
+    )
+
+    f = Filter()
+    f.valves.proxy_url = ""
+    f.valves.model_max_input_tokens_overrides = "gpt-4o-mini=200000"
+
+    body = {"model": "LiteLLM.gpt-4o-mini", "usage": {"total_tokens": 120000}}
+
+    await f.outlet(
+        body,
+        __event_emitter__=emitter,
+        __user__={"valves": {"enabled": True, "display_threshold_percent": 50}},
+        __request__=_Dummy(),
     )
 
     status = next(e for e in events if e.get("type") == "status")
@@ -898,5 +952,3 @@ async def test_usage_with_only_prompt_and_completion_tokens():
     status = next(e for e in events if e.get("type") == "status")
     desc = status["data"]["description"]
     assert "Tokens: 300 / 100,000" in desc
-
-

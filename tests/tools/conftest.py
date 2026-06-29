@@ -118,6 +118,15 @@ def install_open_webui_tool_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "open_webui.models.functions", functions_module)
     monkeypatch.setattr(models_package, "functions", functions_module, raising=False)
 
+    class _Config:
+        @staticmethod
+        async def get(key, default=None):
+            return default
+
+    config_module = _build_module("open_webui.models.config", Config=_Config)
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setattr(models_package, "config", config_module, raising=False)
+
     filter_module = _build_module("open_webui.utils.filter")
     monkeypatch.setitem(sys.modules, "open_webui.utils.filter", filter_module)
     monkeypatch.setattr(utils_package, "filter", filter_module, raising=False)

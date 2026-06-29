@@ -31,7 +31,16 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "view_knowledge_file",
     },
     "chat": {"search_chats", "view_chat"},
-    "memory": {"search_memories", "add_memory", "replace_memory_content", "delete_memory", "list_memories"},
+    "memory": {
+        "search_memories",
+        "list_memory_paths",
+        "read_memory_path",
+        "list_memories",
+        "update_memory",
+        "add_memory",
+        "replace_memory_content",
+        "delete_memory",
+    },
     "notes": {
         "search_notes",
         "view_note",

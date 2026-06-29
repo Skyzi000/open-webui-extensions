@@ -165,6 +165,31 @@ async def _build_mcp_headers_legacy(
     return headers
 
 
+async def _get_tool_server_connections(request: Request) -> list[dict]:
+    try:
+        from open_webui.models.config import Config
+    except ImportError:
+        Config = None
+
+    if Config is not None:
+        try:
+            connections = await _mcp_maybe_await(
+                Config.get("tool_server.connections", None)
+            )
+            if connections is not None:
+                return connections if isinstance(connections, list) else []
+        except Exception as exc:
+            _mcp_tools_log.debug(
+                f"Could not read tool_server.connections from Config: {exc}"
+            )
+
+    legacy_connections = (
+        getattr(getattr(request.app.state, "config", None), "TOOL_SERVER_CONNECTIONS", [])
+        or []
+    )
+    return legacy_connections if isinstance(legacy_connections, list) else []
+
+
 async def resolve_mcp_tools(
     request: Request,
     user: Any,
@@ -209,10 +234,7 @@ async def resolve_mcp_tools(
     extra_params = extra_params or {}
     mcp_tools_dict: dict[str, dict] = {}
     mcp_clients: dict[str, Any] = {}
-    server_connections = (
-        getattr(getattr(request.app.state, "config", None), "TOOL_SERVER_CONNECTIONS", [])
-        or []
-    )
+    server_connections = await _get_tool_server_connections(request)
 
     ordered_server_ids: list[str] = []
     seen_server_ids: set[str] = set()
