@@ -837,14 +837,21 @@ async def test_sync_wrapper_model_records_keeps_stale_wrapper_active_when_target
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_tracks_multiple_target_hide_owners(monkeypatch):
+async def test_sync_wrapper_model_records_does_not_claim_target_hidden_by_other_pipe(monkeypatch):
     records = {
         "target": FakeModelForm(
             id="target",
             base_model_id="provider-target",
             name="Target",
             params=FakeModelParams(),
-            meta=FakeModelMeta(),
+            meta=FakeModelMeta(
+                hidden=True,
+                auto_compaction_target_hidden_by={
+                    "pipe_function_id": "compact_a",
+                    "had_hidden": False,
+                    "previous_hidden": False,
+                },
+            ),
             access_grants=[],
             is_active=True,
         )
@@ -854,11 +861,6 @@ async def test_sync_wrapper_model_records_tracks_multiple_target_hide_owners(mon
     valves.hide_wrapped_target_models = True
 
     await mod.sync_wrapper_model_records(
-        pipe_function_id="compact_a",
-        target_models=[{"id": "target", "name": "Target"}],
-        valves=valves,
-    )
-    await mod.sync_wrapper_model_records(
         pipe_function_id="compact_b",
         target_models=[{"id": "target", "name": "Target"}],
         valves=valves,
@@ -867,25 +869,10 @@ async def test_sync_wrapper_model_records_tracks_multiple_target_hide_owners(mon
     target_meta = records["target"].meta.model_dump(exclude_unset=True)
     assert target_meta["hidden"] is True
     assert target_meta["auto_compaction_target_hidden_by"] == {
-        "pipe_function_ids": ["compact_a", "compact_b"],
+        "pipe_function_id": "compact_a",
         "had_hidden": False,
         "previous_hidden": False,
     }
-
-    await mod.sync_wrapper_model_records(
-        pipe_function_id="compact_a",
-        target_models=[],
-        valves=mod.Pipe.Valves(),
-    )
-
-    target_meta = records["target"].meta.model_dump(exclude_unset=True)
-    assert target_meta["hidden"] is True
-    assert target_meta["auto_compaction_target_hidden_by"] == {
-        "pipe_function_id": "compact_b",
-        "had_hidden": False,
-        "previous_hidden": False,
-    }
-    assert records[mod.build_wrapper_model_id("compact_a", "target")].is_active is False
     assert records[mod.build_wrapper_model_id("compact_b", "target")].is_active is True
 
     await mod.sync_wrapper_model_records(
@@ -895,20 +882,31 @@ async def test_sync_wrapper_model_records_tracks_multiple_target_hide_owners(mon
     )
 
     target_meta = records["target"].meta.model_dump(exclude_unset=True)
-    assert "hidden" not in target_meta
-    assert "auto_compaction_target_hidden_by" not in target_meta
+    assert target_meta["hidden"] is True
+    assert target_meta["auto_compaction_target_hidden_by"] == {
+        "pipe_function_id": "compact_a",
+        "had_hidden": False,
+        "previous_hidden": False,
+    }
     assert records[mod.build_wrapper_model_id("compact_b", "target")].is_active is False
 
 
 @pytest.mark.asyncio
-async def test_hide_target_model_record_merges_owners_from_current_record_when_given_stale_snapshot(monkeypatch):
+async def test_hide_target_model_record_preserves_foreign_marker_with_stale_snapshot(monkeypatch):
     records = {
         "target": FakeModelForm(
             id="target",
             base_model_id="provider-target",
             name="Target",
             params=FakeModelParams(),
-            meta=FakeModelMeta(),
+            meta=FakeModelMeta(
+                hidden=True,
+                auto_compaction_target_hidden_by={
+                    "pipe_function_id": "compact_a",
+                    "had_hidden": False,
+                    "previous_hidden": False,
+                },
+            ),
             access_grants=[],
             is_active=True,
         )
@@ -916,15 +914,6 @@ async def test_hide_target_model_record_merges_owners_from_current_record_when_g
     install_fake_open_webui_model_modules(monkeypatch, records)
     Models = sys.modules["open_webui.models.models"].Models
 
-    stale_snapshot_a = FakeModelForm(
-        id="target",
-        base_model_id="provider-target",
-        name="Target",
-        params=FakeModelParams(),
-        meta=FakeModelMeta(),
-        access_grants=[],
-        is_active=True,
-    )
     stale_snapshot_b = FakeModelForm(
         id="target",
         base_model_id="provider-target",
@@ -940,16 +929,6 @@ async def test_hide_target_model_record_merges_owners_from_current_record_when_g
         ModelForm=FakeModelForm,
         ModelMeta=FakeModelMeta,
         ModelParams=FakeModelParams,
-        pipe_function_id="compact_a",
-        target_model={"id": "target", "name": "Target"},
-        target_model_info=stale_snapshot_a,
-        owner_user_id="function-owner",
-    )
-    await mod._hide_target_model_record(
-        Models=Models,
-        ModelForm=FakeModelForm,
-        ModelMeta=FakeModelMeta,
-        ModelParams=FakeModelParams,
         pipe_function_id="compact_b",
         target_model={"id": "target", "name": "Target"},
         target_model_info=stale_snapshot_b,
@@ -959,7 +938,7 @@ async def test_hide_target_model_record_merges_owners_from_current_record_when_g
     target_meta = records["target"].meta.model_dump(exclude_unset=True)
     assert target_meta["hidden"] is True
     assert target_meta["auto_compaction_target_hidden_by"] == {
-        "pipe_function_ids": ["compact_a", "compact_b"],
+        "pipe_function_id": "compact_a",
         "had_hidden": False,
         "previous_hidden": False,
     }

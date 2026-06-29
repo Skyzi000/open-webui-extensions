@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.10
+version: 0.5.11
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -3504,6 +3504,7 @@ def _target_hidden_marker(meta: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _target_hidden_marker_owner_ids(marker: dict[str, Any]) -> list[str]:
+    # pipe_function_ids is a legacy marker shape; new hide claims are single-owner.
     owner_ids: list[str] = []
     pipe_function_ids = marker.get("pipe_function_ids")
     if isinstance(pipe_function_ids, list):
@@ -3562,13 +3563,14 @@ def _mark_target_model_hidden_by_pipe(
         owns_created_model_record = created_model_record
     else:
         owner_ids = _target_hidden_marker_owner_ids(marker)
+        if owner_ids and pipe_function_id not in owner_ids:
+            return
         had_hidden, previous_hidden, owns_created_model_record = _target_hidden_marker_restore_state(marker)
         if not owner_ids:
             had_hidden = "hidden" in meta
             previous_hidden = bool(meta.get("hidden", False))
             owns_created_model_record = created_model_record
-        if pipe_function_id not in owner_ids:
-            owner_ids.append(pipe_function_id)
+            owner_ids = [pipe_function_id]
     marker = _build_target_hidden_marker(
         pipe_function_ids=owner_ids,
         had_hidden=had_hidden,
@@ -8392,9 +8394,11 @@ class Pipe:
             default=False,
             description=(
                 "Automatically set meta.hidden=true on raw target models wrapped by this pipe so chat model pickers show compact wrappers instead. "
-                "Hidden target models remain available for admin/workspace base-model configuration. Before deleting or disabling this Pipe, "
+                "Hidden target models remain available for admin/workspace base-model configuration. Use one AutoCompact Pipe per environment for "
+                "this hiding feature; other AutoCompact copies with different function IDs are not coordinated for target restoration. "
+                "Before deleting or disabling this Pipe, "
                 "turn this off and let the model list refresh once so targets hidden by this Pipe are restored to their previous visibility; "
-                "targets that were already hidden, or that another AutoCompact Pipe still hides, intentionally stay hidden. Otherwise raw models may remain hidden."
+                "targets that were already hidden or owned by another Pipe's hide marker intentionally stay hidden. Otherwise raw models may remain hidden."
             ),
         )
         summary_model: str = Field(
