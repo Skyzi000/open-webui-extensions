@@ -3414,7 +3414,7 @@ def test_summary_model_validation_rejects_missing_configured_model():
 def test_valve_defaults_are_conservative_for_v1_continuation():
     valves = mod.Pipe.Valves()
 
-    assert valves.trigger_total_tokens == 100000
+    assert valves.trigger_total_tokens == mod.DEFAULT_TRIGGER_TOTAL_TOKENS
     assert valves.force_include_usage is True
     assert valves.compact_task_prompts_from_task_body is False
     assert valves.summary_tool_policy == "fallback_on_tool_call"
@@ -3433,14 +3433,14 @@ def test_trigger_total_tokens_overrides_default_is_empty_string():
 def test_soft_trigger_ratio_default_resolves_against_hard_trigger():
     valves = mod.Pipe.Valves()
 
-    assert valves.soft_trigger_ratio == 0.8
+    assert valves.soft_trigger_ratio == mod.DEFAULT_SOFT_TRIGGER_RATIO
     assert (
         mod.resolve_soft_trigger_total_tokens(
             valves,
             {"id": "target", "name": "Target"},
             valves.trigger_total_tokens,
         )
-        == 80000
+        == int(mod.DEFAULT_TRIGGER_TOTAL_TOKENS * mod.DEFAULT_SOFT_TRIGGER_RATIO)
     )
 
 
@@ -3522,7 +3522,10 @@ def test_trigger_total_tokens_overrides_accepts_soft_trigger_ratio_without_hard_
 
     valves = mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
 
-    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-sonnet", "name": "Sonnet"}) == 100000
+    assert (
+        mod.resolve_trigger_total_tokens(valves, {"id": "claude-sonnet", "name": "Sonnet"})
+        == valves.trigger_total_tokens
+    )
     assert (
         mod.resolve_soft_trigger_total_tokens(
             valves,
@@ -12379,8 +12382,8 @@ async def test_status_compare_estimate_mode(monkeypatch, pipe_request, pipe_user
     assert result == {"ok": True}
     assert len(estimate_calls) == 1
     compacting = _status_events(events)[0]["data"]
-    assert "usage" in compacting["description"]
-    assert "tiktoken" in compacting["description"]
+    assert "observed usage" in compacting["description"]
+    assert "candidate" in compacting["description"]
     assert compacting["tokens"]["usage"] == 1250
     assert compacting["tokens"]["estimate"] == 1280
     assert compacting["tokens"]["pct_of_hard"] == 128.0
@@ -12407,8 +12410,8 @@ async def test_status_compare_estimate_and_before_after_combined(monkeypatch, pi
     assert result == {"ok": True}
     compacted = _status_events(events)[-1]["data"]
     assert compacted["action"] == "auto_compaction_compacted"
-    assert "usage" in compacted["description"]
-    assert "tiktoken" in compacted["description"]
+    assert "observed usage" in compacted["description"]
+    assert "candidate" in compacted["description"]
     assert "→" in compacted["description"]
     assert "500" in compacted["description"]
     assert compacted["tokens"]["after"] == 500
@@ -12446,7 +12449,7 @@ def test_format_token_suffix_summary_mode_with_compare_estimate():
 
     assert (
         mod._format_token_suffix(ctx, after=50, compare_estimate=True, summary=50)
-        == "(usage 850 · tiktoken ≈860 / 1,000 · 85% · summary ≈50 tokens)"
+        == "(observed usage 850 · candidate ≈860 / 1,000 · 85% · summary ≈50 tokens)"
     )
 
 

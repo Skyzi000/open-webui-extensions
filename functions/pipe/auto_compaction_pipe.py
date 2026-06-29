@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.7
+version: 0.5.8
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -91,6 +91,8 @@ SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
 SOURCE_HASH_FAMILY = "canonical-json-v1"
 PROFILE_HASH_FAMILY = "checkpoint-profile-v1"
 MAX_CONTEXT_RETRY_ATTEMPTS = 2
+DEFAULT_TRIGGER_TOTAL_TOKENS = 256000
+DEFAULT_SOFT_TRIGGER_RATIO = 0.5
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES = 512
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT = 32
 SUMMARY_META_FORMAT_VERSION_KEY = "summary_meta_format_version"
@@ -6134,22 +6136,22 @@ def _format_token_suffix(
     if summary is not None:
         summary_part = f"summary {_format_token_count(summary, approximate=True)} tokens"
         if compare_estimate and ctx.usage is not None and ctx.estimate is not None:
-            estimate_part = f"tiktoken ≈{ctx.estimate:,}"
+            estimate_part = f"candidate ≈{ctx.estimate:,}"
             pct_part = f" · {before_pct}%" if before_pct is not None else ""
-            return f"(usage {ctx.usage:,} · {estimate_part} / {hard_limit}{pct_part} · {summary_part})"
+            return f"(observed usage {ctx.usage:,} · {estimate_part} / {hard_limit}{pct_part} · {summary_part})"
 
         before = _format_before_token_count(ctx)
         pct_part = f" · {before_pct}%" if before_pct is not None and ctx.hard_limit > 0 else ""
         return f"({before} / {hard_limit} tokens{pct_part} · {summary_part})"
 
     if compare_estimate and ctx.usage is not None and ctx.estimate is not None:
-        estimate_part = f"tiktoken ≈{ctx.estimate:,}"
+        estimate_part = f"candidate ≈{ctx.estimate:,}"
         pct_part = f" · {before_pct}%" if before_pct is not None else ""
         if after is not None:
             estimate_part += f" → {_format_token_count(after, approximate=True)}"
             if ctx.hard_limit > 0:
                 pct_part += f" → {_round_half_up_int(after / ctx.hard_limit * 100)}%"
-        return f"(usage {ctx.usage:,} · {estimate_part} / {hard_limit}{pct_part})"
+        return f"(observed usage {ctx.usage:,} · {estimate_part} / {hard_limit}{pct_part})"
 
     before = _format_before_token_count(ctx)
     if after is not None:
@@ -8358,32 +8360,49 @@ class Pipe:
             default="auto",
             description=(
                 "Wrapper display name template. Use 'auto' to show the raw target name when hide_wrapped_target_models is on, "
-                "otherwise '{target_name} (AutoCompact)'. Available placeholders: {target_name}, {target_id}."
+                "otherwise '{target_name} (AutoCompact)'. Available placeholders: {target_name}, {target_id}. "
+                "Unsupported placeholders or Python format syntax fall back to the same name as 'auto'. "
+                "Blank or whitespace-only values are also treated as 'auto'. "
+                "With 'auto' and hidden targets, normal chat model pickers stay clean, but Workspace base-model dropdowns may still "
+                "show hidden raw targets with the same name; use an explicit template such as '{target_name} (AutoCompact)' if you "
+                "need those dropdowns disambiguated."
             ),
         )
         include_model_patterns: str = Field(
             default="",
-            description="Comma-separated shell-style patterns for target model id/name. Empty wraps all eligible models; when set, only matches are wrapped.",
+            description=(
+                "Comma/newline-separated patterns matched against the full target model id or name. "
+                "Only * and ? are wildcards; all other characters are literal. Empty wraps every eligible "
+                "target model except this Pipe's own AutoCompact wrappers, models/presets based on them, and "
+                "arena models; models from other pipes can still be wrapped."
+            ),
         )
         exclude_model_patterns: str = Field(
             default="",
-            description="Comma-separated shell-style patterns for target model id/name. Empty excludes nothing; applied after include, matches are not wrapped.",
+            description=(
+                "Comma/newline-separated patterns matched against the full target model id or name. "
+                "Only * and ? are wildcards; all other characters are literal. Empty excludes nothing; "
+                "applied after include_model_patterns, so matches are not wrapped."
+            ),
         )
         hide_wrapped_target_models: bool = Field(
             default=False,
             description=(
                 "Automatically set meta.hidden=true on raw target models wrapped by this pipe so chat model pickers show compact wrappers instead. "
-                "Hidden target models remain available for admin/workspace base-model configuration."
+                "Hidden target models remain available for admin/workspace base-model configuration. Before deleting or disabling this Pipe, "
+                "turn this off and let the model list refresh once so targets hidden by this Pipe are restored to their previous visibility; "
+                "targets that were already hidden, or that another AutoCompact Pipe still hides, intentionally stay hidden. Otherwise raw models may remain hidden."
             ),
         )
         summary_model: str = Field(
             default="",
             description=(
-                "Optional Open WebUI model for summarization. Recommended default: use the same "
-                "underlying target model this wrapper calls, preserving quality and prompt-cache "
-                "reuse for cost efficiency. When a summary model is selected, per-user access "
-                "to that model is not checked; ensure it is acceptable for all users who can "
-                "reach any wrapped target."
+                "Open WebUI model used for internal summarization. Keep this on Default to reuse the same "
+                "underlying target model this wrapper calls; that keeps summaries aligned with the model in "
+                "use and tries to preserve prompt-cache reuse where possible. Switching to Custom and "
+                "selecting a specific model does NOT check that model's per-user access, and internal "
+                "summary requests bypass filters; ensure the selected model is acceptable for all users "
+                "who can reach any wrapped target."
             ),
             json_schema_extra={
                 "input": {
@@ -8393,15 +8412,27 @@ class Pipe:
             },
         )
         trigger_total_tokens: int = Field(
-            default=100000,
+            default=DEFAULT_TRIGGER_TOTAL_TOKENS,
             ge=1,
-            description="Global usage-token threshold that starts compaction. Requires the provider/Open WebUI response to report accurate token usage. Override per model with trigger_total_tokens_overrides_json.",
+            description=(
+                "Global candidate-token threshold for foreground compaction. Decisions use the "
+                "checkpoint-applied, usage-anchored, or full-body local estimate for the payload about "
+                "to be sent; observed provider/Open WebUI usage is an anchor/context signal, not a "
+                "direct trigger by itself. Override per model with trigger_total_tokens_overrides_json."
+            ),
         )
         soft_trigger_ratio: float = Field(
-            default=0.8,
+            default=DEFAULT_SOFT_TRIGGER_RATIO,
             ge=0,
             lt=1,
-            description="Ratio of the effective trigger_total_tokens that starts background checkpoint prefetch before hard compaction. Set 0 to disable. Override per model with soft_trigger_ratio in trigger_total_tokens_overrides_json.",
+            description=(
+                "Ratio of the effective trigger_total_tokens that starts asynchronous background "
+                "summary generation without pausing the current request. Before forwarding, this uses the "
+                "candidate estimate; after a target response completes, that response's own usage can also "
+                "start it when it is >= soft and < hard. The summary is saved as a checkpoint and reused by "
+                "a later request if ready. Set 0, or a value that rounds to 0, to disable. Override per "
+                "model with soft_trigger_ratio in trigger_total_tokens_overrides_json."
+            ),
         )
         trigger_total_tokens_overrides_json: str = Field(
             default="",
@@ -8411,8 +8442,10 @@ class Pipe:
                 "model_patterns match against target model id/name (same as include/exclude); only * (any run) "
                 'and ? (single char) are wildcards and everything else is literal, so "[" needs no escaping: '
                 '"claude-opus-4-8[1m]" matches that exact id and "*[1m]" matches every id ending in "[1m]". '
-                "For each setting, overrides are evaluated top-to-bottom and the first matching override containing that setting wins; soft_trigger_ratio must be >= 0 and < 1. "
-                "Empty disables overrides. Invalid JSON or unknown keys are rejected on save."
+                "Each override requires non-empty model_patterns and at least one of trigger_total_tokens (integer >= 1) "
+                "or soft_trigger_ratio (finite number >= 0 and < 1); optional schema_version must be 1. For each setting, "
+                "overrides are evaluated top-to-bottom and the first matching override containing that setting wins. Empty disables overrides. "
+                "Invalid JSON, non-object roots, unknown keys, or invalid shapes are rejected on save."
             ),
         )
         force_include_usage: bool = Field(
@@ -8423,7 +8456,7 @@ class Pipe:
             default=False,
             description=(
                 "For supported Open WebUI task requests only, rebuild the task prompt from metadata.task_body "
-                "so checkpoints can be reused. If inlet/pipeline filters rewrite body.messages without "
+                "so checkpoints can be reused. If upstream filters or pipelines rewrite body.messages without "
                 "also updating metadata.task_body, those rewrites are not included in the rebuilt task prompt."
             ),
         )
@@ -8431,9 +8464,9 @@ class Pipe:
             default="fallback_on_tool_call",
             description=(
                 "Controls summary requests for tool-enabled chats. Forced tool_choice/function_call is disabled in all modes. "
-                "Recommended default fallback_on_tool_call keeps tool definitions on the first request to preserve "
-                "provider-visible shape and maximize prompt-cache reuse opportunities, then retries without tools only if the summary model emits a tool call. "
-                "always_strip removes tools before the first request. error_on_tool_call keeps tools and fails on tool calls."
+                "Recommended default fallback_on_tool_call keeps tools/functions on the first request to keep the request shape "
+                "stable and avoid disrupting prompt-cache reuse where possible, then retries without tools/functions only if the summary model emits a tool call. "
+                "always_strip removes tools/functions before the first request. error_on_tool_call keeps tools/functions and fails on tool calls."
             ),
         )
         summary_prompt: str = Field(
@@ -8449,12 +8482,21 @@ class Pipe:
         historical_message_excerpt_bytes: int = Field(
             default=DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
             ge=1,
-            description="Maximum UTF-8 bytes per saved historical user-message excerpt. New checkpoints store middle-truncated excerpts; saved excerpts are reused unchanged.",
+            description=(
+                "Maximum UTF-8 bytes per saved excerpt of each recent historical user message from "
+                "the summarized prefix. New checkpoints store middle-truncated excerpts; saved "
+                "excerpts are reused unchanged."
+            ),
         )
         historical_message_excerpt_count: int = Field(
             default=DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
             ge=0,
-            description="Maximum number of recent historical user-message excerpts saved in new checkpoints and inserted into compacted context. Set 0 to disable excerpts.",
+            description=(
+                "Maximum number of recent historical user-message excerpts from the summarized "
+                "prefix saved in new checkpoints and inserted into compacted context. Set 0 to stop "
+                "saving excerpts in new checkpoints; excerpts already stored in existing checkpoints "
+                "are still reused."
+            ),
         )
         token_status_visibility: Literal["compaction_only", "always"] = Field(
             default="compaction_only",
@@ -8462,28 +8504,30 @@ class Pipe:
                 "When to emit token-count status. 'compaction_only' (default) emits token "
                 "info only on existing compaction lifecycle events (compacting/compacted/"
                 "skipped/retry/prefetching/prefetched/failed), keeping normal requests silent. "
-                "'always' additionally emits one token-pressure status per normal request "
-                "(action auto_compaction_status) so you can watch context fill up before "
-                "compaction triggers. Has no effect on compaction decisions, only display."
+                "'always' additionally emits one token-pressure status per non-summary request "
+                "with a known count (action auto_compaction_status), including requests that later "
+                "compact. Has no effect on compaction decisions, only display."
             ),
         )
         token_status_detail: Literal["before", "before_after"] = Field(
             default="before",
             description=(
-                "Token detail shown on compaction events. 'before' (default) shows the "
+                "Token detail shown on compaction lifecycle status events. 'before' (default) shows the "
                 "pre-compaction count only, using values already computed for thresholding "
-                "(zero added cost). 'before_after' also shows the post-compaction count on "
-                "'compacted' events by running estimate_body_tokens_async once on the "
-                "compacted body (one extra estimate per foreground compaction)."
+                "(zero added cost). 'before_after' attempts to show the full post-compaction count on "
+                "'compacted' events by estimating the compacted body once, and the rendered summary-message "
+                "count on completed 'prefetched' events, when those estimates are available."
             ),
         )
         token_status_compare_estimate: bool = Field(
             default=False,
             description=(
-                "When true, show both the provider/Open WebUI usage total and the local "
-                "tiktoken estimate side by side so you can see the gap. Only shown when both "
-                "values are available. When the inlet cannot compute the candidate decision "
-                "estimate, enabling this computes a local estimate purely for display."
+                "When true, include both the observed provider/Open WebUI usage anchor and the "
+                "candidate token estimate in status payloads when available. These usually count "
+                "different request points, so use them for provenance/debugging, not as a direct "
+                "provider-vs-tiktoken accuracy comparison. If the candidate decision estimate is "
+                "otherwise unavailable but observed usage exists, enabling this computes a local "
+                "estimate purely for display and does not affect compaction decisions."
             ),
         )
 
