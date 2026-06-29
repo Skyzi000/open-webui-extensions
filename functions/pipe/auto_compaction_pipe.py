@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.8
+version: 0.5.9
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -6250,7 +6250,7 @@ async def extract_text_from_completion_response(response: Any, *, tools_enabled:
         saw_tool_call = False
         sse_parser = _SSEDataParser()
         media_type = getattr(response, "media_type", None) or response.headers.get("content-type", "")
-        is_sse_response = "text/event-stream" in media_type
+        is_sse_response = "text/event-stream" in str(media_type).lower()
         if not is_sse_response:
             await _close_stream_response(response)
             raise RuntimeError("Summary model did not return a structured OpenAI-compatible response")
@@ -8001,7 +8001,7 @@ async def _coerce_non_streaming_completion_response(response: Any, *, model_id: 
                     parts.append(delta)
 
         media_type = getattr(response, "media_type", None) or response.headers.get("content-type", "")
-        is_sse_response = "text/event-stream" in media_type
+        is_sse_response = "text/event-stream" in str(media_type).lower()
         sse_parser = _SSEJSONEventParser()
         try:
             async for raw_chunk in response.body_iterator:

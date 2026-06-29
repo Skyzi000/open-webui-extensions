@@ -5988,6 +5988,16 @@ async def test_extract_summary_text_from_streaming_response():
 
 
 @pytest.mark.asyncio
+async def test_extract_summary_text_accepts_mixed_case_sse_media_type():
+    async def chunks():
+        yield b'data: {"choices": [{"delta": {"content": "hello"}}]}\n\n'
+
+    response = StreamingResponse(chunks(), media_type="Text/Event-Stream")
+
+    assert await mod.extract_text_from_completion_response(response) == "hello"
+
+
+@pytest.mark.asyncio
 async def test_extract_summary_text_from_streamed_chat_completion_message():
     async def chunks():
         payload = {"choices": [{"message": {"role": "assistant", "content": "pipe summary"}}]}
