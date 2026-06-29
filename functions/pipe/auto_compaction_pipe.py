@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.9
+version: 0.5.10
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -5522,7 +5522,10 @@ async def _emit_source_events(
             continue
         if not (source_info.get("name", "") or source_info.get("id", "")):
             continue
-        await event_emitter({"type": "source", "data": source})
+        try:
+            await event_emitter({"type": "source", "data": source})
+        except Exception:
+            return
 
 
 def _displayable_sources(sources: Any) -> list[dict[str, Any]]:

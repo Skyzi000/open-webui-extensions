@@ -6733,6 +6733,83 @@ async def test_pipe_non_streaming_merges_manual_rag_sources_into_response(
 
 
 @pytest.mark.asyncio
+async def test_pipe_non_streaming_source_event_failure_still_returns_response(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def inject_target_file_context(
+        *,
+        body,
+        metadata_files,
+        request,
+        user,
+        event_emitter,
+        file_context_enabled=True,
+        emit_source_events=True,
+        **kwargs,
+    ):
+        injected = copy.deepcopy(body)
+        injected.setdefault("metadata", {})["sources"] = copy.deepcopy(sources)
+        return injected
+
+    async def forward_target(**kwargs):
+        return {
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "target",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    async def event_emitter(event):
+        raise RuntimeError("event channel closed")
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __event_emitter__=event_emitter,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert result["sources"] == sources
+
+
+@pytest.mark.asyncio
 async def test_pipe_non_streaming_error_does_not_merge_or_emit_manual_rag_sources(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
