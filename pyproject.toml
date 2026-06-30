@@ -25,6 +25,10 @@ extraPaths = ["src", "references/open-webui/backend"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 
+[[tool.uv.index]]
+url = "https://pypi.flatt.tech/simple/"
+default = true
+
 [tool.uv.sources]
 open-webui = { path = "references/open-webui", editable = true }
 open-webui-plugins-builder = { path = "open_webui_plugins_builder", editable = true }
