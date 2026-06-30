@@ -1,0 +1,9390 @@
+"""
+title: Auto Compact
+author: Skyzi000
+author_url: https://github.com/Skyzi000/open-webui-extensions
+description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
+version: 0.5.11
+license: MIT
+required_open_webui_version: 0.9.6
+"""
+
+from __future__ import annotations
+
+import asyncio
+import codecs
+import copy
+import hashlib
+import html
+import json
+import logging
+import math
+import re
+import time
+import uuid
+from contextlib import suppress
+from dataclasses import dataclass
+from html.parser import HTMLParser
+from types import SimpleNamespace
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
+
+from fastapi import HTTPException
+from open_webui.constants import TASKS
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Index,
+    Integer,
+    JSON,
+    MetaData,
+    Table,
+    Text,
+    UniqueConstraint,
+    delete,
+    insert,
+    or_,
+    select,
+    text as sql_text,
+    update,
+)
+from sqlalchemy import inspect as sqlalchemy_inspect
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+from sqlalchemy.schema import CreateIndex, CreateTable
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+
+try:
+    import markdown as _markdown_mod
+except Exception:
+    _markdown_mod = None
+
+
+PIPE_FUNCTION_ID = "auto_compact"
+CHECKPOINT_NAMESPACE = "skyzi000.open_webui_extensions.auto_compaction_pipe"
+CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_TABLE_NAME = "skyzi000_owui_ext_autocompact_checkpoint_v1"
+CHECKPOINT_LOOKUP_UQ = "skyzi000_owui_ext_accp_v1_lookup_uq"
+CHECKPOINT_PREFIX_IDX = "skyzi000_owui_ext_accp_v1_prefix_idx"
+CHECKPOINT_RECENT_IDX = "skyzi000_owui_ext_accp_v1_recent_idx"
+REQUEST_STATE_SCHEMA_READY_KEY = "_auto_compact_checkpoint_schema_ready_v1"
+CHECKPOINT_CLAIM_LEASE_SECONDS = 90
+CHECKPOINT_CLAIM_HEARTBEAT_SECONDS = 30
+CHECKPOINT_PENDING_POLL_SECONDS = 0.25
+CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS = 300.0
+TOKEN_ESTIMATOR_VERSION = "message-canonical-json-v1"
+MESSAGE_TOKEN_OVERHEAD = 4
+REQUEST_TOKEN_OVERHEAD = 3
+MESSAGE_TOKEN_ESTIMATE_CACHE_MAX_ENTRIES = 8192
+MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES = 64 * 1024
+MESSAGE_TOKEN_SAMPLE_MAX_BYTES = 16 * 1024
+BODY_TOKEN_EXTRA_KEYS = (
+    "tools",
+    "tool_choice",
+    "functions",
+    "function_call",
+    "response_format",
+    "parallel_tool_calls",
+)
+INTERNAL_SUMMARY_TASK = "auto_compaction_summary"
+TEMP_CHAT_PREFIXES = ("local:", "channel:")
+SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
+SOURCE_HASH_FAMILY = "canonical-json-v1"
+PROFILE_HASH_FAMILY = "checkpoint-profile-v1"
+MAX_CONTEXT_RETRY_ATTEMPTS = 2
+DEFAULT_TRIGGER_TOTAL_TOKENS = 256000
+DEFAULT_SOFT_TRIGGER_RATIO = 0.5
+DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES = 512
+DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT = 32
+SUMMARY_META_FORMAT_VERSION_KEY = "summary_meta_format_version"
+SUMMARY_META_FORMAT_VERSION = 1
+SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY = "historical_user_messages"
+SUMMARY_META_HISTORICAL_USER_MESSAGES_FORMAT_VERSION = 1
+PROVIDER_MODEL_CACHE_WAIT_DEFAULT_TIMEOUT_SECONDS = 10.0
+PROVIDER_MODEL_CACHE_WAIT_POLL_SECONDS = 0.05
+OLLAMA_PROVIDER_MODEL_CACHE_REFRESH_REQUESTS = 2
+SummaryToolPolicy = Literal["always_strip", "fallback_on_tool_call", "error_on_tool_call"]
+CORE_FUNCTION_MODEL_LISTING_COROUTINE = ("get_function_models", "open_webui/functions.py")
+PROVIDER_MODEL_CACHE_REFRESH_COROUTINES = {
+    "OPENAI_MODELS": (("fetch_openai_models", "open_webui/utils/models.py"),),
+    "OLLAMA_MODELS": (("fetch_ollama_models", "open_webui/utils/models.py"),),
+}
+PROVIDER_MODEL_CACHE_ENABLE_FLAGS = {
+    "OPENAI_MODELS": "ENABLE_OPENAI_API",
+    "OLLAMA_MODELS": "ENABLE_OLLAMA_API",
+}
+MISSING_CORE_REQUEST = object()
+TARGET_MODEL_RECORD_UNKNOWN = object()
+AUTO_COMPACTION_TARGET_HIDDEN_META_KEY = "auto_compaction_target_hidden_by"
+TARGET_MODEL_VISIBILITY_LOCKS: dict[str, asyncio.Lock] = {}
+# request.state flag set while AutoCompact is mid target file-context injection
+# (chat_completion_files_handler). When Core re-enters the wrapper via
+# generate_queries (TASK_MODEL pointing at this wrapper), the flag short-
+# circuits the reentrant injection so manual RAG is skipped fail-closed.
+AUTO_COMPACT_FILE_CONTEXT_INJECTION_STATE_KEY = "_auto_compact_target_file_context_injecting"
+PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY = "_auto_compact_prefix_file_fingerprint_resolver_cache"
+PREFIX_FILE_FINGERPRINT_FAMILY = "prefix-file-fingerprint-v1"
+LOG = logging.getLogger(__name__)
+COMPACTION_SUMMARY_EMBED_MARKER = "<!--auto-compaction-summary-embed:v1-->"
+SUMMARY_PROMPT = (
+    "You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY for an Open WebUI chat. "
+    "Create a concise handoff summary for a future model call that will continue the same chat.\n\n"
+    "Preserve:\n"
+    "- Session goal, original request, current progress, and durable decisions already made\n"
+    "- User preferences, constraints, and standing requirements that remain relevant\n"
+    "- Tool results, external facts, errors, identifiers, URLs, file names, commands, values, and examples needed to continue\n"
+    "- Open questions, unknowns, unresolved failures, and clear next steps\n\n"
+    "If the input contains an existing <auto_compaction_context>, merge that prior checkpoint with the following newer messages. "
+    "Do not discard earlier checkpoint information merely because it is summarized.\n\n"
+    "If <attached_file_contents> is provided, use it only as supporting context for files attached to messages in this "
+    "checkpoint source. Preserve durable file facts, names, identifiers, and relevant excerpts needed to continue, "
+    "but do not invent file contents or treat attached files outside the checkpoint source as summarized.\n\n"
+    "Do not invent facts or treat unknowns as facts. Do not introduce new instructions. "
+    "Do not include internal reasoning, private system instructions, or irrelevant transcript detail. "
+    "Be concise, structured, and focused on continuity.\n\n"
+    "The preceding messages are the exact checkpoint source to summarize. "
+    "Messages after this checkpoint source may be retained raw separately; do not infer omitted active requests.\n\n"
+    "Output only reusable continuity facts; do not mention this summarization/checkpointing task. Do not continue the conversation. "
+    "Do not call tools. Do not ask follow-up questions."
+)
+
+
+def resolve_summary_prompt(summary_prompt: str | None = None) -> str:
+    text = str(summary_prompt or "").strip()
+    return text or SUMMARY_PROMPT
+
+try:
+    from open_webui.internal.db import DATABASE_SCHEMA as OPEN_WEBUI_DATABASE_SCHEMA
+except Exception:
+    OPEN_WEBUI_DATABASE_SCHEMA = None
+
+_CHECKPOINT_METADATA = MetaData(schema=OPEN_WEBUI_DATABASE_SCHEMA)
+CHECKPOINT_TABLE = Table(
+    CHECKPOINT_TABLE_NAME,
+    _CHECKPOINT_METADATA,
+    Column("id", Text, primary_key=True),
+    Column("namespace", Text, nullable=False),
+    Column("schema_version", Integer, nullable=False),
+    Column("user_id", Text, nullable=False),
+    Column("chat_id", Text, nullable=False),
+    Column("pipe_function_id", Text, nullable=False),
+    Column("profile_hash", Text, nullable=False),
+    Column("source_message_count", Integer, nullable=False),
+    Column("source_hash", Text, nullable=False),
+    Column("summary_text", Text, nullable=False),
+    Column("summary_meta", JSON, nullable=False),
+    Column("summary_token_count", Integer, nullable=True),
+    Column("state", Text, nullable=False),
+    Column("parent_checkpoint_id", Text, nullable=True),
+    Column("claim_token", Text, nullable=True),
+    Column("claim_expires_at", BigInteger, nullable=True),
+    Column("created_at", BigInteger, nullable=False),
+    Column("updated_at", BigInteger, nullable=False),
+    Column("last_used_at", BigInteger, nullable=False),
+    UniqueConstraint(
+        "namespace",
+        "user_id",
+        "chat_id",
+        "pipe_function_id",
+        "profile_hash",
+        "source_hash",
+        name=CHECKPOINT_LOOKUP_UQ,
+    ),
+    Index(
+        CHECKPOINT_PREFIX_IDX,
+        "namespace",
+        "user_id",
+        "chat_id",
+        "pipe_function_id",
+        "profile_hash",
+        "source_message_count",
+    ),
+    Index(CHECKPOINT_RECENT_IDX, "namespace", "user_id", "chat_id", "last_used_at"),
+)
+
+_CHECKPOINT_SCHEMA_READY = False
+_SCHEMA_INIT_LOCKS: dict[Any, asyncio.Lock] = {}
+_GENERATION_LOCKS: dict[tuple[str, str, str, str, str, str], asyncio.Lock] = {}
+_SOFT_PREFETCH_TASKS: set[asyncio.Task] = set()
+_SOFT_PREFETCH_INFLIGHT_KEYS: set[tuple[str, str, str, str, str, str]] = set()
+_MESSAGE_TOKEN_ESTIMATE_CACHE: dict[tuple[str, str, str], int] = {}
+# Module-level snapshot of the latest model dict seen during pipe()/pipes()
+# processing. Populated opportunistically so the Valves dropdown for
+# summary_model can list real models without request access at schema time.
+_LATEST_MODELS_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def get_generation_lock(key: tuple[str, str, str, str, str, str]) -> asyncio.Lock:
+    return _GENERATION_LOCKS.setdefault(key, asyncio.Lock())
+
+
+def release_generation_lock(key: tuple[str, str, str, str, str, str], lock: asyncio.Lock) -> None:
+    waiters = getattr(lock, "_waiters", None)
+    has_waiters = bool(waiters)
+    if not lock.locked() and not has_waiters and _GENERATION_LOCKS.get(key) is lock:
+        _GENERATION_LOCKS.pop(key, None)
+
+
+def _release_soft_prefetch_task(
+    key: tuple[str, str, str, str, str, str],
+    task: asyncio.Task,
+) -> None:
+    _SOFT_PREFETCH_INFLIGHT_KEYS.discard(key)
+    _SOFT_PREFETCH_TASKS.discard(task)
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        LOG.exception(
+            "Soft compaction prefetch task failed for user_id=%s chat_id=%s pipe_function_id=%s source_hash=%s",
+            key[1],
+            key[2],
+            key[3],
+            key[5],
+        )
+        return
+    if isinstance(exc, BaseException):
+        LOG.error(
+            "Soft compaction prefetch task failed for user_id=%s chat_id=%s pipe_function_id=%s source_hash=%s",
+            key[1],
+            key[2],
+            key[3],
+            key[5],
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+
+def _launch_soft_prefetch_task(
+    key: tuple[str, str, str, str, str, str],
+    coro: Awaitable[Any],
+) -> bool:
+    if key in _SOFT_PREFETCH_INFLIGHT_KEYS:
+        with suppress(Exception):
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+        return False
+    _SOFT_PREFETCH_INFLIGHT_KEYS.add(key)
+    task = asyncio.create_task(coro)
+    _SOFT_PREFETCH_TASKS.add(task)
+    task.add_done_callback(lambda done: _release_soft_prefetch_task(key, done))
+    return True
+
+
+@dataclass(frozen=True)
+class WrapperIdentity:
+    pipe_function_id: str
+    target_model_suffix: str
+    target_model_id: str
+
+
+@dataclass(frozen=True)
+class ReusableCheckpointMatch:
+    kind: str
+    source_message_count: int
+    source_kind: str = "message"
+    checkpoint: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class TaskPromptSpec:
+    config_attr: str
+    default_attr: str
+    builder_name: str
+    strip_configured: bool = False
+
+
+TASK_PROMPT_SPECS = {
+    TASKS.TITLE_GENERATION.value: TaskPromptSpec(
+        "TITLE_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE",
+        "title_generation_template",
+    ),
+    TASKS.FOLLOW_UP_GENERATION.value: TaskPromptSpec(
+        "FOLLOW_UP_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_FOLLOW_UP_GENERATION_PROMPT_TEMPLATE",
+        "follow_up_generation_template",
+    ),
+    TASKS.TAGS_GENERATION.value: TaskPromptSpec(
+        "TAGS_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_TAGS_GENERATION_PROMPT_TEMPLATE",
+        "tags_generation_template",
+    ),
+    TASKS.QUERY_GENERATION.value: TaskPromptSpec(
+        "QUERY_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE",
+        "query_generation_template",
+        strip_configured=True,
+    ),
+    TASKS.IMAGE_PROMPT_GENERATION.value: TaskPromptSpec(
+        "IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE",
+        "image_prompt_generation_template",
+    ),
+    TASKS.AUTOCOMPLETE_GENERATION.value: TaskPromptSpec(
+        "AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE",
+        "DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE",
+        "autocomplete_generation_template",
+        strip_configured=True,
+    ),
+}
+
+
+@dataclass(frozen=True)
+class TargetModelContract:
+    id: str
+    name: str
+    meta: dict[str, Any]
+    target_params: dict[str, Any]
+    wrapper_params: dict[str, Any]
+    access_grants: list[dict[str, Any]]
+    owner_user_id: str | None
+
+
+@dataclass(frozen=True)
+class CoreChatModelRoute:
+    model_id: str
+
+
+@dataclass(frozen=True)
+class MessageCut:
+    preserved_system_message: dict[str, Any] | None
+    summarization_prefix: list[dict[str, Any]]
+    tail_messages: list[dict[str, Any]]
+    source_message_count: int
+
+
+@dataclass(frozen=True)
+class RetryToolResultCut:
+    preserved_system_message: dict[str, Any] | None
+    summarization_prefix: list[dict[str, Any]]
+    tail_messages: list[dict[str, Any]]
+    source_message_count: int
+
+
+@dataclass(frozen=True)
+class ToolResultCompactionCut:
+    preserved_system_message: dict[str, Any] | None
+    summarization_prefix: list[dict[str, Any]]
+    tail_messages: list[dict[str, Any]]
+    source_message_count: int
+
+
+class RetryableContextOverflow(Exception):
+    """Raised only before any user-visible target output has been emitted."""
+
+
+class CompactionSummaryResult(str):
+    def __new__(cls, summary_text: Any, *, checkpoint: dict[str, Any] | None = None):
+        obj = str.__new__(cls, str(summary_text))
+        obj.checkpoint = checkpoint
+        return obj
+
+
+class UnsupportedCompactionInput(Exception):
+    """Raised when v1 cannot safely compact without rewriting active input."""
+
+    def __init__(self, message: str, *, code: str = "unsafe_compaction_input"):
+        super().__init__(message)
+        self.code = code
+
+
+class SummaryFileContextUnavailable(UnsupportedCompactionInput):
+    """Raised when absorbed prefix files cannot be included in a checkpoint summary."""
+
+    def __init__(
+        self,
+        message: str = "Attached file context could not be loaded for the compaction summary",
+    ):
+        super().__init__(message, code="file_context_unavailable")
+
+
+class ParentCheckpointExtensionFailed(Exception):
+    """Raised when a verified parent checkpoint exists but extension summarization fails."""
+
+    def __init__(self, parent: dict[str, Any], original: Exception):
+        super().__init__(str(original))
+        self.parent = parent
+        self.original = original
+
+
+class _CheckpointGenerationSkipped(Exception):
+    """Raised after a pending claim when a later-ready checkpoint makes generation redundant."""
+
+
+def _json_hash(payload: Any) -> str:
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def encode_target_model_id(target_model_id: str) -> str:
+    if not isinstance(target_model_id, str) or not target_model_id:
+        raise ValueError("target_model_id must be a non-empty string")
+    return target_model_id
+
+
+def build_wrapper_model_id(pipe_function_id: str, target_model_id: str) -> str:
+    return f"{pipe_function_id}.{encode_target_model_id(target_model_id)}"
+
+
+def pipe_function_id_from_module_name(module_name: Any, *, fallback: str = PIPE_FUNCTION_ID) -> str:
+    if isinstance(module_name, str):
+        module_basename = module_name.rsplit(".", 1)[-1]
+        prefix = "function_"
+        if module_basename.startswith(prefix):
+            function_id = module_basename[len(prefix) :]
+            if function_id:
+                return function_id
+    return fallback
+
+
+def runtime_pipe_function_id(pipe: Any, *, fallback: str = PIPE_FUNCTION_ID) -> str:
+    return pipe_function_id_from_module_name(getattr(pipe.__class__, "__module__", None), fallback=fallback)
+
+
+def decode_wrapper_model_id(wrapper_model_id: str, *, expected_pipe_function_id: str = PIPE_FUNCTION_ID) -> WrapperIdentity:
+    if not isinstance(wrapper_model_id, str) or "." not in wrapper_model_id:
+        raise ValueError("Malformed wrapper id: expected '<pipe_function_id>.<target_model_id>'")
+    pipe_function_id, target_model_id = wrapper_model_id.split(".", 1)
+    if expected_pipe_function_id and pipe_function_id != expected_pipe_function_id:
+        raise ValueError(f"Unexpected wrapper pipe function id: expected {expected_pipe_function_id!r}, got {pipe_function_id!r}")
+    if not target_model_id:
+        raise ValueError("Malformed wrapper id: missing target model id")
+    return WrapperIdentity(
+        pipe_function_id=pipe_function_id,
+        target_model_suffix=target_model_id,
+        target_model_id=target_model_id,
+    )
+
+
+def is_generated_wrapper_model_id(model_id: Any, *, pipe_function_id: str = PIPE_FUNCTION_ID) -> bool:
+    return isinstance(model_id, str) and model_id.startswith(f"{pipe_function_id}.")
+
+
+_TOP_LEVEL_MESSAGE_DROP_KEYS = {
+    "id",
+    "parentId",
+    "childrenIds",
+    "timestamp",
+    "created_at",
+    "updated_at",
+    "usage",
+    "info",
+    "done",
+    "status",
+    "statusHistory",
+    "status_history",
+    "error",
+}
+_STABLE_FILE_ATTACHMENT_KEYS = {
+    "collection_name",
+    "collection_names",
+    "content",
+    "content_type",
+    "context",
+    "docs",
+    "file",
+    "id",
+    "legacy",
+    "name",
+    "queries",
+    "type",
+    "url",
+    "urls",
+}
+_STABLE_EMBEDDED_FILE_KEYS = {
+    "collection_name",
+    "collection_names",
+    "content_type",
+    "context",
+    "data",
+    "file_hash",
+    "file_id",
+    "filename",
+    "hash",
+    "id",
+    "legacy",
+    "meta",
+    "metadata",
+    "mime_type",
+    "name",
+    "type",
+    "url",
+}
+_STABLE_FILE_DATA_KEYS = {
+    "content",
+    "metadata",
+}
+_FILE_METADATA_TRANSIENT_KEYS = {
+    "blob_url",
+    "created_at",
+    "download_url",
+    "error",
+    "headers",
+    "itemId",
+    "item_id",
+    "path",
+    "preview_url",
+    "size",
+    "signed_url",
+    "status",
+    "temp_id",
+    "thumbnail_url",
+    "tmp_path",
+    "updated_at",
+    "upload_id",
+}
+_TRANSIENT_SOURCE_KEYS = {
+    "distances",
+}
+_PREFIX_FILE_ATTACHMENT_IDENTITY_KEYS = {
+    "checksum",
+    "collection_name",
+    "collection_names",
+    "content_type",
+    "file",
+    "file_hash",
+    "file_id",
+    "filename",
+    "hash",
+    "id",
+    "legacy",
+    "mime_type",
+    "name",
+    "revision",
+    "sha256",
+    "type",
+    "updated_at",
+    "version",
+}
+_PREFIX_EMBEDDED_FILE_IDENTITY_KEYS = {
+    "checksum",
+    "collection_name",
+    "collection_names",
+    "content_type",
+    "file_hash",
+    "file_id",
+    "filename",
+    "hash",
+    "id",
+    "legacy",
+    "meta",
+    "metadata",
+    "mime_type",
+    "name",
+    "revision",
+    "sha256",
+    "type",
+    "updated_at",
+    "version",
+}
+_PREFIX_FILE_METADATA_TRANSIENT_KEYS = _FILE_METADATA_TRANSIENT_KEYS - {"updated_at"}
+_PREFIX_FILE_METADATA_BODY_KEYS = {
+    "body",
+    "content",
+    "context",
+    "docs",
+    "document",
+    "documents",
+}
+_FILE_CONTENT_PART_TYPES = {
+    "file",
+    "input_file",
+}
+_STABLE_MESSAGE_KEYS = {
+    "role",
+    "content",
+    "name",
+    "tool_call_id",
+    "tool_calls",
+    "function_call",
+    "files",
+    "sources",
+}
+
+
+def _is_empty_canonical_value(value: Any) -> bool:
+    return value in (None, {}, [])
+
+
+def _canonicalize_general_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            item = _canonicalize_general_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_general_value(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return value
+
+
+def _canonicalize_file_metadata_map(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key in _FILE_METADATA_TRANSIENT_KEYS:
+                continue
+            item = _canonicalize_file_metadata_map(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_file_metadata_map(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return value
+
+
+def _canonicalize_file_data_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key not in _STABLE_FILE_DATA_KEYS:
+                continue
+            item = _canonicalize_file_metadata_map(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    return _canonicalize_file_metadata_map(value)
+
+
+def _canonicalize_embedded_file_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key not in _STABLE_EMBEDDED_FILE_KEYS:
+                continue
+            if key == "data":
+                item = _canonicalize_file_data_value(value[key])
+            elif key in {"meta", "metadata"}:
+                item = _canonicalize_file_metadata_map(value[key])
+            else:
+                item = _canonicalize_general_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_embedded_file_value(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return _canonicalize_general_value(value)
+
+
+def _canonicalize_file_attachment_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key not in _STABLE_FILE_ATTACHMENT_KEYS:
+                continue
+            if key == "file":
+                item = _canonicalize_embedded_file_value(value[key])
+            else:
+                item = _canonicalize_general_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_file_attachment_value(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return _canonicalize_general_value(value)
+
+
+def _is_file_content_part(value: dict[str, Any]) -> bool:
+    part_type = value.get("type")
+    return isinstance(part_type, str) and part_type in _FILE_CONTENT_PART_TYPES and "file" in value
+
+
+def _canonicalize_content_part(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        is_file_part = _is_file_content_part(value)
+        for key in sorted(value.keys()):
+            if is_file_part and key == "file":
+                item = _canonicalize_embedded_file_value(value[key])
+            else:
+                item = _canonicalize_general_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    return _canonicalize_general_value(value)
+
+
+def _canonicalize_content_value(value: Any) -> Any:
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_content_part(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return _canonicalize_content_part(value)
+
+
+def _canonicalize_files_value(value: Any) -> Any:
+    return _canonicalize_file_attachment_value(value)
+
+
+def _canonicalize_source_value(value: Any, *, source_root: bool = False) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if source_root and key in _TRANSIENT_SOURCE_KEYS:
+                continue
+            item = _canonicalize_general_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    return _canonicalize_general_value(value)
+
+
+def _canonicalize_sources_value(value: Any) -> Any:
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_source_value(item, source_root=True)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return _canonicalize_source_value(value, source_root=True)
+
+
+def _canonicalize_message_value(key: str, value: Any) -> Any:
+    if key == "content":
+        return _canonicalize_content_value(value)
+    if key == "files":
+        return _canonicalize_files_value(value)
+    if key == "sources":
+        return _canonicalize_sources_value(value)
+    return _canonicalize_general_value(value)
+
+
+def canonicalize_message_for_source_hash(message: dict[str, Any]) -> dict[str, Any]:
+    canonical: dict[str, Any] = {}
+    for key in sorted(message.keys()):
+        if key in _TOP_LEVEL_MESSAGE_DROP_KEYS:
+            continue
+        if key not in _STABLE_MESSAGE_KEYS:
+            continue
+        value = _canonicalize_message_value(key, message[key])
+        if _is_empty_canonical_value(value):
+            continue
+        canonical[key] = value
+    canonical.setdefault("role", message.get("role", "assistant"))
+    canonical.setdefault("content", "")
+    return canonical
+
+
+def canonicalize_messages_for_source_hash(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [canonicalize_message_for_source_hash(message) for message in messages if isinstance(message, dict)]
+
+
+def compute_source_hash(messages: list[dict[str, Any]]) -> str:
+    return _json_hash(
+        {
+            "family": SOURCE_HASH_FAMILY,
+            "messages": canonicalize_messages_for_source_hash(messages),
+        }
+    )
+
+
+def compute_summary_source_hash(
+    messages: list[dict[str, Any]],
+    prefix_file_fingerprint: str | None = None,
+) -> str:
+    # When no prefix files were absorbed (or the DB chain could not be loaded)
+    # the fingerprint is empty, so the identity intentionally collapses to the
+    # canonical message hash. This keeps existing checkpoints reusable and
+    # avoids a family bump.
+    if not prefix_file_fingerprint:
+        return compute_source_hash(messages)
+    return _json_hash(
+        {
+            "family": SOURCE_HASH_FAMILY,
+            "messages": canonicalize_messages_for_source_hash(messages),
+            "prefix_file_fingerprint": prefix_file_fingerprint,
+        }
+    )
+
+
+def _canonicalize_prefix_file_metadata_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key in _PREFIX_FILE_METADATA_TRANSIENT_KEYS or key in _PREFIX_FILE_METADATA_BODY_KEYS:
+                continue
+            item = _canonicalize_prefix_file_metadata_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out_list = []
+        for item in value:
+            canonical_item = _canonicalize_prefix_file_metadata_value(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out_list.append(canonical_item)
+        return out_list
+    return value
+
+
+def _canonicalize_prefix_embedded_file_identity(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key not in _PREFIX_EMBEDDED_FILE_IDENTITY_KEYS:
+                continue
+            item = _canonicalize_prefix_file_metadata_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out_list = []
+        for item in value:
+            canonical_item = _canonicalize_prefix_embedded_file_identity(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out_list.append(canonical_item)
+        return out_list
+    return _canonicalize_prefix_file_metadata_value(value)
+
+
+def _canonicalize_prefix_file_attachment_identity(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key not in _PREFIX_FILE_ATTACHMENT_IDENTITY_KEYS:
+                continue
+            if key == "file":
+                item = _canonicalize_prefix_embedded_file_identity(value[key])
+            else:
+                item = _canonicalize_prefix_file_metadata_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out_list = []
+        for item in value:
+            canonical_item = _canonicalize_prefix_file_attachment_identity(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out_list.append(canonical_item)
+        return out_list
+    return _canonicalize_prefix_file_metadata_value(value)
+
+
+def _stable_file_fingerprint(file_items: list[dict[str, Any]]) -> str:
+    if not file_items:
+        return ""
+    canonical = [
+        _canonicalize_prefix_file_attachment_identity(item)
+        for item in file_items
+        if isinstance(item, dict)
+    ]
+    canonical = [item for item in canonical if not _is_empty_canonical_value(item)]
+    if not canonical:
+        return ""
+    ordered = sorted(canonical, key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False))
+    return _json_hash({"family": PREFIX_FILE_FINGERPRINT_FAMILY, "files": ordered})
+
+
+def _soft_prefetch_inflight_source_hash(
+    source_messages: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> str:
+    files = metadata.get("files")
+    if not isinstance(files, list):
+        return compute_source_hash(source_messages)
+    fingerprint = _stable_file_fingerprint(
+        [item for item in files if isinstance(item, dict) and not _is_image_file_item(item)]
+    )
+    return compute_summary_source_hash(source_messages, fingerprint)
+
+
+def _make_prefix_file_fingerprint_resolver(
+    db_chain: list[dict[str, Any]] | None,
+    metadata_files: Any,
+) -> Callable[[int], str | None]:
+    # Fingerprints cover all non-image prefix files in DB-chain positions
+    # [0, count). Using the full prefix range (rather than the delta
+    # [parent_count, compaction_prefix_count)) keeps the hash basis identical
+    # for a checkpoint and any of its potential children, so parent matching
+    # and parent validation use the same fingerprint the stored row was built
+    # with. The set is order-independent because _classify_files_for_summary
+    # returns a set and the summary file context only depends on which files
+    # are present in the prefix, not their positional order.
+    cache: dict[int, str | None] = {}
+
+    def resolve(count: int) -> str | None:
+        cached = cache.get(count, False)
+        if cached is not False:
+            return cached
+        prefix_ids = _classify_files_for_summary(db_chain, count, 0)
+        if not prefix_ids:
+            result: str | None = None
+        else:
+            items = [
+                item
+                for item in metadata_files
+                if isinstance(item, dict)
+                and not _is_image_file_item(item)
+                and item.get("id") in prefix_ids
+            ]
+            result = _stable_file_fingerprint(items) or None
+        cache[count] = result
+        return result
+
+    return resolve
+
+
+async def _build_prefix_file_fingerprint_resolver(
+    request: Any,
+    metadata: dict[str, Any],
+) -> Callable[[int], str | None] | None:
+    metadata_files = metadata.get("files")
+    if not isinstance(metadata_files, list) or not metadata_files:
+        return None
+    chat_id = str(metadata.get("chat_id") or "")
+    current_message_id = str(metadata.get("user_message_id") or metadata.get("message_id") or "")
+    cache_key = (chat_id, current_message_id)
+    # Cache the resolver on request.state so multiple checkpoint operations in
+    # the same request share one DB-chain load. Different (chat_id, message_id)
+    # pairs get independent resolvers.
+    request_state = getattr(request, "state", None)
+    if request_state is not None:
+        cache = getattr(request_state, PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY, None)
+        if cache is None:
+            cache = {}
+            with suppress(Exception):
+                setattr(request_state, PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY, cache)
+        elif cache_key in cache:
+            return cache[cache_key]
+    else:
+        cache = None
+    try:
+        db_chain = await _load_chat_message_chain(request, chat_id, current_message_id)
+    except Exception:
+        LOG.exception("Failed to load chat message chain for prefix file fingerprint")
+        return None
+    if not db_chain:
+        return None
+    resolver = _make_prefix_file_fingerprint_resolver(db_chain, metadata_files)
+    if cache is not None:
+        with suppress(Exception):
+            cache[cache_key] = resolver
+    return resolver
+
+
+def _request_file_context_injection_active(request_state: Any) -> bool:
+    try:
+        return getattr(request_state, AUTO_COMPACT_FILE_CONTEXT_INJECTION_STATE_KEY, False) is True
+    except Exception:
+        return False
+
+
+def _set_request_file_context_injection_active(request_state: Any, active: bool) -> None:
+    if request_state is None:
+        return
+    with suppress(Exception):
+        setattr(request_state, AUTO_COMPACT_FILE_CONTEXT_INJECTION_STATE_KEY, bool(active))
+
+
+def _resolve_fingerprint(
+    resolver: Callable[[int], str | None] | None,
+    count: int,
+) -> str | None:
+    if resolver is None:
+        return None
+    try:
+        return resolver(count)
+    except Exception:
+        return None
+
+
+def compute_profile_hash(
+    *,
+    schema_family: str = CHECKPOINT_TABLE_NAME,
+    summary_format_family: str = SUMMARY_FORMAT_FAMILY,
+    source_hash_family: str = SOURCE_HASH_FAMILY,
+    **_: Any,
+) -> str:
+    return _json_hash(
+        {
+            "profile": PROFILE_HASH_FAMILY,
+            "schema_family": schema_family,
+            "summary_format_family": summary_format_family,
+            "source_hash_family": source_hash_family,
+        }
+    )
+
+
+def _configured_tiktoken_encoding_names(request: Any = None) -> list[str]:
+    names: list[str] = []
+    config = getattr(getattr(getattr(request, "app", None), "state", None), "config", None)
+    configured = getattr(config, "TIKTOKEN_ENCODING_NAME", None)
+    if configured:
+        names.append(str(configured))
+    try:
+        from open_webui import config as open_webui_config
+
+        fallback = getattr(open_webui_config, "TIKTOKEN_ENCODING_NAME", None)
+        if fallback:
+            names.append(str(fallback))
+    except Exception:
+        pass
+    names.append("cl100k_base")
+    return list(dict.fromkeys(names))
+
+
+def _get_tiktoken_encoder(request: Any = None) -> tuple[Any | None, str | None]:
+    try:
+        import tiktoken
+    except Exception:
+        return None, None
+
+    for encoding_name in _configured_tiktoken_encoding_names(request):
+        try:
+            return tiktoken.get_encoding(encoding_name), encoding_name
+        except Exception:
+            continue
+    return None, None
+
+
+def _message_token_cache_key(message: dict[str, Any], *, encoding_name: str) -> tuple[str, str, str]:
+    canonical = canonicalize_message_for_source_hash(message)
+    return (
+        TOKEN_ESTIMATOR_VERSION,
+        encoding_name,
+        _json_hash({"family": TOKEN_ESTIMATOR_VERSION, "message": canonical}),
+    )
+
+
+def _message_token_text(message: dict[str, Any]) -> str:
+    return json.dumps(
+        canonicalize_message_for_source_hash(message),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _remember_message_token_estimate(key: tuple[str, str, str], count: int) -> None:
+    if len(_MESSAGE_TOKEN_ESTIMATE_CACHE) >= MESSAGE_TOKEN_ESTIMATE_CACHE_MAX_ENTRIES:
+        with suppress(Exception):
+            _MESSAGE_TOKEN_ESTIMATE_CACHE.pop(next(iter(_MESSAGE_TOKEN_ESTIMATE_CACHE)))
+    _MESSAGE_TOKEN_ESTIMATE_CACHE[key] = int(count)
+
+
+def _estimate_large_text_tokens_sampling(
+    text: str,
+    *,
+    encoder: Any,
+    overhead: int = MESSAGE_TOKEN_OVERHEAD,
+) -> int | None:
+    """Estimate token count for large text via 3-point sampling.
+
+    Samples head, middle, and tail regions (each up to
+    ``MESSAGE_TOKEN_SAMPLE_MAX_BYTES`` bytes), encodes them exactly
+    with the tiktoken encoder, and extrapolates the aggregate
+    bytes/tokens ratio to the full text.
+
+    Returns ``None`` if encoding fails for any sample.
+    """
+    total_bytes = len(text.encode("utf-8", errors="ignore"))
+    if total_bytes == 0:
+        return int(overhead)
+
+    total_chars = len(text)
+    if total_chars == 0:
+        return int(overhead)
+
+    # Approximate chars-per-sample to stay within the byte budget.
+    bytes_per_char = total_bytes / total_chars
+    sample_chars = max(1, int(MESSAGE_TOKEN_SAMPLE_MAX_BYTES / bytes_per_char))
+
+    # Three sampling regions: head, middle, tail.
+    regions = [
+        (0, min(sample_chars, total_chars)),
+        (
+            max(0, total_chars // 2 - sample_chars // 2),
+            min(total_chars // 2 + sample_chars // 2, total_chars),
+        ),
+        (max(0, total_chars - sample_chars), total_chars),
+    ]
+
+    total_sample_bytes = 0
+    total_sample_tokens = 0
+
+    for start, end in regions:
+        if end <= start:
+            continue
+        sample = text[start:end]
+        sample_bytes = len(sample.encode("utf-8", errors="ignore"))
+        if sample_bytes == 0:
+            continue
+        sample_tokens = _encode_text_token_count(encoder, sample)
+        if sample_tokens is None:
+            return None
+        total_sample_bytes += sample_bytes
+        total_sample_tokens += sample_tokens
+
+    if total_sample_bytes == 0 or total_sample_tokens == 0:
+        return int(overhead)
+
+    bytes_per_token = total_sample_bytes / total_sample_tokens
+    return math.ceil(total_bytes / bytes_per_token) + int(overhead)
+
+
+def _encode_text_token_count(encoder: Any, text: str) -> int | None:
+    try:
+        return len(encoder.encode(text, disallowed_special=()))
+    except TypeError:
+        try:
+            return len(encoder.encode(text))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _estimate_text_tokens_with_encoder(
+    text: str,
+    *,
+    encoder: Any,
+    overhead: int = MESSAGE_TOKEN_OVERHEAD,
+) -> int | None:
+    if len(text.encode("utf-8", errors="ignore")) > MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES:
+        return _estimate_large_text_tokens_sampling(
+            text, encoder=encoder, overhead=overhead
+        )
+    count = _encode_text_token_count(encoder, text)
+    if count is None:
+        return None
+    return count + int(overhead)
+
+
+def _estimate_message_tokens_with_encoder(
+    message: dict[str, Any],
+    *,
+    encoder: Any,
+    encoding_name: str,
+) -> int | None:
+    key = _message_token_cache_key(message, encoding_name=encoding_name)
+    cached = _MESSAGE_TOKEN_ESTIMATE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    count = _estimate_text_tokens_with_encoder(
+        _message_token_text(message),
+        encoder=encoder,
+        overhead=MESSAGE_TOKEN_OVERHEAD,
+    )
+    if count is None:
+        return None
+    _remember_message_token_estimate(key, count)
+    return count
+
+
+def estimate_message_tokens(
+    message: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    if not isinstance(message, dict):
+        return None
+    resolved_encoder = encoder
+    resolved_encoding_name = encoding_name
+    if resolved_encoder is None:
+        resolved_encoder, resolved_encoding_name = _get_tiktoken_encoder(request)
+    if resolved_encoder is None:
+        return None
+    if not resolved_encoding_name:
+        resolved_encoding_name = str(getattr(resolved_encoder, "name", "unknown"))
+    return _estimate_message_tokens_with_encoder(
+        message,
+        encoder=resolved_encoder,
+        encoding_name=str(resolved_encoding_name),
+    )
+
+
+def estimate_messages_tokens(
+    messages: list[dict[str, Any]],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    if not isinstance(messages, list):
+        return None
+    resolved_encoder = encoder
+    resolved_encoding_name = encoding_name
+    if resolved_encoder is None:
+        resolved_encoder, resolved_encoding_name = _get_tiktoken_encoder(request)
+    if resolved_encoder is None:
+        return None
+    if not resolved_encoding_name:
+        resolved_encoding_name = str(getattr(resolved_encoder, "name", "unknown"))
+
+    total = REQUEST_TOKEN_OVERHEAD
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        count = _estimate_message_tokens_with_encoder(
+            message,
+            encoder=resolved_encoder,
+            encoding_name=str(resolved_encoding_name),
+        )
+        if count is None:
+            return None
+        total += count
+    return total
+
+
+def _body_token_extra_payload(body: dict[str, Any]) -> dict[str, Any]:
+    extra: dict[str, Any] = {}
+    for key in BODY_TOKEN_EXTRA_KEYS:
+        if key not in body:
+            continue
+        value = _canonicalize_general_value(body.get(key))
+        if _is_empty_canonical_value(value):
+            continue
+        extra[key] = value
+    return extra
+
+
+def _body_token_extra_text(body: dict[str, Any]) -> str:
+    extra = _body_token_extra_payload(body)
+    if not extra:
+        return ""
+    return json.dumps(
+        {"family": TOKEN_ESTIMATOR_VERSION, "body_extra": extra},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def estimate_body_tokens(
+    body: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    if not isinstance(body, dict):
+        return None
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    resolved_encoder = encoder
+    resolved_encoding_name = encoding_name
+    if resolved_encoder is None:
+        resolved_encoder, resolved_encoding_name = _get_tiktoken_encoder(request)
+    if resolved_encoder is None:
+        return None
+    if not resolved_encoding_name:
+        resolved_encoding_name = str(getattr(resolved_encoder, "name", "unknown"))
+
+    total = estimate_messages_tokens(
+        messages,
+        request=request,
+        encoder=resolved_encoder,
+        encoding_name=str(resolved_encoding_name),
+    )
+    if total is None:
+        return None
+    extra_text = _body_token_extra_text(body)
+    if extra_text:
+        extra_tokens = _estimate_text_tokens_with_encoder(
+            extra_text,
+            encoder=resolved_encoder,
+            overhead=MESSAGE_TOKEN_OVERHEAD,
+        )
+        if extra_tokens is None:
+            return None
+        total += extra_tokens
+    return total
+
+
+def estimate_body_extra_tokens(
+    body: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    if not isinstance(body, dict):
+        return None
+    extra_text = _body_token_extra_text(body)
+    if not extra_text:
+        return 0
+    resolved_encoder = encoder
+    resolved_encoding_name = encoding_name
+    if resolved_encoder is None:
+        resolved_encoder, resolved_encoding_name = _get_tiktoken_encoder(request)
+    if resolved_encoder is None:
+        return None
+    if not resolved_encoding_name:
+        resolved_encoding_name = str(getattr(resolved_encoder, "name", "unknown"))
+    return _estimate_text_tokens_with_encoder(
+        extra_text,
+        encoder=resolved_encoder,
+        overhead=MESSAGE_TOKEN_OVERHEAD,
+    )
+
+
+async def estimate_body_extra_tokens_async(
+    body: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    return await asyncio.to_thread(
+        estimate_body_extra_tokens,
+        body,
+        request=request,
+        encoder=encoder,
+        encoding_name=encoding_name,
+    )
+
+
+async def estimate_body_tokens_async(
+    body: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    return await asyncio.to_thread(
+        estimate_body_tokens,
+        body,
+        request=request,
+        encoder=encoder,
+        encoding_name=encoding_name,
+    )
+
+
+async def estimate_message_tokens_async(
+    message: dict[str, Any],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    return await asyncio.to_thread(
+        estimate_message_tokens,
+        message,
+        request=request,
+        encoder=encoder,
+        encoding_name=encoding_name,
+    )
+
+
+async def estimate_messages_tokens_async(
+    messages: list[dict[str, Any]],
+    *,
+    request: Any = None,
+    encoder: Any = None,
+    encoding_name: str | None = None,
+) -> int | None:
+    return await asyncio.to_thread(
+        estimate_messages_tokens,
+        messages,
+        request=request,
+        encoder=encoder,
+        encoding_name=encoding_name,
+    )
+
+
+async def _estimate_rendered_summary_message_tokens(
+    *,
+    request: Any,
+    summary_text: str,
+    summary_meta: dict[str, Any] | None,
+    historical_source_messages: list[dict[str, Any]] | None = None,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+) -> int | None:
+    return await estimate_message_tokens_async(
+        render_summary_message(
+            summary_text,
+            summary_meta,
+            historical_source_messages=historical_source_messages,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        ),
+        request=request,
+    )
+
+
+def _first_system_index(messages: list[dict[str, Any]]) -> int | None:
+    for index, message in enumerate(messages):
+        if message.get("role") == "system":
+            return index
+    return None
+
+
+def _tool_call_ids(message: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for call in tool_calls:
+            if isinstance(call, dict) and isinstance(call.get("id"), str):
+                ids.add(call["id"])
+    return ids
+
+
+def _assistant_tool_call_ids(messages: Iterable[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for message in messages:
+        if message.get("role") == "assistant":
+            ids.update(_tool_call_ids(message))
+    return ids
+
+
+def _remove_orphan_tool_messages(tail: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    assistant_ids = _assistant_tool_call_ids(tail)
+    cleaned: list[dict[str, Any]] = []
+    for message in tail:
+        if message.get("role") == "tool" and message.get("tool_call_id") not in assistant_ids:
+            continue
+        cleaned.append(message)
+    while cleaned and cleaned[0].get("role") == "tool":
+        cleaned.pop(0)
+    return cleaned
+
+
+def select_safe_message_cut(
+    messages: list[dict[str, Any]],
+) -> MessageCut:
+    if not messages:
+        return MessageCut(None, [], [], 0)
+
+    source_messages = [copy.deepcopy(message) for message in messages]
+    system_index = _first_system_index(source_messages)
+    preserved_system = copy.deepcopy(source_messages[system_index]) if system_index is not None else None
+    working = [message for index, message in enumerate(source_messages) if index != system_index]
+
+    if not working:
+        return MessageCut(preserved_system, [], [], 0)
+
+    latest_user_index = next(
+        (index for index in range(len(working) - 1, -1, -1) if working[index].get("role") == "user"),
+        len(working) - 1,
+    )
+    tail = copy.deepcopy(working[latest_user_index:])
+    if not any(message.get("role") == "user" for message in tail):
+        tail = [copy.deepcopy(working[latest_user_index])]
+
+    prefix = copy.deepcopy(working[:latest_user_index])
+    return MessageCut(
+        preserved_system_message=preserved_system,
+        summarization_prefix=prefix,
+        tail_messages=tail,
+        source_message_count=len(prefix),
+    )
+
+
+def select_retry_tool_result_cut(messages: list[dict[str, Any]]) -> RetryToolResultCut | None:
+    cut = select_tool_result_compaction_cut(messages)
+    if cut is None:
+        return None
+    return RetryToolResultCut(
+        preserved_system_message=copy.deepcopy(cut.preserved_system_message),
+        summarization_prefix=copy.deepcopy(cut.summarization_prefix),
+        tail_messages=copy.deepcopy(cut.tail_messages),
+        source_message_count=cut.source_message_count,
+    )
+
+
+def select_tool_result_compaction_cut(
+    messages: list[dict[str, Any]],
+) -> ToolResultCompactionCut | None:
+    source_messages = [copy.deepcopy(message) for message in messages]
+    system_index = _first_system_index(source_messages)
+    preserved_system = copy.deepcopy(source_messages[system_index]) if system_index is not None else None
+    working = [message for index, message in enumerate(source_messages) if index != system_index]
+
+    latest_user_index = next(
+        (index for index in range(len(working) - 1, -1, -1) if working[index].get("role") == "user"),
+        None,
+    )
+    if latest_user_index is None or latest_user_index >= len(working) - 1:
+        return None
+
+    tool_loop_start = latest_user_index + 1
+    tool_loop_messages = working[tool_loop_start:]
+    complete_rounds: list[tuple[int, int, set[str]]] = []
+    all_assistant_ids: set[str] = set()
+    for relative_index, message in enumerate(tool_loop_messages):
+        if message.get("role") != "assistant":
+            continue
+        ids = _tool_call_ids(message)
+        if not ids:
+            continue
+        round_tool_indices = [
+            tool_loop_start + candidate_relative_index
+            for candidate_relative_index, candidate in enumerate(tool_loop_messages)
+            if candidate.get("role") == "tool" and candidate.get("tool_call_id") in ids
+        ]
+        seen = {working[index].get("tool_call_id") for index in round_tool_indices}
+        if ids <= seen:
+            round_start = tool_loop_start + relative_index
+            round_end = max(round_tool_indices) + 1
+            complete_rounds.append((round_start, round_end, ids))
+            all_assistant_ids.update(ids)
+
+    if not complete_rounds:
+        return None
+
+    for message in tool_loop_messages:
+        if message.get("role") == "tool" and message.get("tool_call_id") not in all_assistant_ids:
+            return None
+
+    latest_round_start, _, _ = complete_rounds[-1]
+    summarization_prefix = copy.deepcopy(working[:latest_round_start])
+    tail_messages = copy.deepcopy(working[latest_round_start:])
+    if not summarization_prefix or not tail_messages:
+        return None
+
+    tail_assistant_ids = _assistant_tool_call_ids(tail_messages)
+    for message in tail_messages:
+        if message.get("role") == "tool" and message.get("tool_call_id") not in tail_assistant_ids:
+            return None
+
+    if not any(message.get("role") == "tool" for message in tail_messages):
+        return None
+
+    return ToolResultCompactionCut(
+        preserved_system_message=preserved_system,
+        summarization_prefix=summarization_prefix,
+        tail_messages=tail_messages,
+        source_message_count=len(summarization_prefix),
+    )
+
+
+def _message_content_as_excerpt_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, sort_keys=True)
+
+
+def truncate_text_middle_by_utf8_bytes(text: str, max_bytes: int) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    budget = max(0, int(max_bytes or 0))
+    encoded = text.encode("utf-8")
+    if len(encoded) <= budget:
+        return text
+    if budget <= 0:
+        return ""
+
+    marker = "...[middle omitted]..."
+    marker_bytes = marker.encode("utf-8")
+    if budget <= len(marker_bytes):
+        return marker_bytes[:budget].decode("utf-8", errors="ignore")
+
+    remaining = budget - len(marker_bytes)
+    prefix_budget = remaining // 2
+    suffix_budget = remaining - prefix_budget
+    prefix = encoded[:prefix_budget].decode("utf-8", errors="ignore")
+    suffix = encoded[-suffix_budget:].decode("utf-8", errors="ignore") if suffix_budget > 0 else ""
+    result = f"{prefix}{marker}{suffix}"
+    while len(result.encode("utf-8")) > budget and suffix:
+        suffix = suffix[1:]
+        result = f"{prefix}{marker}{suffix}"
+    return result
+
+
+def _xml_attr(value: Any) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _xml_cdata(value: Any) -> str:
+    text = str(value)
+    return "<![CDATA[" + text.replace("]]>", "]]]]><![CDATA[>") + "]]>"
+
+
+def _decode_xml_cdata(value: str) -> str:
+    if value.startswith("<![CDATA[") and value.endswith("]]>"):
+        return value[len("<![CDATA[") : -len("]]>")].replace("]]]]><![CDATA[>", "]]>")
+    return html.unescape(value)
+
+
+_MD_ALLOWED_TAGS = frozenset(
+    {
+        "p",
+        "br",
+        "hr",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
+        "strong",
+        "b",
+        "em",
+        "i",
+        "u",
+        "s",
+        "del",
+        "ins",
+        "blockquote",
+        "pre",
+        "code",
+        "kbd",
+        "samp",
+        "var",
+        "a",
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "th",
+        "td",
+        "span",
+        "div",
+    }
+)
+_MD_VOID_TAGS = frozenset({"br", "hr"})
+_MD_ALLOWED_ATTRS: dict[str, frozenset[str]] = {
+    "a": frozenset({"href", "title"}),
+    "code": frozenset({"class"}),
+    "pre": frozenset({"class"}),
+    "span": frozenset({"class"}),
+    "th": frozenset({"align", "style"}),
+    "td": frozenset({"align", "style"}),
+}
+_MD_CLASS_RE = re.compile(r"^[a-zA-Z][\w\-]{0,40}$")
+_MD_STYLE_RE = re.compile(r"^\s*text-align\s*:\s*(left|center|right)\s*;?\s*$", re.IGNORECASE)
+_MD_RAW_HTML_TAG_RE = re.compile(
+    r"^</?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*)?/?>$|^<!--.*-->$|^<![A-Za-z][^<>]*>$|^<\?[^<>]*\?>$"
+)
+_MD_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def _html_escape(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return html.escape(text, quote=True).replace("'", "&#x27;")
+
+
+def _is_safe_http_url(url: str) -> bool:
+    if not isinstance(url, str):
+        return False
+    if any(char < " " for char in url):
+        return False
+    stripped = url.strip()
+    lower = stripped.lower()
+    return lower.startswith("http://") or lower.startswith("https://")
+
+
+class _MarkdownSanitizer(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.out: list[str] = []
+        self._stack: list[str] = []
+
+    def _build_attrs(self, tag: str, attrs: list[tuple[str, str | None]]) -> str:
+        allowed = _MD_ALLOWED_ATTRS.get(tag, frozenset())
+        safe_pairs: list[tuple[str, str]] = []
+        href_present = False
+        for name, value in attrs:
+            lname = (name or "").lower()
+            if lname not in allowed:
+                continue
+            attr_value = value or ""
+            if tag == "a" and lname == "href":
+                if not _is_safe_http_url(attr_value):
+                    continue
+                href_present = True
+                safe_pairs.append((lname, attr_value))
+            elif lname == "class":
+                tokens = [token for token in attr_value.split() if _MD_CLASS_RE.match(token)]
+                if tokens:
+                    safe_pairs.append((lname, " ".join(tokens)))
+            elif lname == "style":
+                if _MD_STYLE_RE.match(attr_value):
+                    safe_pairs.append((lname, attr_value.strip()))
+            elif lname == "align" and attr_value.lower() in {"left", "center", "right"}:
+                safe_pairs.append((lname, attr_value.lower()))
+            elif lname == "title":
+                safe_pairs.append((lname, attr_value))
+        attrs_str = "".join(f' {name}="{_html_escape(value)}"' for name, value in safe_pairs)
+        if tag == "a" and href_present:
+            attrs_str += ' target="_blank" rel="noopener noreferrer"'
+        return attrs_str
+
+    def _process_start(self, tag: str, attrs: list[tuple[str, str | None]], self_close: bool) -> None:
+        if tag not in _MD_ALLOWED_TAGS:
+            self.out.append(_html_escape(self.get_starttag_text() or f"<{tag}>"))
+            return
+        attrs_str = self._build_attrs(tag, attrs)
+        if tag in _MD_VOID_TAGS:
+            self.out.append(f"<{tag}{attrs_str}>")
+            return
+        if self_close:
+            self.out.append(f"<{tag}{attrs_str}></{tag}>")
+            return
+        self.out.append(f"<{tag}{attrs_str}>")
+        self._stack.append(tag)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._process_start(tag.lower(), attrs, self_close=False)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._process_start(tag.lower(), attrs, self_close=True)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag not in _MD_ALLOWED_TAGS or tag in _MD_VOID_TAGS:
+            self.out.append(_html_escape(f"</{tag}>"))
+            return
+        if tag not in self._stack:
+            return
+        while self._stack:
+            top = self._stack.pop()
+            self.out.append(f"</{top}>")
+            if top == tag:
+                break
+
+    def handle_data(self, data: str) -> None:
+        self.out.append(_html_escape(data))
+
+    def handle_entityref(self, name: str) -> None:
+        self.out.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self.out.append(f"&#{name};")
+
+    def close(self) -> None:
+        super().close()
+        while self._stack:
+            self.out.append(f"</{self._stack.pop()}>")
+
+
+def _escape_markdown_raw_html_line(line: str) -> str:
+    output: list[str] = []
+    index = 0
+    inline_code_ticks = 0
+    while index < len(line):
+        if line[index] == "`":
+            end = index + 1
+            while end < len(line) and line[end] == "`":
+                end += 1
+            tick_count = end - index
+            if inline_code_ticks == 0:
+                inline_code_ticks = tick_count
+            elif inline_code_ticks == tick_count:
+                inline_code_ticks = 0
+            output.append(line[index:end])
+            index = end
+            continue
+        if inline_code_ticks == 0 and line[index] == "<":
+            end = line.find(">", index + 1)
+            if end >= 0:
+                candidate = line[index : end + 1]
+                if _MD_RAW_HTML_TAG_RE.match(candidate):
+                    output.append(_html_escape(candidate))
+                    index = end + 1
+                    continue
+        output.append(line[index])
+        index += 1
+    return "".join(output)
+
+
+def _escape_markdown_raw_html(text: str) -> str:
+    lines: list[str] = []
+    in_fence = False
+    fence_marker = ""
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        newline = line[len(body) :]
+        match = _MD_FENCE_RE.match(body)
+        if match:
+            marker = match.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker[0] * len(marker)
+                lines.append(line)
+                continue
+            if marker[0] == fence_marker[0] and len(marker) >= len(fence_marker):
+                in_fence = False
+                fence_marker = ""
+                lines.append(line)
+                continue
+        if in_fence or body.startswith(("    ", "\t")):
+            lines.append(line)
+            continue
+        lines.append(_escape_markdown_raw_html_line(body) + newline)
+    return "".join(lines)
+
+
+def _render_summary_markdown(text: Any) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    if _markdown_mod is None:
+        return f'<pre class="md-fallback">{_html_escape(text)}</pre>'
+    try:
+        raw_html = _markdown_mod.markdown(
+            _escape_markdown_raw_html(text),
+            extensions=["extra", "sane_lists", "nl2br"],
+            output_format="html",
+        )
+    except Exception:
+        return f'<pre class="md-fallback">{_html_escape(text)}</pre>'
+    sanitizer = _MarkdownSanitizer()
+    try:
+        sanitizer.feed(raw_html)
+        sanitizer.close()
+    except Exception:
+        return f'<pre class="md-fallback">{_html_escape(text)}</pre>'
+    return "".join(sanitizer.out)
+
+
+def render_historical_user_message_excerpts(
+    source_messages: list[dict[str, Any]],
+    *,
+    excerpt_bytes: int,
+    max_messages: int,
+) -> str:
+    count_limit = int(max_messages or 0)
+    if count_limit <= 0:
+        return ""
+
+    excerpts = [item["text"] for item in _build_historical_user_message_excerpt_items(
+        source_messages,
+        excerpt_bytes=excerpt_bytes,
+        max_messages=count_limit,
+    )]
+    if not excerpts:
+        return ""
+
+    lines = [
+        (
+            f'<historical_user_messages order="chronological" selected_count="{len(excerpts)}" '
+            f'max_count="{count_limit}" max_bytes_per_message="{int(excerpt_bytes or 0)}">'
+        )
+    ]
+    for index, excerpt in enumerate(excerpts, start=1):
+        lines.append(f'<historical_user_message ordinal="{index}">{_xml_cdata(excerpt)}</historical_user_message>')
+    lines.append("</historical_user_messages>")
+    return "\n".join(lines)
+
+
+def _coerce_nonnegative_int(value: Any, *, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except Exception:
+        return max(0, int(default))
+
+
+def _build_historical_user_message_excerpt_items(
+    source_messages: list[dict[str, Any]],
+    *,
+    excerpt_bytes: int,
+    max_messages: int,
+) -> list[dict[str, Any]]:
+    count_limit = _coerce_nonnegative_int(max_messages)
+    if count_limit <= 0:
+        return []
+
+    excerpts: list[str] = []
+    for message in source_messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = _message_content_as_excerpt_text(message).strip()
+        if not text:
+            continue
+        excerpts.append(truncate_text_middle_by_utf8_bytes(text, excerpt_bytes))
+    excerpts = excerpts[-count_limit:]
+    return [{"ordinal": index, "text": excerpt} for index, excerpt in enumerate(excerpts, start=1)]
+
+
+def _normalize_stored_historical_user_messages(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    raw_messages = value.get("messages")
+    if not isinstance(raw_messages, list):
+        return None
+
+    messages: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_messages, start=1):
+        if not isinstance(item, dict) or "text" not in item:
+            continue
+        text = item.get("text")
+        if text is None:
+            continue
+        ordinal = _coerce_nonnegative_int(item.get("ordinal"), default=index) or index
+        messages.append({"ordinal": ordinal, "text": str(text)})
+    if not messages:
+        return None
+
+    max_count = _coerce_nonnegative_int(value.get("max_count"), default=len(messages))
+    max_bytes = _coerce_nonnegative_int(value.get("max_bytes_per_message"), default=0)
+    return {
+        "format_version": SUMMARY_META_HISTORICAL_USER_MESSAGES_FORMAT_VERSION,
+        "order": "chronological",
+        "max_count": max_count,
+        "max_bytes_per_message": max_bytes,
+        "selected_count": len(messages),
+        "messages": messages,
+    }
+
+
+def normalize_summary_meta(summary_meta: dict[str, Any] | None) -> dict[str, Any]:
+    meta = copy.deepcopy(summary_meta) if isinstance(summary_meta, dict) else {}
+    stored = _normalize_stored_historical_user_messages(meta.get(SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY))
+    if stored is None:
+        meta.pop(SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY, None)
+    else:
+        meta[SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY] = stored
+    return meta
+
+
+def enrich_summary_meta_with_historical_excerpts(
+    summary_meta: dict[str, Any] | None,
+    source_messages: list[dict[str, Any]],
+    *,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> dict[str, Any]:
+    meta = normalize_summary_meta(summary_meta)
+    meta[SUMMARY_META_FORMAT_VERSION_KEY] = SUMMARY_META_FORMAT_VERSION
+    meta.pop(SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY, None)
+
+    count_limit = _coerce_nonnegative_int(historical_message_excerpt_count)
+    if count_limit <= 0:
+        return meta
+
+    excerpt_bytes = _coerce_nonnegative_int(historical_message_excerpt_bytes)
+    messages = _build_historical_user_message_excerpt_items(
+        source_messages,
+        excerpt_bytes=excerpt_bytes,
+        max_messages=count_limit,
+    )
+    if not messages:
+        return meta
+
+    meta[SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY] = {
+        "format_version": SUMMARY_META_HISTORICAL_USER_MESSAGES_FORMAT_VERSION,
+        "order": "chronological",
+        "max_count": count_limit,
+        "max_bytes_per_message": excerpt_bytes,
+        "selected_count": len(messages),
+        "messages": messages,
+    }
+    return meta
+
+
+def build_checkpoint_summary_meta(
+    source_messages: list[dict[str, Any]],
+    *,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> dict[str, Any]:
+    return enrich_summary_meta_with_historical_excerpts(
+        {"has_multimodal": _messages_have_multimodal(source_messages)},
+        source_messages,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+
+
+def render_stored_historical_user_message_excerpts(summary_meta: dict[str, Any] | None) -> str:
+    meta = normalize_summary_meta(summary_meta)
+    stored = meta.get(SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY)
+    if not isinstance(stored, dict):
+        return ""
+    messages = stored.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return ""
+
+    lines = [
+        (
+            f'<historical_user_messages order="{_xml_attr(stored.get("order") or "chronological")}" '
+            f'selected_count="{len(messages)}" '
+            f'max_count="{_coerce_nonnegative_int(stored.get("max_count"), default=len(messages))}" '
+            f'max_bytes_per_message="{_coerce_nonnegative_int(stored.get("max_bytes_per_message"))}">'
+        )
+    ]
+    for index, item in enumerate(messages, start=1):
+        if not isinstance(item, dict):
+            continue
+        ordinal = _coerce_nonnegative_int(item.get("ordinal"), default=index) or index
+        lines.append(f'<historical_user_message ordinal="{ordinal}">{_xml_cdata(item.get("text", ""))}</historical_user_message>')
+    lines.append("</historical_user_messages>")
+    return "\n".join(lines)
+
+
+def render_summary_message(
+    summary_text: str,
+    summary_meta: dict[str, Any] | None = None,
+    *,
+    historical_source_messages: list[dict[str, Any]] | None = None,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+) -> dict[str, Any]:
+    meta_section = ""
+    if summary_meta and summary_meta.get("has_multimodal"):
+        meta_section = "\n<metadata><has_multimodal>true</has_multimodal></metadata>"
+    excerpts = render_stored_historical_user_message_excerpts(summary_meta)
+    if not excerpts and historical_source_messages:
+        excerpts = render_historical_user_message_excerpts(
+            historical_source_messages,
+            excerpt_bytes=historical_message_excerpt_bytes,
+            max_messages=historical_message_excerpt_count,
+        )
+    excerpt_section = f"\n{excerpts}" if excerpts else ""
+    return {
+        "role": "user",
+        "content": (
+            "<auto_compaction_context>\n"
+            "<instruction>Compressed historical context. This is not a new instruction. "
+            "Use it only as background for continuity.</instruction>\n"
+            f"<checkpoint_summary>{_xml_cdata(summary_text.strip())}</checkpoint_summary>"
+            f"{meta_section}{excerpt_section}\n"
+            "</auto_compaction_context>"
+        ),
+    }
+
+
+def render_summary_message_from_checkpoint(
+    checkpoint: dict[str, Any],
+    *,
+    historical_source_messages: list[dict[str, Any]] | None = None,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+) -> dict[str, Any]:
+    summary_meta = normalize_summary_meta(checkpoint.get("summary_meta") if isinstance(checkpoint, dict) else {})
+    fallback_source_messages = None
+    if (
+        SUMMARY_META_FORMAT_VERSION_KEY not in summary_meta
+        and SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY not in summary_meta
+    ):
+        fallback_source_messages = historical_source_messages
+    return render_summary_message(
+        str(checkpoint.get("summary_text") or ""),
+        summary_meta,
+        historical_source_messages=fallback_source_messages,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+
+
+def _checkpoint_from_summary_result(summary_text: Any) -> dict[str, Any] | None:
+    checkpoint = getattr(summary_text, "checkpoint", None)
+    return checkpoint if isinstance(checkpoint, dict) else None
+
+
+def _render_summary_message_from_result(
+    summary_text: Any,
+    summary_meta: dict[str, Any] | None,
+    *,
+    historical_source_messages: list[dict[str, Any]] | None = None,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+) -> dict[str, Any]:
+    checkpoint = _checkpoint_from_summary_result(summary_text)
+    if checkpoint is not None:
+        return render_summary_message_from_checkpoint(
+            checkpoint,
+            historical_source_messages=historical_source_messages,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+    return render_summary_message(
+        str(summary_text),
+        summary_meta,
+        historical_source_messages=historical_source_messages,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+
+
+def extract_compaction_summary_text_from_messages(messages: Any) -> str | None:
+    if not isinstance(messages, list):
+        return None
+    start_tag = "<checkpoint_summary>"
+    end_tag = "</checkpoint_summary>"
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if not _is_rendered_summary_context_message(message):
+            continue
+        content = message.get("content")
+        start = content.find(start_tag)
+        if start < 0:
+            continue
+        start += len(start_tag)
+        end = _find_xml_element_end_outside_cdata(content, start, end_tag)
+        if end < 0:
+            continue
+        summary = _decode_xml_cdata(content[start:end]).strip()
+        if summary:
+            return summary
+    return None
+
+
+def _is_rendered_summary_context_message(message: dict[str, Any]) -> bool:
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    stripped = content.strip()
+    return stripped.startswith("<auto_compaction_context>") and stripped.endswith("</auto_compaction_context>")
+
+
+def _find_xml_element_end_outside_cdata(text: str, start: int, end_tag: str) -> int:
+    pos = start
+    while pos < len(text):
+        if text.startswith("<![CDATA[", pos):
+            cdata_end = text.find("]]>", pos + len("<![CDATA["))
+            if cdata_end < 0:
+                return -1
+            pos = cdata_end + len("]]>")
+            continue
+        if text.startswith(end_tag, pos):
+            return pos
+        pos += 1
+    return -1
+
+
+def render_compaction_summary_embed_html(summary_text: str) -> str:
+    summary_body_html = _render_summary_markdown(str(summary_text or "").strip())
+    if summary_body_html:
+        rendered_summary = f'<div class="summary-body md">{summary_body_html}</div>'
+    else:
+        rendered_summary = f'<div class="summary-body plain">{_html_escape(summary_text)}</div>'
+    styles = "".join(
+        [
+            "*{box-sizing:border-box}",
+            (
+                ":root{color-scheme:light;--fg:#374151;--fg-strong:#111827;--fg-muted:#6b7280;"
+                "--border:rgba(209,213,219,.75);--border-open:rgba(156,163,175,.55);"
+                "--surface:rgba(249,250,251,.92);--surface-open:#fff;--body-bg:rgba(255,255,255,.82);"
+                "--hover:rgba(243,244,246,.85);--shadow:0 1px 2px rgba(15,23,42,.04)}"
+            ),
+            (
+                ":root[data-theme='dark']{color-scheme:dark;--fg:#d1d5db;--fg-strong:#f9fafb;"
+                "--fg-muted:#9ca3af;--border:rgba(75,85,99,.78);--border-open:rgba(107,114,128,.72);"
+                "--surface:rgba(17,24,39,.68);--surface-open:rgba(17,24,39,.9);"
+                "--body-bg:rgba(3,7,18,.32);--hover:rgba(31,41,55,.72);--shadow:none}"
+            ),
+            (
+                "@media (prefers-color-scheme:dark){:root:not([data-theme='light']){color-scheme:dark;"
+                "--fg:#d1d5db;--fg-strong:#f9fafb;--fg-muted:#9ca3af;--border:rgba(75,85,99,.78);"
+                "--border-open:rgba(107,114,128,.72);--surface:rgba(17,24,39,.68);"
+                "--surface-open:rgba(17,24,39,.9);--body-bg:rgba(3,7,18,.32);"
+                "--hover:rgba(31,41,55,.72);--shadow:none}}"
+            ),
+            (
+                "html,body{margin:0;padding:0;background:transparent;color:var(--fg);"
+                "font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+                "font-size:13px;line-height:1.45}"
+            ),
+            "body{padding:2px}",
+            (
+                ".card{border:1px solid var(--border);border-radius:8px;background:var(--surface);"
+                "overflow:hidden;margin:0;box-shadow:var(--shadow);transition:border-color .18s ease,"
+                "background-color .18s ease,box-shadow .18s ease}"
+            ),
+            ".card[data-expanded='true']{border-color:var(--border-open);background:var(--surface-open)}",
+            (
+                "summary{display:flex;align-items:center;justify-content:space-between;gap:12px;"
+                "padding:7px 10px;cursor:pointer;user-select:none;font-weight:500;color:var(--fg-strong);"
+                "font-size:12.5px;line-height:1.35;transition:background-color .18s ease,color .18s ease}"
+            ),
+            "summary:hover{background:var(--hover)}",
+            "summary::-webkit-details-marker{display:none}",
+            ".title{overflow-wrap:anywhere}",
+            (
+                ".chevron{position:relative;width:16px;height:16px;flex:0 0 auto;color:var(--fg-muted);"
+                "transition:color .18s ease}.chevron:before{content:'';position:absolute;left:4px;top:3px;"
+                "width:7px;height:7px;border-right:1.7px solid currentColor;border-bottom:1.7px solid currentColor;"
+                "transform:rotate(45deg);transition:transform .28s cubic-bezier(.22,1,.36,1),top .28s cubic-bezier(.22,1,.36,1)}"
+            ),
+            ".card[data-expanded='true'] .chevron:before{top:6px;transform:rotate(225deg)}",
+            ".card[open]:not([data-js='true']) .chevron:before{top:6px;transform:rotate(225deg)}",
+            (
+                ".body-wrap{height:0;opacity:0;overflow:hidden;transition:height .28s cubic-bezier(.22,1,.36,1),"
+                "opacity .18s ease}.card[data-expanded='true'] .body-wrap{opacity:1}"
+            ),
+            ".card[open]:not([data-js='true']) .body-wrap{height:auto;opacity:1}",
+            (
+                ".body{border-top:1px solid var(--border);padding:12px;background:var(--body-bg);"
+                "max-height:36em;overflow:auto;scrollbar-width:thin}"
+            ),
+            (
+                ".summary-body{margin:0;overflow-wrap:anywhere;word-break:break-word;"
+                "font-size:12.5px;line-height:1.55;color:var(--fg-strong)}"
+            ),
+            ".summary-body.plain,.summary-body .md-fallback{white-space:pre-wrap}",
+            (
+                ".summary-body.plain,.summary-body .md-fallback,.summary-body.md pre,.summary-body.md code{"
+                "font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;"
+                "font-size:12px}"
+            ),
+            ".summary-body.md h1,.summary-body.md h2,.summary-body.md h3,.summary-body.md h4{margin:10px 0 5px;font-weight:600;line-height:1.3}",
+            ".summary-body.md h1{font-size:16px}.summary-body.md h2{font-size:15px}",
+            ".summary-body.md h3{font-size:14px}.summary-body.md h4,.summary-body.md h5,.summary-body.md h6{font-size:13px}",
+            ".summary-body.md p{margin:5px 0;overflow-wrap:anywhere;word-break:break-word}",
+            ".summary-body.md ul,.summary-body.md ol{margin:5px 0;padding-left:20px}",
+            ".summary-body.md li{margin:2px 0;overflow-wrap:anywhere;word-break:break-word}",
+            (
+                ".summary-body.md code{padding:1px 5px;border-radius:3px;background:rgba(127,127,127,.2);"
+                "overflow-wrap:anywhere;word-break:break-all}"
+            ),
+            (
+                ".summary-body.md pre{padding:8px 10px;border-radius:5px;background:rgba(127,127,127,.17);"
+                "overflow-x:auto;margin:6px 0;line-height:1.4;white-space:pre-wrap}"
+            ),
+            ".summary-body.md pre code{background:transparent;padding:0}",
+            ".summary-body.md blockquote{margin:6px 0;padding:2px 10px;border-left:3px solid rgba(127,127,127,.4);opacity:.85}",
+            ".summary-body.md a{color:#2563eb;text-decoration:underline;text-underline-offset:2px}",
+            ":root[data-theme='dark'] .summary-body.md a{color:#60a5fa}",
+            ".summary-body.md table{border-collapse:collapse;margin:6px 0;font-size:12px;display:block;overflow-x:auto}",
+            ".summary-body.md th,.summary-body.md td{padding:4px 8px;border:1px solid rgba(127,127,127,.3)}",
+            ".summary-body.md hr{border:none;border-top:1px solid rgba(127,127,127,.3);margin:8px 0}",
+            (
+                "@media (prefers-reduced-motion:reduce){.card,summary,.chevron,.chevron:before,.body-wrap{"
+                "transition:none!important}}"
+            ),
+        ]
+    )
+    initial_script = "".join(
+        [
+            "(function(){",
+            "function applyInitialTheme(){var dark=false;var parentThemeRead=false;try{dark=parent.document.documentElement.classList.contains('dark')||(parent.document.body&&parent.document.body.classList.contains('dark'));parentThemeRead=true;}catch(e){dark=false;}",
+            "if(!parentThemeRead&&window.matchMedia){dark=window.matchMedia('(prefers-color-scheme: dark)').matches;}",
+            "document.documentElement.dataset.theme=dark?'dark':'light';}",
+            "applyInitialTheme();",
+            "parent.postMessage({type:'iframe:height',height:0},'*');",
+            "})();",
+        ]
+    )
+    script = "".join(
+        [
+            "(function(){",
+            "var root=document.documentElement;",
+            "var card=document.querySelector('.card');",
+            "var summary=document.querySelector('summary');",
+            "var wrap=document.querySelector('.body-wrap');",
+            "var inner=document.querySelector('.body');",
+            "if(card){card.dataset.js='true';}",
+            "function syncTheme(){var dark=false;var parentThemeRead=false;try{dark=parent.document.documentElement.classList.contains('dark')||(parent.document.body&&parent.document.body.classList.contains('dark'));parentThemeRead=true;}catch(e){dark=false;}",
+            "if(!parentThemeRead&&window.matchMedia){dark=window.matchMedia('(prefers-color-scheme: dark)').matches;}",
+            "root.dataset.theme=dark?'dark':'light';}",
+            "function postHeightValue(height){parent.postMessage({type:'iframe:height',height:Math.max(0,Math.ceil(height||0))},'*');}",
+            "function documentHeight(){var b=document.body;return b?b.scrollHeight:document.documentElement.scrollHeight;}",
+            "function postHeight(){requestAnimationFrame(function(){",
+            "var b=document.body;",
+            "var h=b?b.scrollHeight:document.documentElement.scrollHeight;",
+            "postHeightValue(h);",
+            "});}",
+            "function reducedMotion(){try{return !!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);}catch(e){return false;}}",
+            "function visibleBodyHeight(){if(!inner){return 0;}var height=inner.getBoundingClientRect().height;return Math.ceil(height||inner.offsetHeight||inner.clientHeight||0);}",
+            "function currentWrapHeight(){if(!wrap){return 0;}var height=wrap.getBoundingClientRect().height;return Math.ceil(height||wrap.offsetHeight||0);}",
+            "function baseDocumentHeight(){return Math.max(0,documentHeight()-currentWrapHeight());}",
+            "var iframeAnimationId=0;",
+            "function ease(t){return 1-Math.pow(1-t,3);}",
+            "function animateIframeHeight(from,to,duration){iframeAnimationId+=1;var id=iframeAnimationId;var start=(window.performance&&window.performance.now)?window.performance.now():Date.now();function step(now){if(id!==iframeAnimationId){return;}var elapsed=Math.max(0,now-start);var progress=duration>0?Math.min(1,elapsed/duration):1;var value=from+(to-from)*ease(progress);postHeightValue(value);if(progress<1){requestAnimationFrame(step);}else{postHeight();}}requestAnimationFrame(step);}",
+            "function animate(open){if(!card||!wrap||!inner){return;}",
+            "card.dataset.expanded=open?'true':'false';",
+            "if(reducedMotion()){if(open){card.open=true;wrap.style.height='auto';wrap.style.opacity='1';}else{wrap.style.height='0px';wrap.style.opacity='0';card.open=false;}postHeight();return;}",
+            "var startDocHeight=documentHeight();",
+            "if(open){card.open=true;wrap.style.height='0px';wrap.style.opacity='0';postHeightValue(startDocHeight);requestAnimationFrame(function(){var visibleHeight=visibleBodyHeight();var baseHeight=baseDocumentHeight();var targetDocHeight=baseHeight+visibleHeight;wrap.style.height=visibleHeight+'px';wrap.style.opacity='1';animateIframeHeight(startDocHeight,targetDocHeight,280);});}",
+            "else{var visibleHeight=visibleBodyHeight();var baseHeight=baseDocumentHeight();var targetDocHeight=baseHeight;wrap.style.height=visibleHeight+'px';wrap.style.opacity='1';postHeightValue(startDocHeight);requestAnimationFrame(function(){wrap.style.height='0px';wrap.style.opacity='0';animateIframeHeight(startDocHeight,targetDocHeight,280);});}}",
+            "if(summary){summary.addEventListener('click',function(event){event.preventDefault();animate(!(card.dataset.expanded==='true'));});}",
+            "if(wrap){wrap.addEventListener('transitionend',function(event){if(event.propertyName!=='height'){return;}if(card.dataset.expanded==='true'){wrap.style.height='auto';}else{card.open=false;}postHeight();});}",
+            "syncTheme();",
+            "try{var observer=new MutationObserver(function(){syncTheme();postHeight();});observer.observe(parent.document.documentElement,{attributes:true,attributeFilter:['class']});if(parent.document.body){observer.observe(parent.document.body,{attributes:true,attributeFilter:['class']});}}catch(e){}",
+            "postHeight();",
+            "window.addEventListener('DOMContentLoaded',postHeight);",
+            "window.addEventListener('load',postHeight);",
+            "if(window.matchMedia){try{window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){syncTheme();postHeight();});}catch(e){}}",
+            "})();",
+        ]
+    )
+    return (
+        f"{COMPACTION_SUMMARY_EMBED_MARKER}"
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<script>{initial_script}</script>"
+        f"<style>{styles}</style></head><body>"
+        "<details class=\"card\" data-expanded=\"false\">"
+        "<summary>"
+        "<span class=\"title\">Compact summary</span>"
+        "<span class=\"chevron\" aria-hidden=\"true\"></span>"
+        "</summary>"
+        f"<div class=\"body-wrap\"><div class=\"body\">{rendered_summary}</div></div>"
+        "</details>"
+        f"<script>{script}</script></body></html>"
+    )
+
+
+async def emit_compaction_summary_embed(
+    event_emitter: Callable[[Any], Awaitable[None]] | None,
+    *,
+    summary_text: str | None,
+) -> None:
+    if event_emitter is None or not summary_text:
+        return
+    try:
+        await event_emitter(
+            {
+                "type": "embeds",
+                "data": {
+                    "embeds": [render_compaction_summary_embed_html(summary_text)],
+                    "replace": False,
+                },
+            }
+        )
+    except Exception:
+        return
+
+
+def replace_prefix_with_summary(
+    messages: list[dict[str, Any]],
+    cut: MessageCut,
+    summary_text: str,
+    summary_meta: dict[str, Any] | None = None,
+    *,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    if cut.preserved_system_message is not None:
+        compacted.append(copy.deepcopy(cut.preserved_system_message))
+    compacted.append(
+        _render_summary_message_from_result(
+            summary_text,
+            summary_meta,
+            historical_source_messages=cut.summarization_prefix,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+    )
+    compacted.extend(copy.deepcopy(cut.tail_messages))
+    return compacted
+
+
+def replace_prefix_with_parent_checkpoint_and_delta(
+    cut: MessageCut,
+    parent: dict[str, Any],
+    *,
+    prefix_file_fingerprint: str | None = None,
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+) -> list[dict[str, Any]]:
+    parent_count = int(parent.get("source_message_count") or 0)
+    if parent_count <= 0 or parent_count > len(cut.summarization_prefix):
+        raise UnsupportedCompactionInput(
+            "Parent checkpoint cannot be applied safely because its source boundary is invalid",
+            code="unsafe_checkpoint_parent",
+        )
+    if compute_summary_source_hash(cut.summarization_prefix[:parent_count], prefix_file_fingerprint) != parent.get("source_hash"):
+        raise UnsupportedCompactionInput(
+            "Parent checkpoint cannot be applied safely because its source hash no longer matches",
+            code="unsafe_checkpoint_parent",
+        )
+
+    delta_messages = copy.deepcopy(cut.summarization_prefix[parent_count:])
+    delta_and_tail = [*delta_messages, *copy.deepcopy(cut.tail_messages)]
+    if delta_and_tail and delta_and_tail[0].get("role") == "tool":
+        raise UnsupportedCompactionInput(
+            "Parent checkpoint delta starts with a tool result and cannot preserve tool-call structure",
+            code="unsafe_checkpoint_delta",
+        )
+    if _remove_orphan_tool_messages(copy.deepcopy(delta_and_tail)) != delta_and_tail:
+        raise UnsupportedCompactionInput(
+            "Parent checkpoint delta would split assistant/tool messages",
+            code="unsafe_checkpoint_delta",
+        )
+
+    compacted: list[dict[str, Any]] = []
+    if cut.preserved_system_message is not None:
+        compacted.append(copy.deepcopy(cut.preserved_system_message))
+    compacted.append(
+        render_summary_message_from_checkpoint(
+            parent,
+            historical_source_messages=cut.summarization_prefix[:parent_count],
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+    )
+    compacted.extend(delta_messages)
+    compacted.extend(copy.deepcopy(cut.tail_messages))
+    return compacted
+
+
+def build_checkpoint_id(
+    *,
+    namespace: str,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    profile_hash: str,
+    source_hash: str,
+) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            [namespace, user_id, chat_id, pipe_function_id, profile_hash, source_hash],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"accp_{digest}"
+
+
+def build_checkpoint_row(
+    *,
+    namespace: str,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    profile_hash: str,
+    source_hash: str,
+    source_message_count: int,
+    summary_text: str,
+    summary_meta: dict[str, Any] | None,
+    parent_checkpoint_id: str | None,
+    summary_token_count: int | None = None,
+    state: str = "ready",
+    claim_token: str | None = None,
+    claim_expires_at: int | None = None,
+    now: int | None = None,
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now is None else int(now)
+    return {
+        "id": build_checkpoint_id(
+            namespace=namespace,
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_function_id=pipe_function_id,
+            profile_hash=profile_hash,
+            source_hash=source_hash,
+        ),
+        "namespace": namespace,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "pipe_function_id": pipe_function_id,
+        "profile_hash": profile_hash,
+        "source_message_count": int(source_message_count),
+        "source_hash": source_hash,
+        "summary_text": summary_text,
+        "summary_meta": normalize_summary_meta(summary_meta),
+        "summary_token_count": summary_token_count,
+        "state": state,
+        "parent_checkpoint_id": parent_checkpoint_id,
+        "claim_token": claim_token,
+        "claim_expires_at": claim_expires_at,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "last_used_at": timestamp,
+    }
+
+
+def select_longest_matching_checkpoint(
+    rows: Iterable[dict[str, Any]],
+    source_messages: list[dict[str, Any]],
+    *,
+    states: set[str] | None = None,
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+) -> dict[str, Any] | None:
+    prefix_hashes: dict[int, str] = {}
+    candidates = sorted(rows, key=lambda row: int(row.get("source_message_count") or 0), reverse=True)
+    for row in candidates:
+        if states is not None and row.get("state") not in states:
+            continue
+        count = int(row.get("source_message_count") or 0)
+        if count <= 0 or count > len(source_messages):
+            continue
+        if count not in prefix_hashes:
+            fingerprint = (
+                prefix_file_fingerprint_resolver(count)
+                if prefix_file_fingerprint_resolver is not None
+                else None
+            )
+            prefix_hashes[count] = compute_summary_source_hash(source_messages[:count], fingerprint)
+        if prefix_hashes[count] == row.get("source_hash"):
+            return row
+    return None
+
+
+def select_longest_matching_parent(
+    rows: Iterable[dict[str, Any]],
+    source_messages: list[dict[str, Any]],
+    *,
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+) -> dict[str, Any] | None:
+    return select_longest_matching_checkpoint(
+        rows,
+        source_messages,
+        states={"ready"},
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+    )
+
+
+_CHECKPOINT_COMPAT_COLUMN_DDL_TYPES = (
+    ("claim_token", "TEXT"),
+    ("claim_expires_at", "BIGINT"),
+    ("summary_token_count", "INTEGER"),
+)
+
+
+def _is_duplicate_schema_object_error(exc: Exception) -> bool:
+    message = str(getattr(exc, "orig", None) or exc).lower()
+    return "already exists" in message or "duplicate" in message
+
+
+def _execute_checkpoint_ddl_tolerating_duplicates(sync_conn: Any, statement: Any) -> None:
+    try:
+        with sync_conn.begin_nested():
+            sync_conn.execute(statement)
+    except (IntegrityError, OperationalError, ProgrammingError) as exc:
+        if not _is_duplicate_schema_object_error(exc):
+            raise
+
+
+def _quoted_checkpoint_table_sql() -> str:
+    if OPEN_WEBUI_DATABASE_SCHEMA:
+        return f'"{OPEN_WEBUI_DATABASE_SCHEMA}"."{CHECKPOINT_TABLE_NAME}"'
+    return f'"{CHECKPOINT_TABLE_NAME}"'
+
+
+def _initialize_checkpoint_schema(sync_conn: Any) -> None:
+    _execute_checkpoint_ddl_tolerating_duplicates(sync_conn, CreateTable(CHECKPOINT_TABLE, if_not_exists=True))
+    for index in CHECKPOINT_TABLE.indexes:
+        _execute_checkpoint_ddl_tolerating_duplicates(sync_conn, CreateIndex(index, if_not_exists=True))
+    existing_columns = {
+        column["name"]
+        for column in sqlalchemy_inspect(sync_conn).get_columns(
+            CHECKPOINT_TABLE_NAME, schema=OPEN_WEBUI_DATABASE_SCHEMA
+        )
+    }
+    for column_name, column_ddl_type in _CHECKPOINT_COMPAT_COLUMN_DDL_TYPES:
+        if column_name in existing_columns:
+            continue
+        _execute_checkpoint_ddl_tolerating_duplicates(
+            sync_conn,
+            sql_text(f"ALTER TABLE {_quoted_checkpoint_table_sql()} ADD COLUMN {column_name} {column_ddl_type}"),
+        )
+
+
+def _schema_init_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _SCHEMA_INIT_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SCHEMA_INIT_LOCKS[loop] = lock
+    return lock
+
+
+async def ensure_checkpoint_table_initialized(
+    *,
+    request: Any = None,
+    async_engine: AsyncEngine | Any | None = None,
+) -> None:
+    global _CHECKPOINT_SCHEMA_READY
+
+    state = getattr(request, "state", None)
+    if state is not None and getattr(state, REQUEST_STATE_SCHEMA_READY_KEY, False):
+        return
+    if _CHECKPOINT_SCHEMA_READY:
+        if state is not None:
+            setattr(state, REQUEST_STATE_SCHEMA_READY_KEY, True)
+        return
+
+    if async_engine is None:
+        from open_webui.internal.db import async_engine as open_webui_async_engine
+
+        async_engine = open_webui_async_engine
+
+    loop = asyncio.get_running_loop()
+    lock = _schema_init_lock()
+    try:
+        async with lock:
+            if not _CHECKPOINT_SCHEMA_READY:
+                async with async_engine.begin() as conn:
+                    await conn.run_sync(_initialize_checkpoint_schema)
+                _CHECKPOINT_SCHEMA_READY = True
+    finally:
+        if not lock.locked() and not getattr(lock, "_waiters", None) and _SCHEMA_INIT_LOCKS.get(loop) is lock:
+            _SCHEMA_INIT_LOCKS.pop(loop, None)
+    if state is not None:
+        setattr(state, REQUEST_STATE_SCHEMA_READY_KEY, True)
+
+
+class CheckpointStore:
+    def __init__(self, *, db: AsyncSession | None = None):
+        self.db = db
+
+    async def _context(self):
+        if self.db is not None:
+            class ExistingSessionContext:
+                async def __aenter__(self_nonlocal):
+                    return self.db
+
+                async def __aexit__(self_nonlocal, exc_type, exc, tb):
+                    return False
+
+            return ExistingSessionContext()
+
+        from open_webui.internal.db import get_async_db
+
+        return get_async_db()
+
+    def _identity_clauses(
+        self,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_function_id: str,
+        profile_hash: str,
+    ) -> list[Any]:
+        return [
+            CHECKPOINT_TABLE.c.namespace == namespace,
+            CHECKPOINT_TABLE.c.user_id == user_id,
+            CHECKPOINT_TABLE.c.chat_id == chat_id,
+            CHECKPOINT_TABLE.c.pipe_function_id == pipe_function_id,
+            CHECKPOINT_TABLE.c.profile_hash == profile_hash,
+        ]
+
+    async def lookup_any(
+        self,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_function_id: str,
+        profile_hash: str,
+        source_hash: str,
+    ) -> dict[str, Any] | None:
+        async with await self._context() as db:
+            result = await db.execute(
+                select(CHECKPOINT_TABLE).where(
+                    *self._identity_clauses(
+                        namespace=namespace,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                    ),
+                    CHECKPOINT_TABLE.c.source_hash == source_hash,
+                )
+            )
+            row = result.mappings().first()
+            return dict(row) if row else None
+
+    async def lookup_ready(
+        self,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_function_id: str,
+        profile_hash: str,
+        source_hash: str,
+    ) -> dict[str, Any] | None:
+        async with await self._context() as db:
+            result = await db.execute(
+                select(CHECKPOINT_TABLE).where(
+                    *self._identity_clauses(
+                        namespace=namespace,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                    ),
+                    CHECKPOINT_TABLE.c.source_hash == source_hash,
+                    CHECKPOINT_TABLE.c.state == "ready",
+                )
+            )
+            row = result.mappings().first()
+            return dict(row) if row else None
+
+    async def find_longest_parent(
+        self,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_function_id: str,
+        profile_hash: str,
+        source_messages: list[dict[str, Any]],
+        prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+    ) -> dict[str, Any] | None:
+        if not source_messages:
+            return None
+        async with await self._context() as db:
+            result = await db.execute(
+                select(CHECKPOINT_TABLE)
+                .where(
+                    *self._identity_clauses(
+                        namespace=namespace,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                    ),
+                    CHECKPOINT_TABLE.c.state == "ready",
+                    CHECKPOINT_TABLE.c.source_message_count <= len(source_messages),
+                )
+                .order_by(CHECKPOINT_TABLE.c.source_message_count.desc())
+            )
+            rows = [dict(row) for row in result.mappings().all()]
+        return select_longest_matching_parent(
+            rows,
+            source_messages,
+            prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        )
+
+    async def find_longest_pending_parent(
+        self,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_function_id: str,
+        profile_hash: str,
+        source_messages: list[dict[str, Any]],
+        prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+    ) -> dict[str, Any] | None:
+        if not source_messages:
+            return None
+        now = int(time.time())
+        async with await self._context() as db:
+            result = await db.execute(
+                select(CHECKPOINT_TABLE)
+                .where(
+                    *self._identity_clauses(
+                        namespace=namespace,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                    ),
+                    CHECKPOINT_TABLE.c.state == "pending",
+                    CHECKPOINT_TABLE.c.claim_expires_at.is_not(None),
+                    CHECKPOINT_TABLE.c.claim_expires_at > now,
+                    CHECKPOINT_TABLE.c.source_message_count <= len(source_messages),
+                )
+                .order_by(CHECKPOINT_TABLE.c.source_message_count.desc())
+            )
+            rows = [dict(row) for row in result.mappings().all()]
+        return select_longest_matching_checkpoint(
+            rows,
+            source_messages,
+            states={"pending"},
+            prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        )
+
+    async def claim_pending(self, row: dict[str, Any]) -> bool:
+        async with await self._context() as db:
+            try:
+                await db.execute(insert(CHECKPOINT_TABLE).values(**row))
+                await db.commit()
+                return True
+            except IntegrityError:
+                await db.rollback()
+                return False
+
+    async def reclaim_pending(
+        self,
+        checkpoint_id: str,
+        *,
+        claim_token: str,
+        expires_at: int,
+        now: int | None = None,
+    ) -> bool:
+        timestamp = int(time.time()) if now is None else int(now)
+        async with await self._context() as db:
+            try:
+                result = await db.execute(
+                    update(CHECKPOINT_TABLE)
+                    .where(
+                        CHECKPOINT_TABLE.c.id == checkpoint_id,
+                        CHECKPOINT_TABLE.c.state == "pending",
+                        or_(
+                            CHECKPOINT_TABLE.c.claim_expires_at.is_(None),
+                            CHECKPOINT_TABLE.c.claim_expires_at <= timestamp,
+                        ),
+                    )
+                    .values(claim_token=claim_token, claim_expires_at=int(expires_at), updated_at=timestamp)
+                )
+                if (result.rowcount or 0) != 1:
+                    await db.rollback()
+                    return False
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def extend_claim(self, checkpoint_id: str, *, claim_token: str, expires_at: int) -> bool:
+        async with await self._context() as db:
+            try:
+                result = await db.execute(
+                    update(CHECKPOINT_TABLE)
+                    .where(
+                        CHECKPOINT_TABLE.c.id == checkpoint_id,
+                        CHECKPOINT_TABLE.c.state == "pending",
+                        CHECKPOINT_TABLE.c.claim_token == claim_token,
+                    )
+                    .values(claim_expires_at=int(expires_at))
+                )
+                if (result.rowcount or 0) != 1:
+                    await db.rollback()
+                    return False
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def release_claim(self, checkpoint_id: str, *, claim_token: str) -> bool:
+        async with await self._context() as db:
+            try:
+                result = await db.execute(
+                    delete(CHECKPOINT_TABLE).where(
+                        CHECKPOINT_TABLE.c.id == checkpoint_id,
+                        CHECKPOINT_TABLE.c.state == "pending",
+                        CHECKPOINT_TABLE.c.claim_token == claim_token,
+                    )
+                )
+                if (result.rowcount or 0) != 1:
+                    await db.rollback()
+                    return False
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def complete_pending(
+        self,
+        checkpoint_id: str,
+        *,
+        claim_token: str,
+        summary_text: str,
+        parent_checkpoint_id: str | None,
+        summary_token_count: int | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any] | None:
+        timestamp = int(time.time()) if now is None else int(now)
+        async with await self._context() as db:
+            try:
+                result = await db.execute(
+                    update(CHECKPOINT_TABLE)
+                    .where(
+                        CHECKPOINT_TABLE.c.id == checkpoint_id,
+                        CHECKPOINT_TABLE.c.state == "pending",
+                        CHECKPOINT_TABLE.c.claim_token == claim_token,
+                    )
+                    .values(
+                        state="ready",
+                        summary_text=summary_text,
+                        parent_checkpoint_id=parent_checkpoint_id,
+                        summary_token_count=summary_token_count,
+                        claim_token=None,
+                        claim_expires_at=None,
+                        updated_at=timestamp,
+                        last_used_at=timestamp,
+                    )
+                )
+                if (result.rowcount or 0) != 1:
+                    await db.rollback()
+                    return None
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+            result = await db.execute(select(CHECKPOINT_TABLE).where(CHECKPOINT_TABLE.c.id == checkpoint_id))
+            row = result.mappings().first()
+            return dict(row) if row else None
+
+    async def touch(self, checkpoint_id: str, *, now: int | None = None) -> bool:
+        timestamp = int(time.time()) if now is None else int(now)
+        async with await self._context() as db:
+            try:
+                await db.execute(
+                    update(CHECKPOINT_TABLE)
+                    .where(CHECKPOINT_TABLE.c.id == checkpoint_id)
+                    .values(last_used_at=timestamp, updated_at=timestamp)
+                )
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                return False
+
+
+def _split_patterns(text: str) -> list[str]:
+    return [part.strip() for part in str(text or "").replace("\n", ",").split(",") if part.strip()]
+
+
+def _wildcard_to_regex(pattern: str) -> str:
+    # Only "*" (any run) and "?" (single char) are wildcards; everything else is literal.
+    # Model ids contain "[" / "]" verbatim, so unlike fnmatch we never treat them as classes.
+    out = []
+    for ch in pattern:
+        if ch == "*":
+            out.append(".*")
+        elif ch == "?":
+            out.append(".")
+        else:
+            out.append(re.escape(ch))
+    return "".join(out)
+
+
+def _matches_any_pattern(model: dict[str, Any], patterns: list[str]) -> bool:
+    model_id = str(model.get("id") or "")
+    name = str(model.get("name") or "")
+    for pattern in patterns:
+        regex = _wildcard_to_regex(pattern)
+        if re.fullmatch(regex, model_id) is not None or re.fullmatch(regex, name) is not None:
+            return True
+    return False
+
+
+def parse_trigger_total_tokens_overrides(value: str) -> list[dict[str, Any]]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        root = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"trigger_total_tokens_overrides_json must be valid JSON: {exc}") from exc
+    if not isinstance(root, dict):
+        raise ValueError("trigger_total_tokens_overrides_json must be a JSON object")
+    unknown_root_keys = set(root) - {"schema_version", "overrides"}
+    if unknown_root_keys:
+        raise ValueError(f"trigger_total_tokens_overrides_json has unknown keys: {sorted(unknown_root_keys)}")
+    schema_version = root.get("schema_version", 1)
+    if schema_version != 1:
+        raise ValueError("trigger_total_tokens_overrides_json schema_version must be 1")
+    raw_overrides = root.get("overrides", [])
+    if not isinstance(raw_overrides, list):
+        raise ValueError("trigger_total_tokens_overrides_json overrides must be a list")
+    overrides: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_overrides):
+        if not isinstance(raw, dict):
+            raise ValueError(f"overrides[{index}] must be an object")
+        unknown_override_keys = set(raw) - {"model_patterns", "trigger_total_tokens", "soft_trigger_ratio"}
+        if unknown_override_keys:
+            raise ValueError(f"overrides[{index}] has unknown keys: {sorted(unknown_override_keys)}")
+        patterns = raw.get("model_patterns")
+        if not isinstance(patterns, list) or not patterns or not all(isinstance(p, str) and p for p in patterns):
+            raise ValueError(f"overrides[{index}].model_patterns must be a non-empty list of strings")
+        override: dict[str, Any] = {"model_patterns": list(patterns)}
+        if "trigger_total_tokens" in raw:
+            threshold = raw.get("trigger_total_tokens")
+            if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 1:
+                raise ValueError(f"overrides[{index}].trigger_total_tokens must be an integer >= 1")
+            override["trigger_total_tokens"] = threshold
+        if "soft_trigger_ratio" in raw:
+            ratio = raw.get("soft_trigger_ratio")
+            if (
+                isinstance(ratio, bool)
+                or not isinstance(ratio, (int, float))
+                or not math.isfinite(ratio)
+                or ratio < 0
+                or ratio >= 1
+            ):
+                raise ValueError(f"overrides[{index}].soft_trigger_ratio must be a number >= 0 and < 1")
+            override["soft_trigger_ratio"] = float(ratio)
+        if "trigger_total_tokens" not in override and "soft_trigger_ratio" not in override:
+            raise ValueError(f"overrides[{index}] must set trigger_total_tokens or soft_trigger_ratio")
+        overrides.append(override)
+    return overrides
+
+
+def resolve_trigger_total_tokens(valves: Any, target_model: dict[str, Any]) -> int:
+    overrides = parse_trigger_total_tokens_overrides(getattr(valves, "trigger_total_tokens_overrides_json", ""))
+    for override in overrides:
+        if "trigger_total_tokens" in override and _matches_any_pattern(target_model, override["model_patterns"]):
+            return int(override["trigger_total_tokens"])
+    return int(valves.trigger_total_tokens)
+
+
+def resolve_soft_trigger_ratio(valves: Any, target_model: dict[str, Any]) -> float:
+    overrides = parse_trigger_total_tokens_overrides(getattr(valves, "trigger_total_tokens_overrides_json", ""))
+    for override in overrides:
+        if "soft_trigger_ratio" in override and _matches_any_pattern(target_model, override["model_patterns"]):
+            return float(override["soft_trigger_ratio"])
+    return float(getattr(valves, "soft_trigger_ratio", 0.8) or 0)
+
+
+def resolve_soft_trigger_total_tokens(
+    valves: Any,
+    target_model: dict[str, Any],
+    hard_trigger_total_tokens: int,
+) -> int | None:
+    soft_trigger_ratio = resolve_soft_trigger_ratio(valves, target_model)
+    hard_trigger_total_tokens = int(hard_trigger_total_tokens)
+    soft_trigger_total_tokens = int(hard_trigger_total_tokens * soft_trigger_ratio)
+    if soft_trigger_total_tokens <= 0 or soft_trigger_total_tokens >= hard_trigger_total_tokens:
+        return None
+    return soft_trigger_total_tokens
+
+
+def _is_arena_model(model: dict[str, Any]) -> bool:
+    return bool(model.get("arena")) or model.get("owned_by") == "arena"
+
+
+def _model_id(model: dict[str, Any]) -> str | None:
+    model_id = model.get("id")
+    return model_id if isinstance(model_id, str) and model_id else None
+
+
+def _model_base_model_id(model: dict[str, Any]) -> str | None:
+    base_model_id = model.get("base_model_id")
+    if isinstance(base_model_id, str) and base_model_id:
+        return base_model_id
+
+    info = model.get("info")
+    if isinstance(info, BaseModel):
+        info = info.model_dump()
+    elif not isinstance(info, dict):
+        model_dump = getattr(info, "model_dump", None)
+        if callable(model_dump):
+            with suppress(Exception):
+                info = model_dump()
+        elif hasattr(info, "__dict__"):
+            info = vars(info)
+
+    if isinstance(info, dict):
+        base_model_id = info.get("base_model_id")
+        if isinstance(base_model_id, str) and base_model_id:
+            return base_model_id
+    return None
+
+
+def _is_based_on_generated_wrapper(model: dict[str, Any], *, pipe_function_id: str = PIPE_FUNCTION_ID) -> bool:
+    return is_generated_wrapper_model_id(_model_base_model_id(model), pipe_function_id=pipe_function_id)
+
+
+def filter_target_models(models: Iterable[dict[str, Any]], valves: Any, *, pipe_function_id: str = PIPE_FUNCTION_ID):
+    include_patterns = _split_patterns(getattr(valves, "include_model_patterns", ""))
+    exclude_patterns = _split_patterns(getattr(valves, "exclude_model_patterns", ""))
+    seen: set[str] = set()
+    targets: list[dict[str, Any]] = []
+
+    for raw_model in models:
+        if not isinstance(raw_model, dict):
+            continue
+        model = copy.deepcopy(raw_model)
+        model_id = _model_id(model)
+        if model_id is None or model_id in seen:
+            continue
+        if is_generated_wrapper_model_id(model_id, pipe_function_id=pipe_function_id):
+            continue
+        if _is_based_on_generated_wrapper(model, pipe_function_id=pipe_function_id):
+            continue
+        if _is_arena_model(model):
+            continue
+        if include_patterns and not _matches_any_pattern(model, include_patterns):
+            continue
+        if exclude_patterns and _matches_any_pattern(model, exclude_patterns):
+            continue
+        seen.add(model_id)
+        targets.append(model)
+    return targets
+
+
+def update_latest_models_cache(models: Iterable[dict[str, Any]]) -> None:
+    """Snapshot the latest model dict for Valves dropdown population."""
+    snapshot: dict[str, dict[str, Any]] = {}
+    for raw in models:
+        if not isinstance(raw, dict):
+            continue
+        mid = _model_id(raw)
+        if mid and mid not in snapshot:
+            snapshot[mid] = raw
+    if snapshot:
+        _LATEST_MODELS_CACHE.clear()
+        _LATEST_MODELS_CACHE.update(snapshot)
+
+
+def refresh_latest_models_cache_from_app_state() -> None:
+    """Refresh the dropdown model snapshot from Core's current app.state registries.
+
+    Narrowly scoped: reads exclusively from _iter_cache_models_from_state(app.state)
+    and performs no provider fetch, DB lookup, or async wait. If Core state is not
+    importable or has no models yet, keep the existing snapshot unchanged.
+    """
+    try:
+        from open_webui.main import app
+
+        models = _iter_cache_models_from_state(app.state)
+    except Exception:
+        return
+    update_latest_models_cache(models)
+
+
+def build_summary_model_options(
+    models: dict[str, dict[str, Any]],
+    *,
+    pipe_function_id: str = PIPE_FUNCTION_ID,
+) -> list[dict[str, str]]:
+    """Build dropdown options for summary_model, excluding wrapper and arena models."""
+    options: list[dict[str, str]] = []
+    for mid, model in sorted(models.items()):
+        if not isinstance(model, dict):
+            continue
+        if is_generated_wrapper_model_id(mid, pipe_function_id=pipe_function_id):
+            continue
+        if _is_based_on_generated_wrapper(model, pipe_function_id=pipe_function_id):
+            continue
+        if _is_arena_model(model):
+            continue
+        name = str(model.get("name") or mid)
+        label = f"{name} ({mid})" if name != mid else mid
+        options.append({"value": mid, "label": label})
+    return options
+
+
+def _grant_to_dict(grant: Any) -> dict[str, Any] | None:
+    if isinstance(grant, BaseModel):
+        grant = grant.model_dump()
+    elif not isinstance(grant, dict):
+        grant = {
+            "id": getattr(grant, "id", None),
+            "principal_type": getattr(grant, "principal_type", None),
+            "principal_id": getattr(grant, "principal_id", None),
+            "permission": getattr(grant, "permission", None),
+        }
+    principal_type = grant.get("principal_type")
+    principal_id = grant.get("principal_id")
+    permission = grant.get("permission")
+    if principal_type not in ("user", "group") or permission not in ("read", "write"):
+        return None
+    if not isinstance(principal_id, str) or not principal_id:
+        return None
+    out = {
+        "principal_type": principal_type,
+        "principal_id": principal_id,
+        "permission": permission,
+    }
+    if isinstance(grant.get("id"), str) and grant["id"]:
+        out["id"] = grant["id"]
+    return out
+
+
+def _dump_model_value(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump()
+    if isinstance(value, dict):
+        return copy.deepcopy(value)
+    if isinstance(value, list):
+        return copy.deepcopy(value)
+    if hasattr(value, "__dict__"):
+        return {key: _dump_model_value(item) for key, item in vars(value).items() if not key.startswith("_")}
+    return value
+
+
+def _payload_dict(value: Any) -> dict[str, Any]:
+    dumped = _dump_model_value(value)
+    return dumped if isinstance(dumped, dict) else {}
+
+
+def _target_app_info_payload(target_model: dict[str, Any]) -> dict[str, Any]:
+    return _payload_dict(target_model.get("info"))
+
+
+def _target_record_payload(target_model_info: Any | None) -> dict[str, Any]:
+    return _payload_dict(target_model_info)
+
+
+def _payload_meta(payload: dict[str, Any]) -> dict[str, Any]:
+    meta = _dump_model_value(payload.get("meta"))
+    return copy.deepcopy(meta) if isinstance(meta, dict) else {}
+
+
+def _normalize_meta_tags(tags: Any) -> list[dict[str, Any]]:
+    if not isinstance(tags, list):
+        return []
+    normalized = []
+    for tag in tags:
+        if isinstance(tag, str):
+            normalized.append({"name": tag})
+        elif isinstance(tag, dict) and isinstance(tag.get("name"), str):
+            normalized.append(copy.deepcopy(tag))
+    return normalized
+
+
+def _copy_top_level_display_metadata(meta: dict[str, Any], target_model: dict[str, Any]) -> dict[str, Any]:
+    copied = copy.deepcopy(meta)
+
+    for key in ("description", "profile_image_url"):
+        value = target_model.get(key)
+        if copied.get(key) is None and isinstance(value, str):
+            copied[key] = value
+
+    capabilities = _dump_model_value(target_model.get("capabilities"))
+    if copied.get("capabilities") is None and isinstance(capabilities, dict):
+        copied["capabilities"] = copy.deepcopy(capabilities)
+
+    if copied.get("tags") is None:
+        tags = _normalize_meta_tags(target_model.get("tags"))
+        if tags:
+            copied["tags"] = tags
+    return copied
+
+
+def _payload_params(payload: dict[str, Any]) -> dict[str, Any]:
+    params = _dump_model_value(payload.get("params"))
+    return copy.deepcopy(params) if isinstance(params, dict) else {}
+
+
+def build_wrapper_core_params(target_params: dict[str, Any]) -> dict[str, Any]:
+    wrapper_params: dict[str, Any] = {"stream_response": True}
+    for key in ("function_calling", "stream_delta_chunk_size", "reasoning_tags"):
+        if key in target_params and target_params[key] is not None:
+            wrapper_params[key] = copy.deepcopy(target_params[key])
+    return wrapper_params
+
+
+def _normalize_access_grants(grants: Any) -> list[dict[str, Any]]:
+    if not isinstance(grants, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for grant in grants:
+        normalized = _grant_to_dict(grant)
+        if normalized is not None:
+            out.append(normalized)
+    return out
+
+
+def _payload_access_grants(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+    if "access_grants" in payload:
+        return _normalize_access_grants(payload.get("access_grants"))
+    meta = payload.get("meta")
+    if isinstance(meta, dict) and "access_grants" in meta:
+        return _normalize_access_grants(meta.get("access_grants"))
+    return None
+
+
+def _payload_owner_user_id(payload: dict[str, Any]) -> str | None:
+    user_id = payload.get("user_id")
+    return user_id if isinstance(user_id, str) and user_id else None
+
+
+def build_target_model_contract(target_model: dict[str, Any], target_model_info: Any | None = None) -> TargetModelContract:
+    target_id = str(target_model["id"])
+    app_info = _target_app_info_payload(target_model)
+    record_info = _target_record_payload(target_model_info)
+
+    meta = _payload_meta(app_info) or _payload_meta(record_info)
+    top_level_meta = _dump_model_value(target_model.get("meta"))
+    if not meta and isinstance(top_level_meta, dict):
+        meta = copy.deepcopy(top_level_meta)
+    meta = _copy_top_level_display_metadata(meta, target_model)
+
+    target_params = _payload_params(record_info) or _payload_params(app_info)
+    top_level_params = _dump_model_value(target_model.get("params"))
+    if not target_params and isinstance(top_level_params, dict):
+        target_params = copy.deepcopy(top_level_params)
+
+    grants = None
+    if record_info:
+        grants = _payload_access_grants(record_info)
+    if grants is None:
+        grants = _payload_access_grants(app_info)
+    if grants is None:
+        grants = _normalize_access_grants(target_model.get("access_grants"))
+
+    owner_user_id = _payload_owner_user_id(record_info) or _payload_owner_user_id(app_info)
+    user_id = target_model.get("user_id")
+    if owner_user_id is None and isinstance(user_id, str) and user_id:
+        owner_user_id = user_id
+
+    return TargetModelContract(
+        id=target_id,
+        name=str(target_model.get("name") or target_id),
+        meta=meta,
+        target_params=target_params,
+        wrapper_params=build_wrapper_core_params(target_params),
+        access_grants=grants,
+        owner_user_id=owner_user_id,
+    )
+
+
+def format_wrapper_model_name(
+    target: TargetModelContract,
+    *,
+    template: Any,
+    hide_wrapped_target_models: bool,
+) -> str:
+    template_text = str(template if template is not None else "auto").strip()
+    auto_name = target.name if hide_wrapped_target_models else f"{target.name} (AutoCompact)"
+
+    if not template_text or template_text.lower() == "auto":
+        return auto_name
+
+    # Avoid Python's format mini-language: width specs can allocate huge strings.
+    unsupported_template = template_text.replace("{target_name}", "").replace("{target_id}", "")
+    if "{" in unsupported_template or "}" in unsupported_template:
+        return auto_name
+
+    rendered = re.sub(
+        r"\{target_name\}|\{target_id\}",
+        lambda match: target.name if match.group(0) == "{target_name}" else target.id,
+        template_text,
+    )
+    rendered = rendered.strip()
+    return rendered or auto_name
+
+
+def build_wrapper_model_form(
+    *,
+    pipe_function_id: str,
+    function_owner_user_id: str,
+    target_model: dict[str, Any],
+    target_model_info: Any | None = None,
+    valves: Any,
+) -> dict[str, Any]:
+    target = build_target_model_contract(target_model, target_model_info)
+    target_id = target.id
+    wrapper_id = build_wrapper_model_id(pipe_function_id, target_id)
+    hide_wrapped_target_models = bool(getattr(valves, "hide_wrapped_target_models", False))
+    wrapper_name = format_wrapper_model_name(
+        target,
+        template=getattr(valves, "model_name_template", "auto"),
+        hide_wrapped_target_models=hide_wrapped_target_models,
+    )
+    access_grants = copy.deepcopy(target.access_grants)
+    target_owner = target.owner_user_id
+    if target_owner and target_owner != function_owner_user_id:
+        owner_read = {
+            "principal_type": "user",
+            "principal_id": target_owner,
+            "permission": "read",
+        }
+        if not any(
+            grant.get("principal_type") == "user"
+            and grant.get("principal_id") == target_owner
+            and grant.get("permission") == "read"
+            for grant in access_grants
+        ):
+            access_grants.append(owner_read)
+    meta = copy.deepcopy(target.meta)
+    meta.pop("hidden", None)
+    meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
+    meta["auto_compaction"] = {
+        "pipe_function_id": pipe_function_id,
+        "target_model_id": target_id,
+    }
+    wrapper_capabilities = meta.get("capabilities")
+    if not isinstance(wrapper_capabilities, dict):
+        wrapper_capabilities = {}
+        meta["capabilities"] = wrapper_capabilities
+    wrapper_capabilities["file_context"] = False
+    return {
+        "id": wrapper_id,
+        "user_id": function_owner_user_id,
+        "base_model_id": None,
+        "name": wrapper_name,
+        "params": copy.deepcopy(target.wrapper_params),
+        "meta": meta,
+        "access_grants": access_grants,
+        "is_active": True,
+    }
+
+
+def _record_field(record: Any, field: str) -> Any:
+    if isinstance(record, dict):
+        return record.get(field)
+    return getattr(record, field, None)
+
+
+def _grant_signature(grant: Any) -> tuple[str, str, str] | None:
+    grant_dict = _grant_to_dict(grant)
+    if grant_dict is None:
+        return None
+    return (
+        str(grant_dict.get("principal_type") or ""),
+        str(grant_dict.get("principal_id") or ""),
+        str(grant_dict.get("permission") or ""),
+    )
+
+
+def _grant_signatures(grants: Any) -> list[tuple[str, str, str]]:
+    if not isinstance(grants, list):
+        return []
+    signatures = [_grant_signature(grant) for grant in grants]
+    return sorted(signature for signature in signatures if signature is not None)
+
+
+def _record_meta_dict(record: Any) -> dict[str, Any]:
+    return _payload_dict(_record_field(record, "meta"))
+
+
+def _record_params_dict(record: Any) -> dict[str, Any]:
+    return _payload_dict(_record_field(record, "params"))
+
+
+def _record_access_grants(record: Any) -> list[dict[str, Any]]:
+    return _normalize_access_grants(_record_field(record, "access_grants"))
+
+
+def _record_has_meta_key(record: Any, key: str) -> bool:
+    return key in _record_meta_dict(record)
+
+
+def _record_meta_value(record: Any, key: str, default: Any = None) -> Any:
+    return _record_meta_dict(record).get(key, default)
+
+
+def _target_model_visibility_lock(target_model_id: str) -> asyncio.Lock:
+    lock = TARGET_MODEL_VISIBILITY_LOCKS.get(target_model_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        TARGET_MODEL_VISIBILITY_LOCKS[target_model_id] = lock
+    return lock
+
+
+def _managed_wrapper_pipe_function_id(record: Any) -> str | None:
+    meta = _record_meta_dict(record)
+    auto_compaction = meta.get("auto_compaction")
+    if not isinstance(auto_compaction, dict):
+        return None
+    pipe_function_id = auto_compaction.get("pipe_function_id")
+    return pipe_function_id if isinstance(pipe_function_id, str) and pipe_function_id else None
+
+
+def _managed_wrapper_target_model_id(record: Any) -> str | None:
+    meta = _record_meta_dict(record)
+    auto_compaction = meta.get("auto_compaction")
+    if not isinstance(auto_compaction, dict):
+        return None
+    target_model_id = auto_compaction.get("target_model_id")
+    return target_model_id if isinstance(target_model_id, str) and target_model_id else None
+
+
+def _target_hidden_marker(meta: dict[str, Any]) -> dict[str, Any] | None:
+    marker = meta.get(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY)
+    return marker if isinstance(marker, dict) else None
+
+
+def _target_hidden_marker_owner_ids(marker: dict[str, Any]) -> list[str]:
+    # pipe_function_ids is a legacy marker shape; new hide claims are single-owner.
+    owner_ids: list[str] = []
+    pipe_function_ids = marker.get("pipe_function_ids")
+    if isinstance(pipe_function_ids, list):
+        for owner_id in pipe_function_ids:
+            if isinstance(owner_id, str) and owner_id and owner_id not in owner_ids:
+                owner_ids.append(owner_id)
+    pipe_function_id = marker.get("pipe_function_id")
+    if isinstance(pipe_function_id, str) and pipe_function_id and pipe_function_id not in owner_ids:
+        owner_ids.append(pipe_function_id)
+    return owner_ids
+
+
+def _target_hidden_marker_restore_state(marker: dict[str, Any]) -> tuple[bool, bool, bool]:
+    return (
+        bool(marker.get("had_hidden", False)),
+        bool(marker.get("previous_hidden", False)),
+        bool(marker.get("created_model_record", False)),
+    )
+
+
+def _build_target_hidden_marker(
+    *,
+    pipe_function_ids: list[str],
+    had_hidden: bool,
+    previous_hidden: bool,
+    created_model_record: bool,
+) -> dict[str, Any]:
+    if len(pipe_function_ids) == 1:
+        marker = {
+            "pipe_function_id": pipe_function_ids[0],
+            "had_hidden": had_hidden,
+            "previous_hidden": previous_hidden,
+        }
+    else:
+        marker = {
+            "pipe_function_ids": pipe_function_ids,
+            "had_hidden": had_hidden,
+            "previous_hidden": previous_hidden,
+        }
+    if created_model_record:
+        marker["created_model_record"] = True
+    return marker
+
+
+def _mark_target_model_hidden_by_pipe(
+    meta: dict[str, Any],
+    *,
+    pipe_function_id: str,
+    created_model_record: bool,
+) -> None:
+    marker = _target_hidden_marker(meta)
+    if marker is None:
+        owner_ids = [pipe_function_id]
+        had_hidden = "hidden" in meta
+        previous_hidden = bool(meta.get("hidden", False))
+        owns_created_model_record = created_model_record
+    else:
+        owner_ids = _target_hidden_marker_owner_ids(marker)
+        if owner_ids and pipe_function_id not in owner_ids:
+            return
+        had_hidden, previous_hidden, owns_created_model_record = _target_hidden_marker_restore_state(marker)
+        if not owner_ids:
+            had_hidden = "hidden" in meta
+            previous_hidden = bool(meta.get("hidden", False))
+            owns_created_model_record = created_model_record
+            owner_ids = [pipe_function_id]
+    marker = _build_target_hidden_marker(
+        pipe_function_ids=owner_ids,
+        had_hidden=had_hidden,
+        previous_hidden=previous_hidden,
+        created_model_record=owns_created_model_record,
+    )
+    meta[AUTO_COMPACTION_TARGET_HIDDEN_META_KEY] = marker
+    meta["hidden"] = True
+
+
+def _restore_target_model_hidden_by_pipe(meta: dict[str, Any], *, pipe_function_id: str) -> tuple[bool, bool]:
+    marker = _target_hidden_marker(meta)
+    if marker is None:
+        return False, False
+    owner_ids = _target_hidden_marker_owner_ids(marker)
+    if pipe_function_id not in owner_ids:
+        return False, False
+    had_hidden, previous_hidden, created_model_record = _target_hidden_marker_restore_state(marker)
+    remaining_owner_ids = [owner_id for owner_id in owner_ids if owner_id != pipe_function_id]
+    if remaining_owner_ids:
+        meta[AUTO_COMPACTION_TARGET_HIDDEN_META_KEY] = _build_target_hidden_marker(
+            pipe_function_ids=remaining_owner_ids,
+            had_hidden=had_hidden,
+            previous_hidden=previous_hidden,
+            created_model_record=created_model_record,
+        )
+        meta["hidden"] = True
+    elif created_model_record:
+        meta.pop("hidden", None)
+        meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
+        return True, True
+    elif had_hidden:
+        meta["hidden"] = previous_hidden
+        meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
+    else:
+        meta.pop("hidden", None)
+        meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
+    return True, False
+
+
+def _wrapper_model_record_matches_form(existing: Any, model_form: Any) -> bool:
+    for field in ("id", "base_model_id", "name", "is_active"):
+        if _record_field(existing, field) != getattr(model_form, field, None):
+            return False
+    if _dump_model_value(_record_field(existing, "params")) != _dump_model_value(getattr(model_form, "params", {})):
+        return False
+    if _dump_model_value(_record_field(existing, "meta")) != _dump_model_value(getattr(model_form, "meta", {})):
+        return False
+    return _grant_signatures(_record_field(existing, "access_grants")) == _grant_signatures(
+        getattr(model_form, "access_grants", [])
+    )
+
+
+def _model_form_from_payload(
+    *,
+    ModelForm: Any,
+    ModelMeta: Any,
+    ModelParams: Any,
+    payload: dict[str, Any],
+) -> Any:
+    return ModelForm(
+        id=payload["id"],
+        base_model_id=payload.get("base_model_id"),
+        name=payload["name"],
+        params=ModelParams(**_payload_dict(payload.get("params"))),
+        meta=ModelMeta(**_payload_dict(payload.get("meta"))),
+        access_grants=payload.get("access_grants"),
+        is_active=bool(payload.get("is_active", True)),
+    )
+
+
+def _model_form_from_record(
+    *,
+    ModelForm: Any,
+    ModelMeta: Any,
+    ModelParams: Any,
+    record: Any,
+    meta: dict[str, Any] | None = None,
+    is_active: bool | None = None,
+) -> Any:
+    return ModelForm(
+        id=_record_field(record, "id"),
+        base_model_id=_record_field(record, "base_model_id"),
+        name=_record_field(record, "name"),
+        params=ModelParams(**_record_params_dict(record)),
+        meta=ModelMeta(**(_payload_dict(meta) if meta is not None else _record_meta_dict(record))),
+        access_grants=_record_access_grants(record),
+        is_active=bool(_record_field(record, "is_active") if is_active is None else is_active),
+    )
+
+
+def _target_model_override_form_payload(
+    *,
+    pipe_function_id: str,
+    target_model: dict[str, Any],
+    target_model_info: Any | None = None,
+) -> dict[str, Any]:
+    target = build_target_model_contract(target_model, target_model_info)
+    existing_record = (
+        target_model_info
+        if target_model_info is not None and target_model_info is not TARGET_MODEL_RECORD_UNKNOWN
+        else None
+    )
+    meta = _record_meta_dict(existing_record) if existing_record is not None else copy.deepcopy(target.meta)
+    _mark_target_model_hidden_by_pipe(
+        meta,
+        pipe_function_id=pipe_function_id,
+        created_model_record=existing_record is None,
+    )
+    return {
+        "id": target.id,
+        "base_model_id": _target_record_base_model_id(target_model_info),
+        "name": _record_field(existing_record, "name") or target.name,
+        "params": _record_params_dict(existing_record) if existing_record is not None else copy.deepcopy(target.target_params),
+        "meta": meta,
+        "access_grants": _record_access_grants(existing_record) if existing_record is not None else copy.deepcopy(target.access_grants),
+        "is_active": bool(_record_field(target_model_info, "is_active"))
+        if target_model_info is not None and target_model_info is not TARGET_MODEL_RECORD_UNKNOWN
+        else True,
+    }
+
+
+async def _hide_target_model_record(
+    *,
+    Models: Any,
+    ModelForm: Any,
+    ModelMeta: Any,
+    ModelParams: Any,
+    pipe_function_id: str,
+    target_model: dict[str, Any],
+    target_model_info: Any | None,
+    owner_user_id: str,
+) -> None:
+    target_id = _model_id(target_model)
+    if not target_id:
+        return
+    async with _target_model_visibility_lock(target_id):
+        try:
+            existing = await Models.get_model_by_id(target_id)
+        except Exception:
+            existing = None
+        if (
+            existing is None
+            and target_model_info is not None
+            and target_model_info is not TARGET_MODEL_RECORD_UNKNOWN
+        ):
+            existing = target_model_info
+        payload = _target_model_override_form_payload(
+            pipe_function_id=pipe_function_id,
+            target_model=target_model,
+            target_model_info=existing,
+        )
+        model_form = _model_form_from_payload(
+            ModelForm=ModelForm,
+            ModelMeta=ModelMeta,
+            ModelParams=ModelParams,
+            payload=payload,
+        )
+        if existing:
+            if not _wrapper_model_record_matches_form(existing, model_form):
+                await Models.update_model_by_id(target_id, model_form)
+        else:
+            await Models.insert_new_model(model_form, user_id=owner_user_id)
+
+
+async def _restore_target_model_hidden_record(
+    *,
+    Models: Any,
+    ModelForm: Any,
+    ModelMeta: Any,
+    ModelParams: Any,
+    pipe_function_id: str,
+    target_model_id: str,
+    target_model_info: Any | None = None,
+) -> bool:
+    async with _target_model_visibility_lock(target_model_id):
+        try:
+            existing = await Models.get_model_by_id(target_model_id)
+        except Exception:
+            existing = None
+        if (
+            existing is None
+            and target_model_info is not None
+            and target_model_info is not TARGET_MODEL_RECORD_UNKNOWN
+        ):
+            existing = target_model_info
+        if existing is None or existing is TARGET_MODEL_RECORD_UNKNOWN:
+            return True
+        meta = _record_meta_dict(existing)
+        restored, delete_created_record = _restore_target_model_hidden_by_pipe(
+            meta, pipe_function_id=pipe_function_id
+        )
+        if not restored:
+            return True
+        if delete_created_record:
+            delete_model_by_id = getattr(Models, "delete_model_by_id", None)
+            if not callable(delete_model_by_id):
+                return False
+            try:
+                return bool(await delete_model_by_id(target_model_id))
+            except Exception:
+                return False
+        model_form = _model_form_from_record(
+            ModelForm=ModelForm,
+            ModelMeta=ModelMeta,
+            ModelParams=ModelParams,
+            record=existing,
+            meta=meta,
+        )
+        try:
+            await Models.update_model_by_id(target_model_id, model_form)
+        except Exception:
+            return False
+        return True
+
+
+async def _deactivate_stale_wrapper_model_records(
+    *,
+    Models: Any,
+    ModelForm: Any,
+    ModelMeta: Any,
+    ModelParams: Any,
+    pipe_function_id: str,
+    desired_wrapper_ids: set[str],
+) -> None:
+    try:
+        existing_models = await Models.get_all_models()
+    except Exception:
+        return
+    for existing in existing_models:
+        try:
+            existing_id = _record_field(existing, "id")
+            if (
+                not isinstance(existing_id, str)
+                or existing_id in desired_wrapper_ids
+                or _managed_wrapper_pipe_function_id(existing) != pipe_function_id
+                or _record_field(existing, "is_active") is False
+            ):
+                continue
+            target_model_id = _managed_wrapper_target_model_id(existing)
+            if target_model_id and not await _restore_target_model_hidden_record(
+                Models=Models,
+                ModelForm=ModelForm,
+                ModelMeta=ModelMeta,
+                ModelParams=ModelParams,
+                pipe_function_id=pipe_function_id,
+                target_model_id=target_model_id,
+            ):
+                continue
+            model_form = _model_form_from_record(
+                ModelForm=ModelForm,
+                ModelMeta=ModelMeta,
+                ModelParams=ModelParams,
+                record=existing,
+                is_active=False,
+            )
+            await Models.update_model_by_id(existing_id, model_form)
+        except Exception:
+            continue
+
+
+async def sync_wrapper_model_records(
+    *,
+    pipe_function_id: str,
+    target_models: list[dict[str, Any]],
+    valves: Any,
+) -> None:
+    try:
+        from open_webui.models.functions import Functions
+        from open_webui.models.models import ModelForm, ModelMeta, ModelParams, Models
+    except Exception:
+        return
+
+    function = await Functions.get_function_by_id(pipe_function_id)
+    owner_user_id = getattr(function, "user_id", None)
+    if not owner_user_id:
+        return
+
+    desired_wrapper_ids: set[str] = set()
+    for target_model in target_models:
+        target_id = _model_id(target_model)
+        hide_wrapped_target_models = bool(getattr(valves, "hide_wrapped_target_models", False))
+        try:
+            target_model_info = None
+            if target_id:
+                desired_wrapper_ids.add(build_wrapper_model_id(pipe_function_id, target_id))
+                with suppress(Exception):
+                    target_model_info = await Models.get_model_by_id(target_id)
+            if not hide_wrapped_target_models and target_id:
+                with suppress(Exception):
+                    await _restore_target_model_hidden_record(
+                        Models=Models,
+                        ModelForm=ModelForm,
+                        ModelMeta=ModelMeta,
+                        ModelParams=ModelParams,
+                        pipe_function_id=pipe_function_id,
+                        target_model_id=target_id,
+                        target_model_info=target_model_info,
+                    )
+            form_payload = build_wrapper_model_form(
+                pipe_function_id=pipe_function_id,
+                function_owner_user_id=owner_user_id,
+                target_model=target_model,
+                target_model_info=target_model_info,
+                valves=valves,
+            )
+            existing = await Models.get_model_by_id(form_payload["id"])
+            if existing and _record_has_meta_key(existing, "hidden"):
+                form_payload["meta"]["hidden"] = _record_meta_value(existing, "hidden")
+            model_form = ModelForm(
+                id=form_payload["id"],
+                base_model_id=None,
+                name=form_payload["name"],
+                params=ModelParams(**form_payload["params"]),
+                meta=ModelMeta(**form_payload["meta"]),
+                access_grants=form_payload["access_grants"],
+                is_active=True,
+            )
+            if existing:
+                if not _wrapper_model_record_matches_form(existing, model_form):
+                    await Models.update_model_by_id(form_payload["id"], model_form)
+            else:
+                await Models.insert_new_model(model_form, user_id=owner_user_id)
+            if hide_wrapped_target_models:
+                with suppress(Exception):
+                    await _hide_target_model_record(
+                        Models=Models,
+                        ModelForm=ModelForm,
+                        ModelMeta=ModelMeta,
+                        ModelParams=ModelParams,
+                        pipe_function_id=pipe_function_id,
+                        target_model=target_model,
+                        target_model_info=target_model_info,
+                        owner_user_id=owner_user_id,
+                    )
+        except Exception:
+            if hide_wrapped_target_models and target_id:
+                with suppress(Exception):
+                    await _restore_target_model_hidden_record(
+                        Models=Models,
+                        ModelForm=ModelForm,
+                        ModelMeta=ModelMeta,
+                        ModelParams=ModelParams,
+                        pipe_function_id=pipe_function_id,
+                        target_model_id=target_id,
+                        target_model_info=target_model_info,
+                    )
+            continue
+    await _deactivate_stale_wrapper_model_records(
+        Models=Models,
+        ModelForm=ModelForm,
+        ModelMeta=ModelMeta,
+        ModelParams=ModelParams,
+        pipe_function_id=pipe_function_id,
+        desired_wrapper_ids=desired_wrapper_ids,
+    )
+
+
+def _iter_model_cache_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        return value.values()
+    if isinstance(value, list):
+        return value
+
+    values = getattr(value, "values", None)
+    if callable(values):
+        with suppress(Exception):
+            cache_values = values()
+            if cache_values is not None:
+                return cache_values
+    return ()
+
+
+def _normalize_cache_model(attr: str, model: dict[str, Any]) -> dict[str, Any]:
+    if attr != "OLLAMA_MODELS" or _model_id(model) is not None:
+        return model
+
+    model_id = model.get("model")
+    if not isinstance(model_id, str) or not model_id:
+        return model
+
+    return {
+        "id": model_id,
+        "name": model.get("name") or model_id,
+        "object": model.get("object", "model"),
+        "created": model.get("created", 0),
+        "owned_by": model.get("owned_by", "ollama"),
+        "ollama": model.get("ollama", model),
+        "loaded": model.get("loaded", "expires_at" in model),
+        "connection_type": model.get("connection_type", "local"),
+        "tags": model.get("tags", []),
+    }
+
+
+def _provider_model_cache_enabled_state(state: Any, attr: str) -> bool | None:
+    flag = PROVIDER_MODEL_CACHE_ENABLE_FLAGS.get(attr)
+    if flag is None:
+        return None
+    config = getattr(state, "config", None)
+    if config is None or not hasattr(config, flag):
+        return None
+    return bool(getattr(config, flag))
+
+
+def _disabled_provider_model_cache_attrs(state: Any) -> set[str]:
+    return {
+        attr
+        for attr in PROVIDER_MODEL_CACHE_ENABLE_FLAGS
+        if _provider_model_cache_enabled_state(state, attr) is False
+    }
+
+
+def _is_provider_cache_origin_model(model: dict[str, Any], attr: str) -> bool:
+    if attr == "OPENAI_MODELS":
+        return isinstance(model.get("openai"), dict)
+    if attr == "OLLAMA_MODELS":
+        return isinstance(model.get("ollama"), dict)
+    return False
+
+
+def _is_disabled_provider_cache_origin_model(model: dict[str, Any], disabled_provider_attrs: set[str]) -> bool:
+    return any(_is_provider_cache_origin_model(model, attr) for attr in disabled_provider_attrs)
+
+
+def _iter_cache_models_from_state(state: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    disabled_provider_attrs = _disabled_provider_model_cache_attrs(state)
+    for attr in ("MODELS", "BASE_MODELS", "OPENAI_MODELS", "OLLAMA_MODELS"):
+        if attr in disabled_provider_attrs:
+            continue
+        value = getattr(state, attr, None)
+        try:
+            iterator = iter(_iter_model_cache_values(value))
+        except TypeError:
+            continue
+        for item in iterator:
+            if not isinstance(item, dict):
+                continue
+            model = _normalize_cache_model(attr, item)
+            if _is_disabled_provider_cache_origin_model(model, disabled_provider_attrs):
+                continue
+            out.append(model)
+    return out
+
+
+def _enabled_provider_model_cache_attrs(state: Any) -> list[str]:
+    attrs: list[str] = []
+    for attr in PROVIDER_MODEL_CACHE_ENABLE_FLAGS:
+        if _provider_model_cache_enabled_state(state, attr) is True:
+            attrs.append(attr)
+    return attrs
+
+
+def _provider_model_cache_wait_timeout_seconds() -> float:
+    with suppress(Exception):
+        from open_webui.env import AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST
+
+        if AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST is not None:
+            timeout = float(AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST)
+            if timeout > 0:
+                return timeout
+    return PROVIDER_MODEL_CACHE_WAIT_DEFAULT_TIMEOUT_SECONDS
+
+
+def _provider_cache_has_models(state: Any, attr: str) -> bool:
+    value = getattr(state, attr, None)
+    try:
+        iterator = iter(_iter_model_cache_values(value))
+    except TypeError:
+        return False
+    return any(isinstance(item, dict) for item in iterator)
+
+
+def _iter_task_coroutine_frames(task: Any) -> Iterable[tuple[str, str, Any]]:
+    coro = task.get_coro()
+    seen: set[int] = set()
+    while coro is not None and id(coro) not in seen:
+        seen.add(id(coro))
+        code = getattr(coro, "cr_code", None) or getattr(coro, "gi_code", None)
+        frame = getattr(coro, "cr_frame", None) or getattr(coro, "gi_frame", None)
+        if code is not None:
+            yield code.co_name, str(code.co_filename).replace("\\", "/"), frame
+        coro = getattr(coro, "cr_await", None) or getattr(coro, "gi_yieldfrom", None)
+
+
+def _coroutine_code_matches(code_name: str, filename: str, expected: tuple[str, str]) -> bool:
+    expected_name, expected_filename = expected
+    return code_name == expected_name and filename.endswith(expected_filename)
+
+
+def _task_coroutine_request(task: Any, expected: tuple[str, str]) -> Any:
+    for code_name, filename, frame in _iter_task_coroutine_frames(task):
+        if not _coroutine_code_matches(code_name, filename, expected):
+            continue
+        if frame is None:
+            return MISSING_CORE_REQUEST
+        return frame.f_locals.get("request", MISSING_CORE_REQUEST)
+    return MISSING_CORE_REQUEST
+
+
+def _provider_model_cache_refresh_pending_attrs(provider_cache_attrs: Iterable[str]) -> set[str]:
+    wanted = {
+        attr for attr in provider_cache_attrs if attr in PROVIDER_MODEL_CACHE_REFRESH_COROUTINES
+    }
+    if not wanted:
+        return set()
+
+    # Only Core's get_all_base_models() gather gives pipes() sibling provider tasks to wait for.
+    try:
+        current_task = asyncio.current_task()
+    except RuntimeError:
+        return set()
+    if current_task is None:
+        return set()
+    current_request = _task_coroutine_request(current_task, CORE_FUNCTION_MODEL_LISTING_COROUTINE)
+    if current_request is MISSING_CORE_REQUEST:
+        return set()
+
+    try:
+        tasks = asyncio.all_tasks()
+    except RuntimeError:
+        return set()
+
+    pending: set[str] = set()
+    for task in tasks:
+        if task is current_task or task.done():
+            continue
+        for attr in wanted - pending:
+            if any(
+                _task_coroutine_request(task, expected) is current_request
+                for expected in PROVIDER_MODEL_CACHE_REFRESH_COROUTINES[attr]
+            ):
+                pending.add(attr)
+        if pending == wanted:
+            return pending
+    return pending
+
+
+def _provider_model_caches_ready(
+    state: Any,
+    initial_provider_caches: dict[str, Any],
+    pending_provider_cache_attrs: Iterable[str],
+) -> bool:
+    pending_attrs = set(pending_provider_cache_attrs)
+    for attr, initial_cache in initial_provider_caches.items():
+        if _provider_cache_has_models(state, attr):
+            continue
+        if getattr(state, attr, None) is not initial_cache:
+            continue
+        if attr not in pending_attrs:
+            continue
+        return False
+    return True
+
+
+async def _wait_for_provider_model_caches(
+    state: Any,
+    *,
+    initial_provider_caches: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    provider_cache_attrs = _enabled_provider_model_cache_attrs(state)
+    if not provider_cache_attrs:
+        return []
+
+    timeout = max(0.0, float(_provider_model_cache_wait_timeout_seconds()))
+    if "OLLAMA_MODELS" in provider_cache_attrs:
+        # Core's Ollama refresh waits for /api/tags, then /api/ps before assigning
+        # OLLAMA_MODELS. Each request can consume the model-list timeout.
+        timeout *= OLLAMA_PROVIDER_MODEL_CACHE_REFRESH_REQUESTS
+    poll_seconds = max(0.001, float(PROVIDER_MODEL_CACHE_WAIT_POLL_SECONDS))
+    attempts = max(0, math.ceil(timeout / poll_seconds))
+    if initial_provider_caches is None:
+        initial_provider_caches = {attr: getattr(state, attr, None) for attr in provider_cache_attrs}
+
+    # Core fetches provider models and function models in the same gather call.
+    # Empty caches are final if no sibling Core provider fetch is still pending.
+    for _ in range(attempts):
+        models = _iter_cache_models_from_state(state)
+        pending_provider_cache_attrs = _provider_model_cache_refresh_pending_attrs(provider_cache_attrs)
+        if _provider_model_caches_ready(state, initial_provider_caches, pending_provider_cache_attrs):
+            return models
+        await asyncio.sleep(poll_seconds)
+        models = _iter_cache_models_from_state(state)
+        pending_provider_cache_attrs = _provider_model_cache_refresh_pending_attrs(provider_cache_attrs)
+        if _provider_model_caches_ready(state, initial_provider_caches, pending_provider_cache_attrs):
+            return models
+    return _iter_cache_models_from_state(state)
+
+
+def validate_summary_model_id(configured_summary_model: str, target_model_id: str, models: dict[str, Any]) -> str:
+    configured = (configured_summary_model or "").strip()
+    summary_model = configured or target_model_id
+    model = models.get(summary_model) if isinstance(models, dict) else None
+    if model is None:
+        if configured:
+            raise ValueError(f"Configured summary_model was not found: {summary_model}")
+        raise ValueError(f"Target model was not found for summary generation: {summary_model}")
+    if isinstance(model, dict) and _is_arena_model(model):
+        raise ValueError("Configured summary_model cannot be an arena model")
+    return summary_model
+
+
+def coerce_open_webui_user(user: Any) -> Any:
+    if user is None:
+        return None
+    if all(hasattr(user, attr) for attr in ("id", "role", "name")):
+        return user
+    if isinstance(user, dict):
+        try:
+            from open_webui.models.users import UserModel
+
+            return UserModel(**user)
+        except Exception:
+            return SimpleNamespace(**user)
+    return user
+
+
+def _normalize_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from open_webui.utils.response import normalize_usage
+
+        return normalize_usage(usage)
+    except Exception:
+        if not usage:
+            return {}
+        input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        output_tokens = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        total_tokens = usage.get("total_tokens") or input_tokens + output_tokens
+        result = dict(usage)
+        result["input_tokens"] = int(input_tokens)
+        result["output_tokens"] = int(output_tokens)
+        result["total_tokens"] = int(total_tokens)
+        return result
+
+
+def extract_usage_from_stream_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage")
+    if not usage and isinstance(payload.get("response"), dict):
+        usage = payload["response"].get("usage")
+    if not usage and isinstance(payload.get("data"), dict):
+        usage = payload["data"].get("usage")
+    if isinstance(usage, dict) and usage:
+        return _normalize_usage(usage)
+    return None
+
+
+def usage_state_key(chat_id: str | None, message_id: str | None, wrapper_model_id: str | None) -> str:
+    digest = hashlib.sha256(
+        json.dumps([chat_id or "", message_id or "", wrapper_model_id or ""], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"_auto_compact_usage_{digest}"
+
+
+def store_request_scoped_usage(
+    *,
+    request: Any,
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str | None,
+    usage: dict[str, Any],
+) -> None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    setattr(state, usage_state_key(chat_id, message_id, wrapper_model_id), _normalize_usage(usage))
+
+
+def get_request_scoped_usage(
+    *,
+    request: Any,
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str | None,
+) -> dict[str, Any] | None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    usage = getattr(state, usage_state_key(chat_id, message_id, wrapper_model_id), None)
+    if isinstance(usage, dict) and usage:
+        return _normalize_usage(usage)
+    return None
+
+
+def choose_usage_signal(
+    *,
+    request: Any,
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str | None,
+    persisted_usage: dict[str, Any] | None,
+    messages: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    usage = get_request_scoped_usage(
+        request=request,
+        chat_id=chat_id,
+        message_id=message_id,
+        wrapper_model_id=wrapper_model_id,
+    )
+    if usage:
+        return usage
+    if isinstance(persisted_usage, dict) and persisted_usage:
+        return _normalize_usage(persisted_usage)
+    return None
+
+
+async def lookup_persisted_usage(chat_id: str | None, message_id: str | None) -> dict[str, Any] | None:
+    if not chat_id:
+        return None
+    try:
+        from open_webui.models.chats import Chats
+        from open_webui.utils.misc import get_message_list
+
+        messages_map = await Chats.get_messages_map_by_chat_id(chat_id)
+        if not isinstance(messages_map, dict) or not messages_map:
+            return None
+        branch: list[dict[str, Any]]
+        if message_id and message_id in messages_map:
+            branch = get_message_list(messages_map, message_id)
+        else:
+            branch = list(messages_map.values())
+        for message in reversed(branch):
+            usage = message.get("usage") or (message.get("info") or {}).get("usage")
+            if isinstance(usage, dict) and usage:
+                return _normalize_usage(usage)
+    except Exception:
+        return None
+    return None
+
+
+_METADATA_VALUE_DROPPED = object()
+
+
+def _copy_metadata_value(value: Any, *, drop_uncloneable: bool, memo: dict[int, Any] | None = None) -> Any:
+    if memo is None:
+        memo = {}
+
+    if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in memo:
+            return memo[value_id]
+
+        copied: dict[Any, Any] = {}
+        memo[value_id] = copied
+        for key, item in value.items():
+            try:
+                copied_key = copy.deepcopy(key)
+            except Exception:
+                if drop_uncloneable:
+                    continue
+                copied_key = key
+
+            copied_item = _copy_metadata_value(item, drop_uncloneable=drop_uncloneable, memo=memo)
+            if copied_item is _METADATA_VALUE_DROPPED:
+                continue
+            copied[copied_key] = copied_item
+
+        if drop_uncloneable and value and not copied:
+            return _METADATA_VALUE_DROPPED
+        return copied
+
+    if isinstance(value, list):
+        value_id = id(value)
+        if value_id in memo:
+            return memo[value_id]
+
+        copied_list: list[Any] = []
+        memo[value_id] = copied_list
+        for item in value:
+            copied_item = _copy_metadata_value(item, drop_uncloneable=drop_uncloneable, memo=memo)
+            if copied_item is not _METADATA_VALUE_DROPPED:
+                copied_list.append(copied_item)
+
+        if drop_uncloneable and value and not copied_list:
+            return _METADATA_VALUE_DROPPED
+        return copied_list
+
+    if isinstance(value, tuple):
+        copied_items = []
+        for item in value:
+            copied_item = _copy_metadata_value(item, drop_uncloneable=drop_uncloneable, memo=memo)
+            if copied_item is not _METADATA_VALUE_DROPPED:
+                copied_items.append(copied_item)
+        if drop_uncloneable and value and not copied_items:
+            return _METADATA_VALUE_DROPPED
+        return tuple(copied_items)
+
+    if isinstance(value, (set, frozenset)):
+        copied_items = []
+        for item in value:
+            copied_item = _copy_metadata_value(item, drop_uncloneable=drop_uncloneable, memo=memo)
+            if copied_item is not _METADATA_VALUE_DROPPED:
+                copied_items.append(copied_item)
+        if drop_uncloneable and value and not copied_items:
+            return _METADATA_VALUE_DROPPED
+        try:
+            return type(value)(copied_items)
+        except TypeError:
+            return _METADATA_VALUE_DROPPED if drop_uncloneable else value
+
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return _METADATA_VALUE_DROPPED if drop_uncloneable else value
+
+
+def _copy_metadata_preserving_references(metadata: Any) -> dict[str, Any]:
+    copied = _copy_metadata_value(metadata or {}, drop_uncloneable=False)
+    return copied if isinstance(copied, dict) else {}
+
+
+def _copy_summary_task_metadata(metadata: Any) -> dict[str, Any]:
+    copied = _copy_metadata_value(metadata or {}, drop_uncloneable=True)
+    return copied if isinstance(copied, dict) else {}
+
+
+def _copy_body_preserving_metadata(body: dict[str, Any]) -> dict[str, Any]:
+    copied = copy.deepcopy({key: value for key, value in body.items() if key != "metadata"})
+    if "metadata" in body:
+        copied["metadata"] = _copy_metadata_preserving_references(body.get("metadata"))
+    return copied
+
+
+def _normalized_task_name(task: Any) -> str:
+    value = getattr(task, "value", None)
+    if isinstance(value, str) and value:
+        return value
+    text = str(task or "")
+    if "." in text:
+        text = text.rsplit(".", 1)[-1].lower()
+    return text
+
+
+def _task_body_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    task_body = metadata.get("task_body")
+    return task_body if isinstance(task_body, dict) else None
+
+
+def _task_body_history_messages(metadata: dict[str, Any]) -> list[dict[str, Any]] | None:
+    task_name = _normalized_task_name(metadata.get("task"))
+    if task_name not in TASK_PROMPT_SPECS:
+        return None
+    task_body = _task_body_from_metadata(metadata)
+    if task_body is None:
+        return None
+    messages = task_body.get("messages")
+    if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
+        return None
+    return messages
+
+
+def _task_history_source_body_for_compaction(
+    body: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any] | None:
+    messages = _task_body_history_messages(metadata)
+    if not messages:
+        return None
+    source_body = _copy_body_preserving_metadata(body)
+    source_body["messages"] = copy.deepcopy(messages)
+    source_body.pop("previous_response_id", None)
+    return source_body
+
+
+def _task_template_from_request(request: Any, spec: TaskPromptSpec) -> str | None:
+    config = getattr(getattr(getattr(request, "app", None), "state", None), "config", None)
+    configured = getattr(config, spec.config_attr, None) if config is not None else None
+    if isinstance(configured, str) and (configured.strip() if spec.strip_configured else configured):
+        return configured
+    try:
+        import open_webui.config as core_config
+
+        default_template = getattr(core_config, spec.default_attr, None)
+    except Exception:
+        default_template = None
+    return default_template if isinstance(default_template, str) and default_template else None
+
+
+async def _render_task_prompt_from_messages(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> str | None:
+    task_name = _normalized_task_name(metadata.get("task"))
+    spec = TASK_PROMPT_SPECS.get(task_name)
+    task_body = _task_body_from_metadata(metadata)
+    if spec is None or task_body is None:
+        return None
+    template = _task_template_from_request(request, spec)
+    if template is None:
+        return None
+    try:
+        import open_webui.utils.task as core_task
+
+        builder = getattr(core_task, spec.builder_name)
+        if task_name == TASKS.AUTOCOMPLETE_GENERATION.value:
+            prompt = task_body.get("prompt")
+            if not isinstance(prompt, str):
+                return None
+            return await builder(template, prompt, messages, task_body.get("type"), user)
+        return await builder(template, messages, user)
+    except Exception:
+        return None
+
+
+def _replace_task_prompt_message(body: dict[str, Any], content: str) -> list[dict[str, Any]]:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
+        return [{"role": "user", "content": content}]
+
+    replaced = [dict(message) for message in messages]
+    for index in range(len(replaced) - 1, -1, -1):
+        if replaced[index].get("role") == "user":
+            replaced[index]["content"] = content
+            return replaced
+    replaced.append({"role": "user", "content": content})
+    return replaced
+
+
+async def _rebuild_task_body_from_compacted_history(
+    *,
+    request: Any,
+    user: Any,
+    base_body: dict[str, Any],
+    metadata: dict[str, Any],
+    compacted_history_messages: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    content = await _render_task_prompt_from_messages(
+        request=request,
+        user=user,
+        metadata=metadata,
+        messages=compacted_history_messages,
+    )
+    if content is None:
+        return None
+
+    rebuilt = _copy_body_preserving_metadata(base_body)
+    rebuilt["messages"] = _replace_task_prompt_message(rebuilt, content)
+    rebuilt.pop("previous_response_id", None)
+
+    rebuilt_metadata = _copy_metadata_preserving_references(rebuilt.get("metadata") or metadata)
+    task_body = _task_body_from_metadata(rebuilt_metadata)
+    if task_body is not None:
+        task_body = _copy_metadata_preserving_references(task_body)
+        task_body["messages"] = copy.deepcopy(compacted_history_messages)
+        rebuilt_metadata["task_body"] = task_body
+        rebuilt["metadata"] = rebuilt_metadata
+    return rebuilt
+
+
+def inject_stream_usage_options(body: dict[str, Any], *, force_include_usage: bool = True) -> dict[str, Any]:
+    if not force_include_usage or body.get("stream") is not True:
+        return body
+    stream_options = body.get("stream_options")
+    if not isinstance(stream_options, dict):
+        stream_options = {}
+    if stream_options.get("include_usage") is True:
+        return body
+    copied = _copy_body_preserving_metadata(body)
+    copied["stream_options"] = {**stream_options, "include_usage": True}
+    return copied
+
+
+def _response_body_text(response: Response) -> str:
+    body = getattr(response, "body", b"")
+    if isinstance(body, bytes):
+        return body.decode("utf-8", errors="replace")
+    return str(body)
+
+
+def _json_from_response(response: Response) -> Any:
+    text = _response_body_text(response)
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def _sse_data_chunk(data: str) -> str:
+    text = str(data)
+    lines = re.split(r"\r\n|\r|\n", text)
+    if lines and lines[-1] == "" and text.endswith(("\r", "\n")):
+        lines = lines[:-1]
+    if not lines:
+        lines = [""]
+    return "".join(f"data: {line}\n" for line in lines) + "\n"
+
+
+def _immediate_response_is_error(response: Any) -> bool:
+    if isinstance(response, dict):
+        return bool(response.get("error"))
+    if isinstance(response, (JSONResponse, PlainTextResponse)):
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int) and status_code >= 400:
+            return True
+        parsed = _json_from_response(response)
+        if isinstance(parsed, dict):
+            return bool(parsed.get("error"))
+        if isinstance(parsed, list):
+            return False
+        return isinstance(response, PlainTextResponse)
+    return False
+
+
+def _response_to_sse_chunk(response: Response) -> str:
+    text = _response_body_text(response)
+    parsed = _json_from_response(response)
+    if isinstance(response, JSONResponse) and response.status_code >= 400:
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            return _sse_data_chunk(text)
+        message_source = parsed.get("error") if isinstance(parsed, dict) and parsed.get("error") else parsed
+        return _sse_data_chunk(
+            json.dumps(
+                _error_response(_completion_error_message(message_source), code="provider_error"),
+                ensure_ascii=False,
+            )
+        )
+    if isinstance(response, JSONResponse):
+        return _sse_data_chunk(text)
+    if isinstance(parsed, (dict, list)):
+        return _sse_data_chunk(json.dumps(parsed, ensure_ascii=False))
+    return _sse_data_chunk(
+        json.dumps(
+            {"error": {"code": "provider_error", "message": text}},
+            ensure_ascii=False,
+        )
+    )
+
+
+def _coerce_stream_chunk(chunk: Any) -> bytes | str:
+    if isinstance(chunk, (bytes, str)):
+        return chunk
+    if isinstance(chunk, (dict, list)):
+        return _sse_data_chunk(json.dumps(chunk, ensure_ascii=False))
+    return str(chunk)
+
+
+def _iter_error_structures(value: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(value, dict):
+        if isinstance(value.get("error"), dict):
+            yield value["error"]
+        yield value
+        detail = value.get("detail")
+        if isinstance(detail, dict):
+            yield from _iter_error_structures(detail)
+    elif isinstance(value, HTTPException):
+        yield from _iter_error_structures(value.detail)
+
+
+def _structured_error_strings(value: Any) -> tuple[list[str], list[str], int | None]:
+    status: int | None = None
+    codes: list[str] = []
+    messages: list[str] = []
+
+    if isinstance(value, HTTPException):
+        status = value.status_code
+        value = value.detail
+    elif isinstance(value, BaseException):
+        messages.append(str(value))
+        return codes, messages, 400
+    elif isinstance(value, Response):
+        status = value.status_code
+        value = _json_from_response(value)
+
+    if isinstance(value, str):
+        messages.append(value)
+        return codes, messages, status
+
+    for error in _iter_error_structures(value):
+        for key in ("code", "type", "param"):
+            item = error.get(key)
+            if isinstance(item, str):
+                codes.append(item)
+        for key in ("message", "detail"):
+            item = error.get(key)
+            if isinstance(item, str):
+                messages.append(item)
+            elif isinstance(item, dict):
+                nested = item.get("message") or item.get("detail")
+                if isinstance(nested, str):
+                    messages.append(nested)
+
+    return codes, messages, status
+
+
+_CONTEXT_CODE_PATTERNS = (
+    "context_length_exceeded",
+    "context_window_exceeded",
+    "context_length",
+    "context_limit",
+    "max_context_length",
+    "maximum_context_length",
+    "input_length_exceeded",
+    "input_too_long",
+    "prompt_too_long",
+    "request_too_large",
+    "token_limit_exceeded",
+)
+_NEGATIVE_ERROR_PATTERNS = (
+    "rate limit",
+    "rate-limit",
+    "rate_limit",
+    "too many requests",
+    "quota",
+    "token-per-minute",
+    "tokens per minute",
+    "tpm",
+    "insufficient_quota",
+    "authentication",
+    "permission",
+)
+_CONTEXT_MESSAGE_PATTERNS = (
+    "maximum context length",
+    "max context length",
+    "context length exceeded",
+    "context window",
+    "context limit",
+    "context size",
+    "exceed context",
+    "exceeds context",
+    "exceeded context",
+    "prompt is too long",
+    "prompt too long",
+    "input is too long",
+    "input too long",
+    "input token count exceeds",
+    "input tokens are",
+    "input tokens exceed",
+    "prompt tokens exceed",
+    "too many input tokens",
+    "request too large",
+)
+_OUTPUT_TOKEN_PARAMETER_PATTERNS = (
+    "max_tokens",
+    "max_completion_tokens",
+    "max output tokens",
+    "max_output_tokens",
+)
+_OUTPUT_TOKEN_PARAMETER_CONTEXT_ANCHORS = (
+    "context",
+    "input",
+    "prompt",
+    "request too large",
+)
+
+
+def is_retryable_context_error(value: Any, *, status_code: int | None = None) -> bool:
+    codes, messages, inferred_status = _structured_error_strings(value)
+    status = status_code if status_code is not None else inferred_status
+
+    joined_codes = " ".join(codes).lower()
+    joined_messages = " ".join(messages).lower()
+    if any(pattern in joined_codes for pattern in _NEGATIVE_ERROR_PATTERNS) or any(
+        pattern in joined_messages for pattern in _NEGATIVE_ERROR_PATTERNS
+    ):
+        return False
+    if any(pattern in joined_messages for pattern in _OUTPUT_TOKEN_PARAMETER_PATTERNS) and not any(
+        pattern in joined_messages for pattern in _OUTPUT_TOKEN_PARAMETER_CONTEXT_ANCHORS
+    ):
+        return False
+    if any(pattern in joined_codes for pattern in _CONTEXT_CODE_PATTERNS):
+        return True
+    if status not in (400, 413, 422):
+        return False
+    return any(pattern in joined_messages for pattern in _CONTEXT_MESSAGE_PATTERNS)
+
+
+_SSE_FIELD_NAMES = ("data", "event", "id", "retry")
+_SSE_FIELD_MARKERS = tuple(f"{name}:" for name in _SSE_FIELD_NAMES) + (":",)
+
+
+def _text_can_start_sse_field(stripped: str) -> bool:
+    if not stripped:
+        return False
+    first_line = stripped.splitlines()[0]
+    return (
+        first_line in _SSE_FIELD_NAMES
+        or first_line.startswith(_SSE_FIELD_MARKERS)
+        or any(marker.startswith(first_line) for marker in _SSE_FIELD_MARKERS)
+        or ":" in first_line
+    )
+
+
+class _SSEDataParser:
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._buffer = ""
+        self._data_lines: list[str] = []
+
+    def has_pending_event_or_field(self) -> bool:
+        return bool(self._data_lines) or _text_can_start_sse_field(self._buffer.lstrip())
+
+    def feed(self, chunk: bytes | str) -> tuple[list[str], bool]:
+        text = self._decoder.decode(chunk, final=False) if isinstance(chunk, bytes) else str(chunk)
+        self._buffer += text
+        lines = self._buffer.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._buffer = lines.pop()
+        else:
+            self._buffer = ""
+        return self._process_lines([line.rstrip("\r\n") for line in lines])
+
+    def flush(self) -> tuple[list[str], bool]:
+        lines = []
+        remaining_text = self._decoder.decode(b"", final=True)
+        if remaining_text:
+            self._buffer += remaining_text
+        if self._buffer:
+            lines.append(self._buffer)
+            self._buffer = ""
+        values, saw_data_field = self._process_lines(lines)
+        final_value = self._consume_event()
+        if final_value is not None:
+            values.append(final_value)
+        return values, saw_data_field
+
+    def _process_lines(self, lines: list[str]) -> tuple[list[str], bool]:
+        values: list[str] = []
+        saw_data_field = False
+        for line in lines:
+            if line == "":
+                value = self._consume_event()
+                if value is not None:
+                    values.append(value)
+                continue
+            field, separator, data = line.partition(":")
+            if field != "data":
+                continue
+            saw_data_field = True
+            if not separator:
+                data = ""
+            if data.startswith(" "):
+                data = data[1:]
+            self._data_lines.append(data)
+        return values, saw_data_field
+
+    def _consume_event(self) -> str | None:
+        if not self._data_lines:
+            return None
+        value = "\n".join(self._data_lines)
+        self._data_lines = []
+        if value.strip() == "[DONE]":
+            return None
+        return value
+
+
+def _parse_sse_data_values(chunk: bytes | str) -> tuple[list[str], bool]:
+    parser = _SSEDataParser()
+    values, saw_data_field = parser.feed(chunk)
+    flushed_values, flushed_saw_data_field = parser.flush()
+    values.extend(flushed_values)
+    return values, saw_data_field or flushed_saw_data_field
+
+
+def extract_sse_data_values(chunk: bytes | str) -> list[str]:
+    values, _ = _parse_sse_data_values(chunk)
+    return values
+
+
+def _sse_json_event_from_value(data: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(data.strip())
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _sse_json_events_from_values(values: Iterable[str]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for data in values:
+        payload = _sse_json_event_from_value(data)
+        if payload is not None:
+            events.append(payload)
+    return events
+
+
+class _SSEJSONEventParser:
+    def __init__(self) -> None:
+        self._parser = _SSEDataParser()
+
+    def feed(self, chunk: bytes | str) -> list[dict[str, Any]]:
+        values, _ = self._parser.feed(chunk)
+        return _sse_json_events_from_values(values)
+
+    def feed_events_and_values(self, chunk: bytes | str) -> tuple[list[dict[str, Any]], list[str]]:
+        values, _ = self._parser.feed(chunk)
+        return _sse_json_events_from_values(values), values
+
+    def has_pending_event_or_field(self) -> bool:
+        return self._parser.has_pending_event_or_field()
+
+    def flush(self) -> list[dict[str, Any]]:
+        values, _ = self._parser.flush()
+        return _sse_json_events_from_values(values)
+
+
+def extract_sse_json_events(chunk: bytes | str) -> list[dict[str, Any]]:
+    return _sse_json_events_from_values(extract_sse_data_values(chunk))
+
+
+def first_chunk_is_retryable_context_error(chunk: bytes | str) -> bool:
+    events = extract_sse_json_events(chunk)
+    if not events:
+        return False
+    error_source = _stream_payload_error_source(events[0])
+    return bool(error_source is not None and is_retryable_context_error(error_source, status_code=400))
+
+
+def _stream_payload_is_responses_pre_output_control_event(payload: dict[str, Any]) -> bool:
+    if _stream_payload_error_source(payload) is not None:
+        return False
+    payload_type = payload.get("type")
+    if payload_type in {
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
+    }:
+        return True
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            return False
+        if choice.get("finish_reason") not in (None, ""):
+            return False
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            return False
+        if any(
+            delta.get(key)
+            for key in ("content", "reasoning_content", "tool_calls", "function_call")
+        ):
+            return False
+    return True
+
+
+def _stream_events_are_responses_pre_output_control_events(events: list[dict[str, Any]]) -> bool:
+    return bool(events) and all(_stream_payload_is_responses_pre_output_control_event(payload) for payload in events)
+
+
+def _chunk_starts_unstructured_stream(chunk: bytes | str) -> bool:
+    text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+    stripped = text.lstrip()
+    return bool(stripped) and not _text_can_start_sse_field(stripped)
+
+
+def _stream_chunk_is_empty(chunk: bytes | str) -> bool:
+    return chunk == b"" or chunk == ""
+
+
+def _sse_values_include_unstructured_output(values: Iterable[str]) -> bool:
+    return any(value != "" for value in values)
+
+
+def _request_bypass_system_prompt(request: Any) -> bool:
+    state = getattr(request, "state", None)
+    return bool(getattr(state, "bypass_system_prompt", False))
+
+
+def _iter_request_state_items(state: Any) -> Iterable[tuple[str, Any]]:
+    if state is None:
+        return ()
+    raw_state = getattr(state, "_state", None)
+    if isinstance(raw_state, dict):
+        return tuple(raw_state.items())
+    try:
+        return tuple(vars(state).items())
+    except TypeError:
+        return ()
+
+
+def _copy_state_value(key: str, value: Any) -> Any:
+    if key == "metadata":
+        return _copy_metadata_preserving_references(value)
+    return value
+
+
+def _build_request_state(base_state: Any, overrides: dict[str, Any]) -> SimpleNamespace:
+    state = SimpleNamespace()
+    for key, value in _iter_request_state_items(base_state):
+        setattr(state, key, _copy_state_value(key, value))
+    for key, value in overrides.items():
+        setattr(state, key, _copy_state_value(key, value))
+    return state
+
+
+class RequestStateProxy:
+    def __init__(self, request: Any, **state_overrides: Any):
+        object.__setattr__(self, "_request", request)
+        object.__setattr__(self, "state", _build_request_state(getattr(request, "state", None), state_overrides))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._request, name)
+
+
+async def _close_stream_response(response: StreamingResponse) -> None:
+    if getattr(response, "_auto_compact_stream_closed", False):
+        return
+    with suppress(Exception):
+        setattr(response, "_auto_compact_stream_closed", True)
+    body_iterator = getattr(response, "body_iterator", None)
+    aclose = getattr(body_iterator, "aclose", None)
+    if callable(aclose):
+        with suppress(Exception):
+            await aclose()
+    background = getattr(response, "background", None)
+    if background is not None:
+        with suppress(Exception):
+            await background()
+
+
+async def prepare_streaming_response(
+    response: Any,
+    *,
+    request: Any,
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str | None,
+    restore: Callable[[], None] | None = None,
+) -> StreamingResponse:
+    if isinstance(response, dict):
+        if response.get("error") and is_retryable_context_error(response, status_code=400):
+            if restore:
+                restore()
+            raise RetryableContextOverflow(str(response.get("error")))
+        if restore:
+            restore()
+        streaming_response = StreamingResponse(iter([f"data: {json.dumps(response)}\n\n"]), media_type="text/event-stream")
+        if _immediate_response_is_error(response):
+            setattr(streaming_response, "_auto_compact_immediate_error", True)
+        return streaming_response
+
+    if isinstance(response, (JSONResponse, PlainTextResponse)):
+        if is_retryable_context_error(response):
+            if restore:
+                restore()
+            raise RetryableContextOverflow(_response_body_text(response))
+        if restore:
+            restore()
+        streaming_response = StreamingResponse(iter([_response_to_sse_chunk(response)]), media_type="text/event-stream")
+        if _immediate_response_is_error(response):
+            setattr(streaming_response, "_auto_compact_immediate_error", True)
+        return streaming_response
+
+    if not isinstance(response, StreamingResponse):
+        if restore:
+            restore()
+        return StreamingResponse(iter([f"data: {json.dumps(response)}\n\n"]), media_type="text/event-stream")
+
+    iterator = response.body_iterator.__aiter__()
+    buffered_chunks: list[bytes | str] = []
+    sse_parser = _SSEJSONEventParser()
+    can_retry_context_error = True
+    media_type = getattr(response, "media_type", None) or response.headers.get("content-type", "")
+    is_sse_response = "text/event-stream" in str(media_type).lower()
+    try:
+        while True:
+            chunk = _coerce_stream_chunk(await iterator.__anext__())
+            if is_sse_response:
+                events, sse_values = sse_parser.feed_events_and_values(chunk)
+            else:
+                events, sse_values = [], []
+            for value in sse_values:
+                if value == "":
+                    continue
+                payload = _sse_json_event_from_value(value)
+                if payload is None:
+                    can_retry_context_error = False
+                    continue
+                usage = extract_usage_from_stream_payload(payload)
+                if usage:
+                    store_request_scoped_usage(
+                        request=request,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        wrapper_model_id=wrapper_model_id,
+                        usage=usage,
+                    )
+                if can_retry_context_error:
+                    error_source = _stream_payload_error_source(payload)
+                    if error_source is not None and is_retryable_context_error(error_source, status_code=400):
+                        await _close_stream_response(response)
+                        if restore:
+                            restore()
+                        raise RetryableContextOverflow("Target model reported a context-window error before output")
+                if not _stream_payload_is_responses_pre_output_control_event(payload):
+                    can_retry_context_error = False
+            buffered_chunks.append(chunk)
+            if not is_sse_response:
+                if _stream_chunk_is_empty(chunk):
+                    continue
+                break
+            if not events and (
+                _sse_values_include_unstructured_output(sse_values)
+                or (_chunk_starts_unstructured_stream(chunk) and not sse_parser.has_pending_event_or_field())
+            ):
+                break
+            if events and not (
+                can_retry_context_error and _stream_events_are_responses_pre_output_control_events(events)
+            ):
+                break
+    except StopAsyncIteration:
+        events = sse_parser.flush()
+        for payload in events:
+            usage = extract_usage_from_stream_payload(payload)
+            if usage:
+                store_request_scoped_usage(
+                    request=request,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    wrapper_model_id=wrapper_model_id,
+                    usage=usage,
+                )
+            if can_retry_context_error:
+                error_source = _stream_payload_error_source(payload)
+                if error_source is not None and is_retryable_context_error(error_source, status_code=400):
+                    if restore:
+                        restore()
+                    await _close_stream_response(response)
+                    raise RetryableContextOverflow("Target model reported a context-window error before output")
+            if not _stream_payload_is_responses_pre_output_control_event(payload):
+                can_retry_context_error = False
+        if restore:
+            restore()
+        await _close_stream_response(response)
+        return StreamingResponse(iter(buffered_chunks), media_type="text/event-stream")
+    except Exception as exc:
+        if restore:
+            restore()
+        await _close_stream_response(response)
+        if is_retryable_context_error(exc):
+            raise RetryableContextOverflow(str(exc)) from exc
+        raise
+
+    async def stream() -> AsyncIterator[bytes | str]:
+        try:
+            for buffered_chunk in buffered_chunks:
+                yield buffered_chunk
+
+            async for raw_chunk in iterator:
+                chunk = _coerce_stream_chunk(raw_chunk)
+                if is_sse_response:
+                    events = sse_parser.feed(chunk)
+                    for payload in events:
+                        usage = extract_usage_from_stream_payload(payload)
+                        if usage:
+                            store_request_scoped_usage(
+                                request=request,
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                wrapper_model_id=wrapper_model_id,
+                                usage=usage,
+                            )
+                yield chunk
+            if is_sse_response:
+                for payload in sse_parser.flush():
+                    usage = extract_usage_from_stream_payload(payload)
+                    if usage:
+                        store_request_scoped_usage(
+                            request=request,
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            wrapper_model_id=wrapper_model_id,
+                            usage=usage,
+                        )
+        finally:
+            if restore:
+                restore()
+            await _close_stream_response(response)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+def _messages_have_multimodal(messages: list[dict[str, Any]]) -> bool:
+    for message in messages:
+        if message.get("files"):
+            return True
+        content = message.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") not in (None, "text"):
+                    return True
+    return False
+
+
+def _chat_id_supported(chat_id: str | None) -> bool:
+    return isinstance(chat_id, str) and bool(chat_id) and not chat_id.startswith(TEMP_CHAT_PREFIXES)
+
+
+def _usage_total(usage: dict[str, Any] | None) -> int | None:
+    if not usage:
+        return None
+    total = usage.get("total_tokens")
+    if isinstance(total, bool):
+        return None
+    if isinstance(total, (int, float)):
+        return int(total)
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if isinstance(input_tokens, (int, float)) and isinstance(output_tokens, (int, float)):
+        return int(input_tokens + output_tokens)
+    return None
+
+
+_USAGE_ANCHOR_SOURCE = Literal["request", "persisted"]
+
+
+def _latest_user_usage_anchor_delta(messages: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(messages, list) or not messages:
+        return None
+    latest = messages[-1]
+    if isinstance(latest, dict) and latest.get("role") == "user":
+        return [copy.deepcopy(latest)]
+    return None
+
+
+def _trailing_tool_usage_anchor_delta(messages: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(messages, list) or not messages:
+        return None
+    trailing_tools: list[dict[str, Any]] = []
+    index = len(messages) - 1
+    while index >= 0:
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            break
+        trailing_tools.append(copy.deepcopy(message))
+        index -= 1
+    if not trailing_tools or index < 0:
+        return None
+    anchor = messages[index]
+    if not isinstance(anchor, dict) or anchor.get("role") != "assistant":
+        return None
+    tool_call_ids = _tool_call_ids(anchor)
+    if not tool_call_ids:
+        return None
+    trailing_tools.reverse()
+    if any(message.get("tool_call_id") not in tool_call_ids for message in trailing_tools):
+        return None
+    return trailing_tools
+
+
+def _usage_anchor_delta_for_source(
+    messages: Any,
+    usage_source: _USAGE_ANCHOR_SOURCE | None,
+) -> list[dict[str, Any]] | None:
+    if usage_source == "request":
+        return _trailing_tool_usage_anchor_delta(messages)
+    if usage_source == "persisted":
+        return _latest_user_usage_anchor_delta(messages) or _trailing_tool_usage_anchor_delta(messages)
+    return None
+
+
+async def _estimate_next_input_tokens_from_usage_anchor(
+    *,
+    request: Any,
+    last_observed_total_tokens: int | None,
+    body: dict[str, Any],
+    usage_source: _USAGE_ANCHOR_SOURCE | None,
+) -> int | None:
+    if last_observed_total_tokens is None or not isinstance(body, dict):
+        return None
+    delta_messages = _usage_anchor_delta_for_source(body.get("messages"), usage_source)
+    if delta_messages is None:
+        return None
+    delta_tokens = await estimate_messages_tokens_async(delta_messages, request=request)
+    if delta_tokens is None:
+        return None
+    # Do not add current body extras here. Provider-reported usage for the
+    # anchor request already counted that request's tool/function/response
+    # schemas, and those extras are usually stable across adjacent turns. Adding
+    # the full current payload again would double-count large stable tool
+    # schemas and trigger avoidable prefetch/foreground compaction.
+    return int(last_observed_total_tokens) + int(delta_tokens)
+
+
+def _context_exhaustion_error_response(
+    messages: Any,
+) -> dict[str, Any]:
+    if isinstance(messages, list):
+        cut = select_safe_message_cut(messages)
+        tool_cut = select_tool_result_compaction_cut(messages)
+        latest_user = next((message for message in reversed(messages) if message.get("role") == "user"), None)
+        if latest_user is not None and not cut.summarization_prefix and tool_cut is None:
+            return _error_response(
+                "Target model context window was exceeded after all safe compaction options were exhausted; "
+                "the latest user message must remain raw and appears too large to send safely",
+                code="active_input_too_large",
+            )
+    return _error_response(
+        "Target model context window was exceeded before output, and no safe retry path remains",
+        code="context_window_exceeded",
+    )
+
+
+def _error_response(message: str, *, code: str = "auto_compaction_error") -> dict[str, Any]:
+    return {"error": {"code": code, "message": message}}
+
+
+def _chat_completion_message_response(
+    model_id: str,
+    message: str,
+    *,
+    usage: dict[str, Any] | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    finish_reason: str | None = None,
+) -> dict[str, Any]:
+    from open_webui.utils.misc import openai_chat_completion_message_template
+
+    response = openai_chat_completion_message_template(model_id, message, tool_calls=tool_calls, usage=usage)
+    if finish_reason is not None:
+        response["choices"][0]["finish_reason"] = finish_reason
+    return response
+
+
+def _completion_error_message(value: Any) -> str:
+    codes, messages, _ = _structured_error_strings(value)
+    if messages:
+        return messages[0]
+    if codes:
+        return codes[0]
+    if isinstance(value, Response):
+        return _response_body_text(value)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _chunk_is_sse_done_only(chunk: bytes | str) -> bool:
+    text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+    meaningful_lines = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith(":")]
+    if not meaningful_lines:
+        return False
+    for line in meaningful_lines:
+        if not line.startswith("data:"):
+            return False
+        if line[len("data:") :].strip() != "[DONE]":
+            return False
+    return True
+
+
+def _merge_stream_tool_call_delta(tool_calls: list[dict[str, Any]], delta_tool_call: dict[str, Any]) -> None:
+    tool_call_index = delta_tool_call.get("index")
+    current_tool_call = None
+    if tool_call_index is not None:
+        current_tool_call = next(
+            (tool_call for tool_call in tool_calls if tool_call.get("index") == tool_call_index),
+            None,
+        )
+
+    if current_tool_call is None:
+        current_tool_call = copy.deepcopy(delta_tool_call)
+        function = current_tool_call.get("function")
+        if not isinstance(function, dict):
+            function = {}
+            current_tool_call["function"] = function
+        function.setdefault("name", "")
+        function.setdefault("arguments", "")
+        tool_calls.append(current_tool_call)
+        return
+
+    for key in ("id", "type"):
+        value = delta_tool_call.get(key)
+        if value:
+            current_tool_call[key] = value
+
+    function_delta = delta_tool_call.get("function")
+    if not isinstance(function_delta, dict):
+        return
+
+    function = current_tool_call.setdefault("function", {})
+    if not isinstance(function, dict):
+        function = {}
+        current_tool_call["function"] = function
+
+    name = function_delta.get("name")
+    if isinstance(name, str) and name:
+        function["name"] = name
+
+    arguments = function_delta.get("arguments")
+    if isinstance(arguments, str):
+        function["arguments"] = str(function.get("arguments") or "") + arguments
+
+
+class SummaryToolCallError(RuntimeError):
+    pass
+
+
+_SUMMARY_INCOMPLETE_FINISH_REASON_PATTERNS = (
+    "length",
+    "content_filter",
+    "max_token",
+    "max_output",
+    "max output",
+    "truncat",
+    "incomplete",
+)
+
+
+def _summary_tool_call_error() -> SummaryToolCallError:
+    return SummaryToolCallError("Summary model returned a tool call instead of text content")
+
+
+def _is_image_file_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") == "image":
+        return True
+    content_type = item.get("content_type")
+    return isinstance(content_type, str) and content_type.startswith("image/")
+
+
+def _extract_non_image_file_ids(files_value: Any) -> set[str]:
+    ids: set[str] = set()
+    if not isinstance(files_value, list):
+        return ids
+    for item in files_value:
+        if not isinstance(item, dict) or _is_image_file_item(item):
+            continue
+        file_id = item.get("id")
+        if isinstance(file_id, str) and file_id:
+            ids.add(file_id)
+    return ids
+
+
+async def _load_chat_message_chain(
+    request: Any,
+    chat_id: str | None,
+    current_message_id: str | None,
+) -> list[dict[str, Any]] | None:
+    if not chat_id or not current_message_id:
+        return None
+    try:
+        from open_webui.models.chats import Chats
+        from open_webui.utils.misc import get_message_list
+        from open_webui.utils.middleware import process_messages_with_output
+
+        messages_map = await Chats.get_messages_map_by_chat_id(chat_id)
+        if not isinstance(messages_map, dict) or not messages_map:
+            return None
+        if current_message_id not in messages_map:
+            return None
+        chain = get_message_list(messages_map, current_message_id)
+        # Expand assistant-with-output messages to align positional indices
+        # with the body.messages the pipe receives (Core runs
+        # process_messages_with_output before the pipe). reasoning_format
+        # does not change message COUNT (only reasoning content formatting),
+        # so None is safe for positional alignment.
+        return process_messages_with_output(chain)
+    except Exception:
+        return None
+
+
+def _classify_files_for_target(
+    db_chain: list[dict[str, Any]] | None,
+    compaction_prefix_count: int,
+    metadata_user_message: Any,
+    metadata_files: Any,
+) -> list[Any]:
+    """Return retained files for target forward injection using only DB-chain positions."""
+    if not isinstance(metadata_files, list):
+        return metadata_files
+
+    current_file_ids: set[str] = set()
+    if isinstance(metadata_user_message, dict):
+        current_file_ids |= _extract_non_image_file_ids(metadata_user_message.get("files"))
+
+    if not db_chain:
+        # No compaction (prefix_count==0) means the target sees the full
+        # conversation — ALL files are relevant.  Only when compaction
+        # happened but the DB is unavailable do we conservatively keep
+        # just the current-turn files.
+        if compaction_prefix_count == 0:
+            return list(metadata_files)
+        retained_files: list[Any] = []
+        for file_item in metadata_files:
+            if not isinstance(file_item, dict) or _is_image_file_item(file_item):
+                retained_files.append(file_item)
+                continue
+            file_id = file_item.get("id")
+            if not isinstance(file_id, str) or not file_id:
+                retained_files.append(file_item)
+                continue
+            if file_id in current_file_ids:
+                retained_files.append(file_item)
+        return retained_files
+
+    retained_ids: set[str] = set(current_file_ids)
+    for index in range(compaction_prefix_count, len(db_chain)):
+        message = db_chain[index]
+        if isinstance(message, dict):
+            retained_ids |= _extract_non_image_file_ids(message.get("files"))
+
+    all_db_file_ids: set[str] = set()
+    for message in db_chain:
+        if isinstance(message, dict):
+            all_db_file_ids |= _extract_non_image_file_ids(message.get("files"))
+
+    retained_files: list[Any] = []
+    for file_item in metadata_files:
+        if not isinstance(file_item, dict) or _is_image_file_item(file_item):
+            retained_files.append(file_item)
+            continue
+        file_id = file_item.get("id")
+        if not isinstance(file_id, str) or not file_id:
+            retained_files.append(file_item)
+            continue
+        if file_id in retained_ids or file_id not in all_db_file_ids:
+            retained_files.append(file_item)
+    return retained_files
+
+
+def _classify_files_for_summary(
+    db_chain: list[dict[str, Any]] | None,
+    compaction_prefix_count: int,
+    parent_source_message_count: int,
+) -> set[str]:
+    """Return prefix file ids for summary context, excluding parent-checkpoint absorbed messages."""
+    if not db_chain:
+        return set()
+    prefix_ids: set[str] = set()
+    for index in range(parent_source_message_count, compaction_prefix_count):
+        if index < len(db_chain):
+            message = db_chain[index]
+            if isinstance(message, dict):
+                prefix_ids |= _extract_non_image_file_ids(message.get("files"))
+    return prefix_ids
+
+
+async def _noop_event_emitter(_event: Any) -> None:
+    pass
+
+
+async def _emit_source_events(
+    event_emitter: Callable[[Any], Awaitable[None]] | None,
+    sources: Any,
+) -> None:
+    if event_emitter is None or not isinstance(sources, list):
+        return
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        source_info = source.get("source", {})
+        if not isinstance(source_info, dict):
+            continue
+        if not (source_info.get("name", "") or source_info.get("id", "")):
+            continue
+        try:
+            await event_emitter({"type": "source", "data": source})
+        except Exception:
+            return
+
+
+def _displayable_sources(sources: Any) -> list[dict[str, Any]]:
+    if not isinstance(sources, list):
+        return []
+    displayable = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        source_info = source.get("source", {})
+        if not isinstance(source_info, dict):
+            continue
+        if not (source_info.get("name", "") or source_info.get("id", "")):
+            continue
+        displayable.append(source)
+    return displayable
+
+
+def _merge_source_events_into_response(response: Any, sources: Any) -> Any:
+    # Core merges RAG sources into the non-streaming HTTP response body via
+    # merge_events_into_response (events carry {"sources": [...]}).  The wrapper
+    # disables Core's pre-pipe RAG, so the manual injection sources must be
+    # merged here for API / non-event-emitter callers to retain citations.
+    # Mirror Core semantics: existing response keys win over merged events.
+    if not isinstance(response, dict):
+        return response
+    displayable = _displayable_sources(sources)
+    if not displayable:
+        return response
+    if "sources" in response:
+        return response
+    return {"sources": displayable, **response}
+
+
+def _format_summary_file_context(sources: Any) -> str | None:
+    if not isinstance(sources, list) or not sources:
+        return None
+
+    lines = ["<attached_file_contents>"]
+    emitted = 0
+    for source_index, source in enumerate(sources, start=1):
+        if not isinstance(source, dict):
+            continue
+        source_info = source.get("source") if isinstance(source.get("source"), dict) else {}
+        documents = source.get("document")
+        if not isinstance(documents, list):
+            documents = source.get("documents")
+        if not isinstance(documents, list):
+            documents = []
+        metadata_values = source.get("metadata")
+        metadatas: list[Any] = metadata_values if isinstance(metadata_values, list) else []
+        source_id = source_info.get("id") or source_info.get("source")
+        source_name = source_info.get("name") or source_info.get("filename") or source_id or f"source-{source_index}"
+        for document_index, document in enumerate(documents, start=1):
+            if document is None:
+                continue
+            metadata: dict[str, Any] = {}
+            if document_index - 1 < len(metadatas):
+                candidate_metadata = metadatas[document_index - 1]
+                if isinstance(candidate_metadata, dict):
+                    metadata = candidate_metadata
+            file_id = metadata.get("source") or metadata.get("file_id") or source_id or f"source-{source_index}"
+            file_name = metadata.get("name") or metadata.get("filename") or source_name
+            lines.append(
+                f'<file index="{emitted + 1}" source_index="{_xml_attr(source_index)}" '
+                f'document_index="{_xml_attr(document_index)}" id="{_xml_attr(file_id)}" '
+                f'name="{_xml_attr(file_name)}">{_xml_cdata(document)}</file>'
+            )
+            emitted += 1
+    if emitted == 0:
+        return None
+    lines.append("</attached_file_contents>")
+    return "\n".join(lines)
+
+
+async def _generate_summary_file_context(
+    *,
+    request: Any,
+    user: Any,
+    prefix_files: list[Any],
+) -> str | None:
+    try:
+        from open_webui.retrieval.utils import get_sources_from_items
+
+        state = getattr(getattr(request, "app", None), "state", None)
+        config = getattr(state, "config", None)
+        embedding_function = getattr(state, "EMBEDDING_FUNCTION", None)
+        reranking_function = getattr(state, "RERANKING_FUNCTION", None)
+        user_model = coerce_open_webui_user(user)
+
+        def embed(query: str, prefix: str) -> Any:
+            if embedding_function is None:
+                return None
+            return embedding_function(query, prefix=prefix, user=user_model)
+
+        rerank = None
+        if reranking_function is not None:
+            rerank = lambda query, documents: reranking_function(query, documents, user=user_model)
+
+        sources = await get_sources_from_items(
+            request=request,
+            items=prefix_files,
+            queries=[""],
+            embedding_function=embed,
+            k=getattr(config, "TOP_K", 5),
+            reranking_function=rerank,
+            k_reranker=getattr(config, "TOP_K_RERANKER", 5),
+            r=getattr(config, "RELEVANCE_THRESHOLD", 0.0),
+            hybrid_bm25_weight=getattr(config, "HYBRID_BM25_WEIGHT", 0.5),
+            hybrid_search=getattr(config, "ENABLE_RAG_HYBRID_SEARCH", False),
+            full_context=True,
+            user=user_model,
+        )
+        return _format_summary_file_context(sources)
+    except SummaryFileContextUnavailable:
+        raise
+    except Exception as exc:
+        LOG.exception("Failed to generate summary file context")
+        raise SummaryFileContextUnavailable() from exc
+
+
+async def _prepare_summary_file_context(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    compaction_prefix_count: int,
+    parent_source_message_count: int,
+    file_context_enabled: bool = True,
+) -> str | None:
+    if not file_context_enabled:
+        return None
+    try:
+        metadata_files = metadata.get("files")
+        if not isinstance(metadata_files, list) or not metadata_files:
+            return None
+        chat_id = str(metadata.get("chat_id") or "")
+        current_message_id = str(metadata.get("user_message_id") or metadata.get("message_id") or "")
+        db_chain = await _load_chat_message_chain(request, chat_id, current_message_id)
+        if db_chain is None:
+            return None
+
+        prefix_ids = _classify_files_for_summary(
+            db_chain=db_chain,
+            compaction_prefix_count=compaction_prefix_count,
+            parent_source_message_count=parent_source_message_count,
+        )
+        if not prefix_ids:
+            return None
+
+        prefix_files = [
+            file_item
+            for file_item in metadata_files
+            if isinstance(file_item, dict) and not _is_image_file_item(file_item) and file_item.get("id") in prefix_ids
+        ]
+        if not prefix_files:
+            return None
+        return await _generate_summary_file_context(request=request, user=user, prefix_files=prefix_files)
+    except SummaryFileContextUnavailable:
+        raise
+    except Exception as exc:
+        LOG.exception("Failed to prepare summary file context")
+        raise SummaryFileContextUnavailable() from exc
+
+
+def _target_model_supports_file_context(models: dict[str, Any], target_model_id: str) -> bool:
+    """Check if the TARGET model (not wrapper) has file_context enabled.
+    When the target itself disables file_context, the pipe must not
+    inject file content either — the user/admin explicitly opted out."""
+    target = models.get(target_model_id)
+    if not isinstance(target, dict):
+        return True  # unknown model → default to enabled (safe)
+
+    capability_maps: list[Any] = [target.get("capabilities")]
+    top_meta = target.get("meta")
+    if isinstance(top_meta, dict):
+        capability_maps.append(top_meta.get("capabilities"))
+    info = target.get("info")
+    if isinstance(info, dict):
+        info_meta = info.get("meta")
+        if isinstance(info_meta, dict):
+            capability_maps.append(info_meta.get("capabilities"))
+
+    for capabilities in capability_maps:
+        if isinstance(capabilities, dict) and capabilities.get("file_context") is False:
+            return False
+    return True
+
+
+async def _inject_target_file_context(
+    *,
+    request: Any,
+    user: Any,
+    body: dict[str, Any],
+    chat_id: str | None,
+    current_message_id: str | None,
+    compaction_prefix_count: int,
+    metadata_files: Any,
+    metadata_user_message: Any,
+    event_emitter: Callable[[Any], Awaitable[None]] | None,
+    file_context_enabled: bool = True,
+    emit_source_events: bool = True,
+) -> dict[str, Any]:
+    body_metadata = body.get("metadata")
+    if isinstance(body_metadata, dict):
+        body_metadata.pop("sources", None)
+    if not isinstance(metadata_files, list) or not metadata_files:
+        return body
+    non_image = [file_item for file_item in metadata_files if isinstance(file_item, dict) and not _is_image_file_item(file_item)]
+    if not non_image:
+        return body
+
+    db_chain = await _load_chat_message_chain(request, chat_id, current_message_id)
+    retained_files = _classify_files_for_target(
+        db_chain=db_chain,
+        compaction_prefix_count=compaction_prefix_count,
+        metadata_user_message=metadata_user_message,
+        metadata_files=metadata_files,
+    )
+    # Always update body metadata files to retained-only so downstream pipes/functions
+    # don't receive absorbed prefix files even if target RAG is disabled.
+    body_metadata = body.get("metadata")
+    if isinstance(body_metadata, dict):
+        body_metadata["files"] = retained_files
+        body_metadata.pop("sources", None)
+
+    if not file_context_enabled:
+        return body  # target opted out of file context — skip RAG injection
+
+    if not retained_files:
+        return body
+
+    retained_non_image = [
+        file_item for file_item in retained_files if isinstance(file_item, dict) and not _is_image_file_item(file_item)
+    ]
+    if not retained_non_image:
+        return body
+
+    request_state = getattr(request, "state", None)
+    if _request_file_context_injection_active(request_state):
+        # Same request re-entered injection (e.g. generate_queries routed the
+        # task model back into this wrapper). Skip manual RAG fail-closed so we
+        # never recurse into chat_completion_files_handler again; the retained
+        # metadata files pruning above still applies.
+        return body
+    _set_request_file_context_injection_active(request_state, True)
+    try:
+        try:
+            from open_webui.utils.middleware import apply_source_context_to_messages, chat_completion_files_handler
+            from open_webui.utils.misc import get_last_user_message
+
+            rag_body = {
+                **body,
+                "metadata": {
+                    **(body.get("metadata") if isinstance(body.get("metadata"), dict) else {}),
+                    "files": retained_non_image,
+                },
+            }
+            extra_params = {"__event_emitter__": event_emitter or _noop_event_emitter}
+            _, flags = await chat_completion_files_handler(request, rag_body, extra_params, coerce_open_webui_user(user))
+            sources = flags.get("sources", []) if isinstance(flags, dict) else []
+            if sources:
+                messages = body.get("messages") or []
+                last_user_msg = get_last_user_message(messages) or ""
+                body["messages"] = await apply_source_context_to_messages(request, messages, sources, last_user_msg)
+                # Propagate sources to body metadata and event_emitter, matching
+                # Core's behaviour so UI citation/source display and downstream
+                # consumers work the same as non-AutoCompact file-context.
+                body_metadata = body.get("metadata")
+                if isinstance(body_metadata, dict):
+                    body_metadata["sources"] = sources[:]
+                if emit_source_events:
+                    await _emit_source_events(event_emitter, sources)
+        except Exception:
+            LOG.exception("Failed to inject target file context")
+    finally:
+        _set_request_file_context_injection_active(request_state, False)
+    return body
+
+
+def _choice_has_tool_call(choice: Any) -> bool:
+    if not isinstance(choice, dict):
+        return False
+    if choice.get("finish_reason") in {"tool_calls", "function_call"}:
+        return True
+    message = choice.get("message")
+    if isinstance(message, dict) and (message.get("tool_calls") or message.get("function_call")):
+        return True
+    delta = choice.get("delta")
+    return isinstance(delta, dict) and bool(delta.get("tool_calls") or delta.get("function_call"))
+
+
+def _summary_incomplete_finish_reason(reason: Any) -> str | None:
+    if not isinstance(reason, str) or not reason:
+        return None
+    normalized = reason.lower().replace("-", "_")
+    if any(pattern in normalized for pattern in _SUMMARY_INCOMPLETE_FINISH_REASON_PATTERNS):
+        return reason
+    return None
+
+
+def _summary_response_incomplete_reason(response: Any) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    status_value = response.get("status")
+    if isinstance(status_value, str) and status_value.lower() == "incomplete":
+        details = response.get("incomplete_details")
+        if isinstance(details, dict):
+            reason = details.get("reason")
+            if isinstance(reason, str) and reason:
+                return reason
+        return status_value
+    reason = _summary_incomplete_finish_reason(response.get("finish_reason"))
+    if reason is not None:
+        return reason
+    choices = response.get("choices")
+    if isinstance(choices, list):
+        choice = choices[0] if choices else None
+        if isinstance(choice, dict):
+            reason = _summary_incomplete_finish_reason(choice.get("finish_reason"))
+            if reason is not None:
+                return reason
+    nested_response = response.get("response")
+    if isinstance(nested_response, dict):
+        return _summary_response_incomplete_reason(nested_response)
+    return None
+
+
+def _raise_incomplete_summary(reason: str) -> None:
+    raise RuntimeError(f"Summary model stopped before completing the checkpoint summary: {reason}")
+
+
+def _stream_payload_has_tool_call(payload: dict[str, Any]) -> bool:
+    payload_type = payload.get("type")
+    if isinstance(payload_type, str) and "function_call" in payload_type:
+        return True
+    item = payload.get("item")
+    if isinstance(item, dict) and item.get("type") in {"function_call", "tool_call"}:
+        return True
+    choices = payload.get("choices")
+    return isinstance(choices, list) and any(_choice_has_tool_call(choice) for choice in choices)
+
+
+def _responses_output_has_tool_call(response: dict[str, Any]) -> bool:
+    output = response.get("output")
+    if not isinstance(output, list):
+        return False
+    for item in output:
+        if isinstance(item, dict) and item.get("type") in {"function_call", "tool_call"}:
+            return True
+    return False
+
+
+def _responses_output_text(response: dict[str, Any]) -> str | None:
+    output_text = response.get("output_text")
+    if isinstance(output_text, str):
+        return output_text
+    output = response.get("output")
+    if not isinstance(output, list):
+        return None
+    parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for content_item in content:
+            if not isinstance(content_item, dict) or content_item.get("type") != "output_text":
+                continue
+            text = content_item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    if not parts:
+        return None
+    return "".join(parts)
+
+
+def _choice_message_text(choice: Any) -> str | None:
+    if not isinstance(choice, dict):
+        return None
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    return None
+
+
+def _stream_payload_text(payload: dict[str, Any]) -> str | None:
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if isinstance(content, str):
+            return content
+        message_content = _choice_message_text(choice)
+        if message_content is not None:
+            return message_content
+    if payload.get("type") == "response.output_text.delta":
+        delta = payload.get("delta")
+        if isinstance(delta, str):
+            return delta
+    return None
+
+
+def _observe_streaming_completion_payload(payload: dict[str, Any], state: dict[str, Any]) -> None:
+    if _stream_payload_error_source(payload) is not None:
+        state["saw_error"] = True
+        return
+    usage = extract_usage_from_stream_payload(payload)
+    if usage:
+        state["usage"] = usage
+    if _stream_payload_has_tool_call(payload):
+        state["saw_tool_call"] = True
+    text = _stream_payload_text(payload)
+    if text:
+        state.setdefault("parts", []).append(text)
+
+
+async def _streaming_completion_observer(
+    iterator: AsyncIterator[bytes | str],
+    *,
+    media_type: str,
+    on_complete: Callable[[dict[str, Any]], Any],
+) -> AsyncIterator[bytes | str]:
+    state: dict[str, Any] = {"parts": [], "usage": None, "saw_tool_call": False, "saw_error": False}
+    is_sse_response = "text/event-stream" in (media_type or "").lower()
+    parser = _SSEJSONEventParser() if is_sse_response else None
+    async for raw_chunk in iterator:
+        chunk = _coerce_stream_chunk(raw_chunk)
+        if is_sse_response and parser is not None:
+            events = parser.feed(chunk)
+        else:
+            events = extract_sse_json_events(chunk)
+        for payload in events:
+            _observe_streaming_completion_payload(payload, state)
+        yield raw_chunk
+    if is_sse_response and parser is not None:
+        for payload in parser.flush():
+            _observe_streaming_completion_payload(payload, state)
+    if state.get("saw_tool_call") or state.get("saw_error"):
+        return
+    content = "".join(state.get("parts") or [])
+    if not content:
+        return
+    with suppress(Exception):
+        on_complete(
+            {
+                "assistant_message": {"role": "assistant", "content": content},
+                "usage": state.get("usage"),
+            }
+        )
+
+
+def _attach_streaming_completion_observer(
+    response: StreamingResponse,
+    on_complete: Callable[[dict[str, Any]], Any],
+) -> StreamingResponse:
+    media_type = response.headers.get("content-type", getattr(response, "media_type", "") or "")
+    response.body_iterator = _streaming_completion_observer(
+        response.body_iterator,
+        media_type=media_type,
+        on_complete=on_complete,
+    )
+    return response
+
+
+def _stream_payload_is_control_event(payload: dict[str, Any]) -> bool:
+    if "error" in payload or "usage" in payload:
+        return True
+    return payload.get("done") is True
+
+
+def _stream_payload_is_known_transport_event(payload: dict[str, Any]) -> bool:
+    payload_type = payload.get("type")
+    if isinstance(payload.get("choices"), list):
+        return True
+    if isinstance(payload_type, str) and payload_type.startswith("response."):
+        return True
+    return _stream_payload_is_control_event(payload)
+
+
+def _stream_payload_error_source(payload: dict[str, Any]) -> Any | None:
+    if payload.get("error") is not None:
+        return payload
+    payload_type = payload.get("type")
+    if payload_type == "error":
+        return payload
+    if payload_type == "response.failed":
+        response = payload.get("response")
+        if isinstance(response, dict) and response.get("error") is not None:
+            return {"error": response["error"]}
+        return payload
+    return None
+
+
+def _append_summary_sse_value(value: str, parts: list[str]) -> bool:
+    try:
+        payload = json.loads(value.strip())
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    error_source = _stream_payload_error_source(payload)
+    if error_source is not None:
+        if is_retryable_context_error(error_source, status_code=400):
+            raise RetryableContextOverflow("Summary model reported a context-window error")
+        raise RuntimeError(f"Summary model provider error: {_completion_error_message(error_source)}")
+
+    incomplete_reason = _summary_response_incomplete_reason(payload)
+    if incomplete_reason is not None:
+        _raise_incomplete_summary(incomplete_reason)
+
+    is_known_transport_event = _stream_payload_is_known_transport_event(payload)
+    saw_tool_call = is_known_transport_event and _stream_payload_has_tool_call(payload)
+    if not is_known_transport_event:
+        return False
+    text = _stream_payload_text(payload)
+    if text is not None:
+        parts.append(text)
+    return saw_tool_call
+
+
+@dataclass(frozen=True)
+class DisplayTokenContext:
+    before: int | None
+    usage: int | None
+    estimate: int | None
+    hard_limit: int
+    soft_limit: int | None
+    usage_source: str | None
+    pct_of_hard: float | None
+
+
+def _build_display_token_context(
+    *,
+    estimated_total_tokens: int | None,
+    total_tokens: int | None,
+    effective_trigger_total_tokens: int,
+    effective_soft_trigger_total_tokens: int | None,
+    usage_source: str | None,
+) -> DisplayTokenContext:
+    before = None
+    display_usage_source = usage_source
+    if estimated_total_tokens is not None:
+        before = estimated_total_tokens
+        if total_tokens is None or estimated_total_tokens != total_tokens:
+            display_usage_source = "estimate"
+    elif total_tokens is not None:
+        before = total_tokens
+
+    pct_of_hard = None
+    if before is not None and effective_trigger_total_tokens > 0:
+        pct_of_hard = round(before / effective_trigger_total_tokens * 100, 1)
+
+    return DisplayTokenContext(
+        before=before,
+        usage=total_tokens,
+        estimate=estimated_total_tokens,
+        hard_limit=effective_trigger_total_tokens,
+        soft_limit=effective_soft_trigger_total_tokens,
+        usage_source=display_usage_source,
+        pct_of_hard=pct_of_hard,
+    )
+
+
+def _display_context_with_estimate(ctx: DisplayTokenContext, estimate: int | None) -> DisplayTokenContext:
+    if estimate is None or ctx.estimate is not None:
+        return ctx
+    return DisplayTokenContext(
+        before=ctx.before,
+        usage=ctx.usage,
+        estimate=estimate,
+        hard_limit=ctx.hard_limit,
+        soft_limit=ctx.soft_limit,
+        usage_source=ctx.usage_source,
+        pct_of_hard=ctx.pct_of_hard,
+    )
+
+
+def _round_half_up_int(value: float) -> int:
+    return int(math.floor(value + 0.5))
+
+
+def _format_token_count(value: int, *, approximate: bool) -> str:
+    prefix = "≈" if approximate else ""
+    return f"{prefix}{value:,}"
+
+
+def _format_before_token_count(ctx: DisplayTokenContext) -> str:
+    if ctx.before is None:
+        return "≈unknown"
+    is_provider_usage = ctx.usage_source in {"request", "persisted"} and ctx.usage == ctx.before
+    return _format_token_count(ctx.before, approximate=not is_provider_usage)
+
+
+def _format_token_suffix(
+    ctx: DisplayTokenContext,
+    *,
+    after: int | None,
+    compare_estimate: bool,
+    summary: int | None = None,
+) -> str:
+    hard_limit = f"{ctx.hard_limit:,}"
+    before_pct = None if ctx.pct_of_hard is None else _round_half_up_int(ctx.pct_of_hard)
+
+    if summary is not None:
+        summary_part = f"summary {_format_token_count(summary, approximate=True)} tokens"
+        if compare_estimate and ctx.usage is not None and ctx.estimate is not None:
+            estimate_part = f"candidate ≈{ctx.estimate:,}"
+            pct_part = f" · {before_pct}%" if before_pct is not None else ""
+            return f"(observed usage {ctx.usage:,} · {estimate_part} / {hard_limit}{pct_part} · {summary_part})"
+
+        before = _format_before_token_count(ctx)
+        pct_part = f" · {before_pct}%" if before_pct is not None and ctx.hard_limit > 0 else ""
+        return f"({before} / {hard_limit} tokens{pct_part} · {summary_part})"
+
+    if compare_estimate and ctx.usage is not None and ctx.estimate is not None:
+        estimate_part = f"candidate ≈{ctx.estimate:,}"
+        pct_part = f" · {before_pct}%" if before_pct is not None else ""
+        if after is not None:
+            estimate_part += f" → {_format_token_count(after, approximate=True)}"
+            if ctx.hard_limit > 0:
+                pct_part += f" → {_round_half_up_int(after / ctx.hard_limit * 100)}%"
+        return f"(observed usage {ctx.usage:,} · {estimate_part} / {hard_limit}{pct_part})"
+
+    before = _format_before_token_count(ctx)
+    if after is not None:
+        after_count = _format_token_count(after, approximate=True)
+        if before_pct is None or ctx.hard_limit <= 0:
+            return f"({before} → {after_count} tokens)"
+        after_pct = _round_half_up_int(after / ctx.hard_limit * 100)
+        return f"({before} → {after_count} tokens · {before_pct}% → {after_pct}%)"
+
+    if before_pct is None:
+        return f"({before} / {hard_limit} tokens)"
+    return f"({before} / {hard_limit} tokens · {before_pct}%)"
+
+
+def _tokens_status_payload(
+    ctx: DisplayTokenContext,
+    *,
+    after: int | None,
+    compare_estimate: bool,
+    summary: int | None = None,
+) -> dict[str, Any]:
+    tokens: dict[str, Any] = {
+        "before": ctx.before,
+        "hard_limit": ctx.hard_limit,
+        "soft_limit": ctx.soft_limit,
+        "pct_of_hard": ctx.pct_of_hard,
+        "usage_source": ctx.usage_source,
+    }
+    if summary is not None:
+        tokens["summary"] = summary
+    elif after is not None:
+        tokens["after"] = after
+    if compare_estimate and ctx.usage is not None:
+        tokens["usage"] = ctx.usage
+    if compare_estimate and ctx.estimate is not None:
+        tokens["estimate"] = ctx.estimate
+    return tokens
+
+
+def _description_with_token_suffix(
+    description: str,
+    ctx: DisplayTokenContext,
+    *,
+    after: int | None = None,
+    compare_estimate: bool = False,
+    summary: int | None = None,
+) -> str:
+    return f"{description} {_format_token_suffix(ctx, after=after, compare_estimate=compare_estimate, summary=summary)}"
+
+
+async def emit_compaction_status(
+    event_emitter: Callable[[Any], Awaitable[None]] | None,
+    *,
+    action: str,
+    description: str,
+    done: bool = False,
+    error: bool = False,
+    **extra: Any,
+) -> None:
+    if event_emitter is None:
+        return
+    data = {
+        "action": f"auto_compaction_{action}",
+        "description": description,
+        "done": done,
+    }
+    if error:
+        data["error"] = True
+    data.update({key: value for key, value in extra.items() if value is not None})
+    try:
+        await event_emitter({"type": "status", "data": data})
+    except Exception:
+        return
+
+
+async def extract_text_from_completion_response(response: Any, *, tools_enabled: bool = False) -> str:
+    if isinstance(response, dict):
+        if _responses_output_has_tool_call(response):
+            raise _summary_tool_call_error()
+        incomplete_reason = _summary_response_incomplete_reason(response)
+        if incomplete_reason is not None:
+            _raise_incomplete_summary(incomplete_reason)
+        choices = response.get("choices")
+        if isinstance(choices, list) and choices:
+            choice = choices[0]
+            if _choice_has_tool_call(choice):
+                raise _summary_tool_call_error()
+            value = _choice_message_text(choice)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        responses_text = _responses_output_text(response)
+        if responses_text and responses_text.strip():
+            return responses_text.strip()
+    if isinstance(response, StreamingResponse):
+        parts: list[str] = []
+        saw_tool_call = False
+        sse_parser = _SSEDataParser()
+        media_type = getattr(response, "media_type", None) or response.headers.get("content-type", "")
+        is_sse_response = "text/event-stream" in str(media_type).lower()
+        if not is_sse_response:
+            await _close_stream_response(response)
+            raise RuntimeError("Summary model did not return a structured OpenAI-compatible response")
+        try:
+            async for chunk in response.body_iterator:
+                sse_values, _ = sse_parser.feed(chunk)
+                for value in sse_values:
+                    saw_tool_call = saw_tool_call or _append_summary_sse_value(value, parts)
+            for value in sse_parser.flush()[0]:
+                saw_tool_call = saw_tool_call or _append_summary_sse_value(value, parts)
+            text = "".join(parts).strip()
+            if saw_tool_call:
+                raise _summary_tool_call_error()
+            if text:
+                return text
+        finally:
+            await _close_stream_response(response)
+    if tools_enabled:
+        raise RuntimeError("Summary model returned a tool call or no text content while tools were available")
+    raise RuntimeError("Summary model did not return text content")
+
+
+def build_summary_task_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    copied = _copy_summary_task_metadata(metadata or {})
+    copied.pop("selected_model_id", None)
+    copied.pop("mcp_clients", None)
+    copied["task"] = INTERNAL_SUMMARY_TASK
+    copied["tools"] = {}
+    return copied
+
+
+def _resolve_summary_model_for_call(summary_model_id: str, *, pipe_function_id: str = PIPE_FUNCTION_ID) -> str:
+    if is_generated_wrapper_model_id(summary_model_id, pipe_function_id=pipe_function_id):
+        return decode_wrapper_model_id(summary_model_id, expected_pipe_function_id=pipe_function_id).target_model_id
+    return summary_model_id
+
+
+def _is_forced_tool_choice(value: Any) -> bool:
+    if isinstance(value, dict):
+        choice_type = value.get("type")
+        if choice_type in (None, "function", "tool"):
+            return True
+        return choice_type not in {"auto", "none"}
+    if isinstance(value, str):
+        return value not in {"auto", "none"}
+    return False
+
+
+def _is_forced_function_call(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value.get("name"))
+    if isinstance(value, str):
+        return value not in {"auto", "none"}
+    return False
+
+
+SUMMARY_INHERITED_RESPONSE_CONTROL_KEYS = (
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "stop",
+)
+
+
+def strip_summary_inherited_response_controls(body: dict[str, Any]) -> None:
+    for key in SUMMARY_INHERITED_RESPONSE_CONTROL_KEYS:
+        body.pop(key, None)
+
+
+def neutralize_summary_tool_choice(body: dict[str, Any]) -> None:
+    if body.get("tools") and _is_forced_tool_choice(body.get("tool_choice")):
+        body["tool_choice"] = "none"
+    elif not body.get("tools"):
+        body.pop("tool_choice", None)
+    if body.get("functions") and _is_forced_function_call(body.get("function_call")):
+        body["function_call"] = "none"
+    elif not body.get("functions"):
+        body.pop("function_call", None)
+
+
+def strip_summary_tools_for_retry(body: dict[str, Any]) -> None:
+    for key in ("tools", "tool_choice", "functions", "function_call", "parallel_tool_calls"):
+        body.pop(key, None)
+
+
+def build_summary_request_message(
+    prefix_file_context: str | None = None,
+    *,
+    summary_prompt: str | None = None,
+) -> dict[str, str]:
+    content = resolve_summary_prompt(summary_prompt)
+    if prefix_file_context:
+        content = f"{prefix_file_context}\n\n{content}"
+    return {"role": "user", "content": content}
+
+
+def build_summary_completion_body(
+    base_body: dict[str, Any],
+    *,
+    summary_model_id: str,
+    source_messages: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    pipe_function_id: str = PIPE_FUNCTION_ID,
+    summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
+    prefix_file_context: str | None = None,
+    summary_prompt: str | None = None,
+) -> dict[str, Any]:
+    body = _copy_body_preserving_metadata(base_body)
+    body["model"] = _resolve_summary_model_for_call(summary_model_id, pipe_function_id=pipe_function_id)
+    body["messages"] = [
+        *copy.deepcopy(source_messages),
+        build_summary_request_message(prefix_file_context, summary_prompt=summary_prompt),
+    ]
+    body["metadata"] = build_summary_task_metadata(metadata)
+    body["metadata"].pop("files", None)
+    body.pop("previous_response_id", None)
+    body.pop("response_format", None)
+    strip_summary_inherited_response_controls(body)
+    neutralize_summary_tool_choice(body)
+    if summary_tool_policy == "always_strip":
+        strip_summary_tools_for_retry(body)
+    return body
+
+
+async def _generate_summary_text(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    summary_model_id: str,
+    source_messages: list[dict[str, Any]],
+    base_body: dict[str, Any],
+    pipe_function_id: str = PIPE_FUNCTION_ID,
+    on_summary_start: Callable[[], Awaitable[None]] | None = None,
+    summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
+    compaction_prefix_count: int = 0,
+    parent_source_message_count: int = 0,
+    file_context_enabled: bool = True,
+    summary_prompt: str | None = None,
+) -> str:
+    summary_metadata = build_summary_task_metadata(metadata)
+    summary_metadata.pop("files", None)
+    inner_request = RequestStateProxy(
+        request,
+        bypass_filter=True,
+        bypass_system_prompt=False,
+        metadata=summary_metadata,
+    )
+    from open_webui.utils.chat import generate_chat_completion
+
+    prefix_file_context = await _prepare_summary_file_context(
+        request=request,
+        user=user,
+        metadata=metadata,
+        compaction_prefix_count=compaction_prefix_count,
+        parent_source_message_count=parent_source_message_count,
+        file_context_enabled=file_context_enabled,
+    )
+    body = build_summary_completion_body(
+        base_body,
+        summary_model_id=summary_model_id,
+        source_messages=source_messages,
+        metadata=metadata,
+        pipe_function_id=pipe_function_id,
+        summary_tool_policy=summary_tool_policy,
+        prefix_file_context=prefix_file_context,
+        summary_prompt=summary_prompt,
+    )
+    route = await _resolve_core_chat_model_route(inner_request, str(body.get("model") or ""))
+    body["model"] = route.model_id
+    await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
+    if on_summary_start is not None:
+        await on_summary_start()
+    response = await generate_chat_completion(
+        inner_request,
+        body,
+        user=coerce_open_webui_user(user),
+        bypass_filter=True,
+        bypass_system_prompt=False,
+    )
+    if is_retryable_context_error(response, status_code=400):
+        raise RetryableContextOverflow("Summary model reported a context-window error")
+    try:
+        return await extract_text_from_completion_response(response, tools_enabled=bool(body.get("tools")))
+    except SummaryToolCallError:
+        if summary_tool_policy != "fallback_on_tool_call" or (not body.get("tools") and not body.get("functions")):
+            raise
+        retry_body = copy.deepcopy(body)
+        strip_summary_tools_for_retry(retry_body)
+        response = await generate_chat_completion(
+            inner_request,
+            retry_body,
+            user=coerce_open_webui_user(user),
+            bypass_filter=True,
+            bypass_system_prompt=False,
+        )
+        if is_retryable_context_error(response, status_code=400):
+            raise RetryableContextOverflow("Summary model reported a context-window error")
+        return await extract_text_from_completion_response(response, tools_enabled=False)
+
+
+async def _compact_retry_tool_results(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    pipe_function_id: str,
+    summary_model_id: str,
+    base_body: dict[str, Any],
+    messages: list[dict[str, Any]],
+    parent_checkpoint: dict[str, Any] | None = None,
+    summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+    file_context_enabled: bool = True,
+    summary_prompt: str | None = None,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    cut = select_tool_result_compaction_cut(messages)
+    if cut is None:
+        return messages, False, 0
+
+    source_messages = copy.deepcopy(cut.summarization_prefix)
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
+    if not user_id or not _chat_id_supported(chat_id):
+        raise UnsupportedCompactionInput(
+            "Cannot compact tool history without a durable checkpoint identity",
+            code="checkpoint_identity_missing",
+        )
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    source_identity_fingerprint = _resolve_fingerprint(prefix_file_fingerprint_resolver, len(source_messages))
+    pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
+        request=request,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        source_messages=source_messages,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+    )
+    if pending_checkpoint is not None and not _checkpoint_matches_exact_source(
+        pending_checkpoint,
+        source_messages,
+        prefix_file_fingerprint=source_identity_fingerprint,
+    ):
+        ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
+        if ready_checkpoint is not None:
+            message_cut = MessageCut(
+                preserved_system_message=copy.deepcopy(cut.preserved_system_message),
+                summarization_prefix=copy.deepcopy(cut.summarization_prefix),
+                tail_messages=copy.deepcopy(cut.tail_messages),
+                source_message_count=cut.source_message_count,
+            )
+            return (
+                replace_prefix_with_parent_checkpoint_and_delta(
+                    message_cut,
+                    ready_checkpoint,
+                    prefix_file_fingerprint=_resolve_fingerprint(
+                        prefix_file_fingerprint_resolver,
+                        int(ready_checkpoint.get("source_message_count") or 0),
+                    ),
+                    historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                    historical_message_excerpt_count=historical_message_excerpt_count,
+                ),
+                True,
+                int(ready_checkpoint.get("source_message_count") or 0),
+            )
+    summary_meta = build_checkpoint_summary_meta(
+        source_messages,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+    try:
+        summary = await _get_or_create_compaction_summary(
+            request=request,
+            user=user,
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_function_id=pipe_function_id,
+            metadata=metadata,
+            summary_model_id=summary_model_id,
+            base_body=base_body,
+            source_messages=source_messages,
+            summary_meta=summary_meta,
+            parent_checkpoint=parent_checkpoint,
+            summary_tool_policy=summary_tool_policy,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+            file_context_enabled=file_context_enabled,
+            summary_prompt=summary_prompt,
+        )
+    except Exception as exc:
+        if isinstance(exc, ParentCheckpointExtensionFailed) and (
+            isinstance(exc.original, RetryableContextOverflow) or is_retryable_context_error(exc.original)
+        ):
+            raise UnsupportedCompactionInput(
+                "A conversation history with tool results exceeds the summary model context window and cannot be safely compacted",
+                code="latest_tool_result_too_large",
+            ) from exc
+        if isinstance(exc, RetryableContextOverflow) or is_retryable_context_error(exc):
+            raise UnsupportedCompactionInput(
+                "A conversation history with tool results exceeds the summary model context window and cannot be safely compacted",
+                code="latest_tool_result_too_large",
+            ) from exc
+        raise
+
+    compacted: list[dict[str, Any]] = []
+    if cut.preserved_system_message is not None:
+        compacted.append(copy.deepcopy(cut.preserved_system_message))
+    compacted.append(
+        _render_summary_message_from_result(
+            summary,
+            summary_meta,
+            historical_source_messages=source_messages,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+    )
+    compacted.extend(copy.deepcopy(cut.tail_messages))
+    return compacted, True, len(source_messages)
+
+
+async def _heartbeat_checkpoint_claim(store: Any, checkpoint_id: str, claim_token: str) -> None:
+    while True:
+        await asyncio.sleep(CHECKPOINT_CLAIM_HEARTBEAT_SECONDS)
+        try:
+            extended = await store.extend_claim(
+                checkpoint_id,
+                claim_token=claim_token,
+                expires_at=int(time.time()) + CHECKPOINT_CLAIM_LEASE_SECONDS,
+            )
+        except Exception:
+            continue
+        if not extended:
+            return
+
+
+async def _claim_or_wait_for_checkpoint(
+    store: Any,
+    *,
+    identity: dict[str, str],
+    source_message_count: int,
+    summary_meta: dict[str, Any],
+    claim_token: str,
+) -> str | dict[str, Any]:
+    """Return the claimed pending checkpoint id, or a ready row produced by another worker."""
+    deadline = time.monotonic() + CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS
+    while True:
+        row = await store.lookup_any(**identity)
+        if row is None:
+            now = int(time.time())
+            pending_row = build_checkpoint_row(
+                **identity,
+                source_message_count=source_message_count,
+                summary_text="",
+                summary_meta=summary_meta,
+                parent_checkpoint_id=None,
+                state="pending",
+                claim_token=claim_token,
+                claim_expires_at=now + CHECKPOINT_CLAIM_LEASE_SECONDS,
+                now=now,
+            )
+            if await store.claim_pending(pending_row):
+                return pending_row["id"]
+            continue
+        if row.get("state") == "ready":
+            with suppress(Exception):
+                await store.touch(row["id"])
+            return row
+        now = int(time.time())
+        expires_at = row.get("claim_expires_at")
+        if expires_at is None or int(expires_at) <= now:
+            if await store.reclaim_pending(
+                row["id"],
+                claim_token=claim_token,
+                expires_at=now + CHECKPOINT_CLAIM_LEASE_SECONDS,
+                now=now,
+            ):
+                return row["id"]
+            continue
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Timed out waiting for another worker to finish generating this checkpoint summary"
+            )
+        await asyncio.sleep(CHECKPOINT_PENDING_POLL_SECONDS)
+
+
+async def _get_or_create_checkpoint_summary(
+    *,
+    request: Any,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    source_messages: list[dict[str, Any]],
+    summary_meta: dict[str, Any],
+    summary_factory: Callable[[dict[str, Any] | None], Awaitable[str]],
+    parent_checkpoint: dict[str, Any] | None = None,
+    parent_checkpoint_guard: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    prefix_file_fingerprint: str | None = None,
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+) -> str:
+    profile_hash = compute_profile_hash()
+    source_hash = compute_summary_source_hash(source_messages, prefix_file_fingerprint)
+    summary_meta = normalize_summary_meta(summary_meta)
+    identity = {
+        "namespace": CHECKPOINT_NAMESPACE,
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "pipe_function_id": pipe_function_id,
+        "profile_hash": profile_hash,
+        "source_hash": source_hash,
+    }
+    lock_key = (CHECKPOINT_NAMESPACE, user_id, chat_id, pipe_function_id, profile_hash, source_hash)
+    lock = get_generation_lock(lock_key)
+
+    try:
+        async with lock:
+            await ensure_checkpoint_table_initialized(request=request)
+            store = CheckpointStore()
+            claim_token = uuid.uuid4().hex
+
+            claimed = await _claim_or_wait_for_checkpoint(
+                store,
+                identity=identity,
+                source_message_count=len(source_messages),
+                summary_meta=summary_meta,
+                claim_token=claim_token,
+            )
+            if isinstance(claimed, dict):
+                return CompactionSummaryResult(claimed["summary_text"], checkpoint=claimed)
+            checkpoint_id = claimed
+
+            heartbeat = asyncio.create_task(_heartbeat_checkpoint_claim(store, checkpoint_id, claim_token))
+            try:
+                if parent_checkpoint is not None:
+                    parent_count = int(parent_checkpoint.get("source_message_count") or 0)
+                    parent_fingerprint = (
+                        prefix_file_fingerprint_resolver(parent_count)
+                        if prefix_file_fingerprint_resolver is not None
+                        else None
+                    )
+                    if (
+                        parent_count <= 0
+                        or parent_count > len(source_messages)
+                        or compute_summary_source_hash(source_messages[:parent_count], parent_fingerprint)
+                        != parent_checkpoint.get("source_hash")
+                    ):
+                        raise UnsupportedCompactionInput(
+                            "Parent checkpoint cannot be applied safely because its source boundary is invalid",
+                            code="unsafe_checkpoint_parent",
+                        )
+                    parent = parent_checkpoint
+                else:
+                    parent = await store.find_longest_parent(
+                        namespace=CHECKPOINT_NAMESPACE,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                        source_messages=source_messages,
+                        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+                    )
+                if parent is not None and parent_checkpoint_guard is not None:
+                    await parent_checkpoint_guard(parent)
+                try:
+                    summary_text = await summary_factory(parent)
+                except SummaryFileContextUnavailable:
+                    raise
+                except Exception as exc:
+                    if parent:
+                        raise ParentCheckpointExtensionFailed(parent, exc) from exc
+                    raise
+                summary_token_count = await _estimate_rendered_summary_message_tokens(
+                    request=request,
+                    summary_text=summary_text,
+                    summary_meta=summary_meta,
+                )
+                completed = await store.complete_pending(
+                    checkpoint_id,
+                    claim_token=claim_token,
+                    summary_text=summary_text,
+                    parent_checkpoint_id=parent.get("id") if parent else None,
+                    summary_token_count=summary_token_count,
+                )
+                if completed is not None:
+                    return CompactionSummaryResult(completed["summary_text"], checkpoint=completed)
+                existing = await store.lookup_ready(**identity)
+                if existing is not None:
+                    with suppress(Exception):
+                        await store.touch(existing["id"])
+                    return CompactionSummaryResult(existing["summary_text"], checkpoint=existing)
+                raise RuntimeError("Checkpoint claim was lost before the generated summary could be stored")
+            except (asyncio.CancelledError, Exception):
+                # asyncio.CancelledError is outside Exception on Python 3.11+.
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(store.release_claim(checkpoint_id, claim_token=claim_token))
+                raise
+            finally:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
+    finally:
+        release_generation_lock(lock_key, lock)
+
+
+async def _get_or_create_compaction_summary(
+    *,
+    request: Any,
+    user: Any,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    metadata: dict[str, Any],
+    summary_model_id: str,
+    base_body: dict[str, Any],
+    source_messages: list[dict[str, Any]],
+    summary_meta: dict[str, Any],
+    parent_checkpoint: dict[str, Any] | None = None,
+    parent_checkpoint_guard: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    on_summary_start: Callable[[], Awaitable[None]] | None = None,
+    summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
+    historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+    historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+    file_context_enabled: bool = True,
+    summary_prompt: str | None = None,
+) -> str:
+    summary_source_prefix = copy.deepcopy(source_messages)
+
+    async def summary_factory(parent: dict[str, Any] | None) -> str:
+        parent_count = 0
+        if parent:
+            parent_count = int(parent.get("source_message_count") or 0)
+            source = [
+                render_summary_message_from_checkpoint(
+                    parent,
+                    historical_source_messages=summary_source_prefix[:parent_count],
+                    historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                    historical_message_excerpt_count=historical_message_excerpt_count,
+                ),
+                *copy.deepcopy(summary_source_prefix[parent_count:]),
+            ]
+        else:
+            source = copy.deepcopy(summary_source_prefix)
+        return await _generate_summary_text(
+            request=request,
+            user=user,
+            metadata=metadata,
+            summary_model_id=summary_model_id,
+            source_messages=source,
+            base_body=base_body,
+            pipe_function_id=pipe_function_id,
+            on_summary_start=on_summary_start,
+            summary_tool_policy=summary_tool_policy,
+            compaction_prefix_count=len(summary_source_prefix),
+            parent_source_message_count=parent_count,
+            file_context_enabled=file_context_enabled,
+            summary_prompt=summary_prompt,
+        )
+
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    identity_fingerprint = (
+        prefix_file_fingerprint_resolver(len(source_messages))
+        if prefix_file_fingerprint_resolver is not None
+        else None
+    )
+
+    return await _get_or_create_checkpoint_summary(
+        request=request,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        source_messages=source_messages,
+        summary_meta=summary_meta,
+        summary_factory=summary_factory,
+        parent_checkpoint=parent_checkpoint,
+        parent_checkpoint_guard=parent_checkpoint_guard,
+        prefix_file_fingerprint=identity_fingerprint,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+    )
+
+
+async def _lookup_ready_checkpoint_for_source(
+    *,
+    request: Any,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    source_messages: list[dict[str, Any]],
+    prefix_file_fingerprint: str | None = None,
+) -> dict[str, Any] | None:
+    await ensure_checkpoint_table_initialized(request=request)
+    return await CheckpointStore().lookup_ready(
+        namespace=CHECKPOINT_NAMESPACE,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        profile_hash=compute_profile_hash(),
+        source_hash=compute_summary_source_hash(source_messages, prefix_file_fingerprint),
+    )
+
+
+async def _lookup_pending_checkpoint_for_source_prefix(
+    *,
+    request: Any,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    source_messages: list[dict[str, Any]],
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+) -> dict[str, Any] | None:
+    if not source_messages:
+        return None
+    await ensure_checkpoint_table_initialized(request=request)
+    store = CheckpointStore()
+    find_pending = getattr(store, "find_longest_pending_parent", None)
+    if not callable(find_pending):
+        return None
+    return await find_pending(
+        namespace=CHECKPOINT_NAMESPACE,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        profile_hash=compute_profile_hash(),
+        source_messages=source_messages,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+    )
+
+
+def _checkpoint_identity_from_row(row: dict[str, Any]) -> dict[str, str]:
+    return {
+        "namespace": str(row.get("namespace") or CHECKPOINT_NAMESPACE),
+        "user_id": str(row.get("user_id") or ""),
+        "chat_id": str(row.get("chat_id") or ""),
+        "pipe_function_id": str(row.get("pipe_function_id") or ""),
+        "profile_hash": str(row.get("profile_hash") or ""),
+        "source_hash": str(row.get("source_hash") or ""),
+    }
+
+
+def _checkpoint_matches_exact_source(
+    row: dict[str, Any],
+    source_messages: list[dict[str, Any]],
+    *,
+    prefix_file_fingerprint: str | None = None,
+) -> bool:
+    try:
+        source_message_count = int(row.get("source_message_count") or 0)
+    except Exception:
+        return False
+    return (
+        source_message_count == len(source_messages)
+        and row.get("source_hash") == compute_summary_source_hash(source_messages, prefix_file_fingerprint)
+    )
+
+
+async def _wait_for_pending_checkpoint_ready(row: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    if row.get("state") == "ready":
+        return row
+    identity = _checkpoint_identity_from_row(row)
+    if not all(identity.values()):
+        return None
+    store = CheckpointStore()
+    deadline = time.monotonic() + CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS
+    while True:
+        current = await store.lookup_any(**identity)
+        if current is None:
+            return None
+        if current.get("state") == "ready":
+            with suppress(Exception):
+                await store.touch(str(current["id"]))
+            return current
+        if current.get("state") != "pending":
+            return None
+        expires_at = current.get("claim_expires_at")
+        now = int(time.time())
+        if expires_at is None or int(expires_at) <= now:
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(CHECKPOINT_PENDING_POLL_SECONDS)
+
+
+def _soft_prefetch_source_messages(body: dict[str, Any]) -> list[dict[str, Any]] | None:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 2:
+        return None
+    tool_cut = select_tool_result_compaction_cut(messages)
+    if tool_cut is not None and tool_cut.summarization_prefix:
+        return copy.deepcopy(tool_cut.summarization_prefix)
+    cut = select_safe_message_cut(messages)
+    if cut.summarization_prefix:
+        return copy.deepcopy(cut.summarization_prefix)
+    return None
+
+
+async def _prefetch_compaction_checkpoint(
+    *,
+    request: Any,
+    user: Any,
+    user_id: str,
+    chat_id: str,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    summary_model_id: str,
+    source_messages: list[dict[str, Any]],
+    summary_tool_policy: SummaryToolPolicy,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+    effective_trigger_total_tokens: int = 100000,
+    effective_soft_trigger_total_tokens: int | None = None,
+    trigger_total_tokens: int | None = None,
+    trigger_estimated_tokens: int | None = None,
+    trigger_usage_source: str | None = None,
+    token_status_detail: Literal["before", "before_after"] = "before",
+    token_status_compare_estimate: bool = False,
+    event_emitter: Callable[[Any], Awaitable[None]] | None = None,
+    file_context_enabled: bool = True,
+    task_estimate_body: dict[str, Any] | None = None,
+    summary_prompt: str | None = None,
+) -> bool:
+    if not source_messages:
+        return False
+    if not user_id or not _chat_id_supported(chat_id):
+        return False
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    if await _lookup_pending_checkpoint_for_source_prefix(
+        request=request,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        source_messages=source_messages,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+    ):
+        return False
+    summary_meta = build_checkpoint_summary_meta(
+        source_messages,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+
+    source_kind = "message"
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        tool_cut = select_tool_result_compaction_cut(messages)
+        if tool_cut is not None and tool_cut.summarization_prefix == source_messages:
+            source_kind = "tool"
+
+    def reusable_match_covers_prefetch_source(match: ReusableCheckpointMatch) -> bool:
+        if match.checkpoint is None or match.source_kind != source_kind:
+            return False
+        checkpoint_count = int(match.checkpoint.get("source_message_count") or match.source_message_count or 0)
+        if checkpoint_count <= 0 or checkpoint_count > len(source_messages):
+            return False
+        if match.kind == "exact" and checkpoint_count != len(source_messages):
+            return False
+        checkpoint_fingerprint = (
+            prefix_file_fingerprint_resolver(checkpoint_count)
+            if prefix_file_fingerprint_resolver is not None
+            else None
+        )
+        return (
+            compute_summary_source_hash(source_messages[:checkpoint_count], checkpoint_fingerprint)
+            == match.checkpoint.get("source_hash")
+        )
+
+    task_metadata_body = _task_body_from_metadata(metadata)
+
+    async def estimate_prefetch_checkpoint_applied_tokens(match: ReusableCheckpointMatch) -> int | None:
+        if task_estimate_body is not None:
+            return await _estimate_task_checkpoint_applied_body_tokens(
+                request=request,
+                user=user,
+                metadata=metadata,
+                body=task_estimate_body,
+                pipe_function_id=pipe_function_id,
+                match=match,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
+                file_context_enabled=file_context_enabled,
+            )
+        if task_metadata_body is not None:
+            return None
+        return await _estimate_checkpoint_applied_body_tokens(
+            request=request,
+            user=user,
+            metadata=metadata,
+            body=body,
+            pipe_function_id=pipe_function_id,
+            match=match,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+            file_context_enabled=file_context_enabled,
+        )
+
+    reusable_checkpoint_match = await _body_reusable_checkpoint_match(
+        request=request,
+        user=user,
+        metadata=metadata,
+        body=body,
+        pipe_function_id=pipe_function_id,
+    )
+    if reusable_checkpoint_match is not None and reusable_match_covers_prefetch_source(reusable_checkpoint_match):
+        if reusable_checkpoint_match.kind == "exact":
+            return False
+        checkpoint_applied_estimate = await estimate_prefetch_checkpoint_applied_tokens(reusable_checkpoint_match)
+        if (
+            effective_soft_trigger_total_tokens is not None
+            and checkpoint_applied_estimate is not None
+            and checkpoint_applied_estimate < effective_soft_trigger_total_tokens
+        ):
+            return False
+
+    summary_started = False
+    prefetch_display_context: DisplayTokenContext | None = None
+    prefetch_display_context_ready = False
+
+    async def skip_child_generation_if_parent_below_soft(parent: dict[str, Any]) -> None:
+        if effective_soft_trigger_total_tokens is None:
+            return
+        parent_count = int(parent.get("source_message_count") or 0)
+        checkpoint_applied_estimate = await estimate_prefetch_checkpoint_applied_tokens(
+            ReusableCheckpointMatch(
+                kind="parent",
+                source_message_count=parent_count,
+                source_kind=source_kind,
+                checkpoint=parent,
+            )
+        )
+        if checkpoint_applied_estimate is not None and checkpoint_applied_estimate < effective_soft_trigger_total_tokens:
+            raise _CheckpointGenerationSkipped()
+
+    async def display_token_context() -> DisplayTokenContext:
+        nonlocal prefetch_display_context, prefetch_display_context_ready
+        if not prefetch_display_context_ready:
+            estimated = trigger_estimated_tokens
+            total = trigger_total_tokens
+            usage_src = trigger_usage_source
+            if estimated is None and total is None:
+                with suppress(Exception):
+                    LOG.debug(
+                        "auto-compaction prefetch: no trigger token value available, "
+                        "falling back to fresh body estimate (user_id=%s chat_id=%s)",
+                        user_id,
+                        chat_id,
+                    )
+                    estimated = await estimate_body_tokens_async(body, request=request)
+                usage_src = "estimate" if estimated is not None else None
+            prefetch_display_context = _build_display_token_context(
+                estimated_total_tokens=estimated,
+                total_tokens=total,
+                effective_trigger_total_tokens=effective_trigger_total_tokens,
+                effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+                usage_source=usage_src,
+            )
+            prefetch_display_context_ready = True
+        assert prefetch_display_context is not None
+        return prefetch_display_context
+
+    async def emit_summary_start() -> None:
+        nonlocal summary_started
+        summary_started = True
+        if event_emitter is None:
+            return
+        token_context = await display_token_context()
+        await emit_compaction_status(
+            event_emitter,
+            action="prefetching",
+            description=_description_with_token_suffix(
+                "Creating an auto-compaction checkpoint in the background",
+                token_context,
+            ),
+            done=False,
+            tokens=_tokens_status_payload(token_context, after=None, compare_estimate=False),
+        )
+
+    try:
+        summary = await _get_or_create_compaction_summary(
+            request=request,
+            user=user,
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_function_id=pipe_function_id,
+            metadata=metadata,
+            summary_model_id=summary_model_id,
+            base_body=body,
+            source_messages=source_messages,
+            summary_meta=summary_meta,
+            parent_checkpoint_guard=skip_child_generation_if_parent_below_soft,
+            on_summary_start=emit_summary_start,
+            summary_tool_policy=summary_tool_policy,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+            file_context_enabled=file_context_enabled,
+            summary_prompt=summary_prompt,
+        )
+    except _CheckpointGenerationSkipped:
+        return False
+    except asyncio.CancelledError:
+        if summary_started and event_emitter is not None:
+            token_context = await display_token_context()
+            await emit_compaction_status(
+                event_emitter,
+                action="failed",
+                description=_description_with_token_suffix(
+                    "Background auto-compaction checkpoint creation was cancelled",
+                    token_context,
+                ),
+                done=True,
+                error=True,
+                tokens=_tokens_status_payload(token_context, after=None, compare_estimate=False),
+            )
+        raise
+    except Exception as exc:
+        if summary_started and event_emitter is not None:
+            token_context = await display_token_context()
+            await emit_compaction_status(
+                event_emitter,
+                action="failed",
+                description=_description_with_token_suffix(
+                    f"Failed to create background auto-compaction checkpoint: {exc}",
+                    token_context,
+                ),
+                done=True,
+                error=True,
+                tokens=_tokens_status_payload(token_context, after=None, compare_estimate=False),
+            )
+        raise
+    if summary_started and event_emitter is not None:
+        token_context = await display_token_context()
+        summary_tokens = None
+        if token_status_detail == "before_after":
+            checkpoint = getattr(summary, "checkpoint", None)
+            persisted = checkpoint.get("summary_token_count") if isinstance(checkpoint, dict) else None
+            if isinstance(persisted, int):
+                summary_tokens = persisted
+            if summary_tokens is None:
+                with suppress(Exception):
+                    summary_tokens = await _estimate_rendered_summary_message_tokens(
+                        request=request,
+                        summary_text=str(summary),
+                        summary_meta=summary_meta,
+                        historical_source_messages=source_messages,
+                        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                        historical_message_excerpt_count=historical_message_excerpt_count,
+                    )
+        await emit_compaction_status(
+            event_emitter,
+            action="prefetched",
+            description=_description_with_token_suffix(
+                "Auto-compaction checkpoint is ready",
+                token_context,
+                summary=summary_tokens,
+                compare_estimate=token_status_compare_estimate,
+            ),
+            done=True,
+            tokens=_tokens_status_payload(
+                token_context,
+                after=None,
+                compare_estimate=token_status_compare_estimate,
+                summary=summary_tokens,
+            ),
+        )
+        await emit_compaction_summary_embed(
+            event_emitter,
+            summary_text=str(summary),
+        )
+    return True
+
+
+def _start_soft_compaction_prefetch(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    summary_model_id: str,
+    summary_tool_policy: SummaryToolPolicy,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+    effective_trigger_total_tokens: int = 100000,
+    effective_soft_trigger_total_tokens: int | None = None,
+    trigger_total_tokens: int | None = None,
+    trigger_estimated_tokens: int | None = None,
+    trigger_usage_source: str | None = None,
+    token_status_detail: Literal["before", "before_after"] = "before",
+    token_status_compare_estimate: bool = False,
+    event_emitter: Callable[[Any], Awaitable[None]] | None = None,
+    file_context_enabled: bool = True,
+    task_estimate_body: dict[str, Any] | None = None,
+    summary_prompt: str | None = None,
+) -> bool:
+    source_messages = _soft_prefetch_source_messages(body)
+    if not source_messages:
+        return False
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user or {}).get("id") or "")
+    if not user_id or not _chat_id_supported(chat_id):
+        return False
+    key = (
+        CHECKPOINT_NAMESPACE,
+        user_id,
+        chat_id,
+        pipe_function_id,
+        compute_profile_hash(),
+        _soft_prefetch_inflight_source_hash(source_messages, metadata),
+    )
+    return _launch_soft_prefetch_task(
+        key,
+        _prefetch_compaction_checkpoint(
+            request=request,
+            user=copy.deepcopy(user),
+            user_id=user_id,
+            chat_id=chat_id,
+            metadata=_copy_metadata_preserving_references(metadata),
+            body=_copy_body_preserving_metadata(body),
+            pipe_function_id=pipe_function_id,
+            summary_model_id=summary_model_id,
+            source_messages=source_messages,
+            summary_tool_policy=summary_tool_policy,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+            effective_trigger_total_tokens=effective_trigger_total_tokens,
+            effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+            trigger_total_tokens=trigger_total_tokens,
+            trigger_estimated_tokens=trigger_estimated_tokens,
+            trigger_usage_source=trigger_usage_source,
+            token_status_detail=token_status_detail,
+            token_status_compare_estimate=token_status_compare_estimate,
+            event_emitter=event_emitter,
+            file_context_enabled=file_context_enabled,
+            task_estimate_body=(
+                _copy_body_preserving_metadata(task_estimate_body) if task_estimate_body is not None else None
+            ),
+            summary_prompt=summary_prompt,
+        ),
+    )
+
+
+def _choice_assistant_message_for_prefetch(choice: Any) -> dict[str, Any] | None:
+    if _choice_has_tool_call(choice):
+        return None
+    content = _choice_message_text(choice)
+    if content is None:
+        return None
+    return {"role": "assistant", "content": content}
+
+
+def _assistant_message_for_completed_prefetch(response: Any) -> dict[str, Any] | None:
+    if not isinstance(response, dict) or response.get("error"):
+        return None
+    if _responses_output_has_tool_call(response):
+        return None
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices:
+        return _choice_assistant_message_for_prefetch(choices[0])
+    responses_text = _responses_output_text(response)
+    if isinstance(responses_text, str):
+        return {"role": "assistant", "content": responses_text}
+    return None
+
+
+def _completed_turn_prefetch_body(body: dict[str, Any], assistant_message: dict[str, Any]) -> dict[str, Any] | None:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    completed = _copy_body_preserving_metadata(body)
+    completed["messages"] = [
+        *copy.deepcopy(messages),
+        copy.deepcopy(assistant_message),
+        {"role": "user", "content": ""},
+    ]
+    return completed
+
+
+async def _find_reusable_checkpoint_for_source(
+    *,
+    store: Any,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    profile_hash: str,
+    source_messages: list[dict[str, Any]],
+    prefix_file_fingerprint: str | None = None,
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+) -> tuple[str, dict[str, Any]] | None:
+    source_hash = compute_summary_source_hash(source_messages, prefix_file_fingerprint)
+    existing = await store.lookup_ready(
+        namespace=CHECKPOINT_NAMESPACE,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        profile_hash=profile_hash,
+        source_hash=source_hash,
+    )
+    if existing:
+        return "exact", existing
+
+    parent = await store.find_longest_parent(
+        namespace=CHECKPOINT_NAMESPACE,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        profile_hash=profile_hash,
+        source_messages=source_messages,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+    )
+    if parent is not None:
+        return "parent", parent
+    return None
+
+
+async def _body_reusable_checkpoint_match(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+) -> ReusableCheckpointMatch | None:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 2:
+        return None
+
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
+    if not user_id or not _chat_id_supported(chat_id):
+        return None
+
+    tool_cut = select_tool_result_compaction_cut(messages)
+    cut = select_safe_message_cut(messages)
+    if (tool_cut is None or not tool_cut.summarization_prefix) and not cut.summarization_prefix:
+        return None
+
+    profile_hash = compute_profile_hash()
+    await ensure_checkpoint_table_initialized(request=request)
+    store = CheckpointStore()
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+
+    if tool_cut is not None and tool_cut.summarization_prefix:
+        tool_identity_fingerprint = (
+            prefix_file_fingerprint_resolver(len(tool_cut.summarization_prefix))
+            if prefix_file_fingerprint_resolver is not None
+            else None
+        )
+        tool_match = await _find_reusable_checkpoint_for_source(
+            store=store,
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_function_id=pipe_function_id,
+            profile_hash=profile_hash,
+            source_messages=tool_cut.summarization_prefix,
+            prefix_file_fingerprint=tool_identity_fingerprint,
+            prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        )
+        if tool_match is not None:
+            kind, checkpoint = tool_match
+            return ReusableCheckpointMatch(
+                kind=kind,
+                source_message_count=int(checkpoint.get("source_message_count") or tool_cut.source_message_count),
+                source_kind="tool",
+                checkpoint=checkpoint,
+            )
+
+    if not cut.summarization_prefix:
+        return None
+
+    message_identity_fingerprint = (
+        prefix_file_fingerprint_resolver(len(cut.summarization_prefix))
+        if prefix_file_fingerprint_resolver is not None
+        else None
+    )
+    message_match = await _find_reusable_checkpoint_for_source(
+        store=store,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        profile_hash=profile_hash,
+        source_messages=cut.summarization_prefix,
+        prefix_file_fingerprint=message_identity_fingerprint,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+    )
+    if message_match is not None:
+        kind, checkpoint = message_match
+        return ReusableCheckpointMatch(
+            kind=kind,
+            source_message_count=int(checkpoint.get("source_message_count") or cut.source_message_count),
+            source_kind="message",
+            checkpoint=checkpoint,
+        )
+    return None
+
+
+async def _summary_token_count_from_checkpoint(
+    *,
+    request: Any,
+    checkpoint: dict[str, Any],
+    historical_source_messages: list[dict[str, Any]] | None,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+) -> int | None:
+    stored = checkpoint.get("summary_token_count")
+    if isinstance(stored, int) and stored >= 0:
+        return stored
+    if isinstance(stored, str) and stored.isdigit():
+        return int(stored)
+    return await estimate_message_tokens_async(
+        render_summary_message_from_checkpoint(
+            checkpoint,
+            historical_source_messages=historical_source_messages,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        ),
+        request=request,
+    )
+
+
+async def _estimate_checkpoint_applied_body_tokens(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    match: ReusableCheckpointMatch,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+    file_context_enabled: bool = True,
+) -> int | None:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 2:
+        return None
+
+    candidates: list[tuple[MessageCut | ToolResultCompactionCut, list[dict[str, Any]]]] = []
+    tool_cut = select_tool_result_compaction_cut(messages)
+    if tool_cut is not None and tool_cut.summarization_prefix and match.source_kind == "tool":
+        candidates.append((tool_cut, tool_cut.summarization_prefix))
+
+    cut = select_safe_message_cut(messages)
+    if cut.summarization_prefix and match.source_kind == "message":
+        candidates.append((cut, cut.summarization_prefix))
+
+    if not candidates:
+        return None
+
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
+    profile_hash = compute_profile_hash()
+    store = CheckpointStore()
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+
+    for candidate_cut, source_messages in candidates:
+        checkpoint = match.checkpoint
+        if checkpoint is None:
+            identity_fingerprint = (
+                prefix_file_fingerprint_resolver(len(source_messages))
+                if prefix_file_fingerprint_resolver is not None
+                else None
+            )
+            checkpoint_match = await _find_reusable_checkpoint_for_source(
+                store=store,
+                user_id=user_id,
+                chat_id=chat_id,
+                pipe_function_id=pipe_function_id,
+                profile_hash=profile_hash,
+                source_messages=source_messages,
+                prefix_file_fingerprint=identity_fingerprint,
+                prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+            )
+            checkpoint = checkpoint_match[1] if checkpoint_match is not None else None
+        if checkpoint is None:
+            continue
+
+        parent_count = int(checkpoint.get("source_message_count") or 0)
+        if parent_count <= 0 or parent_count > len(source_messages):
+            continue
+        parent_fingerprint = (
+            prefix_file_fingerprint_resolver(parent_count)
+            if prefix_file_fingerprint_resolver is not None
+            else None
+        )
+        if compute_summary_source_hash(source_messages[:parent_count], parent_fingerprint) != checkpoint.get("source_hash"):
+            continue
+
+        if isinstance(candidate_cut, ToolResultCompactionCut):
+            message_cut = MessageCut(
+                preserved_system_message=copy.deepcopy(candidate_cut.preserved_system_message),
+                summarization_prefix=copy.deepcopy(candidate_cut.summarization_prefix),
+                tail_messages=copy.deepcopy(candidate_cut.tail_messages),
+                source_message_count=candidate_cut.source_message_count,
+            )
+        else:
+            message_cut = candidate_cut
+
+        summary_tokens = await _summary_token_count_from_checkpoint(
+            request=request,
+            checkpoint=checkpoint,
+            historical_source_messages=message_cut.summarization_prefix[:parent_count],
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+        if summary_tokens is None:
+            return None
+
+        estimate_source = []
+        if message_cut.preserved_system_message is not None:
+            estimate_source.append(message_cut.preserved_system_message)
+        estimate_source.extend(message_cut.summarization_prefix[parent_count:])
+        estimate_source.extend(message_cut.tail_messages)
+
+        remaining_body = _copy_body_preserving_metadata(body)
+        remaining_body["messages"] = estimate_source
+        remaining_body.pop("previous_response_id", None)
+        # Reflect retained file context in the estimate so the threshold decision
+        # accounts for what the target will actually receive after compaction.
+        if file_context_enabled:
+            metadata_files = (body.get("metadata") or {}).get("files") if isinstance(body.get("metadata"), dict) else None
+            remaining_body = await _inject_target_file_context(
+                request=request,
+                user=user,
+                body=remaining_body,
+                chat_id=chat_id or None,
+                current_message_id=str(metadata.get("user_message_id") or metadata.get("message_id") or "") or None,
+                compaction_prefix_count=parent_count,
+                metadata_files=metadata_files,
+                metadata_user_message=metadata.get("user_message"),
+                event_emitter=None,
+                file_context_enabled=True,
+                emit_source_events=False,
+            )
+        remaining_tokens = await estimate_body_tokens_async(remaining_body, request=request)
+        if remaining_tokens is None:
+            return None
+        return summary_tokens + remaining_tokens
+    return None
+
+
+async def _compact_body_with_reusable_checkpoint(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    match: ReusableCheckpointMatch,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+    file_context_enabled: bool = True,
+) -> tuple[dict[str, Any], bool, int]:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 2:
+        return body, False, 0
+
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
+    if not user_id or not _chat_id_supported(chat_id):
+        return body, False, 0
+
+    candidates: list[tuple[str, MessageCut | ToolResultCompactionCut, list[dict[str, Any]]]] = []
+    tool_cut = select_tool_result_compaction_cut(messages)
+    if tool_cut is not None and tool_cut.summarization_prefix and match.source_kind == "tool":
+        candidates.append(("tool", tool_cut, tool_cut.summarization_prefix))
+
+    cut = select_safe_message_cut(messages)
+    if cut.summarization_prefix and match.source_kind == "message":
+        candidates.append(("message", cut, cut.summarization_prefix))
+
+    await ensure_checkpoint_table_initialized(request=request)
+    store = CheckpointStore()
+    profile_hash = compute_profile_hash()
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+
+    for _kind, candidate_cut, source_messages in candidates:
+        identity_fingerprint = (
+            prefix_file_fingerprint_resolver(len(source_messages))
+            if prefix_file_fingerprint_resolver is not None
+            else None
+        )
+        checkpoint_match = await _find_reusable_checkpoint_for_source(
+            store=store,
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_function_id=pipe_function_id,
+            profile_hash=profile_hash,
+            source_messages=source_messages,
+            prefix_file_fingerprint=identity_fingerprint,
+            prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        )
+        if checkpoint_match is None:
+            continue
+        _, checkpoint = checkpoint_match
+
+        with suppress(Exception):
+            await store.touch(str(checkpoint["id"]))
+
+        compacted = _copy_body_preserving_metadata(body)
+        if isinstance(candidate_cut, ToolResultCompactionCut):
+            message_cut = MessageCut(
+                preserved_system_message=copy.deepcopy(candidate_cut.preserved_system_message),
+                summarization_prefix=copy.deepcopy(candidate_cut.summarization_prefix),
+                tail_messages=copy.deepcopy(candidate_cut.tail_messages),
+                source_message_count=candidate_cut.source_message_count,
+            )
+        else:
+            message_cut = candidate_cut
+        compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
+            message_cut,
+            checkpoint,
+            prefix_file_fingerprint=_resolve_fingerprint(
+                prefix_file_fingerprint_resolver,
+                int(checkpoint.get("source_message_count") or 0),
+            ),
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+        compacted.pop("previous_response_id", None)
+        return compacted, True, int(checkpoint.get("source_message_count") or match.source_message_count or 0)
+
+    raise RuntimeError("Reusable checkpoint match disappeared before compaction")
+
+
+async def _estimate_task_checkpoint_applied_body_tokens(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    match: ReusableCheckpointMatch,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+    file_context_enabled: bool = True,
+) -> int | None:
+    task_metadata = metadata
+    body_metadata = body.get("metadata")
+    if isinstance(body_metadata, dict) and _task_body_from_metadata(body_metadata) is not None:
+        task_metadata = body_metadata
+    source_body = _task_history_source_body_for_compaction(body, task_metadata) or body
+    compacted_source, compacted, compaction_prefix_count = await _compact_body_with_reusable_checkpoint(
+        request=request,
+        user=user,
+        metadata=task_metadata,
+        body=source_body,
+        pipe_function_id=pipe_function_id,
+        match=match,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+        file_context_enabled=file_context_enabled,
+    )
+    if not compacted:
+        return None
+    rebuilt = await _rebuild_task_body_from_compacted_history(
+        request=request,
+        user=user,
+        base_body=body,
+        metadata=task_metadata,
+        compacted_history_messages=compacted_source["messages"],
+    )
+    if rebuilt is None:
+        return None
+    if file_context_enabled:
+        rebuilt = await _inject_target_file_context(
+            request=request,
+            user=user,
+            body=rebuilt,
+            chat_id=str(task_metadata.get("chat_id") or "") or None,
+            current_message_id=str(task_metadata.get("user_message_id") or task_metadata.get("message_id") or "") or None,
+            compaction_prefix_count=compaction_prefix_count,
+            metadata_files=(rebuilt.get("metadata") or {}).get("files") if isinstance(rebuilt.get("metadata"), dict) else None,
+            metadata_user_message=task_metadata.get("user_message"),
+            event_emitter=None,
+            file_context_enabled=True,
+            emit_source_events=False,
+        )
+    return await estimate_body_tokens_async(rebuilt, request=request)
+
+
+async def _model_dict_from_request(request: Any) -> dict[str, Any]:
+    state = getattr(getattr(request, "app", None), "state", None)
+    if state is None:
+        return {}
+    models: dict[str, Any] = {}
+    for model in _iter_cache_models_from_state(state):
+        model_id = _model_id(model)
+        if model_id is not None and model_id not in models:
+            models[model_id] = model
+    return models
+
+
+async def _ensure_model_in_request_models(request: Any, model_id: str) -> dict[str, Any] | None:
+    models = await _model_dict_from_request(request)
+    model = models.get(model_id)
+    if model is None:
+        return None
+
+    state = getattr(getattr(request, "app", None), "state", None)
+    request_models = getattr(state, "MODELS", None)
+    with suppress(Exception):
+        if request_models is not None and model_id not in request_models:
+            request_models[model_id] = copy.deepcopy(model)
+    return model
+
+
+def _should_bypass_target_access_check(user: Any) -> bool:
+    try:
+        from open_webui.env import BYPASS_MODEL_ACCESS_CONTROL
+
+        if BYPASS_MODEL_ACCESS_CONTROL:
+            return True
+    except Exception:
+        pass
+
+    if getattr(user, "role", None) != "admin":
+        return False
+
+    try:
+        from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
+
+        return bool(BYPASS_ADMIN_ACCESS_CONTROL)
+    except Exception:
+        return False
+
+
+async def _get_target_db_model_record(target_model_id: str) -> Any:
+    try:
+        from open_webui.models.models import Models
+
+        return await Models.get_model_by_id(target_model_id)
+    except Exception:
+        return TARGET_MODEL_RECORD_UNKNOWN
+
+
+def _target_record_base_model_id(model_info: Any) -> str | None:
+    if model_info is None or model_info is TARGET_MODEL_RECORD_UNKNOWN:
+        return None
+    if isinstance(model_info, dict):
+        base_model_id = model_info.get("base_model_id")
+    else:
+        base_model_id = getattr(model_info, "base_model_id", None)
+    return base_model_id if isinstance(base_model_id, str) and base_model_id else None
+
+
+def _custom_model_fallback_enabled() -> bool:
+    try:
+        from open_webui.env import ENABLE_CUSTOM_MODEL_FALLBACK
+
+        return bool(ENABLE_CUSTOM_MODEL_FALLBACK)
+    except Exception:
+        return False
+
+
+def _custom_model_fallback_model_id(request: Any, models: dict[str, Any]) -> str | None:
+    if not _custom_model_fallback_enabled():
+        return None
+    config = getattr(getattr(request, "app", None), "state", None)
+    config = getattr(config, "config", None)
+    default_models = str(getattr(config, "DEFAULT_MODELS", None) or "").split(",")
+    fallback_model_id = default_models[0].strip() if default_models and default_models[0] else None
+    if fallback_model_id and fallback_model_id in models:
+        return fallback_model_id
+    return None
+
+
+def _global_model_access_bypass_enabled() -> bool:
+    try:
+        from open_webui.env import BYPASS_MODEL_ACCESS_CONTROL
+
+        return bool(BYPASS_MODEL_ACCESS_CONTROL)
+    except Exception:
+        return False
+
+
+async def _resolve_core_chat_model_route(request: Any, model_id: str) -> CoreChatModelRoute:
+    models = await _model_dict_from_request(request)
+    if model_id not in models:
+        return CoreChatModelRoute(model_id=model_id)
+    model_info = await _get_target_db_model_record(model_id)
+    base_model_id = _target_record_base_model_id(model_info)
+    if base_model_id and base_model_id not in models:
+        fallback_model_id = _custom_model_fallback_model_id(request, models)
+        if fallback_model_id:
+            return CoreChatModelRoute(model_id=fallback_model_id)
+    return CoreChatModelRoute(model_id=model_id)
+
+
+async def _validate_chat_completion_runtime_model_access(
+    *,
+    request: Any,
+    user: Any,
+    model_id: str,
+) -> None:
+    # Mirrors utils.chat.generate_chat_completion's access gate, which this
+    # pipe bypasses when forwarding to avoid re-running filters/wrappers.
+    user_model = coerce_open_webui_user(user)
+    if _global_model_access_bypass_enabled() or getattr(user_model, "role", None) != "user":
+        return
+    models = await _model_dict_from_request(request)
+    model = models.get(model_id)
+    if model is None:
+        raise HTTPException(status_code=403, detail="Model not found")
+    try:
+        from open_webui.utils.models import check_model_access
+
+        await check_model_access(user_model, model)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail="Model not found") from exc
+
+
+async def _validate_target_access(
+    *,
+    target_model_id: str,
+    request: Any,
+    user: Any,
+    pipe_function_id: str = PIPE_FUNCTION_ID,
+) -> None:
+    models = await _model_dict_from_request(request)
+    model = models.get(target_model_id)
+    if model is None or _is_arena_model(model) or is_generated_wrapper_model_id(
+        target_model_id,
+        pipe_function_id=pipe_function_id,
+    ):
+        raise HTTPException(status_code=403, detail="Model not found")
+
+    model_info = await _get_target_db_model_record(target_model_id)
+    base_model_id = _target_record_base_model_id(model_info)
+    if base_model_id and base_model_id not in models and _custom_model_fallback_model_id(request, models) is None:
+        raise HTTPException(status_code=403, detail="Model not found")
+
+    user_model = coerce_open_webui_user(user)
+    if _should_bypass_target_access_check(user_model):
+        return
+
+    if getattr(user_model, "role", None) == "admin" and model_info is None:
+        return
+
+    try:
+        from open_webui.utils.models import check_model_access
+
+        await check_model_access(user_model, model)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail="Model not found") from exc
+
+
+async def _call_target_completion(
+    *,
+    request: Any,
+    user: Any,
+    body: dict[str, Any],
+) -> Any:
+    bypass_system_prompt = _request_bypass_system_prompt(request)
+    state_overrides: dict[str, Any] = {
+        "bypass_filter": True,
+        "bypass_system_prompt": bypass_system_prompt,
+    }
+    body_metadata = body.get("metadata")
+    if isinstance(body_metadata, dict):
+        state_overrides["metadata"] = body_metadata
+    inner_request = RequestStateProxy(request, **state_overrides)
+    try:
+        from open_webui.utils.chat import generate_chat_completion
+
+        await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
+        response = await generate_chat_completion(
+            inner_request,
+            body,
+            user=coerce_open_webui_user(user),
+            bypass_filter=True,
+            bypass_system_prompt=bypass_system_prompt,
+        )
+        return response
+    except Exception as exc:
+        if is_retryable_context_error(exc):
+            raise RetryableContextOverflow(str(exc)) from exc
+        raise
+
+
+async def _forward_streaming_target(
+    *,
+    request: Any,
+    user: Any,
+    body: dict[str, Any],
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str,
+    on_complete: Callable[[dict[str, Any]], Any] | None = None,
+) -> StreamingResponse:
+    response = await _call_target_completion(request=request, user=user, body=body)
+    prepared = await prepare_streaming_response(
+        response,
+        request=request,
+        chat_id=chat_id,
+        message_id=message_id,
+        wrapper_model_id=wrapper_model_id,
+    )
+    if on_complete is not None:
+        return _attach_streaming_completion_observer(prepared, on_complete)
+    return prepared
+
+
+async def _coerce_non_streaming_completion_response(response: Any, *, model_id: str) -> dict[str, Any]:
+    if isinstance(response, dict):
+        if response.get("error") and is_retryable_context_error(response, status_code=400):
+            raise RetryableContextOverflow(str(response.get("error")))
+        return response
+
+    if isinstance(response, StreamingResponse):
+        parts: list[str] = []
+        usage: dict[str, Any] | None = None
+        tool_calls: list[dict[str, Any]] = []
+        finish_reason: str | None = None
+        provider_error: dict[str, Any] | None = None
+
+        def process_payload(payload: dict[str, Any]) -> None:
+            nonlocal finish_reason, provider_error, usage
+            if payload.get("error"):
+                if is_retryable_context_error(payload, status_code=400):
+                    raise RetryableContextOverflow(str(payload.get("error")))
+                provider_error = _error_response(_completion_error_message(payload), code="provider_error")
+                return
+            chunk_usage = extract_usage_from_stream_payload(payload)
+            if chunk_usage:
+                usage = chunk_usage
+            choices = payload.get("choices")
+            if isinstance(choices, list) and choices:
+                choice = choices[0]
+                if isinstance(choice.get("finish_reason"), str):
+                    finish_reason = choice["finish_reason"]
+                message = choice.get("message") or {}
+                delta = choice.get("delta") or {}
+                for container in (message, delta):
+                    content = container.get("content") or container.get("reasoning_content")
+                    if isinstance(content, str):
+                        parts.append(content)
+                    container_tool_calls = container.get("tool_calls")
+                    if isinstance(container_tool_calls, list):
+                        for tool_call in container_tool_calls:
+                            if isinstance(tool_call, dict):
+                                _merge_stream_tool_call_delta(tool_calls, tool_call)
+            if payload.get("type") == "response.output_text.delta":
+                delta = payload.get("delta")
+                if isinstance(delta, str):
+                    parts.append(delta)
+
+        media_type = getattr(response, "media_type", None) or response.headers.get("content-type", "")
+        is_sse_response = "text/event-stream" in str(media_type).lower()
+        sse_parser = _SSEJSONEventParser()
+        try:
+            async for raw_chunk in response.body_iterator:
+                chunk = _coerce_stream_chunk(raw_chunk)
+                if is_sse_response:
+                    events = sse_parser.feed(chunk)
+                    for payload in events:
+                        process_payload(payload)
+                    continue
+                events = extract_sse_json_events(chunk)
+                if not events:
+                    if _chunk_is_sse_done_only(chunk):
+                        continue
+                    parts.append(chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk))
+                    continue
+                for payload in events:
+                    process_payload(payload)
+            if is_sse_response:
+                for payload in sse_parser.flush():
+                    process_payload(payload)
+        finally:
+            await _close_stream_response(response)
+        if provider_error is not None:
+            return provider_error
+        return _chat_completion_message_response(
+            model_id,
+            "".join(parts).strip(),
+            usage=usage,
+            tool_calls=tool_calls or None,
+            finish_reason=finish_reason,
+        )
+
+    if isinstance(response, (JSONResponse, PlainTextResponse, Response)):
+        if is_retryable_context_error(response):
+            raise RetryableContextOverflow(_response_body_text(response))
+        parsed = _json_from_response(response)
+        if response.status_code >= 400:
+            return _error_response(_completion_error_message(parsed), code="provider_error")
+        if isinstance(parsed, dict) and not parsed.get("error"):
+            return parsed
+        return _error_response(_completion_error_message(parsed), code="provider_error")
+
+    if isinstance(response, BaseModel):
+        dumped = response.model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+
+    if isinstance(response, str):
+        return _chat_completion_message_response(model_id, response)
+
+    return _error_response(
+        f"Unsupported target response type: {type(response).__name__}",
+        code="unsupported_target_response",
+    )
+
+
+async def _forward_non_streaming_target(
+    *,
+    request: Any,
+    user: Any,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    response = await _call_target_completion(request=request, user=user, body=body)
+    return await _coerce_non_streaming_completion_response(response, model_id=str(body.get("model") or ""))
+
+
+async def _compact_body(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    target_model_id: str,
+    summary_model_id: str,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+    summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
+    file_context_enabled: bool = True,
+    summary_prompt: str | None = None,
+) -> tuple[dict[str, Any], bool, int]:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 2:
+        return body, False, 0
+
+    tool_cut = select_tool_result_compaction_cut(messages)
+    cut = select_safe_message_cut(messages)
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
+
+    if tool_cut is not None:
+        tool_compaction_prefix_count = 0
+        try:
+            compacted_messages, did_compact_tools, tool_compaction_prefix_count = await _compact_retry_tool_results(
+                request=request,
+                user=user,
+                metadata=metadata,
+                pipe_function_id=pipe_function_id,
+                summary_model_id=summary_model_id,
+                base_body=body,
+                messages=messages,
+                summary_tool_policy=summary_tool_policy,
+                file_context_enabled=file_context_enabled,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
+                summary_prompt=summary_prompt,
+            )
+        except UnsupportedCompactionInput as exc:
+            if exc.code != "latest_tool_result_too_large":
+                raise
+            if not cut.summarization_prefix:
+                raise
+            if not user_id or not _chat_id_supported(chat_id):
+                raise UnsupportedCompactionInput(
+                    "Cannot compact tool history without a durable checkpoint identity",
+                    code="checkpoint_identity_missing",
+                ) from exc
+            history_summary_meta = build_checkpoint_summary_meta(
+                cut.summarization_prefix,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
+            )
+            await _get_or_create_compaction_summary(
+                request=request,
+                user=user,
+                user_id=user_id,
+                chat_id=chat_id,
+                pipe_function_id=pipe_function_id,
+                metadata=metadata,
+                summary_model_id=summary_model_id,
+                base_body=body,
+                source_messages=cut.summarization_prefix,
+                summary_meta=history_summary_meta,
+                summary_tool_policy=summary_tool_policy,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
+                file_context_enabled=file_context_enabled,
+                summary_prompt=summary_prompt,
+            )
+            history_checkpoint = await _lookup_ready_checkpoint_for_source(
+                request=request,
+                user_id=user_id,
+                chat_id=chat_id,
+                pipe_function_id=pipe_function_id,
+                source_messages=cut.summarization_prefix,
+                prefix_file_fingerprint=_resolve_fingerprint(
+                    await _build_prefix_file_fingerprint_resolver(request, metadata),
+                    len(cut.summarization_prefix),
+                ),
+            )
+            if history_checkpoint is None:
+                raise RuntimeError("History checkpoint was not available after creation")
+            compacted_messages, did_compact_tools, tool_compaction_prefix_count = await _compact_retry_tool_results(
+                request=request,
+                user=user,
+                metadata=metadata,
+                pipe_function_id=pipe_function_id,
+                summary_model_id=summary_model_id,
+                base_body=body,
+                messages=messages,
+                parent_checkpoint=history_checkpoint,
+                file_context_enabled=file_context_enabled,
+                summary_tool_policy=summary_tool_policy,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
+                summary_prompt=summary_prompt,
+            )
+        if did_compact_tools:
+            compacted = _copy_body_preserving_metadata(body)
+            compacted["messages"] = compacted_messages
+            compacted.pop("previous_response_id", None)
+            return compacted, True, tool_compaction_prefix_count
+
+    if not cut.summarization_prefix:
+        return body, False, 0
+
+    latest_user = next((m for m in reversed(cut.tail_messages) if m.get("role") == "user"), None)
+    if latest_user is None:
+        raise UnsupportedCompactionInput("Cannot compact safely without retaining the active latest user message")
+
+    if not user_id or not _chat_id_supported(chat_id):
+        return body, False, 0
+
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    prefix_identity_fingerprint = _resolve_fingerprint(
+        prefix_file_fingerprint_resolver, len(cut.summarization_prefix)
+    )
+    pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
+        request=request,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        source_messages=cut.summarization_prefix,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+    )
+    if pending_checkpoint is not None and not _checkpoint_matches_exact_source(
+        pending_checkpoint,
+        cut.summarization_prefix,
+        prefix_file_fingerprint=prefix_identity_fingerprint,
+    ):
+        ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
+        if ready_checkpoint is not None:
+            compacted = _copy_body_preserving_metadata(body)
+            compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
+                cut,
+                ready_checkpoint,
+                prefix_file_fingerprint=_resolve_fingerprint(
+                    prefix_file_fingerprint_resolver,
+                    int(ready_checkpoint.get("source_message_count") or 0),
+                ),
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
+            )
+            compacted.pop("previous_response_id", None)
+            return compacted, True, int(ready_checkpoint.get("source_message_count") or 0)
+
+    summary_meta = build_checkpoint_summary_meta(
+        cut.summarization_prefix,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+
+    compacted = _copy_body_preserving_metadata(body)
+    compaction_prefix_count_for_return: int
+    try:
+        summary_text = await _get_or_create_compaction_summary(
+            request=request,
+            user=user,
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_function_id=pipe_function_id,
+            metadata=metadata,
+            summary_model_id=summary_model_id,
+            base_body=body,
+            source_messages=cut.summarization_prefix,
+            summary_meta=summary_meta,
+            summary_tool_policy=summary_tool_policy,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+            file_context_enabled=file_context_enabled,
+            summary_prompt=summary_prompt,
+        )
+        compacted["messages"] = replace_prefix_with_summary(
+            messages,
+            cut,
+            summary_text,
+            summary_meta,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+        compaction_prefix_count_for_return = len(cut.summarization_prefix)
+    except ParentCheckpointExtensionFailed as exc:
+        compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
+            cut,
+            exc.parent,
+            prefix_file_fingerprint=_resolve_fingerprint(
+                prefix_file_fingerprint_resolver,
+                int(exc.parent.get("source_message_count") or 0),
+            ),
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+        )
+        compaction_prefix_count_for_return = int(exc.parent.get("source_message_count") or 0)
+    compacted.pop("previous_response_id", None)
+    return compacted, True, compaction_prefix_count_for_return
+
+
+async def _compact_task_body_with_reusable_checkpoint(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    match: ReusableCheckpointMatch,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+    file_context_enabled: bool = True,
+) -> tuple[dict[str, Any], bool, int]:
+    source_body = _task_history_source_body_for_compaction(body, metadata)
+    if source_body is None:
+        return body, False, 0
+    compacted_source, compacted, compaction_prefix_count = await _compact_body_with_reusable_checkpoint(
+        request=request,
+        user=user,
+        metadata=metadata,
+        body=source_body,
+        pipe_function_id=pipe_function_id,
+        match=match,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+    )
+    if not compacted:
+        return body, False, 0
+    rebuilt = await _rebuild_task_body_from_compacted_history(
+        request=request,
+        user=user,
+        base_body=body,
+        metadata=metadata,
+        compacted_history_messages=compacted_source["messages"],
+    )
+    if rebuilt is None:
+        raise RuntimeError("Task prompt could not be rebuilt from compacted history")
+    return rebuilt, True, compaction_prefix_count
+
+
+async def _compact_task_body(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    target_model_id: str,
+    summary_model_id: str,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+    summary_tool_policy: SummaryToolPolicy,
+    file_context_enabled: bool = True,
+    summary_prompt: str | None = None,
+) -> tuple[dict[str, Any], bool, int]:
+    source_body = _task_history_source_body_for_compaction(body, metadata)
+    if source_body is None:
+        return body, False, 0
+    compacted_source, compacted, compaction_prefix_count = await _compact_body(
+        request=request,
+        user=user,
+        metadata=metadata,
+        body=source_body,
+        pipe_function_id=pipe_function_id,
+        target_model_id=target_model_id,
+        summary_model_id=summary_model_id,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+        file_context_enabled=file_context_enabled,
+        summary_tool_policy=summary_tool_policy,
+        summary_prompt=summary_prompt,
+    )
+    if not compacted:
+        return body, False, 0
+    rebuilt = await _rebuild_task_body_from_compacted_history(
+        request=request,
+        user=user,
+        base_body=body,
+        metadata=metadata,
+        compacted_history_messages=compacted_source["messages"],
+    )
+    if rebuilt is None:
+        raise RuntimeError("Task prompt could not be rebuilt from compacted history")
+    return rebuilt, True, compaction_prefix_count
+
+
+class Pipe:
+    class Valves(BaseModel):
+        model_name_template: str = Field(
+            default="auto",
+            description=(
+                "Wrapper display name template. Use 'auto' to show the raw target name when hide_wrapped_target_models is on, "
+                "otherwise '{target_name} (AutoCompact)'. Available placeholders: {target_name}, {target_id}. "
+                "Unsupported placeholders or Python format syntax fall back to the same name as 'auto'. "
+                "Blank or whitespace-only values are also treated as 'auto'. "
+                "With 'auto' and hidden targets, normal chat model pickers stay clean, but Workspace base-model dropdowns may still "
+                "show hidden raw targets with the same name; use an explicit template such as '{target_name} (AutoCompact)' if you "
+                "need those dropdowns disambiguated."
+            ),
+        )
+        include_model_patterns: str = Field(
+            default="",
+            description=(
+                "Comma/newline-separated patterns matched against the full target model id or name. "
+                "Only * and ? are wildcards; all other characters are literal. Empty wraps every eligible "
+                "target model except this Pipe's own AutoCompact wrappers, models/presets based on them, and "
+                "arena models; models from other pipes can still be wrapped."
+            ),
+        )
+        exclude_model_patterns: str = Field(
+            default="",
+            description=(
+                "Comma/newline-separated patterns matched against the full target model id or name. "
+                "Only * and ? are wildcards; all other characters are literal. Empty excludes nothing; "
+                "applied after include_model_patterns, so matches are not wrapped."
+            ),
+        )
+        hide_wrapped_target_models: bool = Field(
+            default=False,
+            description=(
+                "Automatically set meta.hidden=true on raw target models wrapped by this pipe so chat model pickers show compact wrappers instead. "
+                "Hidden target models remain available for admin/workspace base-model configuration. Use one AutoCompact Pipe per environment for "
+                "this hiding feature; other AutoCompact copies with different function IDs are not coordinated for target restoration. "
+                "Before deleting or disabling this Pipe, "
+                "turn this off and let the model list refresh once so targets hidden by this Pipe are restored to their previous visibility; "
+                "targets that were already hidden or owned by another Pipe's hide marker intentionally stay hidden. Otherwise raw models may remain hidden."
+            ),
+        )
+        summary_model: str = Field(
+            default="",
+            description=(
+                "Open WebUI model used for internal summarization. Keep this on Default to reuse the same "
+                "underlying target model this wrapper calls; that keeps summaries aligned with the model in "
+                "use and tries to preserve prompt-cache reuse where possible. Switching to Custom and "
+                "selecting a specific model does NOT check that model's per-user access, and internal "
+                "summary requests bypass filters; ensure the selected model is acceptable for all users "
+                "who can reach any wrapped target."
+            ),
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": "get_summary_model_options",
+                }
+            },
+        )
+        trigger_total_tokens: int = Field(
+            default=DEFAULT_TRIGGER_TOTAL_TOKENS,
+            ge=1,
+            description=(
+                "Global candidate-token threshold for foreground compaction. Decisions use the "
+                "checkpoint-applied, usage-anchored, or full-body local estimate for the payload about "
+                "to be sent; observed provider/Open WebUI usage is an anchor/context signal, not a "
+                "direct trigger by itself. Override per model with trigger_total_tokens_overrides_json."
+            ),
+        )
+        soft_trigger_ratio: float = Field(
+            default=DEFAULT_SOFT_TRIGGER_RATIO,
+            ge=0,
+            lt=1,
+            description=(
+                "Ratio of the effective trigger_total_tokens that starts asynchronous background "
+                "summary generation without pausing the current request. Before forwarding, this uses the "
+                "candidate estimate; after a target response completes, that response's own usage can also "
+                "start it when it is >= soft and < hard. The summary is saved as a checkpoint and reused by "
+                "a later request if ready. Set 0, or a value that rounds to 0, to disable. Override per "
+                "model with soft_trigger_ratio in trigger_total_tokens_overrides_json."
+            ),
+        )
+        trigger_total_tokens_overrides_json: str = Field(
+            default="",
+            description=(
+                "Optional JSON object overriding trigger_total_tokens and/or soft_trigger_ratio per model. Shape: "
+                '{"overrides": [{"model_patterns": ["claude-*", "Claude *"], "trigger_total_tokens": 160000, "soft_trigger_ratio": 0.75}]}. '
+                "model_patterns match against target model id/name (same as include/exclude); only * (any run) "
+                'and ? (single char) are wildcards and everything else is literal, so "[" needs no escaping: '
+                '"claude-opus-4-8[1m]" matches that exact id and "*[1m]" matches every id ending in "[1m]". '
+                "Each override requires non-empty model_patterns and at least one of trigger_total_tokens (integer >= 1) "
+                "or soft_trigger_ratio (finite number >= 0 and < 1); optional schema_version must be 1. For each setting, "
+                "overrides are evaluated top-to-bottom and the first matching override containing that setting wins. Empty disables overrides. "
+                "Invalid JSON, non-object roots, unknown keys, or invalid shapes are rejected on save."
+            ),
+        )
+        force_include_usage: bool = Field(
+            default=True,
+            description="Default-on convenience setting: add stream_options.include_usage=true to streaming target requests so supporting providers return usage even if per-model usage was not enabled. Disable to manage usage per model.",
+        )
+        compact_task_prompts_from_task_body: bool = Field(
+            default=False,
+            description=(
+                "For supported Open WebUI task requests only, rebuild the task prompt from metadata.task_body "
+                "so checkpoints can be reused. If upstream filters or pipelines rewrite body.messages without "
+                "also updating metadata.task_body, those rewrites are not included in the rebuilt task prompt."
+            ),
+        )
+        summary_tool_policy: SummaryToolPolicy = Field(
+            default="fallback_on_tool_call",
+            description=(
+                "Controls summary requests for tool-enabled chats. Forced tool_choice/function_call is disabled in all modes. "
+                "Recommended default fallback_on_tool_call keeps tools/functions on the first request to keep the request shape "
+                "stable and avoid disrupting prompt-cache reuse where possible, then retries without tools/functions only if the summary model emits a tool call. "
+                "always_strip removes tools/functions before the first request. error_on_tool_call keeps tools/functions and fails on tool calls."
+            ),
+        )
+        summary_prompt: str = Field(
+            default=SUMMARY_PROMPT,
+            description=(
+                "Admin-editable auto-compaction checkpoint summary prompt sent to the summary model. "
+                "Leave empty or whitespace-only to fall back to the built-in prompt. This value is applied ONLY when "
+                "generating NEW checkpoint summaries; existing durable checkpoints are always reused as-is regardless of "
+                "prompt changes, so editing it never invalidates or re-identifies ready checkpoints. When file context "
+                "is prepended for prefix files, it is prepended to the effective prompt."
+            ),
+        )
+        historical_message_excerpt_bytes: int = Field(
+            default=DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+            ge=1,
+            description=(
+                "Maximum UTF-8 bytes per saved excerpt of each recent historical user message from "
+                "the summarized prefix. New checkpoints store middle-truncated excerpts; saved "
+                "excerpts are reused unchanged."
+            ),
+        )
+        historical_message_excerpt_count: int = Field(
+            default=DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+            ge=0,
+            description=(
+                "Maximum number of recent historical user-message excerpts from the summarized "
+                "prefix saved in new checkpoints and inserted into compacted context. Set 0 to stop "
+                "saving excerpts in new checkpoints; excerpts already stored in existing checkpoints "
+                "are still reused."
+            ),
+        )
+        token_status_visibility: Literal["compaction_only", "always"] = Field(
+            default="compaction_only",
+            description=(
+                "When to emit token-count status. 'compaction_only' (default) emits token "
+                "info only on existing compaction lifecycle events (compacting/compacted/"
+                "skipped/retry/prefetching/prefetched/failed), keeping normal requests silent. "
+                "'always' additionally emits one token-pressure status per non-summary request "
+                "with a known count (action auto_compaction_status), including requests that later "
+                "compact. Has no effect on compaction decisions, only display."
+            ),
+        )
+        token_status_detail: Literal["before", "before_after"] = Field(
+            default="before",
+            description=(
+                "Token detail shown on compaction lifecycle status events. 'before' (default) shows the "
+                "pre-compaction count only, using values already computed for thresholding "
+                "(zero added cost). 'before_after' attempts to show the full post-compaction count on "
+                "'compacted' events by estimating the compacted body once, and the rendered summary-message "
+                "count on completed 'prefetched' events, when those estimates are available."
+            ),
+        )
+        token_status_compare_estimate: bool = Field(
+            default=False,
+            description=(
+                "When true, include both the observed provider/Open WebUI usage anchor and the "
+                "candidate token estimate in status payloads when available. These usually count "
+                "different request points, so use them for provenance/debugging, not as a direct "
+                "provider-vs-tiktoken accuracy comparison. If the candidate decision estimate is "
+                "otherwise unavailable but observed usage exists, enabling this computes a local "
+                "estimate purely for display and does not affect compaction decisions."
+            ),
+        )
+
+        @field_validator("trigger_total_tokens_overrides_json")
+        @classmethod
+        def _validate_trigger_total_tokens_overrides_json(cls, value: str) -> str:
+            parse_trigger_total_tokens_overrides(value)
+            return value
+
+        @classmethod
+        def get_summary_model_options(cls) -> list[dict[str, str]]:
+            pipe_function_id = pipe_function_id_from_module_name(getattr(cls, "__module__", None))
+            refresh_latest_models_cache_from_app_state()
+            return build_summary_model_options(
+                _LATEST_MODELS_CACHE, pipe_function_id=pipe_function_id
+            )
+
+        pass
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    async def pipes(self) -> list[dict[str, str]]:
+        try:
+            from open_webui.main import app
+
+            state = app.state
+        except Exception:
+            return []
+
+        pipe_function_id = runtime_pipe_function_id(self)
+        provider_cache_attrs = _enabled_provider_model_cache_attrs(state)
+        initial_provider_caches = {attr: getattr(state, attr, None) for attr in provider_cache_attrs}
+        model_candidates = _iter_cache_models_from_state(state)
+        pending_provider_cache_attrs = _provider_model_cache_refresh_pending_attrs(provider_cache_attrs)
+        if pending_provider_cache_attrs and not _provider_model_caches_ready(
+            state,
+            initial_provider_caches,
+            pending_provider_cache_attrs,
+        ):
+            model_candidates = await _wait_for_provider_model_caches(
+                state,
+                initial_provider_caches=initial_provider_caches,
+            )
+        targets = filter_target_models(model_candidates, self.valves, pipe_function_id=pipe_function_id)
+        update_latest_models_cache(model_candidates)
+        await sync_wrapper_model_records(pipe_function_id=pipe_function_id, target_models=targets, valves=self.valves)
+
+        entries: list[dict[str, str]] = []
+        hide_wrapped_target_models = bool(getattr(self.valves, "hide_wrapped_target_models", False))
+        for target in targets:
+            target_contract = build_target_model_contract(target, None)
+            entries.append(
+                {
+                    "id": encode_target_model_id(target_contract.id),
+                    "name": format_wrapper_model_name(
+                        target_contract,
+                        template=getattr(self.valves, "model_name_template", "auto"),
+                        hide_wrapped_target_models=hide_wrapped_target_models,
+                    ),
+                }
+            )
+        return entries
+
+    async def pipe(
+        self,
+        body: dict[str, Any],
+        __request__: Any = None,
+        __user__: dict[str, Any] | None = None,
+        __metadata__: dict[str, Any] | None = None,
+        __event_emitter__: Callable[[Any], Awaitable[None]] | None = None,
+        __tools__: dict[str, Any] | None = None,
+    ) -> Any:
+        if not isinstance(body, dict):
+            return _error_response("Request body must be an object", code="invalid_request")
+        if __request__ is None:
+            return _error_response("Open WebUI request context is required", code="missing_request")
+
+        is_streaming = body.get("stream") is True
+        selected_wrapper_id = str(body.get("model") or "")
+        pipe_function_id = runtime_pipe_function_id(self)
+        try:
+            identity = decode_wrapper_model_id(selected_wrapper_id, expected_pipe_function_id=pipe_function_id)
+        except ValueError as exc:
+            return _error_response(str(exc), code="invalid_wrapper_id")
+
+        user = __user__ or {}
+        metadata = _copy_metadata_preserving_references(__metadata__ or {})
+        metadata_task_body = _task_body_from_metadata(metadata)
+        chat_id = metadata.get("chat_id")
+        if not chat_id and metadata_task_body is not None:
+            chat_id = metadata_task_body.get("chat_id")
+        if chat_id and not metadata.get("chat_id"):
+            metadata["chat_id"] = chat_id
+        message_id = metadata.get("message_id") or metadata.get("user_message_id")
+
+        try:
+            await _validate_target_access(
+                target_model_id=identity.target_model_id,
+                request=__request__,
+                user=user,
+                pipe_function_id=pipe_function_id,
+            )
+        except Exception:
+            return _error_response("Model not found", code="model_access_denied")
+
+        models = await _model_dict_from_request(__request__)
+        update_latest_models_cache(models.values())
+        try:
+            summary_model_id = validate_summary_model_id(self.valves.summary_model, identity.target_model_id, models)
+        except ValueError as exc:
+            return _error_response(str(exc), code="invalid_summary_model")
+
+        inner = _copy_body_preserving_metadata(body)
+        target_route = await _resolve_core_chat_model_route(
+            __request__,
+            identity.target_model_id,
+        )
+        if target_route.model_id != identity.target_model_id:
+            try:
+                await _validate_chat_completion_runtime_model_access(
+                    request=__request__,
+                    user=user,
+                    model_id=target_route.model_id,
+                )
+            except Exception:
+                return _error_response("Model not found", code="model_access_denied")
+        inner["model"] = target_route.model_id
+        inner["metadata"] = _copy_metadata_preserving_references(metadata)
+        if is_streaming and self.valves.force_include_usage:
+            inner = inject_stream_usage_options(inner, force_include_usage=True)
+
+        task_name = _normalized_task_name(metadata.get("task"))
+        is_summary_task = task_name == INTERNAL_SUMMARY_TASK
+        # query_generation runs Core generate_queries, which may route the task
+        # model back into this wrapper (TASK_MODEL pointing here). Injecting
+        # target file context then would recurse via chat_completion_files_handler.
+        is_query_generation_task = task_name == TASKS.QUERY_GENERATION.value
+        supported_context = _chat_id_supported(chat_id) and not is_summary_task
+        task_source_body = (
+            _task_history_source_body_for_compaction(inner, metadata)
+            if supported_context and self.valves.compact_task_prompts_from_task_body
+            else None
+        )
+        checkpoint_lookup_body = task_source_body if task_source_body is not None else _copy_body_preserving_metadata(inner)
+        estimate_lookup_body = checkpoint_lookup_body
+        # Token decisions must reflect the body actually forwarded to the target.
+        # For task-prompt compaction that is the rebuilt provider prompt (inner),
+        # NOT the raw task history — even when the target opted out of file
+        # context.  Checkpoint lookup / source hash keep using the clean
+        # checkpoint_lookup_body (raw task history).
+        if task_source_body is not None:
+            estimate_lookup_body = inner
+
+        # Inject file context into inner BEFORE token estimation so the
+        # estimate reflects the actual forwarded payload (wrapper disables
+        # Core's pre-pipe RAG).  Checkpoint lookup / source hashes keep using
+        # checkpoint_lookup_body (clean, pre-RAG); estimate_lookup_body carries
+        # the injected payload.  inner is used directly when no compaction
+        # occurs.  When compaction runs, clean messages are restored for
+        # the compaction cut, then re-injected with the correct prefix count.
+        target_file_context_enabled = _target_model_supports_file_context(models, identity.target_model_id)
+        reusable_checkpoint_match = None
+        # checkpoint_lookup_unavailable: set when the initial checkpoint lookup
+        # failed because the DB was unavailable. We do NOT fail closed here:
+        # for a request that turns out to be within limits we forward unchanged
+        # (no checkpoint, no prefetch); we fail closed later (R3) only when
+        # compaction is actually required to stay under the model limit. The
+        # exception object is retained so the fail-closed branch reproduces the
+        # exact current error message ("Failed to access auto-compaction
+        # checkpoints: {exc}").
+        checkpoint_lookup_unavailable = False
+        checkpoint_lookup_error: Exception | None = None
+        if supported_context:
+            try:
+                reusable_checkpoint_match = await _body_reusable_checkpoint_match(
+                    request=__request__,
+                    user=user,
+                    metadata=metadata,
+                    body=checkpoint_lookup_body,
+                    pipe_function_id=identity.pipe_function_id,
+                )
+            except Exception as exc:
+                checkpoint_lookup_unavailable = True
+                checkpoint_lookup_error = exc
+                LOG.warning(
+                    "Auto-compaction checkpoint lookup failed (chat_id=%s); "
+                    "request will be forwarded unchanged if within limits, "
+                    "fail closed if compaction is required",
+                    chat_id,
+                    exc_info=True,
+                )
+        pre_rag_messages: list[dict[str, Any]] | None = None
+        pre_injected_file_context_sources = None
+        if (
+            not is_summary_task
+            and not is_query_generation_task
+            and target_file_context_enabled
+            and reusable_checkpoint_match is None
+        ):
+            target_user_message_id_for_inject = str(metadata.get("user_message_id") or message_id or "") or None
+            pre_rag_messages = copy.deepcopy(inner.get("messages") if isinstance(inner.get("messages"), list) else [])
+            inner = await _inject_target_file_context(
+                request=__request__,
+                user=user,
+                body=inner,
+                chat_id=str(chat_id) if chat_id else None,
+                current_message_id=target_user_message_id_for_inject,
+                compaction_prefix_count=0,
+                metadata_files=metadata.get("files"),
+                metadata_user_message=metadata.get("user_message"),
+                event_emitter=None,
+                file_context_enabled=target_file_context_enabled,
+                emit_source_events=False,
+            )
+            inner_metadata = inner.get("metadata")
+            if isinstance(inner_metadata, dict):
+                pre_injected_file_context_sources = inner_metadata.get("sources")
+            # Token decisions use the injected provider body so file context is
+            # included.  For task-prompt compaction the target still receives the
+            # rebuilt provider prompt, so inner (not the raw task history) is the
+            # correct estimate basis.
+            estimate_lookup_body = inner
+
+        request_usage = get_request_scoped_usage(
+            request=__request__,
+            chat_id=str(chat_id) if chat_id else None,
+            message_id=str(message_id) if message_id else None,
+            wrapper_model_id=selected_wrapper_id,
+        )
+        persisted_usage = None
+        usage_source: _USAGE_ANCHOR_SOURCE | None = "request" if request_usage is not None else None
+        if request_usage is None:
+            persisted_usage = await lookup_persisted_usage(
+                str(chat_id) if chat_id else None,
+                str(message_id) if message_id else None,
+            )
+            if persisted_usage is not None:
+                usage_source = "persisted"
+        usage = choose_usage_signal(
+            request=__request__,
+            chat_id=str(chat_id) if chat_id else None,
+            message_id=str(message_id) if message_id else None,
+            wrapper_model_id=selected_wrapper_id,
+            persisted_usage=persisted_usage or request_usage,
+            messages=inner.get("messages") if isinstance(inner.get("messages"), list) else [],
+        )
+        total_tokens = _usage_total(usage)
+        target_model_for_limits = models.get(identity.target_model_id) or {
+            "id": identity.target_model_id,
+            "name": identity.target_model_id,
+        }
+        try:
+            effective_trigger_total_tokens = resolve_trigger_total_tokens(self.valves, target_model_for_limits)
+        except ValueError as exc:
+            return _error_response(str(exc), code="invalid_trigger_total_tokens_overrides")
+        effective_soft_trigger_total_tokens = resolve_soft_trigger_total_tokens(
+            self.valves,
+            target_model_for_limits,
+            effective_trigger_total_tokens,
+        )
+        # --- candidate-payload estimate: the decision basis ---
+        # total_tokens is an OBSERVATION of a past payload, not the size of the
+        # candidate we are about to send. Hard/soft decisions are driven by a
+        # candidate estimate (decision_total), never by raw observed usage.
+        checkpoint_applied_estimate = None
+        estimated_total_tokens = None
+
+        async def estimate_reusable_checkpoint_match(match: ReusableCheckpointMatch) -> int | None:
+            if task_source_body is not None:
+                return await _estimate_task_checkpoint_applied_body_tokens(
+                    request=__request__,
+                    user=user,
+                    metadata=metadata,
+                    body=inner,
+                    pipe_function_id=identity.pipe_function_id,
+                    match=match,
+                    historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                    historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                    file_context_enabled=target_file_context_enabled,
+                )
+            return await _estimate_checkpoint_applied_body_tokens(
+                request=__request__,
+                user=user,
+                metadata=metadata,
+                body=checkpoint_lookup_body,
+                pipe_function_id=identity.pipe_function_id,
+                match=match,
+                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                file_context_enabled=target_file_context_enabled,
+            )
+
+        if supported_context:
+            if reusable_checkpoint_match is not None:
+                checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(reusable_checkpoint_match)
+            else:
+                if total_tokens is not None:
+                    estimated_total_tokens = await _estimate_next_input_tokens_from_usage_anchor(
+                        request=__request__,
+                        last_observed_total_tokens=total_tokens,
+                        body=estimate_lookup_body,
+                        usage_source=usage_source,
+                    )
+                if estimated_total_tokens is None:
+                    estimated_total_tokens = await estimate_body_tokens_async(
+                        estimate_lookup_body,
+                        request=__request__,
+                    )
+        # decision_total: checkpoint-applied estimate (the compacted body we
+        # would actually forward) takes priority over the usage-anchor / full-body
+        # estimate. It NEVER falls back to raw observed total_tokens.
+        if checkpoint_applied_estimate is not None:
+            decision_total = checkpoint_applied_estimate
+        elif estimated_total_tokens is not None:
+            decision_total = estimated_total_tokens
+        else:
+            decision_total = None
+
+        def compute_threshold_decisions() -> tuple[bool, bool, bool]:
+            # A reusable TASK checkpoint whose applied estimate cannot be computed
+            # cannot be confirmed safe, so foreground compaction is still required.
+            checkpoint_applied_unknown_needs_foreground = (
+                reusable_checkpoint_match is not None
+                and task_source_body is not None
+                and checkpoint_applied_estimate is None
+            )
+            # hard/soft decisions look ONLY at decision_total (the candidate estimate).
+            hard = (
+                supported_context
+                and (
+                    (decision_total is not None and decision_total >= effective_trigger_total_tokens)
+                    or checkpoint_applied_unknown_needs_foreground
+                )
+            )
+            soft = (
+                supported_context
+                and not is_summary_task
+                and effective_soft_trigger_total_tokens is not None
+                and decision_total is not None
+                and decision_total >= effective_soft_trigger_total_tokens
+                and decision_total < effective_trigger_total_tokens
+            )
+            should = hard or reusable_checkpoint_match is not None
+            return hard, soft, should
+
+        hard_should_compact, soft_should_prefetch, should_compact = compute_threshold_decisions()
+        if checkpoint_lookup_unavailable:
+            # Fail closed unless we can positively confirm the candidate is
+            # safely under the hard limit. hard_should_compact already encodes
+            # "compaction required", but decision_total can be None (encoder
+            # unavailable) — in that case hard is False yet we still must not
+            # forward, because we cannot confirm the request is under limit.
+            if (
+                hard_should_compact
+                or decision_total is None
+                or decision_total >= effective_trigger_total_tokens
+            ):
+                return _error_response(
+                    f"Failed to access auto-compaction checkpoints: {checkpoint_lookup_error}",
+                    code="checkpoint_unavailable",
+                )
+            # DB down + confirmed below the hard limit: forward unchanged.
+            # Disable prefetch; R4 guards skip the late rechecks (which would
+            # just hit the DB again). No checkpoint is created (R5): the
+            # compaction block only runs when should_compact is True.
+            soft_should_prefetch = False
+        if (
+            supported_context
+            and not checkpoint_lookup_unavailable
+            and reusable_checkpoint_match is None
+            and (hard_should_compact or soft_should_prefetch)
+        ):
+            try:
+                late_checkpoint_match = await _body_reusable_checkpoint_match(
+                    request=__request__,
+                    user=user,
+                    metadata=metadata,
+                    body=checkpoint_lookup_body,
+                    pipe_function_id=identity.pipe_function_id,
+                )
+            except Exception as exc:
+                if not hard_should_compact and soft_should_prefetch:
+                    late_checkpoint_match = None
+                    soft_should_prefetch = False
+                else:
+                    return _error_response(
+                        f"Failed to access auto-compaction checkpoints: {exc}",
+                        code="checkpoint_unavailable",
+                    )
+            if late_checkpoint_match is not None:
+                reusable_checkpoint_match = late_checkpoint_match
+                checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(late_checkpoint_match)
+                # Once a checkpoint is reusable, the checkpoint-applied payload is
+                # the only candidate that matters. If that estimate is unavailable,
+                # do not fall back to the raw estimate that caused this late check.
+                decision_total = checkpoint_applied_estimate
+                hard_should_compact, soft_should_prefetch, should_compact = compute_threshold_decisions()
+
+        compare_estimate_tokens = None
+        if (
+            supported_context
+            and self.valves.token_status_compare_estimate
+            and decision_total is None
+            and total_tokens is not None
+        ):
+            with suppress(Exception):
+                compare_estimate_tokens = await estimate_body_tokens_async(
+                    estimate_lookup_body,
+                    request=__request__,
+                )
+        display_token_context = _build_display_token_context(
+            estimated_total_tokens=decision_total,
+            total_tokens=total_tokens,
+            effective_trigger_total_tokens=effective_trigger_total_tokens,
+            effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+            usage_source=usage_source,
+        )
+        display_token_context = _display_context_with_estimate(display_token_context, compare_estimate_tokens)
+        compare_estimate_status = bool(self.valves.token_status_compare_estimate)
+        should_compact = hard_should_compact or reusable_checkpoint_match is not None
+        reusable_checkpoint_only = None
+        if reusable_checkpoint_match is not None and not hard_should_compact:
+            reusable_checkpoint_only = reusable_checkpoint_match
+        if (
+            self.valves.token_status_visibility == "always"
+            and not is_summary_task
+            and display_token_context.before is not None
+        ):
+            await emit_compaction_status(
+                __event_emitter__,
+                action="status",
+                description=_description_with_token_suffix(
+                    "Context pressure",
+                    display_token_context,
+                    compare_estimate=compare_estimate_status,
+                ),
+                done=True,
+                tokens=_tokens_status_payload(
+                    display_token_context,
+                    after=None,
+                    compare_estimate=compare_estimate_status,
+                ),
+            )
+        if not hard_should_compact and soft_should_prefetch and not checkpoint_lookup_unavailable:
+            if reusable_checkpoint_match is None or reusable_checkpoint_match.kind == "parent":
+                try:
+                    late_checkpoint_match = await _body_reusable_checkpoint_match(
+                        request=__request__,
+                        user=user,
+                        metadata=metadata,
+                        body=checkpoint_lookup_body,
+                        pipe_function_id=identity.pipe_function_id,
+                    )
+                except Exception as exc:
+                    late_checkpoint_match = None
+                    soft_should_prefetch = False
+                if late_checkpoint_match is not None:
+                    late_checkpoint_is_better = (
+                        reusable_checkpoint_match is None
+                        or late_checkpoint_match.kind == "exact"
+                        or late_checkpoint_match.source_message_count > reusable_checkpoint_match.source_message_count
+                    )
+                    if late_checkpoint_is_better:
+                        reusable_checkpoint_match = late_checkpoint_match
+                        checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(late_checkpoint_match)
+                        decision_total = checkpoint_applied_estimate
+                        hard_should_compact, soft_should_prefetch, should_compact = compute_threshold_decisions()
+                        should_compact = hard_should_compact or reusable_checkpoint_match is not None
+                        reusable_checkpoint_only = None
+                        if reusable_checkpoint_match is not None and not hard_should_compact:
+                            reusable_checkpoint_only = reusable_checkpoint_match
+            if not hard_should_compact and soft_should_prefetch:
+                _start_soft_compaction_prefetch(
+                    request=__request__,
+                    user=user,
+                    metadata=metadata,
+                    body=checkpoint_lookup_body,
+                    pipe_function_id=identity.pipe_function_id,
+                    summary_model_id=summary_model_id,
+                    summary_tool_policy=self.valves.summary_tool_policy,
+                    summary_prompt=self.valves.summary_prompt,
+                    historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                    historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                    effective_trigger_total_tokens=effective_trigger_total_tokens,
+                    effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+                    trigger_estimated_tokens=decision_total,
+                    token_status_detail=self.valves.token_status_detail,
+                    token_status_compare_estimate=self.valves.token_status_compare_estimate,
+                    event_emitter=__event_emitter__,
+                    file_context_enabled=target_file_context_enabled,
+                    task_estimate_body=inner if task_source_body is not None else None,
+                )
+
+        async def launch_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
+            if effective_soft_trigger_total_tokens is None:
+                return
+            # Completed-turn prefetch is grounded ONLY in the just-completed
+            # response's own usage. No usage => no prefetch (never fall back to a
+            # previous turn's observed usage).
+            completion_total_tokens = _usage_total(completion.get("usage"))
+            if completion_total_tokens is None:
+                return
+            if (
+                completion_total_tokens < effective_soft_trigger_total_tokens
+                or completion_total_tokens >= effective_trigger_total_tokens
+            ):
+                return
+            assistant_message = completion.get("assistant_message")
+            if not isinstance(assistant_message, dict):
+                return
+            completed_body = _completed_turn_prefetch_body(checkpoint_lookup_body, assistant_message)
+            if completed_body is None:
+                return
+            completed_task_estimate_body = None
+            if task_source_body is not None:
+                completed_messages = completed_body.get("messages")
+                if isinstance(completed_messages, list):
+                    completed_task_estimate_body = await _rebuild_task_body_from_compacted_history(
+                        request=__request__,
+                        user=user,
+                        base_body=inner,
+                        metadata=metadata,
+                        compacted_history_messages=completed_messages,
+                    )
+            _start_soft_compaction_prefetch(
+                request=__request__,
+                user=user,
+                metadata=metadata,
+                body=completed_body,
+                pipe_function_id=identity.pipe_function_id,
+                summary_model_id=summary_model_id,
+                summary_tool_policy=self.valves.summary_tool_policy,
+                summary_prompt=self.valves.summary_prompt,
+                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                effective_trigger_total_tokens=effective_trigger_total_tokens,
+                effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+                trigger_total_tokens=completion_total_tokens,
+                trigger_usage_source="request",
+                token_status_detail=self.valves.token_status_detail,
+                token_status_compare_estimate=self.valves.token_status_compare_estimate,
+                event_emitter=__event_emitter__,
+                file_context_enabled=target_file_context_enabled,
+                task_estimate_body=completed_task_estimate_body,
+            )
+
+        def schedule_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
+            task = asyncio.create_task(launch_completed_turn_soft_prefetch(completion))
+
+            def observe_result(done: asyncio.Task[Any]) -> None:
+                with suppress(asyncio.CancelledError):
+                    exc = done.exception()
+                    if isinstance(exc, BaseException):
+                        LOG.exception(
+                            "Completed-turn soft compaction prefetch failed",
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
+
+            task.add_done_callback(observe_result)
+
+        attempt = 0
+        compacted_once = False
+        compaction_prefix_count = 0
+        while attempt < MAX_CONTEXT_RETRY_ATTEMPTS:
+            attempt += 1
+            candidate = _copy_body_preserving_metadata(inner)
+            # Restore pre-RAG clean messages for compaction so the cut is
+            # computed on original content, not RAG-inflated text.
+            if pre_rag_messages is not None and (should_compact or compacted_once):
+                candidate["messages"] = copy.deepcopy(pre_rag_messages)
+            compaction_prefix_count = 0
+            candidate_source_events = None
+            if should_compact or compacted_once:
+                try:
+                    checkpoint_only_attempt = reusable_checkpoint_only is not None and not compacted_once
+                    emit_progress_status = compacted_once or (
+                        hard_should_compact
+                        and not checkpoint_only_attempt
+                        and (reusable_checkpoint_match is None or reusable_checkpoint_match.kind != "exact")
+                    )
+                    if emit_progress_status:
+                        await emit_compaction_status(
+                            __event_emitter__,
+                            action="compacting",
+                            description=_description_with_token_suffix(
+                                "Compacting chat history before forwarding to the target model",
+                                display_token_context,
+                                compare_estimate=compare_estimate_status,
+                            ),
+                            done=False,
+                            tokens=_tokens_status_payload(
+                                display_token_context,
+                                after=None,
+                                compare_estimate=compare_estimate_status,
+                            ),
+                        )
+                    if reusable_checkpoint_only is not None and not compacted_once:
+                        if task_source_body is not None:
+                            candidate, compacted, compaction_prefix_count = await _compact_task_body_with_reusable_checkpoint(
+                                request=__request__,
+                                user=user,
+                                metadata=metadata,
+                                body=candidate,
+                                pipe_function_id=identity.pipe_function_id,
+                                match=reusable_checkpoint_only,
+                                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                                file_context_enabled=target_file_context_enabled,
+                            )
+                        else:
+                            candidate, compacted, compaction_prefix_count = await _compact_body_with_reusable_checkpoint(
+                                request=__request__,
+                                user=user,
+                                metadata=metadata,
+                                body=candidate,
+                                pipe_function_id=identity.pipe_function_id,
+                                match=reusable_checkpoint_only,
+                                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                                file_context_enabled=target_file_context_enabled,
+                            )
+                    else:
+                        if task_source_body is not None:
+                            candidate, compacted, compaction_prefix_count = await _compact_task_body(
+                                request=__request__,
+                                user=user,
+                                metadata=metadata,
+                                body=candidate,
+                                pipe_function_id=identity.pipe_function_id,
+                                target_model_id=identity.target_model_id,
+                                summary_model_id=summary_model_id,
+                                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                                summary_tool_policy=self.valves.summary_tool_policy,
+                                summary_prompt=self.valves.summary_prompt,
+                                file_context_enabled=target_file_context_enabled,
+                            )
+                        else:
+                            candidate, compacted, compaction_prefix_count = await _compact_body(
+                                request=__request__,
+                                user=user,
+                                metadata=metadata,
+                                body=candidate,
+                                pipe_function_id=identity.pipe_function_id,
+                                target_model_id=identity.target_model_id,
+                                summary_model_id=summary_model_id,
+                                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                                summary_tool_policy=self.valves.summary_tool_policy,
+                                summary_prompt=self.valves.summary_prompt,
+                                file_context_enabled=target_file_context_enabled,
+                            )
+                    compacted_once = compacted_once or compacted
+                    if (
+                        not is_summary_task
+                        and not is_query_generation_task
+                        and (should_compact or compacted_once)
+                    ):
+                        target_user_message_id = str(metadata.get("user_message_id") or message_id or "") or None
+                        candidate = await _inject_target_file_context(
+                            request=__request__,
+                            user=user,
+                            body=candidate,
+                            chat_id=str(chat_id) if chat_id else None,
+                            current_message_id=target_user_message_id,
+                            compaction_prefix_count=compaction_prefix_count,
+                            metadata_files=metadata.get("files"),
+                            metadata_user_message=metadata.get("user_message"),
+                            event_emitter=None,
+                            file_context_enabled=target_file_context_enabled,
+                            emit_source_events=False,
+                        )
+                        candidate_metadata = candidate.get("metadata")
+                        if isinstance(candidate_metadata, dict):
+                            candidate_source_events = candidate_metadata.get("sources")
+                    if emit_progress_status:
+                        if compacted:
+                            after_tokens = None
+                            if self.valves.token_status_detail == "before_after":
+                                with suppress(Exception):
+                                    after_tokens = await estimate_body_tokens_async(candidate, request=__request__)
+                            await emit_compaction_status(
+                                __event_emitter__,
+                                action="compacted",
+                                description=_description_with_token_suffix(
+                                    "Compacted chat history is ready for the target model",
+                                    display_token_context,
+                                    after=after_tokens,
+                                    compare_estimate=compare_estimate_status,
+                                ),
+                                done=True,
+                                tokens=_tokens_status_payload(
+                                    display_token_context,
+                                    after=after_tokens,
+                                    compare_estimate=compare_estimate_status,
+                                ),
+                            )
+                            summary_text = extract_compaction_summary_text_from_messages(candidate.get("messages"))
+                            await emit_compaction_summary_embed(
+                                __event_emitter__,
+                                summary_text=summary_text,
+                            )
+                        else:
+                            await emit_compaction_status(
+                                __event_emitter__,
+                                action="skipped",
+                                description=_description_with_token_suffix(
+                                    "Could not compact chat history safely; forwarding unchanged",
+                                    display_token_context,
+                                    compare_estimate=compare_estimate_status,
+                                ),
+                                done=True,
+                                tokens=_tokens_status_payload(
+                                    display_token_context,
+                                    after=None,
+                                    compare_estimate=compare_estimate_status,
+                                ),
+                            )
+                except UnsupportedCompactionInput as exc:
+                    await emit_compaction_status(
+                        __event_emitter__,
+                        action="failed",
+                        description=_description_with_token_suffix(
+                            str(exc),
+                            display_token_context,
+                            compare_estimate=compare_estimate_status,
+                        ),
+                        done=True,
+                        error=True,
+                        tokens=_tokens_status_payload(
+                            display_token_context,
+                            after=None,
+                            compare_estimate=compare_estimate_status,
+                        ),
+                    )
+                    return _error_response(str(exc), code=exc.code)
+                except Exception as exc:
+                    await emit_compaction_status(
+                        __event_emitter__,
+                        action="failed",
+                        description=_description_with_token_suffix(
+                            f"Failed to compact chat history: {exc}",
+                            display_token_context,
+                            compare_estimate=compare_estimate_status,
+                        ),
+                        done=True,
+                        error=True,
+                        tokens=_tokens_status_payload(
+                            display_token_context,
+                            after=None,
+                            compare_estimate=compare_estimate_status,
+                        ),
+                    )
+                    return _error_response(f"Failed to compact chat history: {exc}", code="summary_failed")
+
+            # When no compaction happened, candidate inherited inner's pre-injected
+            # file context.  Defer source events until the target forward succeeds,
+            # and emit only the sources our own injection produced (never inherited
+            # metadata sources from upstream processing).
+            if not is_summary_task and not (should_compact or compacted_once):
+                candidate_source_events = pre_injected_file_context_sources
+
+            try:
+                if is_streaming:
+                    streaming_kwargs = {
+                        "request": __request__,
+                        "user": user,
+                        "body": candidate,
+                        "chat_id": str(chat_id) if chat_id else None,
+                        "message_id": str(message_id) if message_id else None,
+                        "wrapper_model_id": selected_wrapper_id,
+                    }
+                    if (
+                        effective_soft_trigger_total_tokens is not None
+                        and not is_summary_task
+                        and not checkpoint_lookup_unavailable
+                    ):
+                        streaming_kwargs["on_complete"] = schedule_completed_turn_soft_prefetch
+                    streaming_response = await _forward_streaming_target(**streaming_kwargs)
+                    if not getattr(streaming_response, "_auto_compact_immediate_error", False):
+                        await _emit_source_events(__event_emitter__, candidate_source_events)
+                    return streaming_response
+                response = await _forward_non_streaming_target(
+                    request=__request__,
+                    user=user,
+                    body=candidate,
+                )
+                if isinstance(response, dict) and response.get("error"):
+                    return response
+                await _emit_source_events(__event_emitter__, candidate_source_events)
+                response = _merge_source_events_into_response(response, candidate_source_events)
+                assistant_message = None if is_summary_task else _assistant_message_for_completed_prefetch(response)
+                if assistant_message is not None and not checkpoint_lookup_unavailable:
+                    await launch_completed_turn_soft_prefetch(
+                        {
+                            "assistant_message": assistant_message,
+                            "usage": response.get("usage") if isinstance(response, dict) else None,
+                        }
+                    )
+                return response
+            except RetryableContextOverflow:
+                if checkpoint_lookup_unavailable:
+                    # The request was forwarded under the limit because the
+                    # initial checkpoint lookup failed, but the target overflow
+                    # proves compaction is actually required. The checkpoint DB
+                    # was already known unavailable, so re-entering the
+                    # compaction block would either fail with summary_failed or
+                    # silently create a checkpoint if the DB recovered
+                    # mid-request. Fail closed with the original lookup error.
+                    return _error_response(
+                        f"Failed to access auto-compaction checkpoints: {checkpoint_lookup_error}",
+                        code="checkpoint_unavailable",
+                    )
+                if not supported_context or attempt >= MAX_CONTEXT_RETRY_ATTEMPTS:
+                    error_response = _context_exhaustion_error_response(
+                        candidate.get("messages"),
+                    )
+                    await emit_compaction_status(
+                        __event_emitter__,
+                        action="failed",
+                        description=_description_with_token_suffix(
+                            error_response["error"]["message"],
+                            display_token_context,
+                            compare_estimate=compare_estimate_status,
+                        ),
+                        done=True,
+                        error=True,
+                        tokens=_tokens_status_payload(
+                            display_token_context,
+                            after=None,
+                            compare_estimate=compare_estimate_status,
+                        ),
+                    )
+                    return error_response
+                await emit_compaction_status(
+                    __event_emitter__,
+                    action="retry",
+                    description=_description_with_token_suffix(
+                        "Target context window was exceeded before output; compacting and retrying",
+                        display_token_context,
+                        compare_estimate=compare_estimate_status,
+                    ),
+                    done=False,
+                    tokens=_tokens_status_payload(
+                        display_token_context,
+                        after=None,
+                        compare_estimate=compare_estimate_status,
+                    ),
+                )
+                should_compact = True
+                compacted_once = True
+                continue
