@@ -124,6 +124,32 @@ def install_fake_open_webui_user_model(monkeypatch):
     return FakeUserModel
 
 
+def install_fake_open_webui_config(monkeypatch, config_cls):
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = config_cls
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    try:
+        import open_webui.models as core_models
+
+        monkeypatch.setattr(core_models, "config", config_module, raising=False)
+    except Exception:
+        pass
+    return config_module
+
+
+def install_unavailable_open_webui_config(monkeypatch):
+    class FakeConfig:
+        @staticmethod
+        async def get(key):
+            raise RuntimeError("config unavailable")
+
+        @staticmethod
+        async def get_many(*keys):
+            raise RuntimeError("config unavailable")
+
+    return install_fake_open_webui_config(monkeypatch, FakeConfig)
+
+
 def _file(file_id, *, file_type="file"):
     return {"id": file_id, "type": file_type, "name": f"{file_id}.txt"}
 
@@ -993,6 +1019,7 @@ async def test_pipes_uses_runtime_registered_id_for_filtering_and_sync(monkeypat
 
 @pytest.mark.asyncio
 async def test_pipes_does_not_direct_fetch_provider_models_when_state_caches_remain_empty(monkeypatch):
+    install_unavailable_open_webui_config(monkeypatch)
     captured = {}
 
     async def sync_wrapper_model_records(**kwargs):
@@ -1032,6 +1059,7 @@ async def test_pipes_does_not_direct_fetch_provider_models_when_state_caches_rem
 
 @pytest.mark.asyncio
 async def test_pipes_waits_for_sibling_provider_cache_population(monkeypatch):
+    install_unavailable_open_webui_config(monkeypatch)
     captured = {}
 
     async def sync_wrapper_model_records(**kwargs):
@@ -1068,6 +1096,7 @@ async def test_pipes_waits_for_sibling_provider_cache_population(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pipes_waits_for_all_enabled_provider_cache_population(monkeypatch):
+    install_unavailable_open_webui_config(monkeypatch)
     captured = {}
     sleep_calls = 0
 
@@ -1108,6 +1137,7 @@ async def test_pipes_waits_for_all_enabled_provider_cache_population(monkeypatch
 
 @pytest.mark.asyncio
 async def test_pipes_waits_when_one_of_multiple_provider_caches_is_still_empty(monkeypatch):
+    install_unavailable_open_webui_config(monkeypatch)
     captured = {}
     sleep_calls = 0
 
@@ -1145,6 +1175,7 @@ async def test_pipes_waits_when_one_of_multiple_provider_caches_is_still_empty(m
 
 @pytest.mark.asyncio
 async def test_pipes_does_not_wait_for_disabled_provider_cache(monkeypatch):
+    install_unavailable_open_webui_config(monkeypatch)
     captured = {}
 
     async def sync_wrapper_model_records(**kwargs):
@@ -1216,6 +1247,145 @@ async def test_pipes_excludes_disabled_provider_stale_cache_models(monkeypatch):
         {"id": "other-pipe.child", "name": "Other Pipe (AutoCompact)"},
         {"id": "workspace-preset", "name": "Workspace Preset (AutoCompact)"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_pipes_uses_config_provider_enable_flags_when_legacy_attrs_are_missing(monkeypatch):
+    captured = {}
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    class FakeConfig:
+        @staticmethod
+        async def get_many(*keys):
+            captured["config_keys"] = keys
+            return {"openai.enable": False, "ollama.enable": True}
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    state = SimpleNamespace(
+        MODELS={
+            "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}},
+            "stale-ollama": {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}},
+        },
+        BASE_MODELS=[],
+        OPENAI_MODELS={"direct-openai": {"id": "direct-openai", "name": "Direct OpenAI", "openai": {}}},
+        OLLAMA_MODELS={"direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}},
+        config=SimpleNamespace(),
+    )
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(state=state)
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+
+    result = await mod.Pipe().pipes()
+
+    assert captured["config_keys"] == ("openai.enable", "ollama.enable")
+    assert captured["target_ids"] == ["stale-ollama", "direct-ollama"]
+    assert result == [
+        {"id": "stale-ollama", "name": "Stale Ollama (AutoCompact)"},
+        {"id": "direct-ollama", "name": "Direct Ollama (AutoCompact)"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipes_falls_back_to_legacy_provider_enable_flags_when_config_errors(monkeypatch):
+    captured = {}
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    class FakeConfig:
+        @staticmethod
+        async def get_many(*keys):
+            captured["config_keys"] = keys
+            raise RuntimeError("config unavailable")
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    state = SimpleNamespace(
+        MODELS={
+            "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}},
+            "stale-ollama": {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}},
+        },
+        BASE_MODELS=[],
+        OPENAI_MODELS={"direct-openai": {"id": "direct-openai", "name": "Direct OpenAI", "openai": {}}},
+        OLLAMA_MODELS={"direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}},
+        config=SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=True),
+    )
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(state=state)
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+
+    result = await mod.Pipe().pipes()
+
+    assert captured["config_keys"] == ("openai.enable", "ollama.enable")
+    assert captured["target_ids"] == ["stale-ollama", "direct-ollama"]
+    assert result == [
+        {"id": "stale-ollama", "name": "Stale Ollama (AutoCompact)"},
+        {"id": "direct-ollama", "name": "Direct Ollama (AutoCompact)"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_dict_from_request_excludes_config_disabled_stale_provider_caches(
+    monkeypatch, pipe_request
+):
+    class FakeConfig:
+        @staticmethod
+        async def get_many(*keys):
+            return {"openai.enable": False, "ollama.enable": True}
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    pipe_request.app.state.config = SimpleNamespace()
+    pipe_request.app.state.MODELS = {
+        "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}},
+        "stale-ollama": {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}},
+        "direct": {"id": "direct", "name": "Direct"},
+    }
+    pipe_request.app.state.BASE_MODELS = []
+    pipe_request.app.state.OPENAI_MODELS = {
+        "direct-openai": {"id": "direct-openai", "name": "Direct OpenAI", "openai": {}}
+    }
+    pipe_request.app.state.OLLAMA_MODELS = {
+        "direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}
+    }
+
+    models = await mod._model_dict_from_request(pipe_request)
+
+    assert set(models) == {"direct", "stale-ollama", "direct-ollama"}
+
+
+@pytest.mark.asyncio
+async def test_ensure_model_in_request_models_does_not_inject_config_disabled_provider_model(
+    monkeypatch, pipe_request
+):
+    class FakeConfig:
+        @staticmethod
+        async def get_many(*keys):
+            return {"openai.enable": False, "ollama.enable": True}
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    pipe_request.app.state.config = SimpleNamespace()
+    pipe_request.app.state.MODELS = {}
+    pipe_request.app.state.BASE_MODELS = []
+    pipe_request.app.state.OPENAI_MODELS = {
+        "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "openai": {}}
+    }
+    pipe_request.app.state.OLLAMA_MODELS = {}
+
+    model = await mod._ensure_model_in_request_models(pipe_request, "stale-openai")
+
+    assert model is None
+    assert pipe_request.app.state.MODELS == {}
 
 
 @pytest.mark.asyncio
@@ -1355,6 +1525,7 @@ async def test_pipes_does_not_wait_for_other_request_provider_refresh(monkeypatc
 
 @pytest.mark.asyncio
 async def test_pipes_waits_for_ollama_two_stage_provider_refresh(monkeypatch):
+    install_unavailable_open_webui_config(monkeypatch)
     captured = {}
     sleep_calls = 0
 
@@ -1391,6 +1562,7 @@ async def test_pipes_waits_for_ollama_two_stage_provider_refresh(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pipes_normalizes_ollama_provider_cache_models(monkeypatch):
+    install_unavailable_open_webui_config(monkeypatch)
     captured = {}
 
     async def sync_wrapper_model_records(**kwargs):
@@ -1429,6 +1601,7 @@ async def test_pipes_normalizes_ollama_provider_cache_models(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pipes_waits_until_core_model_list_timeout_for_sibling_provider_cache(monkeypatch):
+    install_unavailable_open_webui_config(monkeypatch)
     captured = {}
     sleep_calls = 0
 
@@ -1465,6 +1638,7 @@ async def test_pipes_waits_until_core_model_list_timeout_for_sibling_provider_ca
 
 @pytest.mark.asyncio
 async def test_pipes_stops_waiting_when_sibling_provider_cache_refresh_completes_empty(monkeypatch):
+    install_unavailable_open_webui_config(monkeypatch)
     captured = {}
     sleep_calls = 0
 
@@ -1698,6 +1872,87 @@ def test_body_token_estimate_includes_provider_visible_tool_payload():
     body_total = mod.estimate_body_tokens(body, encoder=LengthEncoder(), encoding_name="unit-test")
 
     assert body_total > message_only
+
+
+@pytest.mark.asyncio
+async def test_token_estimator_uses_db_config_tiktoken_encoding_before_legacy(monkeypatch, pipe_request):
+    captured = []
+    config_gets = []
+
+    class FakeConfig:
+        @staticmethod
+        async def get(key):
+            config_gets.append(key)
+            assert key == mod.TIKTOKEN_ENCODING_CONFIG_KEY
+            return "db_encoding"
+
+    class DbOnlyEncoder:
+        name = "db_encoding"
+
+        def encode(self, text, **kwargs):
+            return [0] * len(text)
+
+    def get_encoding(name):
+        captured.append(name)
+        if name == "db_encoding":
+            return DbOnlyEncoder()
+        raise ValueError(f"unexpected encoding: {name}")
+
+    config_module = types.ModuleType("open_webui.models.config")
+    setattr(config_module, "Config", FakeConfig)
+    tiktoken_module = types.ModuleType("tiktoken")
+    setattr(tiktoken_module, "get_encoding", get_encoding)
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setitem(sys.modules, "tiktoken", tiktoken_module)
+    pipe_request.app.state.config = SimpleNamespace(TIKTOKEN_ENCODING_NAME="legacy_encoding")
+
+    count = await mod.estimate_message_tokens_async({"role": "user", "content": "hello"}, request=pipe_request)
+    second_count = await mod.estimate_message_tokens_async({"role": "user", "content": "again"}, request=pipe_request)
+
+    assert count is not None
+    assert second_count is not None
+    assert captured[0] == "db_encoding"
+    assert config_gets == [mod.TIKTOKEN_ENCODING_CONFIG_KEY]
+    assert getattr(pipe_request.state, mod.AUTO_COMPACT_TIKTOKEN_ENCODING_STATE_KEY) == "db_encoding"
+
+
+@pytest.mark.asyncio
+async def test_token_estimator_falls_back_to_legacy_tiktoken_encoding_when_config_errors(
+    monkeypatch, pipe_request
+):
+    captured = []
+
+    class FakeConfig:
+        @staticmethod
+        async def get(key):
+            assert key == mod.TIKTOKEN_ENCODING_CONFIG_KEY
+            raise RuntimeError("config unavailable")
+
+    class LegacyEncoder:
+        name = "legacy_encoding"
+
+        def encode(self, text, **kwargs):
+            return [0] * len(text)
+
+    def get_encoding(name):
+        captured.append(name)
+        if name == "legacy_encoding":
+            return LegacyEncoder()
+        raise ValueError(f"unexpected encoding: {name}")
+
+    config_module = types.ModuleType("open_webui.models.config")
+    setattr(config_module, "Config", FakeConfig)
+    tiktoken_module = types.ModuleType("tiktoken")
+    setattr(tiktoken_module, "get_encoding", get_encoding)
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setitem(sys.modules, "tiktoken", tiktoken_module)
+    pipe_request.app.state.config = SimpleNamespace(TIKTOKEN_ENCODING_NAME="legacy_encoding")
+
+    count = await mod.estimate_message_tokens_async({"role": "user", "content": "hello"}, request=pipe_request)
+
+    assert count is not None
+    assert captured[0] == "legacy_encoding"
+    assert not hasattr(pipe_request.state, mod.AUTO_COMPACT_TIKTOKEN_ENCODING_STATE_KEY)
 
 
 def test_checkpoint_schema_init_adds_summary_token_count_to_existing_tables(monkeypatch):
@@ -2522,6 +2777,34 @@ def test_wrapper_model_form_keeps_only_core_metadata_params_and_forces_streaming
     }
 
 
+def test_open_webui_0101_default_native_tool_loop_redispatch_preserves_wrapper_id():
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "provider-target")
+    form_data = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [{"role": "user", "content": "call a tool"}],
+        "params": {},
+        "metadata": {"params": {}},
+    }
+    model_id = form_data["model"]
+
+    assert form_data["metadata"]["params"].get("function_calling") != "legacy"
+
+    new_form_data = {
+        **form_data,
+        "model": model_id,
+        "stream": True,
+        "metadata": form_data["metadata"],
+        "messages": [
+            *form_data["messages"],
+            {"role": "tool", "tool_call_id": "call-1", "content": "tool result"},
+        ],
+    }
+
+    assert new_form_data["model"] == wrapper_id
+    assert mod.decode_wrapper_model_id(new_form_data["model"]).target_model_id == "provider-target"
+
+
 @pytest.mark.asyncio
 async def test_wrapper_sync_uses_function_owner_and_scoped_generated_wrapper_ids(monkeypatch):
     calls = {"insert": [], "update": []}
@@ -3099,6 +3382,54 @@ async def test_target_access_rejects_disabled_provider_stale_cache_target(monkey
 
 
 @pytest.mark.asyncio
+async def test_target_access_rejects_config_disabled_provider_stale_cache_target(monkeypatch, pipe_request, pipe_user):
+    install_fake_open_webui_user_model(monkeypatch)
+    captured = {}
+
+    class FakeConfig:
+        @staticmethod
+        async def get_many(*keys):
+            captured["config_keys"] = keys
+            return {"openai.enable": False, "ollama.enable": True}
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "stale-openai"
+            return None
+
+    async def check_model_access(user, model, db=None):
+        return None
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    pipe_request.app.state.config = SimpleNamespace()
+    pipe_request.app.state.MODELS = {
+        "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}},
+        "stale-ollama": {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}},
+    }
+    pipe_request.app.state.BASE_MODELS = []
+    pipe_request.app.state.OPENAI_MODELS = {}
+    pipe_request.app.state.OLLAMA_MODELS = {}
+
+    with pytest.raises(HTTPException):
+        await mod._validate_target_access(
+            target_model_id="stale-openai",
+            request=pipe_request,
+            user=pipe_user,
+        )
+
+    assert captured["config_keys"] == ("openai.enable", "ollama.enable")
+
+
+@pytest.mark.asyncio
 async def test_target_access_rejects_custom_model_when_base_model_is_unavailable(
     monkeypatch,
     pipe_request,
@@ -3152,6 +3483,16 @@ async def test_target_access_allows_custom_model_missing_base_when_core_fallback
     pipe_user,
 ):
     install_fake_open_webui_user_model(monkeypatch)
+    class FakeConfig:
+        @staticmethod
+        async def get(key):
+            raise RuntimeError("config unavailable")
+
+        @staticmethod
+        async def get_many(*keys):
+            raise RuntimeError("config unavailable")
+
+    install_fake_open_webui_config(monkeypatch, FakeConfig)
     target_model = {
         "id": "workspace-preset",
         "name": "Workspace Preset",
@@ -3199,6 +3540,12 @@ async def test_target_access_allows_custom_model_when_base_model_is_available(
     pipe_user,
 ):
     install_fake_open_webui_user_model(monkeypatch)
+    class FakeConfig:
+        @staticmethod
+        async def get_many(*keys):
+            raise RuntimeError("config unavailable")
+
+    install_fake_open_webui_config(monkeypatch, FakeConfig)
     base_model = {"id": "available-base", "name": "Available Base", "owned_by": "openai", "openai": {}}
     target_model = {
         "id": "workspace-preset",
@@ -3388,6 +3735,33 @@ def test_summary_model_validation_rejects_missing_configured_model():
 
     with pytest.raises(ValueError, match="not found"):
         mod.validate_summary_model_id("missing.summary", "target", models)
+
+
+@pytest.mark.asyncio
+async def test_summary_model_validation_rejects_config_disabled_provider_cache_model(
+    monkeypatch, pipe_request
+):
+    class FakeConfig:
+        @staticmethod
+        async def get_many(*keys):
+            return {"openai.enable": False, "ollama.enable": True}
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    pipe_request.app.state.config = SimpleNamespace()
+    pipe_request.app.state.MODELS = {
+        "target": {"id": "target", "name": "Target"},
+        "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "openai": {}},
+    }
+    pipe_request.app.state.BASE_MODELS = []
+    pipe_request.app.state.OPENAI_MODELS = {}
+    pipe_request.app.state.OLLAMA_MODELS = {}
+
+    models = await mod._model_dict_from_request(pipe_request)
+
+    with pytest.raises(ValueError, match="not found"):
+        mod.validate_summary_model_id("stale-openai", "target", models)
 
 
 def test_valve_defaults_are_conservative_for_v1_continuation():
@@ -4895,6 +5269,140 @@ async def test_generate_summary_file_context_accepts_core_best_effort_partial_so
     assert context is not None
     assert "context for file-a" in context
     assert "file-b" not in context
+
+
+@pytest.mark.asyncio
+async def test_generate_summary_file_context_uses_db_config_rag_values(
+    monkeypatch, pipe_request, pipe_user
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    captured = {}
+
+    class FakeConfig:
+        @staticmethod
+        async def get_many(*keys):
+            captured["config_keys"] = keys
+            return {
+                "rag.top_k": 7,
+                "rag.top_k_reranker": 8,
+                "rag.relevance_threshold": 0.42,
+                "rag.hybrid_bm25_weight": 0.73,
+                "rag.enable_hybrid_search": True,
+            }
+
+    async def get_sources_from_items(**kwargs):
+        captured["rag_kwargs"] = {
+            "k": kwargs["k"],
+            "k_reranker": kwargs["k_reranker"],
+            "r": kwargs["r"],
+            "hybrid_bm25_weight": kwargs["hybrid_bm25_weight"],
+            "hybrid_search": kwargs["hybrid_search"],
+            "full_context": kwargs["full_context"],
+        }
+        return [
+            {
+                "source": {"id": "file-a", "name": "file-a.txt"},
+                "document": ["db rag context"],
+                "metadata": [{"source": "file-a"}],
+            }
+        ]
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    retrieval_module = types.ModuleType("open_webui.retrieval.utils")
+    retrieval_module.get_sources_from_items = get_sources_from_items
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setitem(sys.modules, "open_webui.retrieval.utils", retrieval_module)
+    pipe_request.app.state.config = SimpleNamespace(
+        TOP_K=1,
+        TOP_K_RERANKER=2,
+        RELEVANCE_THRESHOLD=0.1,
+        HYBRID_BM25_WEIGHT=0.2,
+        ENABLE_RAG_HYBRID_SEARCH=False,
+    )
+
+    context = await mod._generate_summary_file_context(
+        request=pipe_request,
+        user=pipe_user,
+        prefix_files=[_file("file-a")],
+    )
+
+    assert captured["config_keys"] == (
+        "rag.top_k",
+        "rag.top_k_reranker",
+        "rag.relevance_threshold",
+        "rag.hybrid_bm25_weight",
+        "rag.enable_hybrid_search",
+    )
+    assert captured["rag_kwargs"] == {
+        "k": 7,
+        "k_reranker": 8,
+        "r": 0.42,
+        "hybrid_bm25_weight": 0.73,
+        "hybrid_search": True,
+        "full_context": True,
+    }
+    assert context is not None
+    assert "db rag context" in context
+
+
+@pytest.mark.asyncio
+async def test_generate_summary_file_context_falls_back_to_legacy_rag_config(
+    monkeypatch, pipe_request, pipe_user
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    captured = {}
+
+    class FakeConfig:
+        @staticmethod
+        async def get_many(*keys):
+            raise RuntimeError("config unavailable")
+
+    async def get_sources_from_items(**kwargs):
+        captured["rag_kwargs"] = {
+            "k": kwargs["k"],
+            "k_reranker": kwargs["k_reranker"],
+            "r": kwargs["r"],
+            "hybrid_bm25_weight": kwargs["hybrid_bm25_weight"],
+            "hybrid_search": kwargs["hybrid_search"],
+        }
+        return [
+            {
+                "source": {"id": "file-a", "name": "file-a.txt"},
+                "document": ["legacy rag context"],
+                "metadata": [{"source": "file-a"}],
+            }
+        ]
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    retrieval_module = types.ModuleType("open_webui.retrieval.utils")
+    retrieval_module.get_sources_from_items = get_sources_from_items
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setitem(sys.modules, "open_webui.retrieval.utils", retrieval_module)
+    pipe_request.app.state.config = SimpleNamespace(
+        TOP_K=4,
+        TOP_K_RERANKER=5,
+        RELEVANCE_THRESHOLD=0.33,
+        HYBRID_BM25_WEIGHT=0.66,
+        ENABLE_RAG_HYBRID_SEARCH=True,
+    )
+
+    context = await mod._generate_summary_file_context(
+        request=pipe_request,
+        user=pipe_user,
+        prefix_files=[_file("file-a")],
+    )
+
+    assert captured["rag_kwargs"] == {
+        "k": 4,
+        "k_reranker": 5,
+        "r": 0.33,
+        "hybrid_bm25_weight": 0.66,
+        "hybrid_search": True,
+    }
+    assert context is not None
+    assert "legacy rag context" in context
 
 
 @pytest.mark.asyncio
@@ -7132,6 +7640,83 @@ async def test_pipe_skips_file_context_injection_for_query_generation_task(
 
 
 @pytest.mark.asyncio
+async def test_pipe_passes_through_official_context_compaction_task(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    # Open WebUI 0.10.1 runs its own context compaction before normal chat
+    # processing and calls generate_chat_completion with
+    # metadata.task == "context_compaction". When TASK_MODEL points at this
+    # AutoCompact wrapper (or Core compaction is enabled on an AutoCompact
+    # chat) that summary request re-enters Pipe.pipe. The wrapper must treat it
+    # as a passthrough task exactly like its own internal summary task: no
+    # nested compaction, no file-context injection (which would recurse via
+    # chat_completion_files_handler), forward the body unchanged.
+    install_fake_open_webui_user_model(monkeypatch)
+    captured = {"handler_calls": 0, "forward_body": None}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        # Force a high token signal so a non-passthrough task would compact.
+        return {"total_tokens": 10_000_000, "input_tokens": 10_000_000, "output_tokens": 0}
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        raise AssertionError("checkpoint lookup must not run for passthrough task")
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        return {"ok": True}
+
+    async def chat_completion_files_handler(request, rag_body, extra_params, user):
+        captured["handler_calls"] += 1
+        return rag_body, {"sources": []}
+
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.chat_completion_files_handler = chat_completion_files_handler
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    metadata = {
+        **pipe_metadata,
+        "task": mod.OFFICIAL_CONTEXT_COMPACTION_TASK,
+        "files": [_file("prefix-file"), _file("current-file")],
+        "user_message": {"files": [_file("current-file")]},
+    }
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 1000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [{"role": "user", "content": "summarize the conversation"}],
+    }
+
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=metadata,
+        __event_emitter__=None,
+    )
+
+    assert result == {"ok": True}
+    assert captured["handler_calls"] == 0
+    assert captured["forward_body"]["messages"] == body["messages"]
+
+
+@pytest.mark.asyncio
 async def test_inject_target_file_context_skips_manual_rag_when_reentry_guard_active(
     monkeypatch, pipe_request
 ):
@@ -7280,6 +7865,16 @@ async def test_pipe_forwards_custom_model_missing_base_to_core_fallback_default(
     pipe_metadata,
 ):
     install_fake_open_webui_user_model(monkeypatch)
+    class FakeConfig:
+        @staticmethod
+        async def get(key):
+            raise RuntimeError("config unavailable")
+
+        @staticmethod
+        async def get_many(*keys):
+            raise RuntimeError("config unavailable")
+
+    install_fake_open_webui_config(monkeypatch, FakeConfig)
     target_model = {
         "id": "workspace-preset",
         "name": "Workspace Preset",
@@ -7359,6 +7954,291 @@ async def test_pipe_forwards_custom_model_missing_base_to_core_fallback_default(
 
 
 @pytest.mark.asyncio
+async def test_pipe_applies_target_params_when_missing_base_uses_custom_model_fallback(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
+    target_params = {
+        "temperature": 0.25,
+        "top_p": 0.8,
+        "max_tokens": 321,
+        "system": "target system prompt is removed by Core fallback param handling",
+        "function_calling": "native",
+        "custom_params": {
+            "vendor_flag": "enabled",
+            "format": '{"type":"json"}',
+        },
+    }
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {"base_model_id": "stale-openai"},
+    }
+    fallback_model = {"id": "fallback-ollama", "name": "Fallback", "owned_by": "ollama", "ollama": {}}
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-ollama")
+    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-ollama": fallback_model}
+    captured = {}
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(
+                id="workspace-preset",
+                base_model_id="stale-openai",
+                params=SimpleNamespace(**target_params),
+            )
+
+    async def check_model_access(user, model, db=None):
+        return None
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    def apply_params_to_form_data(form_data, model):
+        params = copy.deepcopy(form_data.pop("params", {}) or {})
+        custom_params = params.pop("custom_params", {}) or {}
+        for key in (
+            "stream_response",
+            "stream_delta_chunk_size",
+            "function_calling",
+            "reasoning_tags",
+            "compact_token_threshold",
+            "system",
+        ):
+            params.pop(key, None)
+        for key, value in list(custom_params.items()):
+            if isinstance(value, str):
+                try:
+                    custom_params[key] = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+        params.update(custom_params)
+        if model.get("owned_by") == "ollama":
+            form_data["options"] = params
+        else:
+            form_data.update({key: value for key, value in params.items() if value is not None})
+        return form_data
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["forward_body"] = copy.deepcopy(form_data)
+        return {
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "model": form_data["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.apply_params_to_form_data = apply_params_to_form_data
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+            "params": {"top_p": 0.7, "presence_penalty": 0.1},
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert captured["forward_body"]["model"] == "fallback-ollama"
+    assert captured["forward_body"]["options"] == {
+        "temperature": 0.25,
+        "top_p": 0.7,
+        "max_tokens": 321,
+        "presence_penalty": 0.1,
+        "vendor_flag": "enabled",
+        "format": {"type": "json"},
+    }
+    assert "params" not in captured["forward_body"]
+    assert "system" not in captured["forward_body"]
+    assert captured["forward_body"]["messages"] == [{"role": "user", "content": "hello"}]
+
+
+@pytest.mark.asyncio
+async def test_pipe_forwards_custom_model_missing_base_to_config_default_model(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {"base_model_id": "stale-openai"},
+    }
+    fallback_model = {"id": "fallback-config", "name": "Fallback", "owned_by": "openai", "openai": {}}
+    pipe_request.app.state.config = SimpleNamespace()
+    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-config": fallback_model}
+    captured = {"config_gets": []}
+    checked_model_ids = []
+
+    class FakeConfig:
+        @staticmethod
+        async def get(key):
+            captured["config_gets"].append(key)
+            if key == mod.TIKTOKEN_ENCODING_CONFIG_KEY:
+                return None
+            assert key == "ui.default_models"
+            return "fallback-config,other"
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(id="workspace-preset", base_model_id="stale-openai")
+
+    async def check_model_access(user, model, db=None):
+        checked_model_ids.append(model["id"])
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["forward_model"] = form_data["model"]
+        captured["base_model_id"] = getattr(request, "base_model_id", None)
+        return {
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "model": form_data["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert captured["config_gets"] == [
+        mod.TIKTOKEN_ENCODING_CONFIG_KEY,
+        "ui.default_models",
+        "ui.default_models",
+    ]
+    assert checked_model_ids == ["workspace-preset", "fallback-config"]
+    assert captured["forward_model"] == "fallback-config"
+    assert captured["base_model_id"] is None
+    assert result["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_resolve_core_chat_model_route_falls_back_to_legacy_default_models_when_config_errors(
+    monkeypatch,
+    pipe_request,
+):
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-legacy,other")
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": {
+            "id": "workspace-preset",
+            "name": "Workspace Preset",
+            "owned_by": "openai",
+            "preset": True,
+            "info": {"base_model_id": "stale-openai"},
+        },
+        "fallback-legacy": {"id": "fallback-legacy", "name": "Fallback", "owned_by": "openai", "openai": {}},
+    }
+
+    class FakeConfig:
+        @staticmethod
+        async def get(key):
+            assert key == "ui.default_models"
+            raise RuntimeError("config unavailable")
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(id="workspace-preset", base_model_id="stale-openai")
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+
+    route = await mod._resolve_core_chat_model_route(pipe_request, "workspace-preset")
+
+    assert route.model_id == "fallback-legacy"
+
+
+@pytest.mark.asyncio
 async def test_pipe_rejects_custom_model_fallback_default_without_user_access(
     monkeypatch,
     pipe_request,
@@ -7366,6 +8246,16 @@ async def test_pipe_rejects_custom_model_fallback_default_without_user_access(
     pipe_metadata,
 ):
     install_fake_open_webui_user_model(monkeypatch)
+    class FakeConfig:
+        @staticmethod
+        async def get(key):
+            raise RuntimeError("config unavailable")
+
+        @staticmethod
+        async def get_many(*keys):
+            raise RuntimeError("config unavailable")
+
+    install_fake_open_webui_config(monkeypatch, FakeConfig)
     target_model = {
         "id": "workspace-preset",
         "name": "Workspace Preset",
@@ -9542,22 +10432,38 @@ async def test_pipe_returns_error_when_overrides_json_invalid_at_runtime(monkeyp
     assert "forwarded" not in captured
 
 
-def test_task_template_selection_matches_core_whitespace_rules(pipe_request):
+@pytest.mark.asyncio
+async def test_task_template_selection_matches_core_whitespace_rules(monkeypatch, pipe_request):
+    class FakeConfig:
+        @staticmethod
+        async def get(key):
+            raise RuntimeError("config unavailable")
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    core_config_module = types.ModuleType("open_webui.config")
+    core_config_module.DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE = "Default query {{MESSAGES}}"
+    core_config_module.DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE = "Default autocomplete {{PROMPT}}"
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setitem(sys.modules, "open_webui.config", core_config_module)
+    import open_webui as core_package
+
+    monkeypatch.setattr(core_package, "config", core_config_module, raising=False)
     pipe_request.app.state.config = SimpleNamespace(
         TITLE_GENERATION_PROMPT_TEMPLATE="   ",
         QUERY_GENERATION_PROMPT_TEMPLATE="   ",
         AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE="   ",
     )
 
-    title_template = mod._task_template_from_request(
+    title_template = await mod._task_template_from_request(
         pipe_request,
         mod.TASK_PROMPT_SPECS[mod.TASKS.TITLE_GENERATION.value],
     )
-    query_template = mod._task_template_from_request(
+    query_template = await mod._task_template_from_request(
         pipe_request,
         mod.TASK_PROMPT_SPECS[mod.TASKS.QUERY_GENERATION.value],
     )
-    autocomplete_template = mod._task_template_from_request(
+    autocomplete_template = await mod._task_template_from_request(
         pipe_request,
         mod.TASK_PROMPT_SPECS[mod.TASKS.AUTOCOMPLETE_GENERATION.value],
     )
@@ -9567,6 +10473,132 @@ def test_task_template_selection_matches_core_whitespace_rules(pipe_request):
     assert "{{MESSAGES" in query_template
     assert autocomplete_template != "   "
     assert "{{PROMPT}}" in autocomplete_template
+
+
+@pytest.mark.asyncio
+async def test_render_task_prompt_uses_db_config_templates_for_all_supported_tasks(
+    monkeypatch, pipe_request, pipe_user
+):
+    expected_config_keys = {
+        mod.TASKS.TITLE_GENERATION.value: "task.title.prompt_template",
+        mod.TASKS.FOLLOW_UP_GENERATION.value: "task.follow_up.prompt_template",
+        mod.TASKS.TAGS_GENERATION.value: "task.tags.prompt_template",
+        mod.TASKS.QUERY_GENERATION.value: "task.query.prompt_template",
+        mod.TASKS.IMAGE_PROMPT_GENERATION.value: "task.image.prompt_template",
+        mod.TASKS.AUTOCOMPLETE_GENERATION.value: "task.autocomplete.prompt_template",
+    }
+    captured_templates = {}
+    requested_keys = []
+
+    class FakeConfig:
+        @staticmethod
+        async def get(key):
+            requested_keys.append(key)
+            return f"db::{key}"
+
+    task_module = types.ModuleType("open_webui.utils.task")
+
+    for task_name, spec in mod.TASK_PROMPT_SPECS.items():
+        if task_name == mod.TASKS.AUTOCOMPLETE_GENERATION.value:
+
+            async def autocomplete_builder(template, prompt, messages, type, user, *, _task_name=task_name):
+                captured_templates[_task_name] = template
+                return f"rendered::{_task_name}::{template}"
+
+            setattr(task_module, spec.builder_name, autocomplete_builder)
+        else:
+
+            async def builder(template, messages, user, *, _task_name=task_name):
+                captured_templates[_task_name] = template
+                return f"rendered::{_task_name}::{template}"
+
+            setattr(task_module, spec.builder_name, builder)
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.task", task_module)
+    import open_webui.utils as core_utils
+
+    monkeypatch.setattr(core_utils, "task", task_module, raising=False)
+    pipe_request.app.state.config = SimpleNamespace(
+        **{spec.config_attr: f"legacy::{task_name}" for task_name, spec in mod.TASK_PROMPT_SPECS.items()}
+    )
+
+    for task_name in mod.TASK_PROMPT_SPECS:
+        task_body = {
+            "messages": [{"role": "user", "content": f"history for {task_name}"}],
+            "prompt": f"prompt for {task_name}",
+            "type": "sentence",
+        }
+        rendered = await mod._render_task_prompt_from_messages(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={"task": task_name, "task_body": task_body},
+            messages=task_body["messages"],
+        )
+        expected_template = f"db::{expected_config_keys[task_name]}"
+        assert rendered == f"rendered::{task_name}::{expected_template}"
+        assert captured_templates[task_name] == expected_template
+
+    assert requested_keys == [expected_config_keys[task_name] for task_name in mod.TASK_PROMPT_SPECS]
+
+
+@pytest.mark.asyncio
+async def test_render_task_prompt_falls_back_to_legacy_templates_for_all_supported_tasks(
+    monkeypatch, pipe_request, pipe_user
+):
+    captured_templates = {}
+
+    class FakeConfig:
+        @staticmethod
+        async def get(key):
+            raise RuntimeError("config unavailable")
+
+    task_module = types.ModuleType("open_webui.utils.task")
+
+    for task_name, spec in mod.TASK_PROMPT_SPECS.items():
+        if task_name == mod.TASKS.AUTOCOMPLETE_GENERATION.value:
+
+            async def autocomplete_builder(template, prompt, messages, type, user, *, _task_name=task_name):
+                captured_templates[_task_name] = template
+                return f"rendered::{_task_name}::{template}"
+
+            setattr(task_module, spec.builder_name, autocomplete_builder)
+        else:
+
+            async def builder(template, messages, user, *, _task_name=task_name):
+                captured_templates[_task_name] = template
+                return f"rendered::{_task_name}::{template}"
+
+            setattr(task_module, spec.builder_name, builder)
+
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.task", task_module)
+    import open_webui.utils as core_utils
+
+    monkeypatch.setattr(core_utils, "task", task_module, raising=False)
+    pipe_request.app.state.config = SimpleNamespace(
+        **{spec.config_attr: f"legacy::{task_name}" for task_name, spec in mod.TASK_PROMPT_SPECS.items()}
+    )
+
+    for task_name in mod.TASK_PROMPT_SPECS:
+        task_body = {
+            "messages": [{"role": "user", "content": f"history for {task_name}"}],
+            "prompt": f"prompt for {task_name}",
+            "type": "sentence",
+        }
+        rendered = await mod._render_task_prompt_from_messages(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={"task": task_name, "task_body": task_body},
+            messages=task_body["messages"],
+        )
+        expected_template = f"legacy::{task_name}"
+        assert rendered == f"rendered::{task_name}::{expected_template}"
+        assert captured_templates[task_name] == expected_template
 
 
 @pytest.mark.asyncio
@@ -15003,6 +16035,11 @@ async def test_streaming_completion_observer_skips_tool_call_completion():
 
 def _teardown_summary_model_cache():
     mod._LATEST_MODELS_CACHE.clear()
+    latest_provider_states = getattr(mod, "_LATEST_PROVIDER_MODEL_CACHE_ENABLED_STATES", None)
+    if latest_provider_states is not None:
+        latest_provider_states.clear()
+    if hasattr(mod, "_LATEST_PROVIDER_MODEL_CACHE_STATE_ID"):
+        mod._LATEST_PROVIDER_MODEL_CACHE_STATE_ID = None
 
 
 def test_build_summary_model_options_has_no_empty_default_option():
@@ -15061,6 +16098,46 @@ def test_build_summary_model_options_label_format():
     by_value = {opt["value"]: opt["label"] for opt in options}
     assert by_value["gpt-4o"] == "GPT-4o (gpt-4o)"
     assert by_value["no-name"] == "no-name"
+
+
+@pytest.mark.asyncio
+async def test_get_summary_model_options_keeps_config_disabled_provider_cache_hidden_after_async_refresh(
+    monkeypatch,
+):
+    _teardown_summary_model_cache()
+    captured = {}
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["synced_targets"] = [model["id"] for model in kwargs["target_models"]]
+
+    class FakeConfig:
+        @staticmethod
+        async def get_many(*keys):
+            return {"openai.enable": False, "ollama.enable": True}
+
+    state = SimpleNamespace(
+        MODELS={
+            "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "openai": {}},
+            "stale-ollama": {"id": "stale-ollama", "name": "Stale Ollama", "ollama": {}},
+        },
+        BASE_MODELS=[],
+        OPENAI_MODELS={"direct-openai": {"id": "direct-openai", "name": "Direct OpenAI", "openai": {}}},
+        OLLAMA_MODELS={"direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}},
+        config=SimpleNamespace(),
+    )
+    config_module = types.ModuleType("open_webui.models.config")
+    config_module.Config = FakeConfig
+    monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
+    monkeypatch.setitem(sys.modules, "open_webui.main", types.SimpleNamespace(app=types.SimpleNamespace(state=state)))
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+
+    await mod.Pipe().pipes()
+    options = mod.Pipe.Valves.get_summary_model_options()
+    values = [opt["value"] for opt in options]
+
+    assert captured["synced_targets"] == ["stale-ollama", "direct-ollama"]
+    assert values == ["direct-ollama", "stale-ollama"]
+    _teardown_summary_model_cache()
 
 
 def test_update_latest_models_cache_snapshots_models_first_duplicate_wins():
@@ -15135,7 +16212,7 @@ def test_refresh_latest_models_cache_from_app_state_replaces_stale_populated_cac
         {"id": "base-only", "name": "Base Provider"},
     ]
 
-    def _fake_iter(state):
+    def _fake_iter(state, **kwargs):
         return fake_models
 
     monkeypatch.setattr(mod, "_iter_cache_models_from_state", _fake_iter)

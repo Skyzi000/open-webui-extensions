@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.11
+version: 0.5.12
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -15,6 +15,7 @@ import codecs
 import copy
 import hashlib
 import html
+import inspect
 import json
 import logging
 import math
@@ -86,6 +87,14 @@ BODY_TOKEN_EXTRA_KEYS = (
     "parallel_tool_calls",
 )
 INTERNAL_SUMMARY_TASK = "auto_compaction_summary"
+# Open WebUI 0.10.1 added built-in context compaction (utils/context_compaction.py).
+# Its summary request is dispatched through generate_chat_completion with
+# metadata.task == "context_compaction" (a bare string, not a TASKS enum member),
+# so when the task model resolves to this wrapper the call re-enters Pipe.pipe.
+# Treat it as a passthrough summary task so the wrapper does not run its own
+# compaction / file-context injection / checkpointing on top of Core's. On 0.9.6
+# this task never occurs, so the constant is inert there.
+OFFICIAL_CONTEXT_COMPACTION_TASK = "context_compaction"
 TEMP_CHAT_PREFIXES = ("local:", "channel:")
 SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
 SOURCE_HASH_FAMILY = "canonical-json-v1"
@@ -112,6 +121,12 @@ PROVIDER_MODEL_CACHE_ENABLE_FLAGS = {
     "OPENAI_MODELS": "ENABLE_OPENAI_API",
     "OLLAMA_MODELS": "ENABLE_OLLAMA_API",
 }
+PROVIDER_MODEL_CACHE_CONFIG_KEYS = {
+    "OPENAI_MODELS": "openai.enable",
+    "OLLAMA_MODELS": "ollama.enable",
+}
+TIKTOKEN_ENCODING_CONFIG_KEY = "rag.tiktoken_encoding_name"
+CONFIG_VALUE_MISSING = object()
 MISSING_CORE_REQUEST = object()
 TARGET_MODEL_RECORD_UNKNOWN = object()
 AUTO_COMPACTION_TARGET_HIDDEN_META_KEY = "auto_compaction_target_hidden_by"
@@ -121,6 +136,8 @@ TARGET_MODEL_VISIBILITY_LOCKS: dict[str, asyncio.Lock] = {}
 # generate_queries (TASK_MODEL pointing at this wrapper), the flag short-
 # circuits the reentrant injection so manual RAG is skipped fail-closed.
 AUTO_COMPACT_FILE_CONTEXT_INJECTION_STATE_KEY = "_auto_compact_target_file_context_injecting"
+AUTO_COMPACT_TIKTOKEN_ENCODING_STATE_KEY = "_auto_compact_tiktoken_encoding_name"
+AUTO_COMPACT_TIKTOKEN_ENCODING_LOADED_STATE_KEY = "_auto_compact_tiktoken_encoding_loaded"
 PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY = "_auto_compact_prefix_file_fingerprint_resolver_cache"
 PREFIX_FILE_FINGERPRINT_FAMILY = "prefix-file-fingerprint-v1"
 LOG = logging.getLogger(__name__)
@@ -211,6 +228,8 @@ _MESSAGE_TOKEN_ESTIMATE_CACHE: dict[tuple[str, str, str], int] = {}
 # processing. Populated opportunistically so the Valves dropdown for
 # summary_model can list real models without request access at schema time.
 _LATEST_MODELS_CACHE: dict[str, dict[str, Any]] = {}
+_LATEST_PROVIDER_MODEL_CACHE_ENABLED_STATES: dict[str, bool | None] = {}
+_LATEST_PROVIDER_MODEL_CACHE_STATE_ID: int | None = None
 
 
 def get_generation_lock(key: tuple[str, str, str, str, str, str]) -> asyncio.Lock:
@@ -289,6 +308,7 @@ class ReusableCheckpointMatch:
 @dataclass(frozen=True)
 class TaskPromptSpec:
     config_attr: str
+    config_key: str
     default_attr: str
     builder_name: str
     strip_configured: bool = False
@@ -297,32 +317,38 @@ class TaskPromptSpec:
 TASK_PROMPT_SPECS = {
     TASKS.TITLE_GENERATION.value: TaskPromptSpec(
         "TITLE_GENERATION_PROMPT_TEMPLATE",
+        "task.title.prompt_template",
         "DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE",
         "title_generation_template",
     ),
     TASKS.FOLLOW_UP_GENERATION.value: TaskPromptSpec(
         "FOLLOW_UP_GENERATION_PROMPT_TEMPLATE",
+        "task.follow_up.prompt_template",
         "DEFAULT_FOLLOW_UP_GENERATION_PROMPT_TEMPLATE",
         "follow_up_generation_template",
     ),
     TASKS.TAGS_GENERATION.value: TaskPromptSpec(
         "TAGS_GENERATION_PROMPT_TEMPLATE",
+        "task.tags.prompt_template",
         "DEFAULT_TAGS_GENERATION_PROMPT_TEMPLATE",
         "tags_generation_template",
     ),
     TASKS.QUERY_GENERATION.value: TaskPromptSpec(
         "QUERY_GENERATION_PROMPT_TEMPLATE",
+        "task.query.prompt_template",
         "DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE",
         "query_generation_template",
         strip_configured=True,
     ),
     TASKS.IMAGE_PROMPT_GENERATION.value: TaskPromptSpec(
         "IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE",
+        "task.image.prompt_template",
         "DEFAULT_IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE",
         "image_prompt_generation_template",
     ),
     TASKS.AUTOCOMPLETE_GENERATION.value: TaskPromptSpec(
         "AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE",
+        "task.autocomplete.prompt_template",
         "DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE",
         "autocomplete_generation_template",
         strip_configured=True,
@@ -344,6 +370,8 @@ class TargetModelContract:
 @dataclass(frozen=True)
 class CoreChatModelRoute:
     model_id: str
+    fallback_model: dict[str, Any] | None = None
+    target_params: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -1041,8 +1069,41 @@ def compute_profile_hash(
     )
 
 
+def _request_state_tiktoken_encoding_name(request: Any) -> str | None:
+    request_state = getattr(request, "state", None)
+    if request_state is None:
+        return None
+    try:
+        configured = getattr(request_state, AUTO_COMPACT_TIKTOKEN_ENCODING_STATE_KEY, None)
+    except Exception:
+        return None
+    if isinstance(configured, str) and configured:
+        return configured
+    return None
+
+
+async def _refresh_tiktoken_encoding_config(request: Any = None) -> None:
+    if request is None:
+        return
+    request_state = getattr(request, "state", None)
+    if request_state is None:
+        return
+    if getattr(request_state, AUTO_COMPACT_TIKTOKEN_ENCODING_LOADED_STATE_KEY, False) is True:
+        return
+    configured = await _open_webui_config_get(TIKTOKEN_ENCODING_CONFIG_KEY)
+    with suppress(Exception):
+        setattr(request_state, AUTO_COMPACT_TIKTOKEN_ENCODING_LOADED_STATE_KEY, True)
+    if configured is CONFIG_VALUE_MISSING or configured is None or not str(configured).strip():
+        return
+    with suppress(Exception):
+        setattr(request_state, AUTO_COMPACT_TIKTOKEN_ENCODING_STATE_KEY, str(configured))
+
+
 def _configured_tiktoken_encoding_names(request: Any = None) -> list[str]:
     names: list[str] = []
+    cached_configured = _request_state_tiktoken_encoding_name(request)
+    if cached_configured:
+        names.append(cached_configured)
     config = getattr(getattr(getattr(request, "app", None), "state", None), "config", None)
     configured = getattr(config, "TIKTOKEN_ENCODING_NAME", None)
     if configured:
@@ -1364,6 +1425,8 @@ async def estimate_body_extra_tokens_async(
     encoder: Any = None,
     encoding_name: str | None = None,
 ) -> int | None:
+    if encoding_name is None and encoder is None:
+        await _refresh_tiktoken_encoding_config(request)
     return await asyncio.to_thread(
         estimate_body_extra_tokens,
         body,
@@ -1380,6 +1443,8 @@ async def estimate_body_tokens_async(
     encoder: Any = None,
     encoding_name: str | None = None,
 ) -> int | None:
+    if encoding_name is None and encoder is None:
+        await _refresh_tiktoken_encoding_config(request)
     return await asyncio.to_thread(
         estimate_body_tokens,
         body,
@@ -1396,6 +1461,8 @@ async def estimate_message_tokens_async(
     encoder: Any = None,
     encoding_name: str | None = None,
 ) -> int | None:
+    if encoding_name is None and encoder is None:
+        await _refresh_tiktoken_encoding_config(request)
     return await asyncio.to_thread(
         estimate_message_tokens,
         message,
@@ -1412,6 +1479,8 @@ async def estimate_messages_tokens_async(
     encoder: Any = None,
     encoding_name: str | None = None,
 ) -> int | None:
+    if encoding_name is None and encoder is None:
+        await _refresh_tiktoken_encoding_config(request)
     return await asyncio.to_thread(
         estimate_messages_tokens,
         messages,
@@ -3139,17 +3208,37 @@ def update_latest_models_cache(models: Iterable[dict[str, Any]]) -> None:
         _LATEST_MODELS_CACHE.update(snapshot)
 
 
+def update_latest_provider_model_cache_enabled_states(states: dict[str, bool | None], *, state: Any = None) -> None:
+    global _LATEST_PROVIDER_MODEL_CACHE_STATE_ID
+    snapshot = {attr: states.get(attr) for attr in PROVIDER_MODEL_CACHE_ENABLE_FLAGS}
+    if any(value is not None for value in snapshot.values()):
+        _LATEST_PROVIDER_MODEL_CACHE_ENABLED_STATES.clear()
+        _LATEST_PROVIDER_MODEL_CACHE_ENABLED_STATES.update(snapshot)
+        _LATEST_PROVIDER_MODEL_CACHE_STATE_ID = id(state) if state is not None else None
+
+
+def _latest_or_legacy_provider_model_cache_enabled_states(state: Any) -> dict[str, bool | None]:
+    if (
+        _LATEST_PROVIDER_MODEL_CACHE_ENABLED_STATES
+        and (_LATEST_PROVIDER_MODEL_CACHE_STATE_ID is None or _LATEST_PROVIDER_MODEL_CACHE_STATE_ID == id(state))
+    ):
+        return dict(_LATEST_PROVIDER_MODEL_CACHE_ENABLED_STATES)
+    return {attr: _provider_model_cache_enabled_state(state, attr) for attr in PROVIDER_MODEL_CACHE_ENABLE_FLAGS}
+
+
 def refresh_latest_models_cache_from_app_state() -> None:
     """Refresh the dropdown model snapshot from Core's current app.state registries.
 
-    Narrowly scoped: reads exclusively from _iter_cache_models_from_state(app.state)
-    and performs no provider fetch, DB lookup, or async wait. If Core state is not
-    importable or has no models yet, keep the existing snapshot unchanged.
+    Narrowly scoped: reads exclusively from app.state registries and performs no
+    provider fetch, DB lookup, or async wait. If Core state is not importable or
+    has no models yet, keep the existing snapshot unchanged.
     """
     try:
         from open_webui.main import app
 
-        models = _iter_cache_models_from_state(app.state)
+        provider_states = _latest_or_legacy_provider_model_cache_enabled_states(app.state)
+        disabled_provider_attrs = _disabled_provider_model_cache_attrs_from_states(provider_states)
+        models = _iter_cache_models_from_state(app.state, disabled_provider_attrs=disabled_provider_attrs)
     except Exception:
         return
     update_latest_models_cache(models)
@@ -3965,6 +4054,63 @@ def _normalize_cache_model(attr: str, model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _maybe_await_config_value(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _open_webui_config_get(key: str) -> Any:
+    try:
+        from open_webui.models.config import Config
+    except Exception:
+        return CONFIG_VALUE_MISSING
+
+    try:
+        return await _maybe_await_config_value(Config.get(key))
+    except Exception:
+        return CONFIG_VALUE_MISSING
+
+
+async def _open_webui_config_get_many(*keys: str) -> dict[str, Any] | None:
+    try:
+        from open_webui.models.config import Config
+    except Exception:
+        return None
+
+    try:
+        values = await _maybe_await_config_value(Config.get_many(*keys))
+    except Exception:
+        return None
+    return values if isinstance(values, dict) else None
+
+
+SUMMARY_FILE_CONTEXT_RAG_CONFIG_SPECS = {
+    "k": ("rag.top_k", "TOP_K", 5),
+    "k_reranker": ("rag.top_k_reranker", "TOP_K_RERANKER", 5),
+    "r": ("rag.relevance_threshold", "RELEVANCE_THRESHOLD", 0.0),
+    "hybrid_bm25_weight": ("rag.hybrid_bm25_weight", "HYBRID_BM25_WEIGHT", 0.5),
+    "hybrid_search": ("rag.enable_hybrid_search", "ENABLE_RAG_HYBRID_SEARCH", False),
+}
+
+
+async def _summary_file_context_rag_config(request: Any) -> dict[str, Any]:
+    state = getattr(getattr(request, "app", None), "state", None)
+    legacy_config = getattr(state, "config", None)
+    config_values = await _open_webui_config_get_many(
+        *(spec[0] for spec in SUMMARY_FILE_CONTEXT_RAG_CONFIG_SPECS.values())
+    )
+    resolved: dict[str, Any] = {}
+    for arg_name, (config_key, legacy_attr, default) in SUMMARY_FILE_CONTEXT_RAG_CONFIG_SPECS.items():
+        value = CONFIG_VALUE_MISSING
+        if isinstance(config_values, dict) and config_key in config_values:
+            value = config_values.get(config_key)
+        if value is CONFIG_VALUE_MISSING or value is None:
+            value = getattr(legacy_config, legacy_attr, default)
+        resolved[arg_name] = value
+    return resolved
+
+
 def _provider_model_cache_enabled_state(state: Any, attr: str) -> bool | None:
     flag = PROVIDER_MODEL_CACHE_ENABLE_FLAGS.get(attr)
     if flag is None:
@@ -3973,6 +4119,46 @@ def _provider_model_cache_enabled_state(state: Any, attr: str) -> bool | None:
     if config is None or not hasattr(config, flag):
         return None
     return bool(getattr(config, flag))
+
+
+def _provider_model_cache_enabled_config_value(config_values: dict[str, Any] | None, attr: str) -> bool | None:
+    if not isinstance(config_values, dict):
+        return None
+    config_key = PROVIDER_MODEL_CACHE_CONFIG_KEYS.get(attr)
+    if config_key is None or config_key not in config_values:
+        return None
+    value = config_values.get(config_key)
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _provider_model_cache_enabled_states_from_config(
+    state: Any,
+    config_values: dict[str, Any] | None,
+) -> dict[str, bool | None]:
+    states: dict[str, bool | None] = {}
+    for attr in PROVIDER_MODEL_CACHE_ENABLE_FLAGS:
+        enabled = _provider_model_cache_enabled_config_value(config_values, attr)
+        if enabled is None:
+            enabled = _provider_model_cache_enabled_state(state, attr)
+        states[attr] = enabled
+    return states
+
+
+async def _provider_model_cache_enabled_states(state: Any) -> dict[str, bool | None]:
+    config_values = await _open_webui_config_get_many(*PROVIDER_MODEL_CACHE_CONFIG_KEYS.values())
+    states = _provider_model_cache_enabled_states_from_config(state, config_values)
+    update_latest_provider_model_cache_enabled_states(states, state=state)
+    return states
+
+
+def _disabled_provider_model_cache_attrs_from_states(states: dict[str, bool | None]) -> set[str]:
+    return {attr for attr, enabled in states.items() if enabled is False}
+
+
+def _enabled_provider_model_cache_attrs_from_states(states: dict[str, bool | None]) -> list[str]:
+    return [attr for attr in PROVIDER_MODEL_CACHE_ENABLE_FLAGS if states.get(attr) is True]
 
 
 def _disabled_provider_model_cache_attrs(state: Any) -> set[str]:
@@ -3995,9 +4181,14 @@ def _is_disabled_provider_cache_origin_model(model: dict[str, Any], disabled_pro
     return any(_is_provider_cache_origin_model(model, attr) for attr in disabled_provider_attrs)
 
 
-def _iter_cache_models_from_state(state: Any) -> list[dict[str, Any]]:
+def _iter_cache_models_from_state(
+    state: Any,
+    *,
+    disabled_provider_attrs: set[str] | None = None,
+) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    disabled_provider_attrs = _disabled_provider_model_cache_attrs(state)
+    if disabled_provider_attrs is None:
+        disabled_provider_attrs = _disabled_provider_model_cache_attrs(state)
     for attr in ("MODELS", "BASE_MODELS", "OPENAI_MODELS", "OLLAMA_MODELS"):
         if attr in disabled_provider_attrs:
             continue
@@ -4014,6 +4205,12 @@ def _iter_cache_models_from_state(state: Any) -> list[dict[str, Any]]:
                 continue
             out.append(model)
     return out
+
+
+async def _iter_cache_models_from_state_compatible(state: Any) -> list[dict[str, Any]]:
+    provider_enabled_states = await _provider_model_cache_enabled_states(state)
+    disabled_provider_attrs = _disabled_provider_model_cache_attrs_from_states(provider_enabled_states)
+    return _iter_cache_models_from_state(state, disabled_provider_attrs=disabled_provider_attrs)
 
 
 def _enabled_provider_model_cache_attrs(state: Any) -> list[str]:
@@ -4130,8 +4327,13 @@ async def _wait_for_provider_model_caches(
     state: Any,
     *,
     initial_provider_caches: dict[str, Any] | None = None,
+    provider_cache_attrs: Iterable[str] | None = None,
+    disabled_provider_attrs: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    provider_cache_attrs = _enabled_provider_model_cache_attrs(state)
+    if provider_cache_attrs is None:
+        provider_cache_attrs = _enabled_provider_model_cache_attrs(state)
+    else:
+        provider_cache_attrs = list(provider_cache_attrs)
     if not provider_cache_attrs:
         return []
 
@@ -4148,16 +4350,16 @@ async def _wait_for_provider_model_caches(
     # Core fetches provider models and function models in the same gather call.
     # Empty caches are final if no sibling Core provider fetch is still pending.
     for _ in range(attempts):
-        models = _iter_cache_models_from_state(state)
+        models = _iter_cache_models_from_state(state, disabled_provider_attrs=disabled_provider_attrs)
         pending_provider_cache_attrs = _provider_model_cache_refresh_pending_attrs(provider_cache_attrs)
         if _provider_model_caches_ready(state, initial_provider_caches, pending_provider_cache_attrs):
             return models
         await asyncio.sleep(poll_seconds)
-        models = _iter_cache_models_from_state(state)
+        models = _iter_cache_models_from_state(state, disabled_provider_attrs=disabled_provider_attrs)
         pending_provider_cache_attrs = _provider_model_cache_refresh_pending_attrs(provider_cache_attrs)
         if _provider_model_caches_ready(state, initial_provider_caches, pending_provider_cache_attrs):
             return models
-    return _iter_cache_models_from_state(state)
+    return _iter_cache_models_from_state(state, disabled_provider_attrs=disabled_provider_attrs)
 
 
 def validate_summary_model_id(configured_summary_model: str, target_model_id: str, models: dict[str, Any]) -> str:
@@ -4436,10 +4638,20 @@ def _task_history_source_body_for_compaction(
     return source_body
 
 
-def _task_template_from_request(request: Any, spec: TaskPromptSpec) -> str | None:
+def _task_template_is_usable(template: Any, spec: TaskPromptSpec) -> bool:
+    if not isinstance(template, str):
+        return False
+    return bool(template.strip() if spec.strip_configured else template != "")
+
+
+async def _task_template_from_request(request: Any, spec: TaskPromptSpec) -> str | None:
+    configured = await _open_webui_config_get(spec.config_key)
+    if _task_template_is_usable(configured, spec):
+        return configured
+
     config = getattr(getattr(getattr(request, "app", None), "state", None), "config", None)
     configured = getattr(config, spec.config_attr, None) if config is not None else None
-    if isinstance(configured, str) and (configured.strip() if spec.strip_configured else configured):
+    if _task_template_is_usable(configured, spec):
         return configured
     try:
         import open_webui.config as core_config
@@ -4447,7 +4659,7 @@ def _task_template_from_request(request: Any, spec: TaskPromptSpec) -> str | Non
         default_template = getattr(core_config, spec.default_attr, None)
     except Exception:
         default_template = None
-    return default_template if isinstance(default_template, str) and default_template else None
+    return default_template if _task_template_is_usable(default_template, spec) else None
 
 
 async def _render_task_prompt_from_messages(
@@ -4462,7 +4674,7 @@ async def _render_task_prompt_from_messages(
     task_body = _task_body_from_metadata(metadata)
     if spec is None or task_body is None:
         return None
-    template = _task_template_from_request(request, spec)
+    template = await _task_template_from_request(request, spec)
     if template is None:
         return None
     try:
@@ -5613,10 +5825,10 @@ async def _generate_summary_file_context(
         from open_webui.retrieval.utils import get_sources_from_items
 
         state = getattr(getattr(request, "app", None), "state", None)
-        config = getattr(state, "config", None)
         embedding_function = getattr(state, "EMBEDDING_FUNCTION", None)
         reranking_function = getattr(state, "RERANKING_FUNCTION", None)
         user_model = coerce_open_webui_user(user)
+        rag_config = await _summary_file_context_rag_config(request)
 
         def embed(query: str, prefix: str) -> Any:
             if embedding_function is None:
@@ -5632,12 +5844,12 @@ async def _generate_summary_file_context(
             items=prefix_files,
             queries=[""],
             embedding_function=embed,
-            k=getattr(config, "TOP_K", 5),
+            k=rag_config["k"],
             reranking_function=rerank,
-            k_reranker=getattr(config, "TOP_K_RERANKER", 5),
-            r=getattr(config, "RELEVANCE_THRESHOLD", 0.0),
-            hybrid_bm25_weight=getattr(config, "HYBRID_BM25_WEIGHT", 0.5),
-            hybrid_search=getattr(config, "ENABLE_RAG_HYBRID_SEARCH", False),
+            k_reranker=rag_config["k_reranker"],
+            r=rag_config["r"],
+            hybrid_bm25_weight=rag_config["hybrid_bm25_weight"],
+            hybrid_search=rag_config["hybrid_search"],
             full_context=True,
             user=user_model,
         )
@@ -7740,7 +7952,7 @@ async def _model_dict_from_request(request: Any) -> dict[str, Any]:
     if state is None:
         return {}
     models: dict[str, Any] = {}
-    for model in _iter_cache_models_from_state(state):
+    for model in await _iter_cache_models_from_state_compatible(state):
         model_id = _model_id(model)
         if model_id is not None and model_id not in models:
             models[model_id] = model
@@ -7809,16 +8021,67 @@ def _custom_model_fallback_enabled() -> bool:
         return False
 
 
-def _custom_model_fallback_model_id(request: Any, models: dict[str, Any]) -> str | None:
-    if not _custom_model_fallback_enabled():
-        return None
+def _legacy_default_models_config_value(request: Any) -> Any:
     config = getattr(getattr(request, "app", None), "state", None)
     config = getattr(config, "config", None)
-    default_models = str(getattr(config, "DEFAULT_MODELS", None) or "").split(",")
+    return getattr(config, "DEFAULT_MODELS", None)
+
+
+def _available_custom_model_fallback_id(default_models_value: Any, models: dict[str, Any]) -> str | None:
+    default_models = str(default_models_value or "").split(",")
     fallback_model_id = default_models[0].strip() if default_models and default_models[0] else None
     if fallback_model_id and fallback_model_id in models:
         return fallback_model_id
     return None
+
+
+def _custom_model_fallback_model_id(request: Any, models: dict[str, Any]) -> str | None:
+    if not _custom_model_fallback_enabled():
+        return None
+    return _available_custom_model_fallback_id(_legacy_default_models_config_value(request), models)
+
+
+async def _custom_model_fallback_model_id_compatible(request: Any, models: dict[str, Any]) -> str | None:
+    if not _custom_model_fallback_enabled():
+        return None
+    default_models_value = await _open_webui_config_get("ui.default_models")
+    if default_models_value is CONFIG_VALUE_MISSING or default_models_value is None:
+        default_models_value = _legacy_default_models_config_value(request)
+    return _available_custom_model_fallback_id(default_models_value, models)
+
+
+def _target_record_params(model_info: Any) -> dict[str, Any]:
+    if model_info is None or model_info is TARGET_MODEL_RECORD_UNKNOWN:
+        return {}
+    if isinstance(model_info, dict):
+        return _payload_params(model_info)
+    params = getattr(model_info, "params", None)
+    dumped = _dump_model_value(params)
+    return copy.deepcopy(dumped) if isinstance(dumped, dict) else {}
+
+
+def _apply_custom_model_fallback_params(
+    body: dict[str, Any],
+    *,
+    fallback_model: dict[str, Any] | None,
+    target_params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not fallback_model or not target_params:
+        return body
+    try:
+        from open_webui.utils.middleware import apply_params_to_form_data
+    except ImportError:
+        return body
+
+    patched = _copy_body_preserving_metadata(body)
+    existing_params = patched.get("params")
+    merged_params = copy.deepcopy(target_params)
+    if isinstance(existing_params, dict):
+        request_params = {key: copy.deepcopy(value) for key, value in existing_params.items() if value is not None}
+        merged_params.update(request_params)
+    patched["params"] = merged_params
+    return apply_params_to_form_data(patched, fallback_model)
+
 
 
 def _global_model_access_bypass_enabled() -> bool:
@@ -7837,9 +8100,14 @@ async def _resolve_core_chat_model_route(request: Any, model_id: str) -> CoreCha
     model_info = await _get_target_db_model_record(model_id)
     base_model_id = _target_record_base_model_id(model_info)
     if base_model_id and base_model_id not in models:
-        fallback_model_id = _custom_model_fallback_model_id(request, models)
-        if fallback_model_id:
-            return CoreChatModelRoute(model_id=fallback_model_id)
+        fallback_model_id = await _custom_model_fallback_model_id_compatible(request, models)
+        fallback_model = models.get(fallback_model_id) if fallback_model_id else None
+        if fallback_model_id and isinstance(fallback_model, dict):
+            return CoreChatModelRoute(
+                model_id=fallback_model_id,
+                fallback_model=copy.deepcopy(fallback_model),
+                target_params=_target_record_params(model_info),
+            )
     return CoreChatModelRoute(model_id=model_id)
 
 
@@ -7877,6 +8145,12 @@ async def _validate_target_access(
 ) -> None:
     models = await _model_dict_from_request(request)
     model = models.get(target_model_id)
+    state = getattr(getattr(request, "app", None), "state", None)
+    if model is not None and state is not None:
+        provider_enabled_states = await _provider_model_cache_enabled_states(state)
+        disabled_provider_attrs = _disabled_provider_model_cache_attrs_from_states(provider_enabled_states)
+        if _is_disabled_provider_cache_origin_model(model, disabled_provider_attrs):
+            raise HTTPException(status_code=403, detail="Model not found")
     if model is None or _is_arena_model(model) or is_generated_wrapper_model_id(
         target_model_id,
         pipe_function_id=pipe_function_id,
@@ -7885,8 +8159,10 @@ async def _validate_target_access(
 
     model_info = await _get_target_db_model_record(target_model_id)
     base_model_id = _target_record_base_model_id(model_info)
-    if base_model_id and base_model_id not in models and _custom_model_fallback_model_id(request, models) is None:
-        raise HTTPException(status_code=403, detail="Model not found")
+    if base_model_id and base_model_id not in models:
+        fallback_model_id = await _custom_model_fallback_model_id_compatible(request, models)
+        if fallback_model_id is None:
+            raise HTTPException(status_code=403, detail="Model not found")
 
     user_model = coerce_open_webui_user(user)
     if _should_bypass_target_access_check(user_model):
@@ -8566,9 +8842,11 @@ class Pipe:
             return []
 
         pipe_function_id = runtime_pipe_function_id(self)
-        provider_cache_attrs = _enabled_provider_model_cache_attrs(state)
+        provider_enabled_states = await _provider_model_cache_enabled_states(state)
+        provider_cache_attrs = _enabled_provider_model_cache_attrs_from_states(provider_enabled_states)
+        disabled_provider_attrs = _disabled_provider_model_cache_attrs_from_states(provider_enabled_states)
         initial_provider_caches = {attr: getattr(state, attr, None) for attr in provider_cache_attrs}
-        model_candidates = _iter_cache_models_from_state(state)
+        model_candidates = _iter_cache_models_from_state(state, disabled_provider_attrs=disabled_provider_attrs)
         pending_provider_cache_attrs = _provider_model_cache_refresh_pending_attrs(provider_cache_attrs)
         if pending_provider_cache_attrs and not _provider_model_caches_ready(
             state,
@@ -8578,6 +8856,8 @@ class Pipe:
             model_candidates = await _wait_for_provider_model_caches(
                 state,
                 initial_provider_caches=initial_provider_caches,
+                provider_cache_attrs=provider_cache_attrs,
+                disabled_provider_attrs=disabled_provider_attrs,
             )
         targets = filter_target_models(model_candidates, self.valves, pipe_function_id=pipe_function_id)
         update_latest_models_cache(model_candidates)
@@ -8612,6 +8892,7 @@ class Pipe:
             return _error_response("Request body must be an object", code="invalid_request")
         if __request__ is None:
             return _error_response("Open WebUI request context is required", code="missing_request")
+        await _refresh_tiktoken_encoding_config(__request__)
 
         is_streaming = body.get("stream") is True
         selected_wrapper_id = str(body.get("model") or "")
@@ -8668,7 +8949,14 @@ class Pipe:
             inner = inject_stream_usage_options(inner, force_include_usage=True)
 
         task_name = _normalized_task_name(metadata.get("task"))
-        is_summary_task = task_name == INTERNAL_SUMMARY_TASK
+        # Both this wrapper's own internal summary task and Open WebUI 0.10.1's
+        # built-in context_compaction summary task must pass straight through:
+        # the wrapper must not run its own compaction / file-context injection /
+        # checkpointing on top of either summary request.
+        is_summary_task = task_name in (
+            INTERNAL_SUMMARY_TASK,
+            OFFICIAL_CONTEXT_COMPACTION_TASK,
+        )
         # query_generation runs Core generate_queries, which may route the task
         # model back into this wrapper (TASK_MODEL pointing here). Injecting
         # target file context then would recurse via chat_completion_files_handler.
@@ -9299,11 +9587,16 @@ class Pipe:
                 candidate_source_events = pre_injected_file_context_sources
 
             try:
+                forward_candidate = _apply_custom_model_fallback_params(
+                    candidate,
+                    fallback_model=target_route.fallback_model,
+                    target_params=target_route.target_params,
+                )
                 if is_streaming:
                     streaming_kwargs = {
                         "request": __request__,
                         "user": user,
-                        "body": candidate,
+                        "body": forward_candidate,
                         "chat_id": str(chat_id) if chat_id else None,
                         "message_id": str(message_id) if message_id else None,
                         "wrapper_model_id": selected_wrapper_id,
@@ -9321,7 +9614,7 @@ class Pipe:
                 response = await _forward_non_streaming_target(
                     request=__request__,
                     user=user,
-                    body=candidate,
+                    body=forward_candidate,
                 )
                 if isinstance(response, dict) and response.get("error"):
                     return response
