@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.12
+version: 0.5.13
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -19,6 +19,7 @@ import inspect
 import json
 import logging
 import math
+import random
 import re
 import time
 import uuid
@@ -3132,6 +3133,58 @@ def resolve_soft_trigger_total_tokens(
 
 def _is_arena_model(model: dict[str, Any]) -> bool:
     return bool(model.get("arena")) or model.get("owned_by") == "arena"
+
+
+def _arena_chat_candidate_model_ids(models: dict[str, Any], arena_model: dict[str, Any]) -> list[str]:
+    info = arena_model.get("info")
+    meta = info.get("meta") if isinstance(info, dict) else None
+    meta = meta if isinstance(meta, dict) else {}
+    model_ids = meta.get("model_ids")
+    filter_mode = meta.get("filter_mode")
+    if model_ids and filter_mode == "exclude":
+        excluded_model_ids = set(model_ids)
+        return [
+            model_id
+            for available_model in list(models.values())
+            if isinstance(available_model, dict)
+            and available_model.get("owned_by") != "arena"
+            and isinstance((model_id := available_model.get("id")), str)
+            and model_id not in excluded_model_ids
+        ]
+    if isinstance(model_ids, list) and model_ids:
+        return [model_id for model_id in model_ids if isinstance(model_id, str) and model_id]
+    return [
+        model_id
+        for available_model in list(models.values())
+        if isinstance(available_model, dict)
+        and available_model.get("owned_by") != "arena"
+        and isinstance((model_id := available_model.get("id")), str)
+    ]
+
+
+def _resolve_arena_chat_model_route(
+    models: dict[str, Any],
+    route: CoreChatModelRoute,
+) -> tuple[CoreChatModelRoute, str | None]:
+    model = models.get(route.model_id)
+    if not isinstance(model, dict) or not _is_arena_model(model):
+        return route, None
+    candidate_model_ids = _arena_chat_candidate_model_ids(models, model)
+    if not candidate_model_ids:
+        raise HTTPException(status_code=403, detail="Model not found")
+    selected_model_id = random.choice(candidate_model_ids)
+    selected_model = models.get(selected_model_id)
+    if not isinstance(selected_model, dict) or _is_arena_model(selected_model):
+        raise HTTPException(status_code=403, detail="Model not found")
+    fallback_model = copy.deepcopy(selected_model) if route.fallback_model is not None else route.fallback_model
+    return (
+        CoreChatModelRoute(
+            model_id=selected_model_id,
+            fallback_model=fallback_model,
+            target_params=route.target_params,
+        ),
+        selected_model_id,
+    )
 
 
 def _model_id(model: dict[str, Any]) -> str | None:
@@ -6637,7 +6690,23 @@ async def _generate_summary_text(
         summary_prompt=summary_prompt,
     )
     route = await _resolve_core_chat_model_route(inner_request, str(body.get("model") or ""))
+    models = await _model_dict_from_request(inner_request)
+    original_model_id = str(body.get("model") or "")
+    route, selected_arena_model_id = await _resolve_arena_chat_model_route_with_access(
+        request=inner_request,
+        user=user,
+        models=models,
+        route=route,
+        original_model_id=original_model_id,
+    )
     body["model"] = route.model_id
+    if selected_arena_model_id:
+        body["metadata"]["selected_model_id"] = selected_arena_model_id
+    body = _apply_custom_model_fallback_params(
+        body,
+        fallback_model=route.fallback_model,
+        target_params=route.target_params,
+    )
     await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
     if on_summary_start is not None:
         await on_summary_start()
@@ -8060,13 +8129,129 @@ def _target_record_params(model_info: Any) -> dict[str, Any]:
     return copy.deepcopy(dumped) if isinstance(dumped, dict) else {}
 
 
+FALLBACK_OPEN_WEBUI_PARAM_KEYS = frozenset(
+    {
+        "stream_response",
+        "stream_delta_chunk_size",
+        "function_calling",
+        "reasoning_tags",
+        "compact_token_threshold",
+        "system",
+    }
+)
+FALLBACK_OPENAI_PROVIDER_PARAM_KEYS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "min_p",
+        "max_tokens",
+        "frequency_penalty",
+        "presence_penalty",
+        "reasoning_effort",
+        "seed",
+        "stop",
+        "logit_bias",
+        "response_format",
+    }
+)
+FALLBACK_OLLAMA_OPTION_PARAM_KEYS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "seed",
+        "mirostat",
+        "mirostat_eta",
+        "mirostat_tau",
+        "num_ctx",
+        "num_batch",
+        "num_keep",
+        "num_predict",
+        "repeat_last_n",
+        "top_k",
+        "min_p",
+        "repeat_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "stop",
+        "num_gpu",
+        "use_mmap",
+        "use_mlock",
+        "num_thread",
+    }
+)
+FALLBACK_OLLAMA_ROOT_PARAM_KEYS = frozenset({"format", "keep_alive", "think"})
+FALLBACK_PROVIDER_TOP_LEVEL_PARAM_KEYS = (
+    FALLBACK_OPENAI_PROVIDER_PARAM_KEYS | FALLBACK_OLLAMA_OPTION_PARAM_KEYS | FALLBACK_OLLAMA_ROOT_PARAM_KEYS
+)
+FALLBACK_PROVIDER_PARAM_ALIASES = {"max_tokens": "num_predict"}
+FALLBACK_OLLAMA_ROOT_PASSTHROUGH_PARAM_KEYS = frozenset({"response_format"})
+FALLBACK_BODY_NON_PARAM_KEYS = frozenset(
+    {
+        "model",
+        "messages",
+        "metadata",
+        "stream",
+        "files",
+        "tools",
+        "tool_choice",
+        "functions",
+        "function_call",
+        "parallel_tool_calls",
+    }
+)
+
+
+def _fallback_provider_top_level_param_keys(target_params: dict[str, Any] | None) -> set[str]:
+    keys = set(FALLBACK_PROVIDER_TOP_LEVEL_PARAM_KEYS)
+    if isinstance(target_params, dict):
+        for key, value in target_params.items():
+            if key == "custom_params" and isinstance(value, dict):
+                keys.update(param_key for param_key in value if param_key not in FALLBACK_BODY_NON_PARAM_KEYS)
+                continue
+            if key not in FALLBACK_OPEN_WEBUI_PARAM_KEYS and key not in FALLBACK_BODY_NON_PARAM_KEYS:
+                keys.add(key)
+            alias = FALLBACK_PROVIDER_PARAM_ALIASES.get(key)
+            if alias:
+                keys.add(alias)
+    return keys
+
+
 def _apply_custom_model_fallback_params(
     body: dict[str, Any],
     *,
     fallback_model: dict[str, Any] | None,
     target_params: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if not fallback_model or not target_params:
+    if not fallback_model:
+        return body
+    is_ollama_fallback = fallback_model.get("owned_by") == "ollama"
+    existing_params = body.get("params")
+    merged_params = copy.deepcopy(target_params or {})
+    top_level_param_keys = _fallback_provider_top_level_param_keys(merged_params)
+    top_level_request_params = {
+        key: copy.deepcopy(body[key])
+        for key in top_level_param_keys
+        if key in body and body[key] is not None
+    }
+    existing_options = body.get("options")
+    option_request_params = (
+        {key: copy.deepcopy(value) for key, value in existing_options.items() if value is not None}
+        if isinstance(existing_options, dict)
+        else {}
+    )
+    request_params = (
+        {key: copy.deepcopy(value) for key, value in existing_params.items() if value is not None}
+        if isinstance(existing_params, dict)
+        else {}
+    )
+    root_passthrough_request_params = {}
+    if is_ollama_fallback:
+        root_passthrough_request_params = {
+            key: top_level_request_params.pop(key)
+            for key in list(top_level_request_params)
+            if key in FALLBACK_OLLAMA_ROOT_PASSTHROUGH_PARAM_KEYS
+        }
+    if not merged_params and not isinstance(existing_params, dict) and not top_level_request_params and not option_request_params:
         return body
     try:
         from open_webui.utils.middleware import apply_params_to_form_data
@@ -8074,13 +8259,34 @@ def _apply_custom_model_fallback_params(
         return body
 
     patched = _copy_body_preserving_metadata(body)
-    existing_params = patched.get("params")
-    merged_params = copy.deepcopy(target_params)
-    if isinstance(existing_params, dict):
-        request_params = {key: copy.deepcopy(value) for key, value in existing_params.items() if value is not None}
+    if request_params:
         merged_params.update(request_params)
+    merged_params.update(top_level_request_params)
+    request_visible_params = {**request_params, **top_level_request_params}
+    custom_params = merged_params.get("custom_params")
+    if isinstance(custom_params, dict):
+        custom_params = copy.deepcopy(custom_params)
+        for key, value in request_visible_params.items():
+            if key in custom_params:
+                custom_params[key] = copy.deepcopy(value)
+        if is_ollama_fallback:
+            for source_key, alias_key in FALLBACK_PROVIDER_PARAM_ALIASES.items():
+                if alias_key in request_visible_params or alias_key in option_request_params:
+                    custom_params.pop(source_key, None)
+            for key in root_passthrough_request_params:
+                custom_params.pop(key, None)
+        merged_params["custom_params"] = custom_params
+    if is_ollama_fallback:
+        for source_key, alias_key in FALLBACK_PROVIDER_PARAM_ALIASES.items():
+            if alias_key in request_visible_params or alias_key in option_request_params:
+                merged_params.pop(source_key, None)
+        for key in root_passthrough_request_params:
+            merged_params.pop(key, None)
     patched["params"] = merged_params
-    return apply_params_to_form_data(patched, fallback_model)
+    patched = apply_params_to_form_data(patched, fallback_model)
+    if option_request_params and isinstance(patched.get("options"), dict):
+        patched["options"].update(option_request_params)
+    return patched
 
 
 
@@ -8134,6 +8340,24 @@ async def _validate_chat_completion_runtime_model_access(
         raise
     except Exception as exc:
         raise HTTPException(status_code=403, detail="Model not found") from exc
+
+
+async def _resolve_arena_chat_model_route_with_access(
+    *,
+    request: Any,
+    user: Any,
+    models: dict[str, Any],
+    route: CoreChatModelRoute,
+    original_model_id: str,
+) -> tuple[CoreChatModelRoute, str | None]:
+    route, selected_arena_model_id = _resolve_arena_chat_model_route(models, route)
+    if route.model_id != original_model_id:
+        await _validate_chat_completion_runtime_model_access(
+            request=request,
+            user=user,
+            model_id=route.model_id,
+        )
+    return route, selected_arena_model_id
 
 
 async def _validate_target_access(
@@ -8911,6 +9135,15 @@ class Pipe:
         if chat_id and not metadata.get("chat_id"):
             metadata["chat_id"] = chat_id
         message_id = metadata.get("message_id") or metadata.get("user_message_id")
+        task_name = _normalized_task_name(metadata.get("task"))
+        # Both this wrapper's own internal summary task and Open WebUI 0.10.1's
+        # built-in context_compaction summary task must pass straight through:
+        # the wrapper must not run its own compaction / file-context injection /
+        # checkpointing on top of either summary request.
+        is_summary_task = task_name in (
+            INTERNAL_SUMMARY_TASK,
+            OFFICIAL_CONTEXT_COMPACTION_TASK,
+        )
 
         try:
             await _validate_target_access(
@@ -8924,39 +9157,39 @@ class Pipe:
 
         models = await _model_dict_from_request(__request__)
         update_latest_models_cache(models.values())
-        try:
-            summary_model_id = validate_summary_model_id(self.valves.summary_model, identity.target_model_id, models)
-        except ValueError as exc:
-            return _error_response(str(exc), code="invalid_summary_model")
+        summary_model_id = identity.target_model_id
+        if not is_summary_task:
+            try:
+                summary_model_id = validate_summary_model_id(
+                    self.valves.summary_model,
+                    identity.target_model_id,
+                    models,
+                )
+            except ValueError as exc:
+                return _error_response(str(exc), code="invalid_summary_model")
 
         inner = _copy_body_preserving_metadata(body)
         target_route = await _resolve_core_chat_model_route(
             __request__,
             identity.target_model_id,
         )
-        if target_route.model_id != identity.target_model_id:
-            try:
-                await _validate_chat_completion_runtime_model_access(
-                    request=__request__,
-                    user=user,
-                    model_id=target_route.model_id,
-                )
-            except Exception:
-                return _error_response("Model not found", code="model_access_denied")
+        try:
+            target_route, selected_arena_model_id = await _resolve_arena_chat_model_route_with_access(
+                request=__request__,
+                user=user,
+                models=models,
+                route=target_route,
+                original_model_id=identity.target_model_id,
+            )
+        except Exception:
+            return _error_response("Model not found", code="model_access_denied")
         inner["model"] = target_route.model_id
         inner["metadata"] = _copy_metadata_preserving_references(metadata)
+        if selected_arena_model_id:
+            inner["metadata"]["selected_model_id"] = selected_arena_model_id
         if is_streaming and self.valves.force_include_usage:
             inner = inject_stream_usage_options(inner, force_include_usage=True)
 
-        task_name = _normalized_task_name(metadata.get("task"))
-        # Both this wrapper's own internal summary task and Open WebUI 0.10.1's
-        # built-in context_compaction summary task must pass straight through:
-        # the wrapper must not run its own compaction / file-context injection /
-        # checkpointing on top of either summary request.
-        is_summary_task = task_name in (
-            INTERNAL_SUMMARY_TASK,
-            OFFICIAL_CONTEXT_COMPACTION_TASK,
-        )
         # query_generation runs Core generate_queries, which may route the task
         # model back into this wrapper (TASK_MODEL pointing here). Injecting
         # target file context then would recurse via chat_completion_files_handler.
@@ -8984,7 +9217,7 @@ class Pipe:
         # the injected payload.  inner is used directly when no compaction
         # occurs.  When compaction runs, clean messages are restored for
         # the compaction cut, then re-injected with the correct prefix count.
-        target_file_context_enabled = _target_model_supports_file_context(models, identity.target_model_id)
+        target_file_context_enabled = _target_model_supports_file_context(models, target_route.model_id)
         reusable_checkpoint_match = None
         # checkpoint_lookup_unavailable: set when the initial checkpoint lookup
         # failed because the DB was unavailable. We do NOT fail closed here:

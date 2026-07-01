@@ -5606,6 +5606,376 @@ async def test_summary_generation_strips_request_response_format_without_overrid
 
 
 @pytest.mark.asyncio
+async def test_summary_generation_applies_fallback_params_when_route_falls_back(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    captured = {}
+    checked_model_ids = []
+    fallback_model = {"id": "fallback-openai", "name": "Fallback", "owned_by": "openai", "openai": {}}
+    pipe_request.app.state.MODELS = {"fallback-openai": fallback_model}
+
+    async def resolve_core_chat_model_route(request, model_id):
+        assert model_id == "summary-preset"
+        return mod.CoreChatModelRoute(
+            model_id="fallback-openai",
+            fallback_model=fallback_model,
+            target_params={
+                "temperature": 0.2,
+                "max_tokens": 128,
+                "system": "drop this like Core fallback param handling",
+                "custom_params": {"provider_flag": "true"},
+            },
+        )
+
+    def apply_params_to_form_data(form_data, model):
+        params = copy.deepcopy(form_data.pop("params", {}) or {})
+        custom_params = params.pop("custom_params", {}) or {}
+        for key in (
+            "stream_response",
+            "stream_delta_chunk_size",
+            "function_calling",
+            "reasoning_tags",
+            "compact_token_threshold",
+            "system",
+        ):
+            params.pop(key, None)
+        params.update(custom_params)
+        form_data.update({key: value for key, value in params.items() if value is not None})
+        return form_data
+
+    async def model_dict_from_request(request):
+        return dict(pipe_request.app.state.MODELS)
+
+    async def check_model_access(user, model, db=None):
+        checked_model_ids.append(model["id"])
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["form_body"] = copy.deepcopy(form_data)
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.apply_params_to_form_data = apply_params_to_form_data
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="summary-preset",
+        source_messages=[{"role": "user", "content": "old"}],
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+            "params": {"temperature": 0.4, "top_p": 0.7},
+        },
+    )
+
+    assert result == "summary"
+    assert checked_model_ids == ["fallback-openai"]
+    assert captured["form_body"]["model"] == "fallback-openai"
+    assert captured["form_body"]["temperature"] == 0.4
+    assert captured["form_body"]["top_p"] == 0.7
+    assert captured["form_body"]["max_tokens"] == 128
+    assert captured["form_body"]["provider_flag"] == "true"
+    assert "params" not in captured["form_body"]
+    assert "system" not in captured["form_body"]
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_checks_access_for_non_arena_fallback_model(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    fallback_model = {"id": "fallback-openai", "name": "Fallback", "owned_by": "openai", "openai": {}}
+    pipe_request.app.state.MODELS = {"fallback-openai": fallback_model}
+    checked_model_ids = []
+
+    async def resolve_core_chat_model_route(request, model_id):
+        assert model_id == "summary-preset"
+        return mod.CoreChatModelRoute(
+            model_id="fallback-openai",
+            fallback_model=fallback_model,
+            target_params=None,
+        )
+
+    async def model_dict_from_request(request):
+        return dict(pipe_request.app.state.MODELS)
+
+    async def check_model_access(user, model, db=None):
+        checked_model_ids.append(model["id"])
+        if model["id"] == "fallback-openai":
+            raise HTTPException(status_code=403, detail="Model not found")
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        raise AssertionError("fallback model access denial must stop before summary generation")
+
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+
+    with pytest.raises(HTTPException):
+        await mod._generate_summary_text(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={"chat_id": "chat-1"},
+            summary_model_id="summary-preset",
+            source_messages=[{"role": "user", "content": "old"}],
+            base_body={
+                "model": "target",
+                "stream": True,
+                "messages": [{"role": "user", "content": "old"}],
+            },
+        )
+
+    assert checked_model_ids == ["fallback-openai"]
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_resolves_arena_fallback_before_params(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    captured = {}
+    fallback_arena = {
+        "id": "fallback-arena",
+        "name": "Fallback Arena",
+        "owned_by": "arena",
+        "arena": True,
+        "info": {"meta": {"model_ids": ["arena-selected-ollama"]}},
+    }
+    selected_model = {
+        "id": "arena-selected-ollama",
+        "name": "Arena Selected Ollama",
+        "owned_by": "ollama",
+        "ollama": {},
+    }
+    pipe_request.app.state.MODELS = {
+        "fallback-arena": fallback_arena,
+        "arena-selected-ollama": selected_model,
+    }
+
+    async def resolve_core_chat_model_route(request, model_id):
+        assert model_id == "summary-preset"
+        return mod.CoreChatModelRoute(
+            model_id="fallback-arena",
+            fallback_model=fallback_arena,
+            target_params={
+                "temperature": 0.2,
+                "max_tokens": 128,
+                "custom_params": {"provider_flag": "true"},
+            },
+        )
+
+    async def model_dict_from_request(request):
+        return dict(pipe_request.app.state.MODELS)
+
+    def apply_params_to_form_data(form_data, model):
+        params = copy.deepcopy(form_data.pop("params", {}) or {})
+        custom_params = params.pop("custom_params", {}) or {}
+        params.update(custom_params)
+        if params.get("max_tokens") is not None:
+            params["num_predict"] = params.pop("max_tokens")
+        if model.get("owned_by") == "ollama":
+            form_data["options"] = params
+        else:
+            form_data.update({key: value for key, value in params.items() if value is not None})
+        return form_data
+
+    async def check_model_access(user, model, db=None):
+        captured.setdefault("checked_models", []).append(model["id"])
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["form_body"] = copy.deepcopy(form_data)
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.apply_params_to_form_data = apply_params_to_form_data
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="summary-preset",
+        source_messages=[{"role": "user", "content": "old"}],
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+            "params": {"temperature": 0.4, "num_predict": 99},
+        },
+    )
+
+    assert result == "summary"
+    assert captured["checked_models"] == ["arena-selected-ollama"]
+    assert captured["form_body"]["model"] == "arena-selected-ollama"
+    assert captured["form_body"]["metadata"]["selected_model_id"] == "arena-selected-ollama"
+    assert captured["form_body"]["options"]["temperature"] == 0.4
+    assert captured["form_body"]["options"]["num_predict"] == 99
+    assert captured["form_body"]["options"]["provider_flag"] == "true"
+    assert "params" not in captured["form_body"]
+    assert "max_tokens" not in captured["form_body"]["options"]
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_checks_access_for_selected_arena_fallback_model(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    fallback_arena = {
+        "id": "fallback-arena",
+        "name": "Fallback Arena",
+        "owned_by": "arena",
+        "arena": True,
+        "info": {"meta": {"model_ids": ["arena-selected"]}},
+    }
+    selected_model = {
+        "id": "arena-selected",
+        "name": "Arena Selected",
+        "owned_by": "openai",
+        "openai": {},
+    }
+    pipe_request.app.state.MODELS = {
+        "fallback-arena": fallback_arena,
+        "arena-selected": selected_model,
+    }
+    checked_model_ids = []
+
+    async def resolve_core_chat_model_route(request, model_id):
+        assert model_id == "summary-preset"
+        return mod.CoreChatModelRoute(
+            model_id="fallback-arena",
+            fallback_model=fallback_arena,
+            target_params=None,
+        )
+
+    async def model_dict_from_request(request):
+        return dict(pipe_request.app.state.MODELS)
+
+    async def check_model_access(user, model, db=None):
+        checked_model_ids.append(model["id"])
+        if model["id"] == "fallback-arena":
+            raise AssertionError("arena wrapper access must not be checked after fallback selection")
+        if model["id"] == "arena-selected":
+            raise HTTPException(status_code=403, detail="Model not found")
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        raise AssertionError("selected arena model access denial must stop before summary generation")
+
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+
+    with pytest.raises(HTTPException):
+        await mod._generate_summary_text(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={"chat_id": "chat-1"},
+            summary_model_id="summary-preset",
+            source_messages=[{"role": "user", "content": "old"}],
+            base_body={
+                "model": "target",
+                "stream": True,
+                "messages": [{"role": "user", "content": "old"}],
+            },
+        )
+
+    assert checked_model_ids == ["arena-selected"]
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_rejects_stale_arena_fallback_candidate_before_forwarding(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    fallback_arena = {
+        "id": "fallback-arena",
+        "name": "Fallback Arena",
+        "owned_by": "arena",
+        "arena": True,
+        "info": {"meta": {"model_ids": ["stale-id", "arena-selected"]}},
+    }
+    selected_model = {
+        "id": "arena-selected",
+        "name": "Arena Selected",
+        "owned_by": "openai",
+        "openai": {},
+    }
+    pipe_request.app.state.MODELS = {
+        "fallback-arena": fallback_arena,
+        "arena-selected": selected_model,
+    }
+
+    async def resolve_core_chat_model_route(request, model_id):
+        assert model_id == "summary-preset"
+        return mod.CoreChatModelRoute(
+            model_id="fallback-arena",
+            fallback_model=fallback_arena,
+            target_params=None,
+        )
+
+    async def model_dict_from_request(request):
+        return dict(pipe_request.app.state.MODELS)
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        raise AssertionError("stale arena fallback candidate must stop before summary generation")
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod.random, "choice", lambda items: "stale-id")
+
+    with pytest.raises(HTTPException):
+        await mod._generate_summary_text(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={"chat_id": "chat-1"},
+            summary_model_id="summary-preset",
+            source_messages=[{"role": "user", "content": "old"}],
+            base_body={
+                "model": "target",
+                "stream": True,
+                "messages": [{"role": "user", "content": "old"}],
+            },
+        )
+
+
+@pytest.mark.asyncio
 async def test_summary_generation_strips_inherited_response_limits_and_stop(
     monkeypatch,
     pipe_request,
@@ -5716,6 +6086,7 @@ async def test_summary_generation_uses_core_fallback_default_for_custom_model_mi
     pipe_user,
 ):
     captured = {}
+    checked_model_ids = []
     pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-summary")
     pipe_request.app.state.MODELS = {
         "summary-preset": {
@@ -5738,14 +6109,20 @@ async def test_summary_generation_uses_core_fallback_default_for_custom_model_mi
         captured["base_model_id"] = getattr(request, "base_model_id", None)
         return {"choices": [{"message": {"content": "summary"}}]}
 
+    async def check_model_access(user, model, db=None):
+        checked_model_ids.append(model["id"])
+
     env_module = types.ModuleType("open_webui.env")
     env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
     models_module = types.ModuleType("open_webui.models.models")
     models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
     chat_module = types.ModuleType("open_webui.utils.chat")
     chat_module.generate_chat_completion = generate_chat_completion
     monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
 
     result = await mod._generate_summary_text(
@@ -5758,6 +6135,7 @@ async def test_summary_generation_uses_core_fallback_default_for_custom_model_mi
     )
 
     assert result == "summary"
+    assert checked_model_ids == ["fallback-summary"]
     assert captured == {"model": "fallback-summary", "base_model_id": None}
 
 
@@ -7696,6 +8074,7 @@ async def test_pipe_passes_through_official_context_compaction_task(
     }
     pipe = mod.Pipe()
     pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.summary_model = "missing-summary"
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -8089,6 +8468,1185 @@ async def test_pipe_applies_target_params_when_missing_base_uses_custom_model_fa
     assert "params" not in captured["forward_body"]
     assert "system" not in captured["forward_body"]
     assert captured["forward_body"]["messages"] == [{"role": "user", "content": "hello"}]
+
+
+@pytest.mark.asyncio
+async def test_pipe_applies_request_params_when_missing_base_fallback_has_no_target_params(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {"base_model_id": "stale-openai"},
+    }
+    fallback_model = {"id": "fallback-ollama", "name": "Fallback", "owned_by": "ollama", "ollama": {}}
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-ollama")
+    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-ollama": fallback_model}
+    captured = {}
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(
+                id="workspace-preset",
+                base_model_id="stale-openai",
+                params=None,
+            )
+
+    async def check_model_access(user, model, db=None):
+        return None
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    def apply_params_to_form_data(form_data, model):
+        params = copy.deepcopy(form_data.pop("params", {}) or {})
+        custom_params = params.pop("custom_params", {}) or {}
+        params.update(custom_params)
+        if model.get("owned_by") == "ollama":
+            form_data["options"] = params
+        else:
+            form_data.update({key: value for key, value in params.items() if value is not None})
+        return form_data
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["forward_body"] = copy.deepcopy(form_data)
+        return {
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "model": form_data["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.apply_params_to_form_data = apply_params_to_form_data
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+            "params": {"temperature": 0.33, "top_p": None, "presence_penalty": 0.1},
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert captured["forward_body"]["model"] == "fallback-ollama"
+    assert captured["forward_body"]["options"] == {
+        "temperature": 0.33,
+        "presence_penalty": 0.1,
+    }
+    assert "params" not in captured["forward_body"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_preserves_top_level_request_params_when_missing_base_uses_fallback_params(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
+    target_params = {
+        "temperature": 0.25,
+        "top_p": 0.8,
+        "max_tokens": 321,
+        "presence_penalty": 0.2,
+        "response_format": {"type": "text"},
+        "custom_params": {"vendor_flag": "target"},
+    }
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {"base_model_id": "stale-openai"},
+    }
+    fallback_model = {"id": "fallback-openai", "name": "Fallback", "owned_by": "openai", "openai": {}}
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-openai")
+    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-openai": fallback_model}
+    captured = {}
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(
+                id="workspace-preset",
+                base_model_id="stale-openai",
+                params=SimpleNamespace(**target_params),
+            )
+
+    async def check_model_access(user, model, db=None):
+        return None
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    def apply_params_to_form_data(form_data, model):
+        params = copy.deepcopy(form_data.pop("params", {}) or {})
+        custom_params = params.pop("custom_params", {}) or {}
+        params.update(custom_params)
+        form_data.update({key: value for key, value in params.items() if value is not None})
+        return form_data
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["forward_body"] = copy.deepcopy(form_data)
+        return {
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "model": form_data["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.apply_params_to_form_data = apply_params_to_form_data
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.9,
+            "top_p": 0.6,
+            "presence_penalty": 0.4,
+            "response_format": {"type": "json_object"},
+            "vendor_flag": "request",
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert captured["forward_body"]["model"] == "fallback-openai"
+    assert captured["forward_body"]["temperature"] == 0.9
+    assert captured["forward_body"]["top_p"] == 0.6
+    assert captured["forward_body"]["max_tokens"] == 321
+    assert captured["forward_body"]["presence_penalty"] == 0.4
+    assert captured["forward_body"]["response_format"] == {"type": "json_object"}
+    assert captured["forward_body"]["vendor_flag"] == "request"
+    assert "params" not in captured["forward_body"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_preserves_top_level_ollama_provider_params_when_missing_base_uses_fallback_params(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
+    target_params = {
+        "temperature": 0.25,
+        "max_tokens": 321,
+    }
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {"base_model_id": "stale-openai"},
+    }
+    fallback_model = {"id": "fallback-ollama", "name": "Fallback", "owned_by": "ollama", "ollama": {}}
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-ollama")
+    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-ollama": fallback_model}
+    captured = {}
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(
+                id="workspace-preset",
+                base_model_id="stale-openai",
+                params=SimpleNamespace(**target_params),
+            )
+
+    async def check_model_access(user, model, db=None):
+        return None
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    def apply_params_to_form_data(form_data, model):
+        params = copy.deepcopy(form_data.pop("params", {}) or {})
+        if params.get("max_tokens") is not None:
+            params["num_predict"] = params.pop("max_tokens")
+        if model.get("owned_by") == "ollama":
+            form_data["options"] = params
+        else:
+            form_data.update({key: value for key, value in params.items() if value is not None})
+        return form_data
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["forward_body"] = copy.deepcopy(form_data)
+        return {
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "model": form_data["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.apply_params_to_form_data = apply_params_to_form_data
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.9,
+            "num_predict": 99,
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert captured["forward_body"]["model"] == "fallback-ollama"
+    assert captured["forward_body"]["options"]["temperature"] == 0.9
+    assert captured["forward_body"]["options"]["num_predict"] == 99
+    assert "params" not in captured["forward_body"]
+
+
+def test_custom_model_fallback_params_drop_custom_max_tokens_when_ollama_num_predict_requested():
+    from open_webui.utils.payload import convert_payload_openai_to_ollama
+
+    patched = mod._apply_custom_model_fallback_params(
+        {
+            "model": "fallback-ollama",
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+            "num_predict": 99,
+        },
+        fallback_model={"id": "fallback-ollama", "owned_by": "ollama"},
+        target_params={
+            "temperature": 0.25,
+            "custom_params": {
+                "max_tokens": 321,
+            },
+        },
+    )
+
+    assert patched["options"]["num_predict"] == 99
+    assert "max_tokens" not in patched["options"]
+
+    converted = convert_payload_openai_to_ollama(patched)
+    assert converted["options"]["num_predict"] == 99
+    assert "max_tokens" not in converted["options"]
+
+
+def test_custom_model_fallback_params_drop_custom_max_tokens_when_ollama_params_num_predict_requested():
+    from open_webui.utils.payload import convert_payload_openai_to_ollama
+
+    patched = mod._apply_custom_model_fallback_params(
+        {
+            "model": "fallback-ollama",
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+            "params": {"num_predict": 99},
+        },
+        fallback_model={"id": "fallback-ollama", "owned_by": "ollama"},
+        target_params={
+            "custom_params": {
+                "max_tokens": 321,
+            },
+        },
+    )
+
+    assert patched["options"]["num_predict"] == 99
+    assert "max_tokens" not in patched["options"]
+
+    converted = convert_payload_openai_to_ollama(patched)
+    assert converted["options"]["num_predict"] == 99
+    assert "max_tokens" not in converted["options"]
+
+
+def test_custom_model_fallback_params_keep_ollama_response_format_at_root_for_convert():
+    from open_webui.utils.payload import convert_payload_openai_to_ollama
+
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Answer",
+            "schema": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+            },
+        },
+    }
+    patched = mod._apply_custom_model_fallback_params(
+        {
+            "model": "fallback-ollama",
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.9,
+            "response_format": response_format,
+        },
+        fallback_model={"id": "fallback-ollama", "owned_by": "ollama"},
+        target_params={
+            "temperature": 0.25,
+            "response_format": {"type": "text"},
+            "custom_params": {
+                "response_format": {"type": "json_object"},
+            },
+        },
+    )
+
+    assert patched["response_format"] == response_format
+    assert patched["options"]["temperature"] == 0.9
+    assert "response_format" not in patched["options"]
+
+    converted = convert_payload_openai_to_ollama(patched)
+    assert converted["format"] == response_format["json_schema"]["schema"]
+    assert "response_format" not in converted.get("options", {})
+
+
+@pytest.mark.asyncio
+async def test_pipe_preserves_top_level_ollama_provider_params_when_fallback_has_no_target_params(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {"base_model_id": "stale-openai"},
+    }
+    fallback_model = {"id": "fallback-ollama", "name": "Fallback", "owned_by": "ollama", "ollama": {}}
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-ollama")
+    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-ollama": fallback_model}
+    captured = {}
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(
+                id="workspace-preset",
+                base_model_id="stale-openai",
+                params=None,
+            )
+
+    async def check_model_access(user, model, db=None):
+        return None
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    def apply_params_to_form_data(form_data, model):
+        params = copy.deepcopy(form_data.pop("params", {}) or {})
+        if model.get("owned_by") == "ollama":
+            form_data["options"] = params
+        else:
+            form_data.update({key: value for key, value in params.items() if value is not None})
+        return form_data
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["forward_body"] = copy.deepcopy(form_data)
+        return {
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "model": form_data["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.apply_params_to_form_data = apply_params_to_form_data
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.9,
+            "top_p": 0.7,
+            "presence_penalty": 0.2,
+            "num_predict": 99,
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert captured["forward_body"]["model"] == "fallback-ollama"
+    assert captured["forward_body"]["options"] == {
+        "temperature": 0.9,
+        "top_p": 0.7,
+        "presence_penalty": 0.2,
+        "num_predict": 99,
+    }
+    assert "params" not in captured["forward_body"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_preserves_existing_ollama_options_when_missing_base_uses_fallback_params(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
+    target_params = {
+        "temperature": 0.25,
+        "max_tokens": 321,
+    }
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {"base_model_id": "stale-openai"},
+    }
+    fallback_model = {"id": "fallback-ollama", "name": "Fallback", "owned_by": "ollama", "ollama": {}}
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-ollama")
+    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-ollama": fallback_model}
+    captured = {}
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(
+                id="workspace-preset",
+                base_model_id="stale-openai",
+                params=SimpleNamespace(**target_params),
+            )
+
+    async def check_model_access(user, model, db=None):
+        return None
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    def apply_params_to_form_data(form_data, model):
+        params = copy.deepcopy(form_data.pop("params", {}) or {})
+        if params.get("max_tokens") is not None:
+            params["num_predict"] = params.pop("max_tokens")
+        if model.get("owned_by") == "ollama":
+            form_data["options"] = params
+        else:
+            form_data.update({key: value for key, value in params.items() if value is not None})
+        return form_data
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["forward_body"] = copy.deepcopy(form_data)
+        return {
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "model": form_data["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.apply_params_to_form_data = apply_params_to_form_data
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {"temperature": 0.9, "num_predict": 99},
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert captured["forward_body"]["model"] == "fallback-ollama"
+    assert captured["forward_body"]["options"] == {"temperature": 0.9, "num_predict": 99}
+    assert "params" not in captured["forward_body"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target_file_context", "fallback_file_context", "expected_injections"),
+    [
+        (False, True, 1),
+        (True, False, 0),
+    ],
+)
+async def test_pipe_uses_fallback_model_file_context_capability_after_missing_base_fallback(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+    target_file_context,
+    fallback_file_context,
+    expected_injections,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
+    file_item = {"id": "file-1", "type": "file", "name": "file-1.txt"}
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {
+            "base_model_id": "stale-openai",
+            "meta": {"capabilities": {"file_context": target_file_context}},
+        },
+    }
+    fallback_model = {
+        "id": "fallback-openai",
+        "name": "Fallback",
+        "owned_by": "openai",
+        "openai": {},
+        "info": {"meta": {"capabilities": {"file_context": fallback_file_context}}},
+    }
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-openai")
+    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-openai": fallback_model}
+    captured = {"injections": 0}
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(
+                id="workspace-preset",
+                base_model_id="stale-openai",
+                params=None,
+            )
+
+    async def check_model_access(user, model, db=None):
+        return None
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def inject_target_file_context(**kwargs):
+        captured["injections"] += 1
+        assert kwargs["file_context_enabled"] is True
+        return kwargs["body"]
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        return {
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "model": kwargs["body"]["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__={
+            **pipe_metadata,
+            "files": [file_item],
+            "user_message": {"files": [file_item]},
+        },
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert captured["forward_body"]["model"] == "fallback-openai"
+    assert captured["injections"] == expected_injections
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selected_file_context", "expected_injections"),
+    [
+        (False, 0),
+        (True, 1),
+    ],
+)
+async def test_pipe_resolves_arena_fallback_before_file_context_capability_check(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+    selected_file_context,
+    expected_injections,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
+    file_item = {"id": "file-1", "type": "file", "name": "file-1.txt"}
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {
+            "base_model_id": "stale-openai",
+            "meta": {"capabilities": {"file_context": True}},
+        },
+    }
+    fallback_arena = {
+        "id": "fallback-arena",
+        "name": "Fallback Arena",
+        "owned_by": "arena",
+        "arena": True,
+        "info": {"meta": {"model_ids": ["arena-selected"]}},
+    }
+    selected_model = {
+        "id": "arena-selected",
+        "name": "Arena Selected",
+        "owned_by": "openai",
+        "openai": {},
+        "info": {"meta": {"capabilities": {"file_context": selected_file_context}}},
+    }
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-arena")
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-arena": fallback_arena,
+        "arena-selected": selected_model,
+    }
+    captured = {"injections": 0}
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(
+                id="workspace-preset",
+                base_model_id="stale-openai",
+                params=None,
+            )
+
+    async def check_model_access(user, model, db=None):
+        return None
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def inject_target_file_context(**kwargs):
+        captured["injections"] += 1
+        assert kwargs["file_context_enabled"] is True
+        return kwargs["body"]
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        return {
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "model": kwargs["body"]["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__={
+            **pipe_metadata,
+            "files": [file_item],
+            "user_message": {"files": [file_item]},
+        },
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert captured["forward_body"]["model"] == "arena-selected"
+    assert captured["forward_body"]["metadata"]["selected_model_id"] == "arena-selected"
+    assert captured["injections"] == expected_injections
+
+
+@pytest.mark.asyncio
+async def test_pipe_checks_access_for_selected_arena_fallback_model(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {"base_model_id": "stale-openai"},
+    }
+    fallback_arena = {
+        "id": "fallback-arena",
+        "name": "Fallback Arena",
+        "owned_by": "arena",
+        "arena": True,
+        "info": {"meta": {"model_ids": ["arena-selected"]}},
+    }
+    selected_model = {
+        "id": "arena-selected",
+        "name": "Arena Selected",
+        "owned_by": "openai",
+        "openai": {},
+    }
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-arena")
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-arena": fallback_arena,
+        "arena-selected": selected_model,
+    }
+    checked_model_ids = []
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(
+                id="workspace-preset",
+                base_model_id="stale-openai",
+                params=None,
+            )
+
+    async def check_model_access(user, model, db=None):
+        checked_model_ids.append(model["id"])
+        if model["id"] == "arena-selected":
+            raise HTTPException(status_code=403, detail="Model not found")
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def inject_target_file_context(**kwargs):
+        raise AssertionError("selected arena model access denial must stop before file-context injection")
+
+    async def forward_target(**kwargs):
+        raise AssertionError("selected arena model access denial must stop before forwarding")
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["error"]["code"] == "model_access_denied"
+    assert checked_model_ids == ["workspace-preset", "arena-selected"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_rejects_stale_arena_fallback_candidate_before_forwarding(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {"base_model_id": "stale-openai"},
+    }
+    fallback_arena = {
+        "id": "fallback-arena",
+        "name": "Fallback Arena",
+        "owned_by": "arena",
+        "arena": True,
+        "info": {"meta": {"model_ids": ["stale-id", "arena-selected"]}},
+    }
+    selected_model = {
+        "id": "arena-selected",
+        "name": "Arena Selected",
+        "owned_by": "openai",
+        "openai": {},
+    }
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-arena")
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-arena": fallback_arena,
+        "arena-selected": selected_model,
+    }
+    checked_model_ids = []
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(
+                id="workspace-preset",
+                base_model_id="stale-openai",
+                params=None,
+            )
+
+    async def check_model_access(user, model, db=None):
+        checked_model_ids.append(model["id"])
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def inject_target_file_context(**kwargs):
+        raise AssertionError("stale arena fallback candidate must stop before file-context injection")
+
+    async def forward_target(**kwargs):
+        raise AssertionError("stale arena fallback candidate must stop before forwarding")
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod.random, "choice", lambda items: "stale-id")
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["error"]["code"] == "model_access_denied"
+    assert checked_model_ids == ["workspace-preset"]
+
+
+@pytest.mark.asyncio
+async def test_pipe_rejects_nested_arena_fallback_candidate_before_forwarding(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
+    target_model = {
+        "id": "workspace-preset",
+        "name": "Workspace Preset",
+        "owned_by": "openai",
+        "preset": True,
+        "info": {"base_model_id": "stale-openai"},
+    }
+    fallback_arena = {
+        "id": "fallback-arena",
+        "name": "Fallback Arena",
+        "owned_by": "arena",
+        "arena": True,
+        "info": {"meta": {"model_ids": ["nested-arena"]}},
+    }
+    nested_arena = {
+        "id": "nested-arena",
+        "name": "Nested Arena",
+        "owned_by": "arena",
+        "arena": True,
+        "info": {"meta": {"model_ids": ["private-model"]}},
+    }
+    private_model = {
+        "id": "private-model",
+        "name": "Private Model",
+        "owned_by": "openai",
+        "openai": {},
+    }
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-arena")
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-arena": fallback_arena,
+        "nested-arena": nested_arena,
+        "private-model": private_model,
+    }
+    checked_model_ids = []
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(
+                id="workspace-preset",
+                base_model_id="stale-openai",
+                params=None,
+            )
+
+    async def check_model_access(user, model, db=None):
+        checked_model_ids.append(model["id"])
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def inject_target_file_context(**kwargs):
+        raise AssertionError("nested arena fallback candidate must stop before file-context injection")
+
+    async def forward_target(**kwargs):
+        raise AssertionError("nested arena fallback candidate must stop before forwarding")
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    utils_models_module = types.ModuleType("open_webui.utils.models")
+    utils_models_module.check_model_access = check_model_access
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["error"]["code"] == "model_access_denied"
+    assert checked_model_ids == ["workspace-preset"]
 
 
 @pytest.mark.asyncio
