@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.16
+version: 0.5.17
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -587,7 +587,6 @@ _PREFIX_FILE_ATTACHMENT_IDENTITY_KEYS = {
     "revision",
     "sha256",
     "type",
-    "updated_at",
     "version",
 }
 _PREFIX_EMBEDDED_FILE_IDENTITY_KEYS = {
@@ -608,10 +607,9 @@ _PREFIX_EMBEDDED_FILE_IDENTITY_KEYS = {
     "revision",
     "sha256",
     "type",
-    "updated_at",
     "version",
 }
-_PREFIX_FILE_METADATA_TRANSIENT_KEYS = _FILE_METADATA_TRANSIENT_KEYS - {"updated_at"}
+_PREFIX_FILE_METADATA_TRANSIENT_KEYS = _FILE_METADATA_TRANSIENT_KEYS
 _PREFIX_FILE_METADATA_BODY_KEYS = {
     "body",
     "content",
