@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.13
+version: 0.5.14
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -9077,15 +9077,21 @@ class Pipe:
             initial_provider_caches,
             pending_provider_cache_attrs,
         ):
-            model_candidates = await _wait_for_provider_model_caches(
-                state,
-                initial_provider_caches=initial_provider_caches,
-                provider_cache_attrs=provider_cache_attrs,
-                disabled_provider_attrs=disabled_provider_attrs,
-            )
+            try:
+                model_candidates = await _wait_for_provider_model_caches(
+                    state,
+                    initial_provider_caches=initial_provider_caches,
+                    provider_cache_attrs=provider_cache_attrs,
+                    disabled_provider_attrs=disabled_provider_attrs,
+                )
+            except Exception:
+                LOG.exception("Failed to wait for provider model caches during AutoCompact pipe listing")
         targets = filter_target_models(model_candidates, self.valves, pipe_function_id=pipe_function_id)
         update_latest_models_cache(model_candidates)
-        await sync_wrapper_model_records(pipe_function_id=pipe_function_id, target_models=targets, valves=self.valves)
+        try:
+            await sync_wrapper_model_records(pipe_function_id=pipe_function_id, target_models=targets, valves=self.valves)
+        except Exception:
+            LOG.exception("Failed to sync AutoCompact wrapper model records")
 
         entries: list[dict[str, str]] = []
         hide_wrapped_target_models = bool(getattr(self.valves, "hide_wrapped_target_models", False))

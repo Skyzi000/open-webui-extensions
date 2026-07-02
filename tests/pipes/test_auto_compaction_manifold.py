@@ -1018,6 +1018,25 @@ async def test_pipes_uses_runtime_registered_id_for_filtering_and_sync(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_pipes_returns_entries_when_wrapper_record_sync_fails(monkeypatch):
+    async def sync_wrapper_model_records(**kwargs):
+        raise RuntimeError("db unavailable")
+
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(
+        state=SimpleNamespace(
+            MODELS={"target": {"id": "target", "name": "Target"}},
+        )
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+
+    result = await mod.Pipe().pipes()
+
+    assert result == [{"id": "target", "name": "Target (AutoCompact)"}]
+
+
+@pytest.mark.asyncio
 async def test_pipes_does_not_direct_fetch_provider_models_when_state_caches_remain_empty(monkeypatch):
     install_unavailable_open_webui_config(monkeypatch)
     captured = {}
@@ -1634,6 +1653,37 @@ async def test_pipes_waits_until_core_model_list_timeout_for_sibling_provider_ca
     assert sleep_calls == 25
     assert captured["target_ids"] == ["slow-target"]
     assert result == [{"id": "slow-target", "name": "Slow Target (AutoCompact)"}]
+
+
+@pytest.mark.asyncio
+async def test_pipes_keeps_current_cache_when_provider_cache_wait_fails(monkeypatch):
+    install_unavailable_open_webui_config(monkeypatch)
+    captured = {}
+
+    async def sync_wrapper_model_records(**kwargs):
+        captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
+
+    async def wait_for_provider_model_caches(*args, **kwargs):
+        raise RuntimeError("provider wait failed")
+
+    state = SimpleNamespace(
+        MODELS={"cached-target": {"id": "cached-target", "name": "Cached Target"}},
+        BASE_MODELS=[],
+        OPENAI_MODELS={},
+        OLLAMA_MODELS={},
+        config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=False),
+    )
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(state=state)
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+    monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
+    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+    monkeypatch.setattr(mod, "_wait_for_provider_model_caches", wait_for_provider_model_caches)
+
+    result = await mod.Pipe().pipes()
+
+    assert captured["target_ids"] == ["cached-target"]
+    assert result == [{"id": "cached-target", "name": "Cached Target (AutoCompact)"}]
 
 
 @pytest.mark.asyncio
