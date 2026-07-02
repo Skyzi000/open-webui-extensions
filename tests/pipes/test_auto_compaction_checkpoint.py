@@ -34,6 +34,34 @@ def test_source_hash_is_deterministic_for_equivalent_canonical_payloads():
     assert mod.compute_source_hash(left) == mod.compute_source_hash(right)
 
 
+def test_source_hash_ignores_provider_prompt_cache_hints():
+    stable = [
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": [{"type": "text", "text": "nested result"}],
+                },
+            ],
+        },
+    ]
+    with_cache_hint = copy.deepcopy(stable)
+    with_cache_hint[0]["content"][0]["cache_control"] = {"type": "ephemeral"}
+    with_cache_hint[1]["content"][0]["cache_control"] = {"type": "ephemeral"}
+    with_cache_hint[1]["content"][0]["cacheControl"] = {"type": "ephemeral"}
+    with_cache_hint[1]["content"][1]["cache_control"] = {"type": "ephemeral"}
+    with_cache_hint[1]["content"][1]["content"][0]["cache_control"] = {"type": "ephemeral"}
+    changed_text = copy.deepcopy(stable)
+    changed_text[1]["content"][1]["content"][0]["text"] = "changed result"
+
+    assert mod.compute_source_hash(stable) == mod.compute_source_hash(with_cache_hint)
+    assert mod.compute_source_hash(stable) != mod.compute_source_hash(changed_text)
+
+
 def test_source_hash_ignores_core_file_upload_transients():
     stable = {
         "role": "user",

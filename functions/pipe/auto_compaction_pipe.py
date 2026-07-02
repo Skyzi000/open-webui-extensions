@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.14
+version: 0.5.15
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -566,6 +566,10 @@ _FILE_METADATA_TRANSIENT_KEYS = {
 _TRANSIENT_SOURCE_KEYS = {
     "distances",
 }
+_PROVIDER_PROMPT_CACHE_HINT_KEYS = {
+    "cache_control",
+    "cacheControl",
+}
 _PREFIX_FILE_ATTACHMENT_IDENTITY_KEYS = {
     "checksum",
     "collection_name",
@@ -750,8 +754,12 @@ def _canonicalize_content_part(value: Any) -> Any:
         out: dict[str, Any] = {}
         is_file_part = _is_file_content_part(value)
         for key in sorted(value.keys()):
+            if key in _PROVIDER_PROMPT_CACHE_HINT_KEYS:
+                continue
             if is_file_part and key == "file":
                 item = _canonicalize_embedded_file_value(value[key])
+            elif key == "content" and isinstance(value[key], list):
+                item = _canonicalize_content_value(value[key])
             else:
                 item = _canonicalize_general_value(value[key])
             if _is_empty_canonical_value(item):
@@ -799,6 +807,31 @@ def _canonicalize_sources_value(value: Any) -> Any:
                 out.append(canonical_item)
         return out
     return _canonicalize_source_value(value, source_root=True)
+
+
+def _canonicalize_tool_definition_for_token_extra(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key in _PROVIDER_PROMPT_CACHE_HINT_KEYS:
+                continue
+            item = _canonicalize_general_value(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    return _canonicalize_general_value(value)
+
+
+def _canonicalize_tools_for_token_extra(value: Any) -> Any:
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            canonical_item = _canonicalize_tool_definition_for_token_extra(item)
+            if not _is_empty_canonical_value(canonical_item):
+                out.append(canonical_item)
+        return out
+    return _canonicalize_tool_definition_for_token_extra(value)
 
 
 def _canonicalize_message_value(key: str, value: Any) -> Any:
@@ -1331,7 +1364,10 @@ def _body_token_extra_payload(body: dict[str, Any]) -> dict[str, Any]:
     for key in BODY_TOKEN_EXTRA_KEYS:
         if key not in body:
             continue
-        value = _canonicalize_general_value(body.get(key))
+        if key == "tools":
+            value = _canonicalize_tools_for_token_extra(body.get(key))
+        else:
+            value = _canonicalize_general_value(body.get(key))
         if _is_empty_canonical_value(value):
             continue
         extra[key] = value

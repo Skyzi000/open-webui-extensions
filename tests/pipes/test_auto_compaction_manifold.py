@@ -1924,6 +1924,30 @@ def test_body_token_estimate_includes_provider_visible_tool_payload():
     assert body_total > message_only
 
 
+def test_body_token_estimate_ignores_provider_prompt_cache_hints_on_tools():
+    class LengthEncoder:
+        def encode(self, text, **kwargs):
+            return [0] * len(text)
+
+    body = {
+        "messages": [{"role": "user", "content": "short"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ],
+    }
+    with_cache_hint = copy.deepcopy(body)
+    with_cache_hint["tools"][0]["cache_control"] = {"type": "ephemeral"}
+
+    assert mod.estimate_body_tokens(body, encoder=LengthEncoder(), encoding_name="unit-test") == mod.estimate_body_tokens(
+        with_cache_hint,
+        encoder=LengthEncoder(),
+        encoding_name="unit-test",
+    )
+
+
 @pytest.mark.asyncio
 async def test_token_estimator_uses_db_config_tiktoken_encoding_before_legacy(monkeypatch, pipe_request):
     captured = []
