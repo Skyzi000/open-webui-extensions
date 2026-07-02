@@ -1028,6 +1028,52 @@ async def test_lost_claim_falls_back_to_ready_row_from_other_worker(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_lookup_ready_checkpoint_uses_file_backed_image_identity(monkeypatch):
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image]}]
+    source_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ],
+        }
+    ]
+    expected_hash = mod.compute_summary_source_hash(
+        source_messages,
+        file_backed_image_db_chain=db_chain,
+    )
+    captured = {}
+
+    class ReadyStore:
+        async def lookup_ready(self, **kwargs):
+            captured.update(kwargs)
+            return {"summary_text": "ready"}
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ReadyStore())
+
+    checkpoint = await mod._lookup_ready_checkpoint_for_source(
+        request=SimpleNamespace(),
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        file_backed_image_db_chain=db_chain,
+    )
+
+    assert checkpoint == {"summary_text": "ready"}
+    assert captured["source_hash"] == expected_hash
+
+
+@pytest.mark.asyncio
 async def test_lost_claim_without_ready_row_surfaces_error(monkeypatch):
     source_messages = [{"role": "user", "content": "old"}]
 
@@ -1581,6 +1627,401 @@ def test_stable_file_fingerprint_ignores_file_bodies_and_docs():
     changed_body[0]["file"]["metadata"]["data"]["content"] = "metadata embedded body B"
 
     assert mod._stable_file_fingerprint(stable) == mod._stable_file_fingerprint(changed_body)
+
+
+def test_source_hash_stabilizes_db_file_backed_image_urls():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image]}]
+    with_url = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "https://files.example/photo.png"}},
+            ],
+        }
+    ]
+    with_base64 = copy.deepcopy(with_url)
+    with_base64[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,abc"
+    different_image = copy.deepcopy(db_chain)
+    different_image[0]["files"][0]["file"]["hash"] = "def"
+
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) == mod.compute_summary_source_hash(with_base64, file_backed_image_db_chain=db_chain)
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) != mod.compute_summary_source_hash(with_url, file_backed_image_db_chain=different_image)
+    assert mod.compute_summary_source_hash(with_url) != mod.compute_summary_source_hash(with_base64)
+
+
+def test_source_hash_ignores_db_image_files_without_urls():
+    image_without_url = {
+        "id": "image-0",
+        "type": "image",
+        "name": "missing-url.png",
+        "file": {"id": "image-0", "hash": "missing-url"},
+    }
+    injected_image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image_without_url, injected_image]}]
+    with_url = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "https://files.example/photo.png"}},
+            ],
+        }
+    ]
+    with_base64 = copy.deepcopy(with_url)
+    with_base64[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,abc"
+
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) == mod.compute_summary_source_hash(with_base64, file_backed_image_db_chain=db_chain)
+
+
+def test_source_hash_keeps_unstable_db_images_distinct():
+    for first_image, second_image in (
+        (
+            {"type": "image", "url": "https://files.example/a.png"},
+            {"type": "image", "url": "https://files.example/b.png"},
+        ),
+        (
+            {"type": "image", "name": "screenshot.png", "url": "https://files.example/a.png"},
+            {"type": "image", "name": "screenshot.png", "url": "https://files.example/b.png"},
+        ),
+    ):
+        first_chain = [{"role": "user", "content": "describe", "files": [first_image]}]
+        second_chain = [{"role": "user", "content": "describe", "files": [second_image]}]
+        first_message = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aaa"}},
+                ],
+            }
+        ]
+        second_message = copy.deepcopy(first_message)
+        second_message[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,bbb"
+
+        assert mod.compute_summary_source_hash(
+            first_message,
+            file_backed_image_db_chain=first_chain,
+        ) != mod.compute_summary_source_hash(second_message, file_backed_image_db_chain=second_chain)
+
+
+def test_source_hash_does_not_relabel_existing_multimodal_image_parts():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [
+        {
+            "role": "user",
+            "files": [image],
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "https://external.example/other.png"}},
+            ],
+        }
+    ]
+    with_url = copy.deepcopy(db_chain)
+    with_url[0].pop("files")
+    with_base64 = copy.deepcopy(with_url)
+    with_base64[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,abc"
+
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) != mod.compute_summary_source_hash(with_base64, file_backed_image_db_chain=db_chain)
+
+
+def test_source_hash_does_not_relabel_non_user_image_files():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "assistant", "content": "rendered image", "files": [image]}]
+    with_url = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "rendered image"},
+                {"type": "image_url", "image_url": {"url": "https://files.example/photo.png"}},
+            ],
+        }
+    ]
+    with_base64 = copy.deepcopy(with_url)
+    with_base64[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,abc"
+
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) != mod.compute_summary_source_hash(with_base64, file_backed_image_db_chain=db_chain)
+
+
+def test_source_hash_does_not_relabel_non_user_source_image_parts():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "rendered image", "files": [image]}]
+    with_url = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "rendered image"},
+                {"type": "image_url", "image_url": {"url": "https://files.example/photo.png"}},
+            ],
+        }
+    ]
+    with_base64 = copy.deepcopy(with_url)
+    with_base64[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,abc"
+
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) != mod.compute_summary_source_hash(with_base64, file_backed_image_db_chain=db_chain)
+
+
+def test_longest_matching_checkpoint_uses_file_backed_image_identity():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image]}]
+    with_base64 = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ],
+        }
+    ]
+    row = {
+        "state": "ready",
+        "source_message_count": 1,
+        "source_hash": mod.compute_summary_source_hash(
+            with_base64,
+            file_backed_image_db_chain=db_chain,
+        ),
+    }
+
+    def resolver(count):
+        return None
+
+    setattr(resolver, mod.PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR, db_chain)
+
+    assert mod.select_longest_matching_checkpoint(
+        [row],
+        with_base64,
+        prefix_file_fingerprint_resolver=resolver,
+    ) == row
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_resolver_keeps_db_chain_without_metadata_files(monkeypatch):
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image]}]
+
+    async def load_chain(request, chat_id, current_message_id):
+        return db_chain
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        SimpleNamespace(state=SimpleNamespace()),
+        {"chat_id": "chat-1", "user_message_id": "msg-1"},
+        source_messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            }
+        ],
+    )
+
+    assert resolver is not None
+    assert resolver(1) is None
+    assert mod._prefix_file_fingerprint_resolver_db_chain(resolver) == db_chain
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_resolver_skips_db_chain_for_text_without_metadata_files(monkeypatch):
+    calls = []
+
+    async def load_chain(request, chat_id, current_message_id):
+        calls.append((chat_id, current_message_id))
+        return [{"role": "user", "content": "hello"}]
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        SimpleNamespace(state=SimpleNamespace()),
+        {"chat_id": "chat-1", "user_message_id": "msg-1"},
+        source_messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert resolver is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_resolver_skips_db_chain_for_text_with_empty_metadata_files(monkeypatch):
+    calls = []
+
+    async def load_chain(request, chat_id, current_message_id):
+        calls.append((chat_id, current_message_id))
+        return [{"role": "user", "content": "hello"}]
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        SimpleNamespace(state=SimpleNamespace()),
+        {"chat_id": "chat-1", "user_message_id": "msg-1", "files": []},
+        source_messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert resolver is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_resolver_skips_db_chain_for_assistant_image_without_metadata_files(monkeypatch):
+    calls = []
+
+    async def load_chain(request, chat_id, current_message_id):
+        calls.append((chat_id, current_message_id))
+        return [{"role": "assistant", "content": "image"}]
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        SimpleNamespace(state=SimpleNamespace()),
+        {"chat_id": "chat-1", "user_message_id": "msg-1"},
+        source_messages=[
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "image"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            }
+        ],
+    )
+
+    assert resolver is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_reusable_checkpoint_paths_skip_db_chain_for_tail_only_images_without_metadata_files(monkeypatch):
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "active"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,active"}},
+            ],
+        },
+    ]
+    prefix = messages[:2]
+    checkpoint = make_checkpoint_row(
+        prefix,
+        state="ready",
+        summary_text="old summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([checkpoint])
+    calls = []
+
+    async def load_chain(request, chat_id, current_message_id):
+        calls.append((chat_id, current_message_id))
+        return [{"role": "user", "content": "active"}]
+
+    async def estimate_body_tokens_async(body, *, request):
+        return 10
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
+
+    match = await mod._body_reusable_checkpoint_match(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1", "user_message_id": "msg-1"},
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+    )
+    assert match is not None
+
+    tokens = await mod._estimate_checkpoint_applied_body_tokens(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1", "user_message_id": "msg-1"},
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+        match=match,
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        file_context_enabled=False,
+    )
+    assert tokens is not None
+
+    compacted, did_compact, _prefix_count = await mod._compact_body_with_reusable_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1", "user_message_id": "msg-1"},
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+        match=match,
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+    )
+    assert did_compact is True
+    assert "old summary" in compacted["messages"][0]["content"]
+    assert calls == []
 
 
 def test_replace_prefix_accepts_parent_checkpoint_with_prefix_file_fingerprint():

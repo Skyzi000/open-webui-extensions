@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.17
+version: 0.5.18
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -141,6 +141,7 @@ AUTO_COMPACT_TIKTOKEN_ENCODING_STATE_KEY = "_auto_compact_tiktoken_encoding_name
 AUTO_COMPACT_TIKTOKEN_ENCODING_LOADED_STATE_KEY = "_auto_compact_tiktoken_encoding_loaded"
 PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY = "_auto_compact_prefix_file_fingerprint_resolver_cache"
 PREFIX_FILE_FINGERPRINT_FAMILY = "prefix-file-fingerprint-v1"
+PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR = "_auto_compact_db_chain"
 LOG = logging.getLogger(__name__)
 COMPACTION_SUMMARY_EMBED_MARKER = "<!--auto-compaction-summary-embed:v1-->"
 SUMMARY_PROMPT = (
@@ -609,6 +610,14 @@ _PREFIX_EMBEDDED_FILE_IDENTITY_KEYS = {
     "type",
     "version",
 }
+_FILE_IDENTITY_STABLE_DISCRIMINATOR_KEYS = {
+    "checksum",
+    "file_hash",
+    "file_id",
+    "hash",
+    "id",
+    "sha256",
+}
 _PREFIX_FILE_METADATA_TRANSIENT_KEYS = _FILE_METADATA_TRANSIENT_KEYS
 _PREFIX_FILE_METADATA_BODY_KEYS = {
     "body",
@@ -874,17 +883,19 @@ def compute_source_hash(messages: list[dict[str, Any]]) -> str:
 def compute_summary_source_hash(
     messages: list[dict[str, Any]],
     prefix_file_fingerprint: str | None = None,
+    file_backed_image_db_chain: list[dict[str, Any]] | None = None,
 ) -> str:
+    source_messages = _stable_file_backed_image_source_messages(messages, file_backed_image_db_chain)
     # When no prefix files were absorbed (or the DB chain could not be loaded)
     # the fingerprint is empty, so the identity intentionally collapses to the
     # canonical message hash. This keeps existing checkpoints reusable and
     # avoids a family bump.
     if not prefix_file_fingerprint:
-        return compute_source_hash(messages)
+        return compute_source_hash(source_messages)
     return _json_hash(
         {
             "family": SOURCE_HASH_FAMILY,
-            "messages": canonicalize_messages_for_source_hash(messages),
+            "messages": canonicalize_messages_for_source_hash(source_messages),
             "prefix_file_fingerprint": prefix_file_fingerprint,
         }
     )
@@ -971,6 +982,115 @@ def _stable_file_fingerprint(file_items: list[dict[str, Any]]) -> str:
     return _json_hash({"family": PREFIX_FILE_FINGERPRINT_FAMILY, "files": ordered})
 
 
+def _file_identity_has_stable_discriminator(identity: Any) -> bool:
+    if isinstance(identity, list):
+        return any(_file_identity_has_stable_discriminator(item) for item in identity)
+    if not isinstance(identity, dict):
+        return False
+    for key, value in identity.items():
+        if _is_empty_canonical_value(value):
+            continue
+        if key in {"type", "content_type", "mime_type"}:
+            continue
+        if key in {"file", "meta", "metadata", "legacy"}:
+            if _file_identity_has_stable_discriminator(value):
+                return True
+            continue
+        if key in _FILE_IDENTITY_STABLE_DISCRIMINATOR_KEYS:
+            return True
+    return False
+
+
+def _messages_have_user_image_url_parts(messages: list[dict[str, Any]] | None) -> bool:
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                return True
+    return False
+
+
+def _stable_file_backed_image_source_messages(
+    source_messages: list[dict[str, Any]],
+    db_chain: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    if not db_chain:
+        return source_messages
+
+    normalized = copy.deepcopy(source_messages)
+    for index, message in enumerate(normalized):
+        if index >= len(db_chain):
+            break
+        db_message = db_chain[index]
+        if not isinstance(message, dict) or not isinstance(db_message, dict):
+            continue
+        if message.get("role") != "user":
+            continue
+        if db_message.get("role") != "user":
+            continue
+        files = db_message.get("files")
+        if not isinstance(files, list):
+            continue
+        image_files = [item for item in files if _is_image_file_item(item) and item.get("url")]
+        if not image_files:
+            continue
+        if not isinstance(db_message.get("content"), str):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        image_part_indexes = [
+            part_index
+            for part_index, part in enumerate(content)
+            if isinstance(part, dict)
+            and part.get("type") == "image_url"
+            and isinstance(part.get("image_url"), dict)
+        ]
+        if len(image_part_indexes) != len(image_files):
+            continue
+
+        identities: list[dict[str, Any]] = []
+        for image_file in image_files:
+            identity = _canonicalize_prefix_file_attachment_identity(image_file)
+            if _is_empty_canonical_value(identity) or not _file_identity_has_stable_discriminator(identity):
+                identities = []
+                break
+            identities.append(identity)
+        if len(identities) != len(image_part_indexes):
+            continue
+
+        for part_index, identity in zip(image_part_indexes, identities):
+            part = copy.deepcopy(content[part_index])
+            image_url = part.get("image_url")
+            stable_image_url = {
+                key: value
+                for key, value in image_url.items()
+                if key != "url"
+            }
+            stable_image_url["file"] = identity
+            part["image_url"] = stable_image_url
+            content[part_index] = part
+
+    return normalized
+
+
+def _prefix_file_fingerprint_resolver_db_chain(
+    resolver: Callable[[int], str | None] | None,
+) -> list[dict[str, Any]] | None:
+    if resolver is None:
+        return None
+    db_chain = getattr(resolver, PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR, None)
+    return db_chain if isinstance(db_chain, list) else None
+
+
 def _soft_prefetch_inflight_source_hash(
     source_messages: list[dict[str, Any]],
     metadata: dict[str, Any],
@@ -1017,16 +1137,20 @@ def _make_prefix_file_fingerprint_resolver(
         cache[count] = result
         return result
 
+    setattr(resolve, PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR, db_chain)
     return resolve
 
 
 async def _build_prefix_file_fingerprint_resolver(
     request: Any,
     metadata: dict[str, Any],
+    source_messages: list[dict[str, Any]] | None = None,
 ) -> Callable[[int], str | None] | None:
     metadata_files = metadata.get("files")
     if not isinstance(metadata_files, list) or not metadata_files:
-        return None
+        if not _messages_have_user_image_url_parts(source_messages):
+            return None
+        metadata_files = []
     chat_id = str(metadata.get("chat_id") or "")
     current_message_id = str(metadata.get("user_message_id") or metadata.get("message_id") or "")
     cache_key = (chat_id, current_message_id)
@@ -2508,6 +2632,7 @@ def replace_prefix_with_parent_checkpoint_and_delta(
     parent: dict[str, Any],
     *,
     prefix_file_fingerprint: str | None = None,
+    file_backed_image_db_chain: list[dict[str, Any]] | None = None,
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
 ) -> list[dict[str, Any]]:
@@ -2517,7 +2642,14 @@ def replace_prefix_with_parent_checkpoint_and_delta(
             "Parent checkpoint cannot be applied safely because its source boundary is invalid",
             code="unsafe_checkpoint_parent",
         )
-    if compute_summary_source_hash(cut.summarization_prefix[:parent_count], prefix_file_fingerprint) != parent.get("source_hash"):
+    if (
+        compute_summary_source_hash(
+            cut.summarization_prefix[:parent_count],
+            prefix_file_fingerprint,
+            file_backed_image_db_chain,
+        )
+        != parent.get("source_hash")
+    ):
         raise UnsupportedCompactionInput(
             "Parent checkpoint cannot be applied safely because its source hash no longer matches",
             code="unsafe_checkpoint_parent",
@@ -2628,6 +2760,7 @@ def select_longest_matching_checkpoint(
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
 ) -> dict[str, Any] | None:
     prefix_hashes: dict[int, str] = {}
+    file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     candidates = sorted(rows, key=lambda row: int(row.get("source_message_count") or 0), reverse=True)
     for row in candidates:
         if states is not None and row.get("state") not in states:
@@ -2641,7 +2774,11 @@ def select_longest_matching_checkpoint(
                 if prefix_file_fingerprint_resolver is not None
                 else None
             )
-            prefix_hashes[count] = compute_summary_source_hash(source_messages[:count], fingerprint)
+            prefix_hashes[count] = compute_summary_source_hash(
+                source_messages[:count],
+                fingerprint,
+                file_backed_image_db_chain,
+            )
         if prefix_hashes[count] == row.get("source_hash"):
             return row
     return None
@@ -6800,7 +6937,10 @@ async def _compact_retry_tool_results(
             "Cannot compact tool history without a durable checkpoint identity",
             code="checkpoint_identity_missing",
         )
-    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
+        request, metadata, source_messages
+    )
+    file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     source_identity_fingerprint = _resolve_fingerprint(prefix_file_fingerprint_resolver, len(source_messages))
     pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
         request=request,
@@ -6814,6 +6954,7 @@ async def _compact_retry_tool_results(
         pending_checkpoint,
         source_messages,
         prefix_file_fingerprint=source_identity_fingerprint,
+        file_backed_image_db_chain=file_backed_image_db_chain,
     ):
         ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
         if ready_checkpoint is not None:
@@ -6831,6 +6972,7 @@ async def _compact_retry_tool_results(
                         prefix_file_fingerprint_resolver,
                         int(ready_checkpoint.get("source_message_count") or 0),
                     ),
+                    file_backed_image_db_chain=file_backed_image_db_chain,
                     historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                     historical_message_excerpt_count=historical_message_excerpt_count,
                 ),
@@ -6972,7 +7114,12 @@ async def _get_or_create_checkpoint_summary(
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
 ) -> str:
     profile_hash = compute_profile_hash()
-    source_hash = compute_summary_source_hash(source_messages, prefix_file_fingerprint)
+    file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
+    source_hash = compute_summary_source_hash(
+        source_messages,
+        prefix_file_fingerprint,
+        file_backed_image_db_chain,
+    )
     summary_meta = normalize_summary_meta(summary_meta)
     identity = {
         "namespace": CHECKPOINT_NAMESPACE,
@@ -7014,7 +7161,11 @@ async def _get_or_create_checkpoint_summary(
                     if (
                         parent_count <= 0
                         or parent_count > len(source_messages)
-                        or compute_summary_source_hash(source_messages[:parent_count], parent_fingerprint)
+                        or compute_summary_source_hash(
+                            source_messages[:parent_count],
+                            parent_fingerprint,
+                            file_backed_image_db_chain,
+                        )
                         != parent_checkpoint.get("source_hash")
                     ):
                         raise UnsupportedCompactionInput(
@@ -7129,7 +7280,9 @@ async def _get_or_create_compaction_summary(
             summary_prompt=summary_prompt,
         )
 
-    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
+        request, metadata, source_messages
+    )
     identity_fingerprint = (
         prefix_file_fingerprint_resolver(len(source_messages))
         if prefix_file_fingerprint_resolver is not None
@@ -7159,6 +7312,7 @@ async def _lookup_ready_checkpoint_for_source(
     pipe_function_id: str,
     source_messages: list[dict[str, Any]],
     prefix_file_fingerprint: str | None = None,
+    file_backed_image_db_chain: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     await ensure_checkpoint_table_initialized(request=request)
     return await CheckpointStore().lookup_ready(
@@ -7167,7 +7321,11 @@ async def _lookup_ready_checkpoint_for_source(
         chat_id=chat_id,
         pipe_function_id=pipe_function_id,
         profile_hash=compute_profile_hash(),
-        source_hash=compute_summary_source_hash(source_messages, prefix_file_fingerprint),
+        source_hash=compute_summary_source_hash(
+            source_messages,
+            prefix_file_fingerprint,
+            file_backed_image_db_chain,
+        ),
     )
 
 
@@ -7214,6 +7372,7 @@ def _checkpoint_matches_exact_source(
     source_messages: list[dict[str, Any]],
     *,
     prefix_file_fingerprint: str | None = None,
+    file_backed_image_db_chain: list[dict[str, Any]] | None = None,
 ) -> bool:
     try:
         source_message_count = int(row.get("source_message_count") or 0)
@@ -7221,7 +7380,8 @@ def _checkpoint_matches_exact_source(
         return False
     return (
         source_message_count == len(source_messages)
-        and row.get("source_hash") == compute_summary_source_hash(source_messages, prefix_file_fingerprint)
+        and row.get("source_hash")
+        == compute_summary_source_hash(source_messages, prefix_file_fingerprint, file_backed_image_db_chain)
     )
 
 
@@ -7297,7 +7457,9 @@ async def _prefetch_compaction_checkpoint(
         return False
     if not user_id or not _chat_id_supported(chat_id):
         return False
-    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
+        request, metadata, source_messages
+    )
     if await _lookup_pending_checkpoint_for_source_prefix(
         request=request,
         user_id=user_id,
@@ -7321,6 +7483,7 @@ async def _prefetch_compaction_checkpoint(
             source_kind = "tool"
 
     def reusable_match_covers_prefetch_source(match: ReusableCheckpointMatch) -> bool:
+        file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
         if match.checkpoint is None or match.source_kind != source_kind:
             return False
         checkpoint_count = int(match.checkpoint.get("source_message_count") or match.source_message_count or 0)
@@ -7334,7 +7497,11 @@ async def _prefetch_compaction_checkpoint(
             else None
         )
         return (
-            compute_summary_source_hash(source_messages[:checkpoint_count], checkpoint_fingerprint)
+            compute_summary_source_hash(
+                source_messages[:checkpoint_count],
+                checkpoint_fingerprint,
+                file_backed_image_db_chain,
+            )
             == match.checkpoint.get("source_hash")
         )
 
@@ -7659,7 +7826,12 @@ async def _find_reusable_checkpoint_for_source(
     prefix_file_fingerprint: str | None = None,
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
-    source_hash = compute_summary_source_hash(source_messages, prefix_file_fingerprint)
+    file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
+    source_hash = compute_summary_source_hash(
+        source_messages,
+        prefix_file_fingerprint,
+        file_backed_image_db_chain,
+    )
     existing = await store.lookup_ready(
         namespace=CHECKPOINT_NAMESPACE,
         user_id=user_id,
@@ -7710,7 +7882,14 @@ async def _body_reusable_checkpoint_match(
     profile_hash = compute_profile_hash()
     await ensure_checkpoint_table_initialized(request=request)
     store = CheckpointStore()
-    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    resolver_source_messages: list[dict[str, Any]] = []
+    if tool_cut is not None and tool_cut.summarization_prefix:
+        resolver_source_messages.extend(tool_cut.summarization_prefix)
+    if cut.summarization_prefix:
+        resolver_source_messages.extend(cut.summarization_prefix)
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
+        request, metadata, resolver_source_messages
+    )
 
     if tool_cut is not None and tool_cut.summarization_prefix:
         tool_identity_fingerprint = (
@@ -7822,7 +8001,13 @@ async def _estimate_checkpoint_applied_body_tokens(
     user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
     profile_hash = compute_profile_hash()
     store = CheckpointStore()
-    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    resolver_source_messages: list[dict[str, Any]] = []
+    for _candidate_cut, source_messages in candidates:
+        resolver_source_messages.extend(source_messages)
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
+        request, metadata, resolver_source_messages
+    )
+    file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
 
     for candidate_cut, source_messages in candidates:
         checkpoint = match.checkpoint
@@ -7854,7 +8039,14 @@ async def _estimate_checkpoint_applied_body_tokens(
             if prefix_file_fingerprint_resolver is not None
             else None
         )
-        if compute_summary_source_hash(source_messages[:parent_count], parent_fingerprint) != checkpoint.get("source_hash"):
+        if (
+            compute_summary_source_hash(
+                source_messages[:parent_count],
+                parent_fingerprint,
+                file_backed_image_db_chain,
+            )
+            != checkpoint.get("source_hash")
+        ):
             continue
 
         if isinstance(candidate_cut, ToolResultCompactionCut):
@@ -7943,7 +8135,13 @@ async def _compact_body_with_reusable_checkpoint(
     await ensure_checkpoint_table_initialized(request=request)
     store = CheckpointStore()
     profile_hash = compute_profile_hash()
-    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    resolver_source_messages: list[dict[str, Any]] = []
+    for _kind, _candidate_cut, source_messages in candidates:
+        resolver_source_messages.extend(source_messages)
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
+        request, metadata, resolver_source_messages
+    )
+    file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
 
     for _kind, candidate_cut, source_messages in candidates:
         identity_fingerprint = (
@@ -7985,6 +8183,7 @@ async def _compact_body_with_reusable_checkpoint(
                 prefix_file_fingerprint_resolver,
                 int(checkpoint.get("source_message_count") or 0),
             ),
+            file_backed_image_db_chain=file_backed_image_db_chain,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
@@ -8680,6 +8879,9 @@ async def _compact_body(
                 file_context_enabled=file_context_enabled,
                 summary_prompt=summary_prompt,
             )
+            history_prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
+                request, metadata, cut.summarization_prefix
+            )
             history_checkpoint = await _lookup_ready_checkpoint_for_source(
                 request=request,
                 user_id=user_id,
@@ -8687,8 +8889,11 @@ async def _compact_body(
                 pipe_function_id=pipe_function_id,
                 source_messages=cut.summarization_prefix,
                 prefix_file_fingerprint=_resolve_fingerprint(
-                    await _build_prefix_file_fingerprint_resolver(request, metadata),
+                    history_prefix_file_fingerprint_resolver,
                     len(cut.summarization_prefix),
+                ),
+                file_backed_image_db_chain=_prefix_file_fingerprint_resolver_db_chain(
+                    history_prefix_file_fingerprint_resolver
                 ),
             )
             if history_checkpoint is None:
@@ -8724,7 +8929,10 @@ async def _compact_body(
     if not user_id or not _chat_id_supported(chat_id):
         return body, False, 0
 
-    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(request, metadata)
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
+        request, metadata, cut.summarization_prefix
+    )
+    file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     prefix_identity_fingerprint = _resolve_fingerprint(
         prefix_file_fingerprint_resolver, len(cut.summarization_prefix)
     )
@@ -8740,6 +8948,7 @@ async def _compact_body(
         pending_checkpoint,
         cut.summarization_prefix,
         prefix_file_fingerprint=prefix_identity_fingerprint,
+        file_backed_image_db_chain=file_backed_image_db_chain,
     ):
         ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
         if ready_checkpoint is not None:
@@ -8751,6 +8960,7 @@ async def _compact_body(
                     prefix_file_fingerprint_resolver,
                     int(ready_checkpoint.get("source_message_count") or 0),
                 ),
+                file_backed_image_db_chain=file_backed_image_db_chain,
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
             )
@@ -8800,6 +9010,7 @@ async def _compact_body(
                 prefix_file_fingerprint_resolver,
                 int(exc.parent.get("source_message_count") or 0),
             ),
+            file_backed_image_db_chain=file_backed_image_db_chain,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
