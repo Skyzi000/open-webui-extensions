@@ -3871,6 +3871,14 @@ def test_soft_trigger_ratio_default_resolves_against_hard_trigger():
     )
 
 
+def test_soft_trigger_ratio_missing_field_falls_back_to_default_constant():
+    valves = SimpleNamespace(trigger_total_tokens_overrides_json="")
+
+    resolved = mod.resolve_soft_trigger_total_tokens(valves, {"id": "target", "name": "Target"}, 1000)
+
+    assert resolved == int(1000 * mod.DEFAULT_SOFT_TRIGGER_RATIO)
+
+
 def test_trigger_total_tokens_overrides_empty_string_is_valid():
     valves = mod.Pipe.Valves(trigger_total_tokens_overrides_json="")
 

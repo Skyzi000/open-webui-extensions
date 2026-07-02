@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.15
+version: 0.5.16
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -101,7 +101,7 @@ SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
 SOURCE_HASH_FAMILY = "canonical-json-v1"
 PROFILE_HASH_FAMILY = "checkpoint-profile-v1"
 MAX_CONTEXT_RETRY_ATTEMPTS = 2
-DEFAULT_TRIGGER_TOTAL_TOKENS = 256000
+DEFAULT_TRIGGER_TOTAL_TOKENS = 180000
 DEFAULT_SOFT_TRIGGER_RATIO = 0.5
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES = 512
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT = 32
@@ -3151,7 +3151,7 @@ def resolve_soft_trigger_ratio(valves: Any, target_model: dict[str, Any]) -> flo
     for override in overrides:
         if "soft_trigger_ratio" in override and _matches_any_pattern(target_model, override["model_patterns"]):
             return float(override["soft_trigger_ratio"])
-    return float(getattr(valves, "soft_trigger_ratio", 0.8) or 0)
+    return float(getattr(valves, "soft_trigger_ratio", DEFAULT_SOFT_TRIGGER_RATIO) or 0)
 
 
 def resolve_soft_trigger_total_tokens(
@@ -8958,7 +8958,8 @@ class Pipe:
             default=DEFAULT_TRIGGER_TOTAL_TOKENS,
             ge=1,
             description=(
-                "Global candidate-token threshold for foreground compaction. Decisions use the "
+                f"Global candidate-token threshold for foreground compaction. Default {DEFAULT_TRIGGER_TOTAL_TOKENS:,} "
+                "is intentionally below a 256k context window to leave output-token budget. Decisions use the "
                 "checkpoint-applied, usage-anchored, or full-body local estimate for the payload about "
                 "to be sent; observed provider/Open WebUI usage is an anchor/context signal, not a "
                 "direct trigger by itself. Override per model with trigger_total_tokens_overrides_json."
