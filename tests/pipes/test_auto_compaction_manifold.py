@@ -5323,6 +5323,133 @@ async def test_prepare_summary_file_context_fails_closed_when_prefix_file_contex
 
 
 @pytest.mark.asyncio
+async def test_prepare_summary_file_context_fails_closed_when_db_chain_is_unavailable(
+    monkeypatch, pipe_request, pipe_user
+):
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        assert chat_id == "chat-1"
+        assert current_message_id == "message-1"
+        return None
+
+    async def generate_summary_file_context(*, request, user, prefix_files):
+        raise AssertionError("summary file context must not be generated without DB chain")
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context)
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await mod._prepare_summary_file_context(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={
+                "chat_id": "chat-1",
+                "user_message_id": "message-1",
+                "files": [_file("maybe-absorbed-file")],
+            },
+            compaction_prefix_count=1,
+            parent_source_message_count=0,
+            file_context_enabled=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_prepare_summary_file_context_fails_closed_for_current_file_when_db_chain_is_unavailable(
+    monkeypatch, pipe_request, pipe_user
+):
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        return None
+
+    async def generate_summary_file_context(*, request, user, prefix_files):
+        raise AssertionError("current-only files must not be summarized")
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context)
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await mod._prepare_summary_file_context(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={
+                "chat_id": "chat-1",
+                "user_message_id": "message-1",
+                "files": [_file("current-file")],
+                "user_message": {"files": [_file("current-file")]},
+            },
+            compaction_prefix_count=1,
+            parent_source_message_count=0,
+            file_context_enabled=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_prepare_summary_file_context_fails_when_current_file_may_be_stripped_from_prefix_without_db_chain(
+    monkeypatch, pipe_request, pipe_user
+):
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        return None
+
+    async def generate_summary_file_context(*, request, user, prefix_files):
+        raise AssertionError("summary file context must not be generated without DB chain")
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context)
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await mod._prepare_summary_file_context(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={
+                "chat_id": "chat-1",
+                "user_message_id": "message-1",
+                "files": [_file("shared-file")],
+                "user_message": {"files": [_file("shared-file")]},
+            },
+            compaction_prefix_count=1,
+            parent_source_message_count=0,
+            file_context_enabled=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_prepare_summary_file_context_includes_current_file_when_it_is_in_prefix(
+    monkeypatch, pipe_request, pipe_user
+):
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        assert chat_id == "chat-1"
+        assert current_message_id == "message-1"
+        return [
+            {"role": "user", "content": "active with file", "files": [_file("current-file")]},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call-2", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+        ]
+
+    async def generate_summary_file_context(*, request, user, prefix_files):
+        assert prefix_files == [_file("current-file")]
+        return "current file context"
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context)
+
+    context = await mod._prepare_summary_file_context(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={
+            "chat_id": "chat-1",
+            "user_message_id": "message-1",
+            "files": [_file("current-file")],
+            "user_message": {"files": [_file("current-file")]},
+        },
+        compaction_prefix_count=3,
+        parent_source_message_count=0,
+        file_context_enabled=True,
+    )
+
+    assert context == "current file context"
+
+
+@pytest.mark.asyncio
 async def test_generate_summary_file_context_accepts_core_best_effort_partial_sources(
     monkeypatch, pipe_request, pipe_user
 ):
@@ -12566,6 +12693,80 @@ async def test_task_checkpoint_applied_estimate_uses_rebuilt_provider_body(monke
 
 
 @pytest.mark.asyncio
+async def test_task_checkpoint_applied_estimate_returns_none_when_file_context_unavailable(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    async def compact_body_with_reusable_checkpoint(**kwargs):
+        raise mod.SummaryFileContextUnavailable("attached file context unavailable")
+
+    monkeypatch.setattr(mod, "_compact_body_with_reusable_checkpoint", compact_body_with_reusable_checkpoint)
+
+    count = await mod._estimate_task_checkpoint_applied_body_tokens(
+        request=pipe_request,
+        user=pipe_user,
+        metadata=pipe_metadata,
+        body={"messages": [{"role": "user", "content": "source task history"}]},
+        pipe_function_id="auto_compact",
+        match=mod.ReusableCheckpointMatch(kind="exact", source_message_count=1, checkpoint={"id": "checkpoint-task"}),
+        historical_message_excerpt_bytes=0,
+        historical_message_excerpt_count=0,
+    )
+
+    assert count is None
+
+
+@pytest.mark.asyncio
+async def test_task_reusable_checkpoint_passes_file_context_disabled_to_history_compaction(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+
+    async def compact_body_with_reusable_checkpoint(**kwargs):
+        captured["file_context_enabled"] = kwargs.get("file_context_enabled")
+        return {"messages": [{"role": "user", "content": "checkpointed task history"}]}, True, 1
+
+    async def rebuild_task_body_from_compacted_history(**kwargs):
+        return {"messages": [{"role": "user", "content": "rebuilt task prompt"}]}
+
+    monkeypatch.setattr(mod, "_compact_body_with_reusable_checkpoint", compact_body_with_reusable_checkpoint)
+    monkeypatch.setattr(mod, "_rebuild_task_body_from_compacted_history", rebuild_task_body_from_compacted_history)
+
+    rebuilt, compacted, prefix_count = await mod._compact_task_body_with_reusable_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={
+            **pipe_metadata,
+            "task": mod.TASKS.TAGS_GENERATION.value,
+            "task_body": {
+                "model": "target",
+                "messages": [
+                    {"role": "user", "content": "old task input"},
+                    {"role": "assistant", "content": "old task answer"},
+                    {"role": "user", "content": "active task input"},
+                ],
+            },
+        },
+        body={"messages": [{"role": "user", "content": "provider task prompt"}]},
+        pipe_function_id="auto_compact",
+        match=mod.ReusableCheckpointMatch(kind="exact", source_message_count=2, source_kind="message"),
+        historical_message_excerpt_bytes=0,
+        historical_message_excerpt_count=0,
+        file_context_enabled=False,
+    )
+
+    assert compacted is True
+    assert prefix_count == 1
+    assert rebuilt["messages"] == [{"role": "user", "content": "rebuilt task prompt"}]
+    assert captured["file_context_enabled"] is False
+
+
+@pytest.mark.asyncio
 async def test_pipe_uses_task_checkpoint_applied_estimate_for_reusable_checkpoint_guard(
     monkeypatch,
     pipe_request,
@@ -13339,6 +13540,344 @@ async def test_direct_tool_compaction_and_reusable_checkpoint_render_same_saved_
     assert '<historical_user_message ordinal="1"><![CDATA[active request]]></historical_user_message>' in direct_body["messages"][0]["content"]
     assert direct_body["messages"][1:] == latest_round
     assert reusable_body["messages"][1:] == latest_round
+
+
+@pytest.mark.asyncio
+async def test_reusable_checkpoint_fails_closed_when_db_chain_is_unavailable_for_attached_files(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    messages = [
+        {"role": "user", "content": "old with file"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    cut = mod.select_safe_message_cut(messages)
+    assert cut.summarization_prefix
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(cut.summarization_prefix),
+        source_message_count=len(cut.summarization_prefix),
+        summary_text="summary without attached file context",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        assert chat_id == "chat-1"
+        assert current_message_id == "message-1"
+        return None
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint]))
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await mod._compact_body_with_reusable_checkpoint(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={
+                "chat_id": "chat-1",
+                "user_message_id": "message-1",
+                "files": [_file("absorbed-file")],
+            },
+            body={"messages": messages},
+            pipe_function_id="auto_compact",
+            match=mod.ReusableCheckpointMatch(
+                kind="exact",
+                source_message_count=len(cut.summarization_prefix),
+                source_kind="message",
+            ),
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_tool_reusable_checkpoint_fails_closed_when_current_file_is_in_prefix_and_db_chain_unavailable(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    messages = [
+        {"role": "user", "content": "active with file"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function"}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-2", "type": "function"}]},
+        {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+    ]
+    tool_cut = mod.select_tool_result_compaction_cut(messages)
+    assert tool_cut is not None
+    assert tool_cut.summarization_prefix[0]["content"] == "active with file"
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(tool_cut.summarization_prefix),
+        source_message_count=len(tool_cut.summarization_prefix),
+        summary_text="summary without current file context",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        return None
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint]))
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await mod._compact_body_with_reusable_checkpoint(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={
+                "chat_id": "chat-1",
+                "user_message_id": "message-1",
+                "files": [_file("current-file")],
+                "user_message": {"files": [_file("current-file")]},
+            },
+            body={"messages": messages},
+            pipe_function_id="auto_compact",
+            match=mod.ReusableCheckpointMatch(
+                kind="exact",
+                source_message_count=len(tool_cut.summarization_prefix),
+                source_kind="tool",
+                checkpoint=checkpoint,
+            ),
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_tool_compaction_fails_closed_when_current_file_is_in_prefix_and_db_chain_unavailable(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    messages = [
+        {"role": "user", "content": "active with file"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function"}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-2", "type": "function"}]},
+        {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+    ]
+    tool_cut = mod.select_tool_result_compaction_cut(messages)
+    assert tool_cut is not None
+    assert tool_cut.summarization_prefix[0]["content"] == "active with file"
+
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        return None
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await mod._compact_retry_tool_results(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={
+                "chat_id": "chat-1",
+                "user_message_id": "message-1",
+                "files": [_file("current-file")],
+                "user_message": {"files": [_file("current-file")]},
+            },
+            pipe_function_id="auto_compact",
+            summary_model_id="target",
+            base_body={"messages": messages},
+            messages=messages,
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_completed_turn_prefetch_fails_closed_when_current_file_is_in_prefix_and_db_chain_unavailable(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    import open_webui.utils.chat as chat_module
+
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active with file"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": ""},
+    ]
+    source_messages = mod._soft_prefetch_source_messages({"model": "target", "messages": messages})
+    assert source_messages == messages[:-1]
+
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        return None
+
+    async def generate_chat_completion(*args, **kwargs):
+        raise AssertionError("summary generation must not run without absorbed file context")
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([]))
+    chat_module.generate_chat_completion = generate_chat_completion
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await mod._prefetch_compaction_checkpoint(
+            request=pipe_request,
+            user=pipe_user,
+            user_id=pipe_user["id"],
+            chat_id="chat-1",
+            metadata={
+                "chat_id": "chat-1",
+                "user_message_id": "message-1",
+                "files": [_file("current-file")],
+                "user_message": {"content": "active with file", "files": [_file("current-file")]},
+            },
+            body={"model": "target", "messages": messages},
+            pipe_function_id="auto_compact",
+            summary_model_id="target",
+            source_messages=source_messages,
+            summary_tool_policy="fallback_on_tool_call",
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_message_reusable_checkpoint_fails_closed_for_current_file_when_db_chain_is_unavailable(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    messages = [
+        {"role": "user", "content": "old text"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active with file"},
+    ]
+    cut = mod.select_safe_message_cut(messages)
+    assert cut.summarization_prefix
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(cut.summarization_prefix),
+        source_message_count=len(cut.summarization_prefix),
+        summary_text="old text summary",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        return None
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint]))
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await mod._compact_body_with_reusable_checkpoint(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={
+                "chat_id": "chat-1",
+                "user_message_id": "message-1",
+                "files": [_file("current-file")],
+                "user_message": {"files": [_file("current-file")]},
+            },
+            body={"messages": messages},
+            pipe_function_id="auto_compact",
+            match=mod.ReusableCheckpointMatch(
+                kind="exact",
+                source_message_count=len(cut.summarization_prefix),
+                source_kind="message",
+                checkpoint=checkpoint,
+            ),
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_message_reusable_checkpoint_fails_closed_when_current_file_id_is_also_in_prefix(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    messages = [
+        {"role": "user", "content": "old with shared file"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active with same file"},
+    ]
+    cut = mod.select_safe_message_cut(messages)
+    assert cut.summarization_prefix
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(cut.summarization_prefix),
+        source_message_count=len(cut.summarization_prefix),
+        summary_text="summary without shared file context",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        return None
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint]))
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await mod._compact_body_with_reusable_checkpoint(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={
+                "chat_id": "chat-1",
+                "user_message_id": "message-1",
+                "files": [_file("shared-file")],
+                "user_message": {"files": [_file("shared-file")]},
+            },
+            body={"messages": messages},
+            pipe_function_id="auto_compact",
+            match=mod.ReusableCheckpointMatch(
+                kind="exact",
+                source_message_count=len(cut.summarization_prefix),
+                source_kind="message",
+                checkpoint=checkpoint,
+            ),
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+        )
 
 
 @pytest.mark.asyncio

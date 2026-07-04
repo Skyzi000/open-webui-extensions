@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.18
+version: 0.5.19
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -1145,12 +1145,15 @@ async def _build_prefix_file_fingerprint_resolver(
     request: Any,
     metadata: dict[str, Any],
     source_messages: list[dict[str, Any]] | None = None,
+    *,
+    require_file_context_chain: bool = False,
 ) -> Callable[[int], str | None] | None:
     metadata_files = metadata.get("files")
     if not isinstance(metadata_files, list) or not metadata_files:
         if not _messages_have_user_image_url_parts(source_messages):
             return None
         metadata_files = []
+    required_file_ids = _extract_non_image_file_ids(metadata_files)
     chat_id = str(metadata.get("chat_id") or "")
     current_message_id = str(metadata.get("user_message_id") or metadata.get("message_id") or "")
     cache_key = (chat_id, current_message_id)
@@ -1174,6 +1177,8 @@ async def _build_prefix_file_fingerprint_resolver(
         LOG.exception("Failed to load chat message chain for prefix file fingerprint")
         return None
     if not db_chain:
+        if require_file_context_chain and required_file_ids:
+            raise SummaryFileContextUnavailable()
         return None
     resolver = _make_prefix_file_fingerprint_resolver(db_chain, metadata_files)
     if cache is not None:
@@ -6100,11 +6105,18 @@ async def _prepare_summary_file_context(
         metadata_files = metadata.get("files")
         if not isinstance(metadata_files, list) or not metadata_files:
             return None
+        if compaction_prefix_count <= parent_source_message_count:
+            return None
+        if not _extract_non_image_file_ids(metadata_files):
+            return None
+        required_file_ids = _extract_non_image_file_ids(metadata_files)
         chat_id = str(metadata.get("chat_id") or "")
         current_message_id = str(metadata.get("user_message_id") or metadata.get("message_id") or "")
         db_chain = await _load_chat_message_chain(request, chat_id, current_message_id)
         if db_chain is None:
-            return None
+            if not required_file_ids:
+                return None
+            raise SummaryFileContextUnavailable()
 
         prefix_ids = _classify_files_for_summary(
             db_chain=db_chain,
@@ -6938,7 +6950,10 @@ async def _compact_retry_tool_results(
             code="checkpoint_identity_missing",
         )
     prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
-        request, metadata, source_messages
+        request,
+        metadata,
+        source_messages,
+        require_file_context_chain=file_context_enabled,
     )
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     source_identity_fingerprint = _resolve_fingerprint(prefix_file_fingerprint_resolver, len(source_messages))
@@ -7281,7 +7296,10 @@ async def _get_or_create_compaction_summary(
         )
 
     prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
-        request, metadata, source_messages
+        request,
+        metadata,
+        source_messages,
+        require_file_context_chain=file_context_enabled,
     )
     identity_fingerprint = (
         prefix_file_fingerprint_resolver(len(source_messages))
@@ -8139,7 +8157,10 @@ async def _compact_body_with_reusable_checkpoint(
     for _kind, _candidate_cut, source_messages in candidates:
         resolver_source_messages.extend(source_messages)
     prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
-        request, metadata, resolver_source_messages
+        request,
+        metadata,
+        resolver_source_messages,
+        require_file_context_chain=file_context_enabled,
     )
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
 
@@ -8210,17 +8231,20 @@ async def _estimate_task_checkpoint_applied_body_tokens(
     if isinstance(body_metadata, dict) and _task_body_from_metadata(body_metadata) is not None:
         task_metadata = body_metadata
     source_body = _task_history_source_body_for_compaction(body, task_metadata) or body
-    compacted_source, compacted, compaction_prefix_count = await _compact_body_with_reusable_checkpoint(
-        request=request,
-        user=user,
-        metadata=task_metadata,
-        body=source_body,
-        pipe_function_id=pipe_function_id,
-        match=match,
-        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
-        historical_message_excerpt_count=historical_message_excerpt_count,
-        file_context_enabled=file_context_enabled,
-    )
+    try:
+        compacted_source, compacted, compaction_prefix_count = await _compact_body_with_reusable_checkpoint(
+            request=request,
+            user=user,
+            metadata=task_metadata,
+            body=source_body,
+            pipe_function_id=pipe_function_id,
+            match=match,
+            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+            historical_message_excerpt_count=historical_message_excerpt_count,
+            file_context_enabled=file_context_enabled,
+        )
+    except SummaryFileContextUnavailable:
+        return None
     if not compacted:
         return None
     rebuilt = await _rebuild_task_body_from_compacted_history(
@@ -8930,7 +8954,10 @@ async def _compact_body(
         return body, False, 0
 
     prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
-        request, metadata, cut.summarization_prefix
+        request,
+        metadata,
+        cut.summarization_prefix,
+        require_file_context_chain=file_context_enabled,
     )
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     prefix_identity_fingerprint = _resolve_fingerprint(
@@ -9043,6 +9070,7 @@ async def _compact_task_body_with_reusable_checkpoint(
         match=match,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
+        file_context_enabled=file_context_enabled,
     )
     if not compacted:
         return body, False, 0
