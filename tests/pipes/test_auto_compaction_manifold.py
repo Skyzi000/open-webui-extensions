@@ -462,8 +462,9 @@ async def test_sync_wrapper_model_records_keeps_current_wrapper_desired_when_tar
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("insert_failure", ["exception", "none"])
 async def test_sync_wrapper_model_records_does_not_hide_existing_target_when_wrapper_insert_fails(
-    monkeypatch,
+    monkeypatch, insert_failure
 ):
     existing_target = FakeModelForm(
         id="target",
@@ -480,6 +481,8 @@ async def test_sync_wrapper_model_records_does_not_hide_existing_target_when_wra
 
     async def fail_wrapper_insert(model_form, user_id):
         if model_form.id == mod.build_wrapper_model_id("auto_compact", "target"):
+            if insert_failure == "none":
+                return None
             raise RuntimeError("wrapper insert failed")
         return await original_insert_new_model(model_form, user_id)
 
@@ -500,8 +503,9 @@ async def test_sync_wrapper_model_records_does_not_hide_existing_target_when_wra
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("insert_failure", ["exception", "none"])
 async def test_sync_wrapper_model_records_does_not_create_target_override_when_wrapper_insert_fails(
-    monkeypatch,
+    monkeypatch, insert_failure
 ):
     records, calls = install_fake_open_webui_model_modules(monkeypatch)
     Models = sys.modules["open_webui.models.models"].Models
@@ -509,6 +513,8 @@ async def test_sync_wrapper_model_records_does_not_create_target_override_when_w
 
     async def fail_wrapper_insert(model_form, user_id):
         if model_form.id == mod.build_wrapper_model_id("auto_compact", "provider-target"):
+            if insert_failure == "none":
+                return None
             raise RuntimeError("wrapper insert failed")
         return await original_insert_new_model(model_form, user_id)
 
@@ -528,7 +534,8 @@ async def test_sync_wrapper_model_records_does_not_create_target_override_when_w
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_restores_target_when_wrapper_update_fails(monkeypatch):
+@pytest.mark.parametrize("update_failure", ["exception", "none"])
+async def test_sync_wrapper_model_records_restores_target_when_wrapper_update_fails(monkeypatch, update_failure):
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     records = {
         "target": FakeModelForm(
@@ -568,6 +575,8 @@ async def test_sync_wrapper_model_records_restores_target_when_wrapper_update_fa
 
     async def fail_wrapper_update(model_id, model_form):
         if model_id == wrapper_id:
+            if update_failure == "none":
+                return None
             raise RuntimeError("wrapper update failed")
         return await original_update_model_by_id(model_id, model_form)
 
@@ -806,7 +815,10 @@ async def test_sync_wrapper_model_records_keeps_preexisting_hidden_target_when_r
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_keeps_stale_wrapper_active_when_target_restore_fails(monkeypatch):
+@pytest.mark.parametrize("restore_failure", ["exception", "none"])
+async def test_sync_wrapper_model_records_keeps_stale_wrapper_active_when_target_restore_fails(
+    monkeypatch, restore_failure
+):
     stale_wrapper_id = mod.build_wrapper_model_id("auto_compact", "stale-target")
     records = {
         "stale-target": FakeModelForm(
@@ -846,6 +858,8 @@ async def test_sync_wrapper_model_records_keeps_stale_wrapper_active_when_target
 
     async def fail_target_restore_update(model_id, model_form):
         if model_id == "stale-target":
+            if restore_failure == "none":
+                return None
             raise RuntimeError("restore failed")
         return await original_update_model_by_id(model_id, model_form)
 
@@ -16836,6 +16850,72 @@ async def test_pipe_launches_soft_prefetch_below_hard_without_foreground_compact
 
 
 @pytest.mark.asyncio
+async def test_pipe_logs_late_parent_checkpoint_lookup_failure_for_soft_prefetch(
+    monkeypatch, caplog, pipe_request, pipe_user, pipe_metadata
+):
+    calls = {"lookup": 0, "prefetch": 0}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 150, "input_tokens": 150, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        calls["lookup"] += 1
+        if calls["lookup"] == 1:
+            return mod.ReusableCheckpointMatch(kind="parent", source_message_count=2)
+        raise RuntimeError("late checkpoint lookup failed")
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        return 150
+
+    async def compact_body_with_reusable_checkpoint(**kwargs):
+        return kwargs["body"], False, 0
+
+    async def forward_target(**kwargs):
+        return {"ok": True}
+
+    def start_soft_prefetch(**kwargs):
+        calls["prefetch"] += 1
+        return True
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_compact_body_with_reusable_checkpoint", compact_body_with_reusable_checkpoint)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    with caplog.at_level("WARNING", logger=mod.LOG.name):
+        result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result == {"ok": True}
+    assert calls == {"lookup": 2, "prefetch": 0}
+    assert "late checkpoint lookup failed during soft prefetch check" in caplog.text
+    assert "disabling soft prefetch" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_pipe_uses_full_body_estimate_for_request_usage_without_tool_suffix(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
@@ -17992,6 +18072,111 @@ async def test_task_completed_turn_prefetch_passes_rebuilt_prompt_for_checkpoint
     task_estimate_body = calls[0]["task_estimate_body"]
     assert task_estimate_body["messages"] == [{"role": "user", "content": "rebuilt completed task prompt"}]
     assert task_estimate_body["metadata"]["task_body"]["messages"] == completed_messages
+
+
+@pytest.mark.asyncio
+async def test_streaming_completed_turn_prefetch_retains_task_while_rebuilding_task_prompt(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    captured = {}
+    calls = []
+    rebuild_started = asyncio.Event()
+    release_rebuild = asyncio.Event()
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 8, "output_tokens": 2}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 10
+
+    async def rebuild_task_body_from_compacted_history(**kwargs):
+        rebuild_started.set()
+        await release_rebuild.wait()
+        return {"messages": [{"role": "user", "content": "rebuilt completed task prompt"}]}
+
+    async def forward_target(**kwargs):
+        captured["on_complete"] = kwargs.get("on_complete")
+        return {"ok": True}
+
+    def start_soft_prefetch(**kwargs):
+        calls.append({key: copy.deepcopy(value) for key, value in kwargs.items() if key != "event_emitter"})
+        return True
+
+    monkeypatch.setattr(mod, "_SOFT_PREFETCH_TASKS", set())
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_rebuild_task_body_from_compacted_history", rebuild_task_body_from_compacted_history)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.compact_task_prompts_from_task_body = True
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    task_history = [
+        {"role": "user", "content": "old task input"},
+        {"role": "assistant", "content": "old task answer"},
+        {"role": "user", "content": "active task input"},
+    ]
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [{"role": "user", "content": "Task:\nold task input\nactive task input"}],
+    }
+    metadata = {
+        **pipe_metadata,
+        "task": mod.TASKS.TAGS_GENERATION.value,
+        "task_body": {
+            "model": wrapper_id,
+            "chat_id": pipe_metadata["chat_id"],
+            "messages": task_history,
+        },
+    }
+
+    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+
+    assert callable(captured["on_complete"])
+    captured["on_complete"](
+        {
+            "assistant_message": {"role": "assistant", "content": "task answer"},
+            "usage": {"total_tokens": 150, "prompt_tokens": 100, "completion_tokens": 50},
+        }
+    )
+    await asyncio.wait_for(rebuild_started.wait(), timeout=1)
+    try:
+        retained_tasks = list(mod._SOFT_PREFETCH_TASKS)
+        assert len(retained_tasks) == 1
+        assert calls == []
+    finally:
+        release_rebuild.set()
+        await asyncio.sleep(0)
+
+    await asyncio.wait_for(asyncio.gather(*retained_tasks), timeout=1)
+    await asyncio.sleep(0)
+
+    assert mod._SOFT_PREFETCH_TASKS == set()
+    assert len(calls) == 1
+    assert calls[0]["task_estimate_body"]["messages"] == [
+        {"role": "user", "content": "rebuilt completed task prompt"}
+    ]
 
 
 @pytest.mark.asyncio

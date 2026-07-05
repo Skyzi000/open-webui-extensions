@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.20
+version: 0.5.21
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -4103,10 +4103,9 @@ async def _restore_target_model_hidden_record(
             meta=meta,
         )
         try:
-            await Models.update_model_by_id(target_model_id, model_form)
+            return await Models.update_model_by_id(target_model_id, model_form) is not None
         except Exception:
             return False
-        return True
 
 
 async def _deactivate_stale_wrapper_model_records(
@@ -4213,9 +4212,11 @@ async def sync_wrapper_model_records(
             )
             if existing:
                 if not _wrapper_model_record_matches_form(existing, model_form):
-                    await Models.update_model_by_id(form_payload["id"], model_form)
+                    if await Models.update_model_by_id(form_payload["id"], model_form) is None:
+                        raise RuntimeError("wrapper model update failed")
             else:
-                await Models.insert_new_model(model_form, user_id=owner_user_id)
+                if await Models.insert_new_model(model_form, user_id=owner_user_id) is None:
+                    raise RuntimeError("wrapper model insert failed")
             if hide_wrapped_target_models:
                 with suppress(Exception):
                     await _hide_target_model_record(
@@ -9737,6 +9738,13 @@ class Pipe:
                 )
             except Exception as exc:
                 if not hard_should_compact and soft_should_prefetch:
+                    LOG.warning(
+                        "Auto-compaction late checkpoint lookup failed during soft prefetch check "
+                        "(chat_id=%s); disabling soft prefetch: %s",
+                        chat_id,
+                        exc,
+                        exc_info=True,
+                    )
                     late_checkpoint_match = None
                     soft_should_prefetch = False
                 else:
@@ -9809,6 +9817,13 @@ class Pipe:
                         pipe_function_id=identity.pipe_function_id,
                     )
                 except Exception as exc:
+                    LOG.warning(
+                        "Auto-compaction late checkpoint lookup failed during soft prefetch check "
+                        "(chat_id=%s); disabling soft prefetch: %s",
+                        chat_id,
+                        exc,
+                        exc_info=True,
+                    )
                     late_checkpoint_match = None
                     soft_should_prefetch = False
                 if late_checkpoint_match is not None:
@@ -9903,8 +9918,10 @@ class Pipe:
 
         def schedule_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
             task = asyncio.create_task(launch_completed_turn_soft_prefetch(completion))
+            _SOFT_PREFETCH_TASKS.add(task)
 
             def observe_result(done: asyncio.Task[Any]) -> None:
+                _SOFT_PREFETCH_TASKS.discard(done)
                 with suppress(asyncio.CancelledError):
                     exc = done.exception()
                     if isinstance(exc, BaseException):
