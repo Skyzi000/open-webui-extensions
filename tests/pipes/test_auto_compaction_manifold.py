@@ -7488,6 +7488,47 @@ def pipe_metadata():
 
 
 @pytest.mark.asyncio
+async def test_pipe_rejects_when_core_context_compaction_is_enabled(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    class FakeConfig:
+        @staticmethod
+        async def get(key, default=None):
+            if key == mod.CORE_CONTEXT_COMPACTION_ENABLE_CONFIG_KEY:
+                return True
+            return default
+
+    async def validate_target_access(**kwargs):
+        raise AssertionError("target access must not run when Core context compaction is enabled")
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    install_fake_open_webui_config(monkeypatch, FakeConfig)
+
+    pipe = mod.Pipe()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["error"]["code"] == "core_context_compaction_conflict"
+    assert "Disable Open WebUI Core context compaction" in result["error"]["message"]
+
+
+def test_core_context_compaction_guard_matches_core_bool_semantics():
+    assert mod._config_value_is_enabled(mod.CONFIG_VALUE_MISSING) is False
+    assert mod._config_value_is_enabled(None) is False
+    assert mod._config_value_is_enabled("false") is True
+
+
+@pytest.mark.asyncio
 async def test_pipe_forwards_below_threshold_to_decoded_target_with_metadata(monkeypatch, pipe_request, pipe_user, pipe_metadata):
     captured = {}
 
@@ -8227,53 +8268,19 @@ async def test_pipe_skips_file_context_injection_for_query_generation_task(
 
 
 @pytest.mark.asyncio
-async def test_pipe_passes_through_official_context_compaction_task(
+async def test_pipe_rejects_official_context_compaction_task_as_dict_error(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
-    # Open WebUI 0.10.1 runs its own context compaction before normal chat
-    # processing and calls generate_chat_completion with
-    # metadata.task == "context_compaction". When TASK_MODEL points at this
-    # AutoCompact wrapper (or Core compaction is enabled on an AutoCompact
-    # chat) that summary request re-enters Pipe.pipe. The wrapper must treat it
-    # as a passthrough task exactly like its own internal summary task: no
-    # nested compaction, no file-context injection (which would recurse via
-    # chat_completion_files_handler), forward the body unchanged.
-    install_fake_open_webui_user_model(monkeypatch)
-    captured = {"handler_calls": 0, "forward_body": None}
+    class FakeConfig:
+        @staticmethod
+        async def get(key, default=None):
+            return default
 
     async def validate_target_access(**kwargs):
-        return None
+        raise AssertionError("target access must not run for Core context compaction tasks")
 
-    async def model_dict_from_request(request):
-        return {"target": {"id": "target", "name": "Target"}}
-
-    async def lookup_persisted_usage(chat_id, message_id):
-        # Force a high token signal so a non-passthrough task would compact.
-        return {"total_tokens": 10_000_000, "input_tokens": 10_000_000, "output_tokens": 0}
-
-    async def noop_initialize(**kwargs):
-        return None
-
-    async def body_reusable_checkpoint_match(**kwargs):
-        raise AssertionError("checkpoint lookup must not run for passthrough task")
-
-    async def forward_target(**kwargs):
-        captured["forward_body"] = copy.deepcopy(kwargs["body"])
-        return {"ok": True}
-
-    async def chat_completion_files_handler(request, rag_body, extra_params, user):
-        captured["handler_calls"] += 1
-        return rag_body, {"sources": []}
-
-    middleware_module = types.ModuleType("open_webui.utils.middleware")
-    middleware_module.chat_completion_files_handler = chat_completion_files_handler
-    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
-    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
-    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+    install_fake_open_webui_config(monkeypatch, FakeConfig)
 
     metadata = {
         **pipe_metadata,
@@ -8299,9 +8306,8 @@ async def test_pipe_passes_through_official_context_compaction_task(
         __event_emitter__=None,
     )
 
-    assert result == {"ok": True}
-    assert captured["handler_calls"] == 0
-    assert captured["forward_body"]["messages"] == body["messages"]
+    assert result["error"]["code"] == "core_context_compaction_conflict"
+    assert "Disable Open WebUI Core context compaction" in result["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -9952,6 +9958,7 @@ async def test_pipe_forwards_custom_model_missing_base_to_config_default_model(
 
     assert captured["config_gets"] == [
         mod.TIKTOKEN_ENCODING_CONFIG_KEY,
+        mod.CORE_CONTEXT_COMPACTION_ENABLE_CONFIG_KEY,
         "ui.default_models",
         "ui.default_models",
     ]

@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.19
+version: 0.5.20
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -88,14 +88,18 @@ BODY_TOKEN_EXTRA_KEYS = (
     "parallel_tool_calls",
 )
 INTERNAL_SUMMARY_TASK = "auto_compaction_summary"
-# Open WebUI 0.10.1 added built-in context compaction (utils/context_compaction.py).
-# Its summary request is dispatched through generate_chat_completion with
-# metadata.task == "context_compaction" (a bare string, not a TASKS enum member),
-# so when the task model resolves to this wrapper the call re-enters Pipe.pipe.
-# Treat it as a passthrough summary task so the wrapper does not run its own
-# compaction / file-context injection / checkpointing on top of Core's. On 0.9.6
-# this task never occurs, so the constant is inert there.
+# Open WebUI Core context compaction runs before pipes and truncates the message
+# chain this wrapper uses for checkpoint identity. Treat its task re-entry as
+# unsupported; do not passthrough because that looks like supported coexistence.
 OFFICIAL_CONTEXT_COMPACTION_TASK = "context_compaction"
+CORE_CONTEXT_COMPACTION_ENABLE_CONFIG_KEY = "chat.context_compaction.enable"
+CORE_CONTEXT_COMPACTION_CONFLICT_MESSAGE = (
+    "Auto Compact cannot be used while Open WebUI Core context compaction is enabled. "
+    "Disable Open WebUI Core context compaction (ENABLE_CONTEXT_COMPACTION / "
+    "chat.context_compaction.enable) before using this Pipe, or use the target model directly."
+)
+
+
 TEMP_CHAT_PREFIXES = ("local:", "channel:")
 SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
 SOURCE_HASH_FAMILY = "canonical-json-v1"
@@ -4312,6 +4316,23 @@ async def _open_webui_config_get_many(*keys: str) -> dict[str, Any] | None:
     except Exception:
         return None
     return values if isinstance(values, dict) else None
+
+
+def _config_value_is_enabled(value: Any) -> bool:
+    if value is CONFIG_VALUE_MISSING:
+        return False
+    return bool(value)
+
+
+async def _core_context_compaction_enabled() -> bool:
+    return _config_value_is_enabled(await _open_webui_config_get(CORE_CONTEXT_COMPACTION_ENABLE_CONFIG_KEY))
+
+
+def _core_context_compaction_conflict_response() -> dict[str, Any]:
+    return _error_response(
+        CORE_CONTEXT_COMPACTION_CONFLICT_MESSAGE,
+        code="core_context_compaction_conflict",
+    )
 
 
 SUMMARY_FILE_CONTEXT_RAG_CONFIG_SPECS = {
@@ -9416,14 +9437,11 @@ class Pipe:
             metadata["chat_id"] = chat_id
         message_id = metadata.get("message_id") or metadata.get("user_message_id")
         task_name = _normalized_task_name(metadata.get("task"))
-        # Both this wrapper's own internal summary task and Open WebUI 0.10.1's
-        # built-in context_compaction summary task must pass straight through:
-        # the wrapper must not run its own compaction / file-context injection /
-        # checkpointing on top of either summary request.
-        is_summary_task = task_name in (
-            INTERNAL_SUMMARY_TASK,
-            OFFICIAL_CONTEXT_COMPACTION_TASK,
-        )
+        if task_name == OFFICIAL_CONTEXT_COMPACTION_TASK:
+            return _core_context_compaction_conflict_response()
+        is_summary_task = task_name == INTERNAL_SUMMARY_TASK
+        if not is_summary_task and await _core_context_compaction_enabled():
+            return _core_context_compaction_conflict_response()
 
         try:
             await _validate_target_access(
