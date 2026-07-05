@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from functions.pipe import auto_compaction_pipe as mod
+from functions.pipe import auto_compact as mod
 
 
 class ClaimCheckpointStore:

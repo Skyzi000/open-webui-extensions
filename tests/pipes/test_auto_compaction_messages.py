@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from functions.pipe import auto_compaction_pipe as mod
+from functions.pipe import auto_compact as mod
 
 
 def test_safe_cut_keeps_only_latest_user_and_following_active_turn_raw():

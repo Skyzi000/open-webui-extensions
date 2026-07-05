@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from functions.pipe import auto_compaction_pipe as mod
+from functions.pipe import auto_compact as mod
 
 
 def test_source_hash_is_deterministic_for_equivalent_canonical_payloads():
