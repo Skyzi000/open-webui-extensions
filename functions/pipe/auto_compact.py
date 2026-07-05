@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.21
+version: 0.5.22
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -780,6 +780,15 @@ def _canonicalize_content_part(value: Any) -> Any:
     return _canonicalize_general_value(value)
 
 
+def _collapse_text_only_content_part(part: Any) -> str | None:
+    if not isinstance(part, dict) or part.get("type") != "text":
+        return None
+    if set(part.keys()) - {"type", "text"}:
+        return None
+    text = part.get("text", "")
+    return text if isinstance(text, str) else None
+
+
 def _canonicalize_content_value(value: Any) -> Any:
     if isinstance(value, list):
         out = []
@@ -787,6 +796,13 @@ def _canonicalize_content_value(value: Any) -> Any:
             canonical_item = _canonicalize_content_part(item)
             if not _is_empty_canonical_value(canonical_item):
                 out.append(canonical_item)
+        # Filters attaching prompt-cache hints must wrap str content in a
+        # single text part; hash it as the equivalent plain string so the
+        # canonical identity survives the wrap/unwrap across turns.
+        if len(out) == 1:
+            collapsed = _collapse_text_only_content_part(out[0])
+            if collapsed is not None:
+                return collapsed
         return out
     return _canonicalize_content_part(value)
 

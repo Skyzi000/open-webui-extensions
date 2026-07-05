@@ -62,6 +62,50 @@ def test_source_hash_ignores_provider_prompt_cache_hints():
     assert mod.compute_source_hash(stable) != mod.compute_source_hash(changed_text)
 
 
+def test_source_hash_collapses_single_text_part_to_plain_string():
+    plain = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "world"},
+    ]
+    wrapped = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "world"}]},
+    ]
+
+    assert mod.compute_source_hash(plain) == mod.compute_source_hash(wrapped)
+
+
+def test_source_hash_does_not_collapse_multimodal_or_annotated_parts():
+    plain = [{"role": "user", "content": "hello"}]
+    with_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+        }
+    ]
+    with_extra_key = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello", "annotations": ["note"]}],
+        }
+    ]
+
+    assert mod.compute_source_hash(plain) != mod.compute_source_hash(with_image)
+    assert mod.compute_source_hash(plain) != mod.compute_source_hash(with_extra_key)
+
+
 def test_source_hash_ignores_core_file_upload_transients():
     stable = {
         "role": "user",
