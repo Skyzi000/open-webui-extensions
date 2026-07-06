@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.23
+version: 0.5.24
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -887,8 +887,38 @@ def canonicalize_message_for_source_hash(message: dict[str, Any]) -> dict[str, A
     return canonical
 
 
+def _is_system_message(message: dict[str, Any]) -> bool:
+    return message.get("role") == "system"
+
+
+def _source_identity_message_count(messages: list[dict[str, Any]]) -> int:
+    return sum(1 for message in messages if isinstance(message, dict) and not _is_system_message(message))
+
+
+def _raw_prefix_len_for_source_count(messages: list[dict[str, Any]], source_message_count: int) -> int | None:
+    if source_message_count < 0:
+        return None
+    if source_message_count == 0:
+        return 0
+    seen = 0
+    for index, message in enumerate(messages):
+        if _is_system_message(message):
+            continue
+        seen += 1
+        if seen == source_message_count:
+            boundary = index + 1
+            while boundary < len(messages) and _is_system_message(messages[boundary]):
+                boundary += 1
+            return boundary
+    return None
+
+
 def canonicalize_messages_for_source_hash(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [canonicalize_message_for_source_hash(message) for message in messages if isinstance(message, dict)]
+    return [
+        canonicalize_message_for_source_hash(message)
+        for message in messages
+        if isinstance(message, dict) and not _is_system_message(message)
+    ]
 
 
 def compute_source_hash(messages: list[dict[str, Any]]) -> str:
@@ -1751,15 +1781,13 @@ def select_safe_message_cut(
         len(working) - 1,
     )
     tail = copy.deepcopy(working[latest_user_index:])
-    if not any(message.get("role") == "user" for message in tail):
-        tail = [copy.deepcopy(working[latest_user_index])]
 
     prefix = copy.deepcopy(working[:latest_user_index])
     return MessageCut(
         preserved_system_message=preserved_system,
         summarization_prefix=prefix,
         tail_messages=tail,
-        source_message_count=len(prefix),
+        source_message_count=_source_identity_message_count(prefix),
     )
 
 
@@ -1837,7 +1865,7 @@ def select_tool_result_compaction_cut(
         preserved_system_message=preserved_system,
         summarization_prefix=summarization_prefix,
         tail_messages=tail_messages,
-        source_message_count=len(summarization_prefix),
+        source_message_count=_source_identity_message_count(summarization_prefix),
     )
 
 
@@ -2662,14 +2690,15 @@ def replace_prefix_with_parent_checkpoint_and_delta(
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
 ) -> list[dict[str, Any]]:
     parent_count = int(parent.get("source_message_count") or 0)
-    if parent_count <= 0 or parent_count > len(cut.summarization_prefix):
+    raw_parent_count = _raw_prefix_len_for_source_count(cut.summarization_prefix, parent_count)
+    if parent_count <= 0 or raw_parent_count is None:
         raise UnsupportedCompactionInput(
             "Parent checkpoint cannot be applied safely because its source boundary is invalid",
             code="unsafe_checkpoint_parent",
         )
     if (
         compute_summary_source_hash(
-            cut.summarization_prefix[:parent_count],
+            cut.summarization_prefix[:raw_parent_count],
             prefix_file_fingerprint,
             file_backed_image_db_chain,
         )
@@ -2680,7 +2709,7 @@ def replace_prefix_with_parent_checkpoint_and_delta(
             code="unsafe_checkpoint_parent",
         )
 
-    delta_messages = copy.deepcopy(cut.summarization_prefix[parent_count:])
+    delta_messages = copy.deepcopy(cut.summarization_prefix[raw_parent_count:])
     delta_and_tail = [*delta_messages, *copy.deepcopy(cut.tail_messages)]
     if delta_and_tail and delta_and_tail[0].get("role") == "tool":
         raise UnsupportedCompactionInput(
@@ -2699,7 +2728,7 @@ def replace_prefix_with_parent_checkpoint_and_delta(
     compacted.append(
         render_summary_message_from_checkpoint(
             parent,
-            historical_source_messages=cut.summarization_prefix[:parent_count],
+            historical_source_messages=cut.summarization_prefix[:raw_parent_count],
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
@@ -2787,20 +2816,24 @@ def select_longest_matching_checkpoint(
     prefix_hashes: dict[int, str] = {}
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     candidates = sorted(rows, key=lambda row: int(row.get("source_message_count") or 0), reverse=True)
+    source_count = _source_identity_message_count(source_messages)
     for row in candidates:
         if states is not None and row.get("state") not in states:
             continue
         count = int(row.get("source_message_count") or 0)
-        if count <= 0 or count > len(source_messages):
+        if count <= 0 or count > source_count:
+            continue
+        raw_count = _raw_prefix_len_for_source_count(source_messages, count)
+        if raw_count is None:
             continue
         if count not in prefix_hashes:
             fingerprint = (
-                prefix_file_fingerprint_resolver(count)
+                prefix_file_fingerprint_resolver(raw_count)
                 if prefix_file_fingerprint_resolver is not None
                 else None
             )
             prefix_hashes[count] = compute_summary_source_hash(
-                source_messages[:count],
+                source_messages[:raw_count],
                 fingerprint,
                 file_backed_image_db_chain,
             )
@@ -3015,6 +3048,7 @@ class CheckpointStore:
     ) -> dict[str, Any] | None:
         if not source_messages:
             return None
+        source_count = _source_identity_message_count(source_messages)
         async with await self._context() as db:
             result = await db.execute(
                 select(CHECKPOINT_TABLE)
@@ -3027,7 +3061,7 @@ class CheckpointStore:
                         profile_hash=profile_hash,
                     ),
                     CHECKPOINT_TABLE.c.state == "ready",
-                    CHECKPOINT_TABLE.c.source_message_count <= len(source_messages),
+                    CHECKPOINT_TABLE.c.source_message_count <= source_count,
                 )
                 .order_by(CHECKPOINT_TABLE.c.source_message_count.desc())
             )
@@ -3051,6 +3085,7 @@ class CheckpointStore:
     ) -> dict[str, Any] | None:
         if not source_messages:
             return None
+        source_count = _source_identity_message_count(source_messages)
         now = int(time.time())
         async with await self._context() as db:
             result = await db.execute(
@@ -3066,7 +3101,7 @@ class CheckpointStore:
                     CHECKPOINT_TABLE.c.state == "pending",
                     CHECKPOINT_TABLE.c.claim_expires_at.is_not(None),
                     CHECKPOINT_TABLE.c.claim_expires_at > now,
-                    CHECKPOINT_TABLE.c.source_message_count <= len(source_messages),
+                    CHECKPOINT_TABLE.c.source_message_count <= source_count,
                 )
                 .order_by(CHECKPOINT_TABLE.c.source_message_count.desc())
             )
@@ -7016,27 +7051,32 @@ async def _compact_retry_tool_results(
     ):
         ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
         if ready_checkpoint is not None:
-            message_cut = MessageCut(
-                preserved_system_message=copy.deepcopy(cut.preserved_system_message),
-                summarization_prefix=copy.deepcopy(cut.summarization_prefix),
-                tail_messages=copy.deepcopy(cut.tail_messages),
-                source_message_count=cut.source_message_count,
-            )
-            return (
-                replace_prefix_with_parent_checkpoint_and_delta(
-                    message_cut,
-                    ready_checkpoint,
-                    prefix_file_fingerprint=_resolve_fingerprint(
-                        prefix_file_fingerprint_resolver,
-                        int(ready_checkpoint.get("source_message_count") or 0),
-                    ),
-                    file_backed_image_db_chain=file_backed_image_db_chain,
-                    historical_message_excerpt_bytes=historical_message_excerpt_bytes,
-                    historical_message_excerpt_count=historical_message_excerpt_count,
-                ),
-                True,
+            ready_raw_count = _raw_prefix_len_for_source_count(
+                cut.summarization_prefix,
                 int(ready_checkpoint.get("source_message_count") or 0),
             )
+            if ready_raw_count is not None:
+                message_cut = MessageCut(
+                    preserved_system_message=copy.deepcopy(cut.preserved_system_message),
+                    summarization_prefix=copy.deepcopy(cut.summarization_prefix),
+                    tail_messages=copy.deepcopy(cut.tail_messages),
+                    source_message_count=cut.source_message_count,
+                )
+                return (
+                    replace_prefix_with_parent_checkpoint_and_delta(
+                        message_cut,
+                        ready_checkpoint,
+                        prefix_file_fingerprint=_resolve_fingerprint(
+                            prefix_file_fingerprint_resolver,
+                            ready_raw_count,
+                        ),
+                        file_backed_image_db_chain=file_backed_image_db_chain,
+                        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                        historical_message_excerpt_count=historical_message_excerpt_count,
+                    ),
+                    True,
+                    ready_raw_count,
+                )
     summary_meta = build_checkpoint_summary_meta(
         source_messages,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
@@ -7200,7 +7240,7 @@ async def _get_or_create_checkpoint_summary(
             claimed = await _claim_or_wait_for_checkpoint(
                 store,
                 identity=identity,
-                source_message_count=len(source_messages),
+                source_message_count=_source_identity_message_count(source_messages),
                 summary_meta=summary_meta,
                 claim_token=claim_token,
             )
@@ -7212,16 +7252,18 @@ async def _get_or_create_checkpoint_summary(
             try:
                 if parent_checkpoint is not None:
                     parent_count = int(parent_checkpoint.get("source_message_count") or 0)
+                    raw_parent_count = _raw_prefix_len_for_source_count(source_messages, parent_count)
                     parent_fingerprint = (
-                        prefix_file_fingerprint_resolver(parent_count)
+                        prefix_file_fingerprint_resolver(raw_parent_count)
                         if prefix_file_fingerprint_resolver is not None
+                        and raw_parent_count is not None
                         else None
                     )
                     if (
                         parent_count <= 0
-                        or parent_count > len(source_messages)
+                        or raw_parent_count is None
                         or compute_summary_source_hash(
-                            source_messages[:parent_count],
+                            source_messages[:raw_parent_count],
                             parent_fingerprint,
                             file_backed_image_db_chain,
                         )
@@ -7311,16 +7353,24 @@ async def _get_or_create_compaction_summary(
 
     async def summary_factory(parent: dict[str, Any] | None) -> str:
         parent_count = 0
+        raw_parent_count = 0
         if parent:
             parent_count = int(parent.get("source_message_count") or 0)
+            raw_count = _raw_prefix_len_for_source_count(summary_source_prefix, parent_count)
+            if raw_count is None:
+                raise UnsupportedCompactionInput(
+                    "Parent checkpoint cannot be applied safely because its source boundary is invalid",
+                    code="unsafe_checkpoint_parent",
+                )
+            raw_parent_count = raw_count
             source = [
                 render_summary_message_from_checkpoint(
                     parent,
-                    historical_source_messages=summary_source_prefix[:parent_count],
+                    historical_source_messages=summary_source_prefix[:raw_parent_count],
                     historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                     historical_message_excerpt_count=historical_message_excerpt_count,
                 ),
-                *copy.deepcopy(summary_source_prefix[parent_count:]),
+                *copy.deepcopy(summary_source_prefix[raw_parent_count:]),
             ]
         else:
             source = copy.deepcopy(summary_source_prefix)
@@ -7336,7 +7386,7 @@ async def _get_or_create_compaction_summary(
             on_summary_start=on_summary_start,
             summary_tool_policy=summary_tool_policy,
             compaction_prefix_count=len(summary_source_prefix),
-            parent_source_message_count=parent_count,
+            parent_source_message_count=raw_parent_count,
             file_context_enabled=file_context_enabled,
             summary_prompt=summary_prompt,
         )
@@ -7443,7 +7493,7 @@ def _checkpoint_matches_exact_source(
     except Exception:
         return False
     return (
-        source_message_count == len(source_messages)
+        source_message_count == _source_identity_message_count(source_messages)
         and row.get("source_hash")
         == compute_summary_source_hash(source_messages, prefix_file_fingerprint, file_backed_image_db_chain)
     )
@@ -7554,18 +7604,20 @@ async def _prefetch_compaction_checkpoint(
         if match.checkpoint is None or match.source_kind != source_kind:
             return False
         checkpoint_count = int(match.checkpoint.get("source_message_count") or match.source_message_count or 0)
-        if checkpoint_count <= 0 or checkpoint_count > len(source_messages):
+        source_count = _source_identity_message_count(source_messages)
+        raw_checkpoint_count = _raw_prefix_len_for_source_count(source_messages, checkpoint_count)
+        if checkpoint_count <= 0 or checkpoint_count > source_count or raw_checkpoint_count is None:
             return False
-        if match.kind == "exact" and checkpoint_count != len(source_messages):
+        if match.kind == "exact" and checkpoint_count != source_count:
             return False
         checkpoint_fingerprint = (
-            prefix_file_fingerprint_resolver(checkpoint_count)
+            prefix_file_fingerprint_resolver(raw_checkpoint_count)
             if prefix_file_fingerprint_resolver is not None
             else None
         )
         return (
             compute_summary_source_hash(
-                source_messages[:checkpoint_count],
+                source_messages[:raw_checkpoint_count],
                 checkpoint_fingerprint,
                 file_backed_image_db_chain,
             )
@@ -8102,16 +8154,17 @@ async def _estimate_checkpoint_applied_body_tokens(
             continue
 
         parent_count = int(checkpoint.get("source_message_count") or 0)
-        if parent_count <= 0 or parent_count > len(source_messages):
+        raw_parent_count = _raw_prefix_len_for_source_count(source_messages, parent_count)
+        if parent_count <= 0 or raw_parent_count is None:
             continue
         parent_fingerprint = (
-            prefix_file_fingerprint_resolver(parent_count)
+            prefix_file_fingerprint_resolver(raw_parent_count)
             if prefix_file_fingerprint_resolver is not None
             else None
         )
         if (
             compute_summary_source_hash(
-                source_messages[:parent_count],
+                source_messages[:raw_parent_count],
                 parent_fingerprint,
                 file_backed_image_db_chain,
             )
@@ -8132,7 +8185,7 @@ async def _estimate_checkpoint_applied_body_tokens(
         summary_tokens = await _summary_token_count_from_checkpoint(
             request=request,
             checkpoint=checkpoint,
-            historical_source_messages=message_cut.summarization_prefix[:parent_count],
+            historical_source_messages=message_cut.summarization_prefix[:raw_parent_count],
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
@@ -8142,7 +8195,7 @@ async def _estimate_checkpoint_applied_body_tokens(
         estimate_source = []
         if message_cut.preserved_system_message is not None:
             estimate_source.append(message_cut.preserved_system_message)
-        estimate_source.extend(message_cut.summarization_prefix[parent_count:])
+        estimate_source.extend(message_cut.summarization_prefix[raw_parent_count:])
         estimate_source.extend(message_cut.tail_messages)
 
         remaining_body = _copy_body_preserving_metadata(body)
@@ -8158,7 +8211,7 @@ async def _estimate_checkpoint_applied_body_tokens(
                 body=remaining_body,
                 chat_id=chat_id or None,
                 current_message_id=str(metadata.get("user_message_id") or metadata.get("message_id") or "") or None,
-                compaction_prefix_count=parent_count,
+                compaction_prefix_count=raw_parent_count,
                 metadata_files=metadata_files,
                 metadata_user_message=metadata.get("user_message"),
                 event_emitter=None,
@@ -8249,19 +8302,25 @@ async def _compact_body_with_reusable_checkpoint(
             )
         else:
             message_cut = candidate_cut
+        checkpoint_raw_count = _raw_prefix_len_for_source_count(
+            message_cut.summarization_prefix,
+            int(checkpoint.get("source_message_count") or 0),
+        )
+        if checkpoint_raw_count is None:
+            continue
         compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
             message_cut,
             checkpoint,
             prefix_file_fingerprint=_resolve_fingerprint(
                 prefix_file_fingerprint_resolver,
-                int(checkpoint.get("source_message_count") or 0),
+                checkpoint_raw_count,
             ),
             file_backed_image_db_chain=file_backed_image_db_chain,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
         compacted.pop("previous_response_id", None)
-        return compacted, True, int(checkpoint.get("source_message_count") or match.source_message_count or 0)
+        return compacted, True, checkpoint_raw_count
 
     raise RuntimeError("Reusable checkpoint match disappeared before compaction")
 
@@ -9032,20 +9091,25 @@ async def _compact_body(
     ):
         ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
         if ready_checkpoint is not None:
-            compacted = _copy_body_preserving_metadata(body)
-            compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
-                cut,
-                ready_checkpoint,
-                prefix_file_fingerprint=_resolve_fingerprint(
-                    prefix_file_fingerprint_resolver,
-                    int(ready_checkpoint.get("source_message_count") or 0),
-                ),
-                file_backed_image_db_chain=file_backed_image_db_chain,
-                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
-                historical_message_excerpt_count=historical_message_excerpt_count,
+            ready_raw_count = _raw_prefix_len_for_source_count(
+                cut.summarization_prefix,
+                int(ready_checkpoint.get("source_message_count") or 0),
             )
-            compacted.pop("previous_response_id", None)
-            return compacted, True, int(ready_checkpoint.get("source_message_count") or 0)
+            if ready_raw_count is not None:
+                compacted = _copy_body_preserving_metadata(body)
+                compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
+                    cut,
+                    ready_checkpoint,
+                    prefix_file_fingerprint=_resolve_fingerprint(
+                        prefix_file_fingerprint_resolver,
+                        ready_raw_count,
+                    ),
+                    file_backed_image_db_chain=file_backed_image_db_chain,
+                    historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                    historical_message_excerpt_count=historical_message_excerpt_count,
+                )
+                compacted.pop("previous_response_id", None)
+                return compacted, True, ready_raw_count
 
     summary_meta = build_checkpoint_summary_meta(
         cut.summarization_prefix,
@@ -9084,18 +9148,27 @@ async def _compact_body(
         )
         compaction_prefix_count_for_return = len(cut.summarization_prefix)
     except ParentCheckpointExtensionFailed as exc:
+        parent_raw_count = _raw_prefix_len_for_source_count(
+            cut.summarization_prefix,
+            int(exc.parent.get("source_message_count") or 0),
+        )
+        if parent_raw_count is None:
+            raise UnsupportedCompactionInput(
+                "Parent checkpoint cannot be applied safely because its source boundary is invalid",
+                code="unsafe_checkpoint_parent",
+            ) from exc
         compacted["messages"] = replace_prefix_with_parent_checkpoint_and_delta(
             cut,
             exc.parent,
             prefix_file_fingerprint=_resolve_fingerprint(
                 prefix_file_fingerprint_resolver,
-                int(exc.parent.get("source_message_count") or 0),
+                parent_raw_count,
             ),
             file_backed_image_db_chain=file_backed_image_db_chain,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
-        compaction_prefix_count_for_return = int(exc.parent.get("source_message_count") or 0)
+        compaction_prefix_count_for_return = parent_raw_count
     compacted.pop("previous_response_id", None)
     return compacted, True, compaction_prefix_count_for_return
 

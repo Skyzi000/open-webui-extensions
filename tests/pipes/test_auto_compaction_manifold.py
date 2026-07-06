@@ -6787,11 +6787,13 @@ async def test_compact_body_summary_request_preserves_system_but_checkpoint_iden
     rows = []
     captured = {}
     system = {"role": "system", "content": "system prompt"}
+    volatile_system = {"role": "system", "content": "volatile middle system"}
     source_messages = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
     ]
-    messages = [*source_messages, {"role": "user", "content": "active"}]
+    request_prefix = [source_messages[0], volatile_system, source_messages[1]]
+    messages = [*request_prefix, {"role": "user", "content": "active"}]
 
     async def noop_initialize(**kwargs):
         return None
@@ -6819,16 +6821,19 @@ async def test_compact_body_summary_request_preserves_system_but_checkpoint_iden
     )
 
     assert did_compact is True
-    assert prefix_count == len(source_messages)
-    assert captured["messages"][:-1] == [system, *source_messages]
+    assert prefix_count == len(request_prefix)
+    assert captured["messages"][:-1] == [system, *request_prefix]
     assert captured["messages"][-1]["role"] == "user"
     assert rows[0]["source_message_count"] == len(source_messages)
     assert rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
-    assert rows[0]["source_hash"] != mod.compute_source_hash([system, *source_messages])
+    assert rows[0]["source_hash"] == mod.compute_source_hash([system, *request_prefix])
     assert rows[0]["summary_meta"]["historical_user_messages"]["messages"] == [
         {"ordinal": 1, "text": "old"}
     ]
     assert compacted["messages"][0] == system
+    assert "summary" in compacted["messages"][1]["content"]
+    assert compacted["messages"][2:] == [{"role": "user", "content": "active"}]
+    assert volatile_system not in compacted["messages"]
 
 
 @pytest.mark.asyncio
@@ -6894,6 +6899,150 @@ async def test_compact_body_reuses_checkpoint_when_only_system_content_changes(
     assert store.touched == [checkpoint["id"]]
     assert compacted["messages"][0] == {"role": "system", "content": "changed system prompt"}
     assert "reused summary" in compacted["messages"][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_compact_body_reuses_checkpoint_when_middle_system_presence_changes(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    stable_source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "system", "content": "original volatile middle system"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(stable_source_messages),
+        source_message_count=len([message for message in stable_source_messages if message["role"] != "system"]),
+        summary_text="reused summary",
+        summary_meta=mod.build_checkpoint_summary_meta(
+            stable_source_messages,
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+        ),
+        parent_checkpoint_id=None,
+        now=123,
+    )
+    store = ClaimCheckpointStore([checkpoint])
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("middle system presence changes must not invalidate a reusable checkpoint")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    compacted, did_compact, prefix_count = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body={
+            "model": "target",
+            "messages": [
+                {"role": "system", "content": "first system prompt"},
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "active"},
+            ],
+        },
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+    )
+
+    assert did_compact is True
+    assert prefix_count == 2
+    assert store.touched == [checkpoint["id"]]
+    assert compacted["messages"][0] == {"role": "system", "content": "first system prompt"}
+    assert "reused summary" in compacted["messages"][1]["content"]
+    assert compacted["messages"][2:] == [{"role": "user", "content": "active"}]
+
+
+@pytest.mark.asyncio
+async def test_compact_body_parent_extension_failure_returns_raw_parent_boundary_after_middle_system(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    parent_raw_source = [
+        {"role": "user", "content": "old"},
+        {"role": "system", "content": "volatile middle system"},
+    ]
+    parent = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(parent_raw_source),
+        source_message_count=1,
+        summary_text="parent summary",
+        summary_meta=mod.build_checkpoint_summary_meta(
+            parent_raw_source,
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+        ),
+        parent_checkpoint_id=None,
+        now=123,
+    )
+    store = ClaimCheckpointStore([parent])
+    summary_inputs = []
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_summary_text(**kwargs):
+        summary_inputs.append(kwargs["source_messages"])
+        raise RuntimeError("parent extension failed")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    compacted, did_compact, prefix_count = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body={
+            "model": "target",
+            "messages": [
+                {"role": "system", "content": "first system prompt"},
+                {"role": "user", "content": "old"},
+                {"role": "system", "content": "volatile middle system"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "active"},
+            ],
+        },
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+    )
+
+    assert did_compact is True
+    assert prefix_count == 2
+    assert store.touched == []
+    assert summary_inputs[0][0]["role"] == "user"
+    assert "parent summary" in summary_inputs[0][0]["content"]
+    assert summary_inputs[0][1:] == [{"role": "assistant", "content": "old answer"}]
+    assert compacted["messages"][0] == {"role": "system", "content": "first system prompt"}
+    assert "parent summary" in compacted["messages"][1]["content"]
+    assert compacted["messages"][2:] == [
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
 
 
 @pytest.mark.asyncio

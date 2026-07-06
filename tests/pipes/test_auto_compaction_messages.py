@@ -53,6 +53,22 @@ def test_safe_cut_keeps_latest_user_raw_when_no_following_tool_round():
     assert cut.tail_messages == [{"role": "user", "content": "active request"}]
 
 
+def test_source_hash_ignores_all_system_messages():
+    source_messages = [
+        {"role": "system", "content": "first system"},
+        {"role": "user", "content": "old"},
+        {"role": "system", "content": "volatile middle system"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    assert mod.compute_source_hash(source_messages) == mod.compute_source_hash(
+        [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+    )
+
+
 def test_summary_insertion_preserves_system_and_adds_chronological_user_excerpts():
     long_user = "first " + ("x" * 200) + " last"
     messages = [
@@ -427,3 +443,38 @@ def test_legacy_parent_checkpoint_respects_disabled_excerpt_fallback():
 
     assert "Legacy parent summary" in compacted[0]["content"]
     assert "<historical_user_messages" not in compacted[0]["content"]
+
+
+def test_parent_checkpoint_count_maps_to_raw_boundary_after_middle_system():
+    messages = [
+        {"role": "system", "content": "first system"},
+        {"role": "user", "content": "old"},
+        {"role": "system", "content": "volatile middle system"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    cut = mod.select_safe_message_cut(messages)
+    raw_parent_prefix = cut.summarization_prefix[:2]
+    parent = mod.build_checkpoint_row(
+        namespace="ns",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash=mod.compute_source_hash(raw_parent_prefix),
+        source_message_count=1,
+        summary_text="Parent summary",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    compacted = mod.replace_prefix_with_parent_checkpoint_and_delta(cut, parent)
+
+    assert compacted[0] == {"role": "system", "content": "first system"}
+    assert "Parent summary" in compacted[1]["content"]
+    assert {"role": "system", "content": "volatile middle system"} not in compacted
+    assert compacted[2:] == [
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
