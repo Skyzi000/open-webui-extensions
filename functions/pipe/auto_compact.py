@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.22
+version: 0.5.23
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -6843,6 +6843,7 @@ def build_summary_completion_body(
     *,
     summary_model_id: str,
     source_messages: list[dict[str, Any]],
+    preserved_system_message: dict[str, Any] | None = None,
     metadata: dict[str, Any],
     pipe_function_id: str = PIPE_FUNCTION_ID,
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
@@ -6851,10 +6852,12 @@ def build_summary_completion_body(
 ) -> dict[str, Any]:
     body = _copy_body_preserving_metadata(base_body)
     body["model"] = _resolve_summary_model_for_call(summary_model_id, pipe_function_id=pipe_function_id)
-    body["messages"] = [
-        *copy.deepcopy(source_messages),
-        build_summary_request_message(prefix_file_context, summary_prompt=summary_prompt),
-    ]
+    messages = []
+    if preserved_system_message is not None:
+        messages.append(copy.deepcopy(preserved_system_message))
+    messages.extend(copy.deepcopy(source_messages))
+    messages.append(build_summary_request_message(prefix_file_context, summary_prompt=summary_prompt))
+    body["messages"] = messages
     body["metadata"] = build_summary_task_metadata(metadata)
     body["metadata"].pop("files", None)
     body.pop("previous_response_id", None)
@@ -6873,6 +6876,7 @@ async def _generate_summary_text(
     metadata: dict[str, Any],
     summary_model_id: str,
     source_messages: list[dict[str, Any]],
+    preserved_system_message: dict[str, Any] | None = None,
     base_body: dict[str, Any],
     pipe_function_id: str = PIPE_FUNCTION_ID,
     on_summary_start: Callable[[], Awaitable[None]] | None = None,
@@ -6904,6 +6908,7 @@ async def _generate_summary_text(
         base_body,
         summary_model_id=summary_model_id,
         source_messages=source_messages,
+        preserved_system_message=preserved_system_message,
         metadata=metadata,
         pipe_function_id=pipe_function_id,
         summary_tool_policy=summary_tool_policy,
@@ -7048,6 +7053,7 @@ async def _compact_retry_tool_results(
             summary_model_id=summary_model_id,
             base_body=base_body,
             source_messages=source_messages,
+            preserved_system_message=cut.preserved_system_message,
             summary_meta=summary_meta,
             parent_checkpoint=parent_checkpoint,
             summary_tool_policy=summary_tool_policy,
@@ -7290,6 +7296,7 @@ async def _get_or_create_compaction_summary(
     summary_model_id: str,
     base_body: dict[str, Any],
     source_messages: list[dict[str, Any]],
+    preserved_system_message: dict[str, Any] | None = None,
     summary_meta: dict[str, Any],
     parent_checkpoint: dict[str, Any] | None = None,
     parent_checkpoint_guard: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
@@ -7323,6 +7330,7 @@ async def _get_or_create_compaction_summary(
             metadata=metadata,
             summary_model_id=summary_model_id,
             source_messages=source,
+            preserved_system_message=preserved_system_message,
             base_body=base_body,
             pipe_function_id=pipe_function_id,
             on_summary_start=on_summary_start,
@@ -7470,16 +7478,18 @@ async def _wait_for_pending_checkpoint_ready(row: dict[str, Any]) -> dict[str, A
         await asyncio.sleep(CHECKPOINT_PENDING_POLL_SECONDS)
 
 
-def _soft_prefetch_source_messages(body: dict[str, Any]) -> list[dict[str, Any]] | None:
+def _soft_prefetch_source_messages(
+    body: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None] | None:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
         return None
     tool_cut = select_tool_result_compaction_cut(messages)
     if tool_cut is not None and tool_cut.summarization_prefix:
-        return copy.deepcopy(tool_cut.summarization_prefix)
+        return copy.deepcopy(tool_cut.summarization_prefix), copy.deepcopy(tool_cut.preserved_system_message)
     cut = select_safe_message_cut(messages)
     if cut.summarization_prefix:
-        return copy.deepcopy(cut.summarization_prefix)
+        return copy.deepcopy(cut.summarization_prefix), copy.deepcopy(cut.preserved_system_message)
     return None
 
 
@@ -7494,6 +7504,7 @@ async def _prefetch_compaction_checkpoint(
     pipe_function_id: str,
     summary_model_id: str,
     source_messages: list[dict[str, Any]],
+    preserved_system_message: dict[str, Any] | None = None,
     summary_tool_policy: SummaryToolPolicy,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
@@ -7682,6 +7693,7 @@ async def _prefetch_compaction_checkpoint(
             summary_model_id=summary_model_id,
             base_body=body,
             source_messages=source_messages,
+            preserved_system_message=preserved_system_message,
             summary_meta=summary_meta,
             parent_checkpoint_guard=skip_child_generation_if_parent_below_soft,
             on_summary_start=emit_summary_start,
@@ -7788,9 +7800,10 @@ def _start_soft_compaction_prefetch(
     task_estimate_body: dict[str, Any] | None = None,
     summary_prompt: str | None = None,
 ) -> bool:
-    source_messages = _soft_prefetch_source_messages(body)
-    if not source_messages:
+    prefetch_source = _soft_prefetch_source_messages(body)
+    if prefetch_source is None:
         return False
+    source_messages, preserved_system_message = prefetch_source
     chat_id = str(metadata.get("chat_id") or "")
     user_id = str((user or {}).get("id") or "")
     if not user_id or not _chat_id_supported(chat_id):
@@ -7815,6 +7828,7 @@ def _start_soft_compaction_prefetch(
             pipe_function_id=pipe_function_id,
             summary_model_id=summary_model_id,
             source_messages=source_messages,
+            preserved_system_message=preserved_system_message,
             summary_tool_policy=summary_tool_policy,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
@@ -8934,6 +8948,7 @@ async def _compact_body(
                 summary_model_id=summary_model_id,
                 base_body=body,
                 source_messages=cut.summarization_prefix,
+                preserved_system_message=cut.preserved_system_message,
                 summary_meta=history_summary_meta,
                 summary_tool_policy=summary_tool_policy,
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
@@ -9051,6 +9066,7 @@ async def _compact_body(
             summary_model_id=summary_model_id,
             base_body=body,
             source_messages=cut.summarization_prefix,
+            preserved_system_message=cut.preserved_system_message,
             summary_meta=summary_meta,
             summary_tool_policy=summary_tool_policy,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,

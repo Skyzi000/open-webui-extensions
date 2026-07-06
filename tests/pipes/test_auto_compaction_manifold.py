@@ -6736,6 +6736,26 @@ def test_build_summary_completion_body_uses_custom_summary_prompt_in_final_messa
     assert body["messages"][-1] == {"role": "user", "content": custom}
 
 
+def test_build_summary_completion_body_prepends_preserved_system_message():
+    system = {"role": "system", "content": "system prompt"}
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    body = mod.build_summary_completion_body(
+        {"model": "target", "messages": [{"role": "user", "content": "old"}], "metadata": {}},
+        summary_model_id="summary",
+        source_messages=source_messages,
+        preserved_system_message=system,
+        metadata={"chat_id": "chat-1"},
+    )
+
+    assert body["messages"][:-1] == [system, *source_messages]
+    assert body["messages"][-1]["role"] == "user"
+    assert "AUTO-COMPACTION CHECKPOINT SUMMARY" in body["messages"][-1]["content"]
+
+
 def test_summary_prompt_does_not_affect_checkpoint_profile_hash_or_identity():
     # compute_profile_hash intentionally ignores summary_prompt entirely (**_),
     # so changing it can never re-identify or invalidate a ready checkpoint.
@@ -6756,6 +6776,178 @@ def test_summary_prompt_does_not_affect_checkpoint_profile_hash_or_identity():
         summary_format_family=mod.SUMMARY_FORMAT_FAMILY,
         source_hash_family=mod.SOURCE_HASH_FAMILY,
     )
+
+
+@pytest.mark.asyncio
+async def test_compact_body_summary_request_preserves_system_but_checkpoint_identity_excludes_it(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    rows = []
+    captured = {}
+    system = {"role": "system", "content": "system prompt"}
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    messages = [*source_messages, {"role": "user", "content": "active"}]
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["messages"] = copy.deepcopy(form_data["messages"])
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
+
+    compacted, did_compact, prefix_count = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body={"model": "target", "messages": [system, *messages]},
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+    )
+
+    assert did_compact is True
+    assert prefix_count == len(source_messages)
+    assert captured["messages"][:-1] == [system, *source_messages]
+    assert captured["messages"][-1]["role"] == "user"
+    assert rows[0]["source_message_count"] == len(source_messages)
+    assert rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
+    assert rows[0]["source_hash"] != mod.compute_source_hash([system, *source_messages])
+    assert rows[0]["summary_meta"]["historical_user_messages"]["messages"] == [
+        {"ordinal": 1, "text": "old"}
+    ]
+    assert compacted["messages"][0] == system
+
+
+@pytest.mark.asyncio
+async def test_compact_body_reuses_checkpoint_when_only_system_content_changes(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages),
+        source_message_count=len(source_messages),
+        summary_text="reused summary",
+        summary_meta=mod.build_checkpoint_summary_meta(
+            source_messages,
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+        ),
+        parent_checkpoint_id=None,
+        now=123,
+    )
+    store = ClaimCheckpointStore([checkpoint])
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("system-only changes must not invalidate a reusable checkpoint")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    compacted, did_compact, prefix_count = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body={
+            "model": "target",
+            "messages": [
+                {"role": "system", "content": "changed system prompt"},
+                *source_messages,
+                {"role": "user", "content": "active"},
+            ],
+        },
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+    )
+
+    assert did_compact is True
+    assert prefix_count == len(source_messages)
+    assert store.touched == [checkpoint["id"]]
+    assert compacted["messages"][0] == {"role": "system", "content": "changed system prompt"}
+    assert "reused summary" in compacted["messages"][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_tool_result_compaction_summary_request_preserves_system_but_identity_excludes_it(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    rows = []
+    captured = {}
+    system = {"role": "system", "content": "system prompt"}
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    latest_round = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function"}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
+    ]
+    messages = [system, *source_messages, *latest_round]
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["messages"] = copy.deepcopy(form_data["messages"])
+        return {"choices": [{"message": {"content": "tool summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
+
+    compacted, did_compact, prefix_count = await mod._compact_retry_tool_results(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        base_body={"model": "target", "messages": messages},
+        messages=messages,
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+    )
+
+    assert did_compact is True
+    assert prefix_count == len(source_messages)
+    assert captured["messages"][:-1] == [system, *source_messages]
+    assert captured["messages"][-1]["role"] == "user"
+    assert rows[0]["source_message_count"] == len(source_messages)
+    assert rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
+    assert compacted[0] == system
 
 
 @pytest.mark.asyncio
@@ -13742,8 +13934,9 @@ async def test_completed_turn_prefetch_fails_closed_when_current_file_is_in_pref
         {"role": "assistant", "content": "answer"},
         {"role": "user", "content": ""},
     ]
-    source_messages = mod._soft_prefetch_source_messages({"model": "target", "messages": messages})
-    assert source_messages == messages[:-1]
+    prefetch_source = mod._soft_prefetch_source_messages({"model": "target", "messages": messages})
+    assert prefetch_source == (messages[:-1], None)
+    source_messages, preserved_system_message = prefetch_source
 
     async def load_chat_message_chain(request, chat_id, current_message_id):
         return None
@@ -13775,6 +13968,7 @@ async def test_completed_turn_prefetch_fails_closed_when_current_file_is_in_pref
             pipe_function_id="auto_compact",
             summary_model_id="target",
             source_messages=source_messages,
+            preserved_system_message=preserved_system_message,
             summary_tool_policy="fallback_on_tool_call",
             historical_message_excerpt_bytes=64,
             historical_message_excerpt_count=1,
@@ -14121,6 +14315,71 @@ async def test_tool_loop_summary_extends_existing_history_parent_when_summary_fi
     assert history_store.completed_rows[0]["parent_checkpoint_id"] == history_checkpoint["id"]
     assert "direct tool summary" in compacted["messages"][0]["content"]
     assert compacted["messages"][1:] == body["messages"][3:]
+
+
+@pytest.mark.asyncio
+async def test_parent_checkpoint_extension_summary_request_preserves_system(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    rows = []
+    captured = {}
+    system = {"role": "system", "content": "system prompt"}
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    active = {"role": "user", "content": "active"}
+    source_messages = [*parent_source, active]
+    parent_checkpoint = {
+        "id": "parent-checkpoint-1",
+        "state": "ready",
+        "source_message_count": len(parent_source),
+        "source_hash": mod.compute_source_hash(parent_source),
+        "summary_text": "existing parent summary",
+        "summary_meta": {},
+    }
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["messages"] = copy.deepcopy(form_data["messages"])
+        return {"choices": [{"message": {"content": "extended summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
+
+    summary = await mod._get_or_create_compaction_summary(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        base_body={"model": "target", "messages": [system, *source_messages]},
+        source_messages=source_messages,
+        preserved_system_message=system,
+        summary_meta=mod.build_checkpoint_summary_meta(
+            source_messages,
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+        ),
+        parent_checkpoint=parent_checkpoint,
+    )
+
+    assert summary == "extended summary"
+    assert captured["messages"][0] == system
+    assert "existing parent summary" in captured["messages"][1]["content"]
+    assert captured["messages"][2:-1] == [active]
+    assert captured["messages"][-1]["role"] == "user"
+    assert rows[0]["source_message_count"] == len(source_messages)
+    assert rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
 
 
 @pytest.mark.asyncio
@@ -17745,14 +18004,16 @@ async def test_start_soft_prefetch_passes_selected_source_messages_to_task(monke
 
     def soft_prefetch_source_messages(body):
         calls["source_selection"] += 1
-        return copy.deepcopy(selected_source)
+        return copy.deepcopy(selected_source), None
 
     async def get_or_create_compaction_summary(
         *,
         source_messages,
+        preserved_system_message,
         **kwargs,
     ):
         launched["source_messages"] = copy.deepcopy(source_messages)
+        launched["preserved_system_message"] = preserved_system_message
         return "summary"
 
     def launch_soft_prefetch_task(key, coro):
@@ -17790,6 +18051,7 @@ async def test_start_soft_prefetch_passes_selected_source_messages_to_task(monke
 
     assert calls["source_selection"] == 1
     assert launched["source_messages"] == selected_source
+    assert launched["preserved_system_message"] is None
 
 
 @pytest.mark.asyncio
@@ -17823,8 +18085,9 @@ async def test_soft_prefetch_uses_tool_aware_source_prefix(
         },
         {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
     ]
-    source_messages = mod._soft_prefetch_source_messages({"model": "target", "messages": messages})
-    assert source_messages == messages[:3]
+    prefetch_source = mod._soft_prefetch_source_messages({"model": "target", "messages": messages})
+    assert prefetch_source == (messages[:3], None)
+    source_messages, preserved_system_message = prefetch_source
 
     prefetched = await mod._prefetch_compaction_checkpoint(
         request=pipe_request,
@@ -17836,6 +18099,7 @@ async def test_soft_prefetch_uses_tool_aware_source_prefix(
         pipe_function_id="auto_compact",
         summary_model_id="target",
         source_messages=source_messages,
+        preserved_system_message=preserved_system_message,
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
@@ -17843,6 +18107,62 @@ async def test_soft_prefetch_uses_tool_aware_source_prefix(
 
     assert prefetched is True
     assert captured["source_messages"] == messages[:3]
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_summary_request_preserves_system_but_identity_excludes_it(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    rows = []
+    captured = {}
+    system = {"role": "system", "content": "system prompt"}
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    messages = [system, *source_messages, {"role": "user", "content": "active"}]
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["messages"] = copy.deepcopy(form_data["messages"])
+        return {"choices": [{"message": {"content": "prefetch summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
+
+    prefetch_source = mod._soft_prefetch_source_messages({"model": "target", "messages": messages})
+    assert prefetch_source == (source_messages, system)
+    selected_source_messages, preserved_system_message = prefetch_source
+
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        metadata=pipe_metadata,
+        body={"model": "target", "messages": messages},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=selected_source_messages,
+        preserved_system_message=preserved_system_message,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+    )
+
+    assert prefetched is True
+    assert captured["messages"][:-1] == [system, *source_messages]
+    assert captured["messages"][-1]["role"] == "user"
+    assert rows[0]["source_message_count"] == len(source_messages)
+    assert rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
 
 
 def test_start_soft_prefetch_preserves_uncopyable_metadata_references(monkeypatch, pipe_user):
