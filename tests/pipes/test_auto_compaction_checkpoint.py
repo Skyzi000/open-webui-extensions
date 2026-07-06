@@ -1893,6 +1893,92 @@ def test_longest_matching_checkpoint_uses_file_backed_image_identity():
     ) == row
 
 
+def test_file_backed_image_identity_survives_middle_system_churn():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image]}]
+    creation_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ],
+        }
+    ]
+    row = {
+        "state": "ready",
+        "source_message_count": 1,
+        "source_hash": mod.compute_summary_source_hash(
+            creation_messages,
+            file_backed_image_db_chain=db_chain,
+        ),
+    }
+
+    current_messages = [
+        {"role": "system", "content": "volatile middle system"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,reencoded"}},
+            ],
+        },
+    ]
+
+    def resolver(count):
+        return None
+
+    setattr(resolver, mod.PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR, db_chain)
+
+    assert mod.select_longest_matching_checkpoint(
+        [row],
+        current_messages,
+        prefix_file_fingerprint_resolver=resolver,
+    ) == row
+
+
+def test_longest_matching_checkpoint_fingerprint_window_survives_middle_system_churn():
+    resolver_counts: list[int] = []
+
+    def resolver(count):
+        resolver_counts.append(count)
+        return f"fingerprint-{count}"
+
+    creation_prefix = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    row = {
+        "state": "ready",
+        "source_message_count": 2,
+        "source_hash": mod.compute_summary_source_hash(creation_prefix, resolver(2)),
+    }
+
+    current_prefix = [
+        {"role": "user", "content": "old"},
+        {"role": "system", "content": "volatile middle system"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "follow-up"},
+        {"role": "assistant", "content": "follow-up answer"},
+    ]
+
+    assert (
+        mod.select_longest_matching_checkpoint(
+            [row],
+            current_prefix,
+            prefix_file_fingerprint_resolver=resolver,
+        )
+        == row
+    )
+    assert set(resolver_counts) == {2}
+
+
 @pytest.mark.asyncio
 async def test_prefix_file_resolver_keeps_db_chain_without_metadata_files(monkeypatch):
     image = {

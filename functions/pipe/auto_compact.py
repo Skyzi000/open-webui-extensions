@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.24
+version: 0.5.25
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -1076,11 +1076,18 @@ def _stable_file_backed_image_source_messages(
         return source_messages
 
     normalized = copy.deepcopy(source_messages)
-    for index, message in enumerate(normalized):
-        if index >= len(db_chain):
+    # Pair body messages with DB-chain entries by non-system position:
+    # injected system messages exist only in the request body, so a raw
+    # index pairing would shift whenever they churn between turns.
+    chain_index = 0
+    for message in normalized:
+        if not isinstance(message, dict) or _is_system_message(message):
+            continue
+        if chain_index >= len(db_chain):
             break
-        db_message = db_chain[index]
-        if not isinstance(message, dict) or not isinstance(db_message, dict):
+        db_message = db_chain[chain_index]
+        chain_index += 1
+        if not isinstance(db_message, dict):
             continue
         if message.get("role") != "user":
             continue
@@ -1159,7 +1166,11 @@ def _make_prefix_file_fingerprint_resolver(
     metadata_files: Any,
 ) -> Callable[[int], str | None]:
     # Fingerprints cover all non-image prefix files in DB-chain positions
-    # [0, count). Using the full prefix range (rather than the delta
+    # [0, count). Counts are non-system source message counts (the same basis
+    # as checkpoint source_message_count): filter-injected system messages
+    # exist only in the request body, never in the DB chain, so a raw body
+    # index would drift with system-message churn and shift this window.
+    # Using the full prefix range (rather than the delta
     # [parent_count, compaction_prefix_count)) keeps the hash basis identical
     # for a checkpoint and any of its potential children, so parent matching
     # and parent validation use the same fingerprint the stored row was built
@@ -2828,7 +2839,7 @@ def select_longest_matching_checkpoint(
             continue
         if count not in prefix_hashes:
             fingerprint = (
-                prefix_file_fingerprint_resolver(raw_count)
+                prefix_file_fingerprint_resolver(count)
                 if prefix_file_fingerprint_resolver is not None
                 else None
             )
@@ -7034,7 +7045,9 @@ async def _compact_retry_tool_results(
         require_file_context_chain=file_context_enabled,
     )
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
-    source_identity_fingerprint = _resolve_fingerprint(prefix_file_fingerprint_resolver, len(source_messages))
+    source_identity_fingerprint = _resolve_fingerprint(
+        prefix_file_fingerprint_resolver, _source_identity_message_count(source_messages)
+    )
     pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
         request=request,
         user_id=user_id,
@@ -7051,9 +7064,10 @@ async def _compact_retry_tool_results(
     ):
         ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
         if ready_checkpoint is not None:
+            ready_count = int(ready_checkpoint.get("source_message_count") or 0)
             ready_raw_count = _raw_prefix_len_for_source_count(
                 cut.summarization_prefix,
-                int(ready_checkpoint.get("source_message_count") or 0),
+                ready_count,
             )
             if ready_raw_count is not None:
                 message_cut = MessageCut(
@@ -7068,14 +7082,14 @@ async def _compact_retry_tool_results(
                         ready_checkpoint,
                         prefix_file_fingerprint=_resolve_fingerprint(
                             prefix_file_fingerprint_resolver,
-                            ready_raw_count,
+                            ready_count,
                         ),
                         file_backed_image_db_chain=file_backed_image_db_chain,
                         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                         historical_message_excerpt_count=historical_message_excerpt_count,
                     ),
                     True,
-                    ready_raw_count,
+                    ready_count,
                 )
     summary_meta = build_checkpoint_summary_meta(
         source_messages,
@@ -7130,7 +7144,7 @@ async def _compact_retry_tool_results(
         )
     )
     compacted.extend(copy.deepcopy(cut.tail_messages))
-    return compacted, True, len(source_messages)
+    return compacted, True, _source_identity_message_count(source_messages)
 
 
 async def _heartbeat_checkpoint_claim(store: Any, checkpoint_id: str, claim_token: str) -> None:
@@ -7254,9 +7268,8 @@ async def _get_or_create_checkpoint_summary(
                     parent_count = int(parent_checkpoint.get("source_message_count") or 0)
                     raw_parent_count = _raw_prefix_len_for_source_count(source_messages, parent_count)
                     parent_fingerprint = (
-                        prefix_file_fingerprint_resolver(raw_parent_count)
+                        prefix_file_fingerprint_resolver(parent_count)
                         if prefix_file_fingerprint_resolver is not None
-                        and raw_parent_count is not None
                         else None
                     )
                     if (
@@ -7385,8 +7398,8 @@ async def _get_or_create_compaction_summary(
             pipe_function_id=pipe_function_id,
             on_summary_start=on_summary_start,
             summary_tool_policy=summary_tool_policy,
-            compaction_prefix_count=len(summary_source_prefix),
-            parent_source_message_count=raw_parent_count,
+            compaction_prefix_count=_source_identity_message_count(summary_source_prefix),
+            parent_source_message_count=parent_count,
             file_context_enabled=file_context_enabled,
             summary_prompt=summary_prompt,
         )
@@ -7398,7 +7411,7 @@ async def _get_or_create_compaction_summary(
         require_file_context_chain=file_context_enabled,
     )
     identity_fingerprint = (
-        prefix_file_fingerprint_resolver(len(source_messages))
+        prefix_file_fingerprint_resolver(_source_identity_message_count(source_messages))
         if prefix_file_fingerprint_resolver is not None
         else None
     )
@@ -7611,7 +7624,7 @@ async def _prefetch_compaction_checkpoint(
         if match.kind == "exact" and checkpoint_count != source_count:
             return False
         checkpoint_fingerprint = (
-            prefix_file_fingerprint_resolver(raw_checkpoint_count)
+            prefix_file_fingerprint_resolver(checkpoint_count)
             if prefix_file_fingerprint_resolver is not None
             else None
         )
@@ -8015,7 +8028,7 @@ async def _body_reusable_checkpoint_match(
 
     if tool_cut is not None and tool_cut.summarization_prefix:
         tool_identity_fingerprint = (
-            prefix_file_fingerprint_resolver(len(tool_cut.summarization_prefix))
+            prefix_file_fingerprint_resolver(_source_identity_message_count(tool_cut.summarization_prefix))
             if prefix_file_fingerprint_resolver is not None
             else None
         )
@@ -8042,7 +8055,7 @@ async def _body_reusable_checkpoint_match(
         return None
 
     message_identity_fingerprint = (
-        prefix_file_fingerprint_resolver(len(cut.summarization_prefix))
+        prefix_file_fingerprint_resolver(_source_identity_message_count(cut.summarization_prefix))
         if prefix_file_fingerprint_resolver is not None
         else None
     )
@@ -8135,7 +8148,7 @@ async def _estimate_checkpoint_applied_body_tokens(
         checkpoint = match.checkpoint
         if checkpoint is None:
             identity_fingerprint = (
-                prefix_file_fingerprint_resolver(len(source_messages))
+                prefix_file_fingerprint_resolver(_source_identity_message_count(source_messages))
                 if prefix_file_fingerprint_resolver is not None
                 else None
             )
@@ -8158,7 +8171,7 @@ async def _estimate_checkpoint_applied_body_tokens(
         if parent_count <= 0 or raw_parent_count is None:
             continue
         parent_fingerprint = (
-            prefix_file_fingerprint_resolver(raw_parent_count)
+            prefix_file_fingerprint_resolver(parent_count)
             if prefix_file_fingerprint_resolver is not None
             else None
         )
@@ -8211,7 +8224,7 @@ async def _estimate_checkpoint_applied_body_tokens(
                 body=remaining_body,
                 chat_id=chat_id or None,
                 current_message_id=str(metadata.get("user_message_id") or metadata.get("message_id") or "") or None,
-                compaction_prefix_count=raw_parent_count,
+                compaction_prefix_count=parent_count,
                 metadata_files=metadata_files,
                 metadata_user_message=metadata.get("user_message"),
                 event_emitter=None,
@@ -8271,7 +8284,7 @@ async def _compact_body_with_reusable_checkpoint(
 
     for _kind, candidate_cut, source_messages in candidates:
         identity_fingerprint = (
-            prefix_file_fingerprint_resolver(len(source_messages))
+            prefix_file_fingerprint_resolver(_source_identity_message_count(source_messages))
             if prefix_file_fingerprint_resolver is not None
             else None
         )
@@ -8302,9 +8315,10 @@ async def _compact_body_with_reusable_checkpoint(
             )
         else:
             message_cut = candidate_cut
+        checkpoint_count = int(checkpoint.get("source_message_count") or 0)
         checkpoint_raw_count = _raw_prefix_len_for_source_count(
             message_cut.summarization_prefix,
-            int(checkpoint.get("source_message_count") or 0),
+            checkpoint_count,
         )
         if checkpoint_raw_count is None:
             continue
@@ -8313,14 +8327,14 @@ async def _compact_body_with_reusable_checkpoint(
             checkpoint,
             prefix_file_fingerprint=_resolve_fingerprint(
                 prefix_file_fingerprint_resolver,
-                checkpoint_raw_count,
+                checkpoint_count,
             ),
             file_backed_image_db_chain=file_backed_image_db_chain,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
         compacted.pop("previous_response_id", None)
-        return compacted, True, checkpoint_raw_count
+        return compacted, True, checkpoint_count
 
     raise RuntimeError("Reusable checkpoint match disappeared before compaction")
 
@@ -9026,7 +9040,7 @@ async def _compact_body(
                 source_messages=cut.summarization_prefix,
                 prefix_file_fingerprint=_resolve_fingerprint(
                     history_prefix_file_fingerprint_resolver,
-                    len(cut.summarization_prefix),
+                    _source_identity_message_count(cut.summarization_prefix),
                 ),
                 file_backed_image_db_chain=_prefix_file_fingerprint_resolver_db_chain(
                     history_prefix_file_fingerprint_resolver
@@ -9073,7 +9087,7 @@ async def _compact_body(
     )
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     prefix_identity_fingerprint = _resolve_fingerprint(
-        prefix_file_fingerprint_resolver, len(cut.summarization_prefix)
+        prefix_file_fingerprint_resolver, _source_identity_message_count(cut.summarization_prefix)
     )
     pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
         request=request,
@@ -9091,9 +9105,10 @@ async def _compact_body(
     ):
         ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
         if ready_checkpoint is not None:
+            ready_count = int(ready_checkpoint.get("source_message_count") or 0)
             ready_raw_count = _raw_prefix_len_for_source_count(
                 cut.summarization_prefix,
-                int(ready_checkpoint.get("source_message_count") or 0),
+                ready_count,
             )
             if ready_raw_count is not None:
                 compacted = _copy_body_preserving_metadata(body)
@@ -9102,14 +9117,14 @@ async def _compact_body(
                     ready_checkpoint,
                     prefix_file_fingerprint=_resolve_fingerprint(
                         prefix_file_fingerprint_resolver,
-                        ready_raw_count,
+                        ready_count,
                     ),
                     file_backed_image_db_chain=file_backed_image_db_chain,
                     historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                     historical_message_excerpt_count=historical_message_excerpt_count,
                 )
                 compacted.pop("previous_response_id", None)
-                return compacted, True, ready_raw_count
+                return compacted, True, ready_count
 
     summary_meta = build_checkpoint_summary_meta(
         cut.summarization_prefix,
@@ -9146,11 +9161,12 @@ async def _compact_body(
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
-        compaction_prefix_count_for_return = len(cut.summarization_prefix)
+        compaction_prefix_count_for_return = _source_identity_message_count(cut.summarization_prefix)
     except ParentCheckpointExtensionFailed as exc:
+        parent_count = int(exc.parent.get("source_message_count") or 0)
         parent_raw_count = _raw_prefix_len_for_source_count(
             cut.summarization_prefix,
-            int(exc.parent.get("source_message_count") or 0),
+            parent_count,
         )
         if parent_raw_count is None:
             raise UnsupportedCompactionInput(
@@ -9162,13 +9178,13 @@ async def _compact_body(
             exc.parent,
             prefix_file_fingerprint=_resolve_fingerprint(
                 prefix_file_fingerprint_resolver,
-                parent_raw_count,
+                parent_count,
             ),
             file_backed_image_db_chain=file_backed_image_db_chain,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
-        compaction_prefix_count_for_return = parent_raw_count
+        compaction_prefix_count_for_return = parent_count
     compacted.pop("previous_response_id", None)
     return compacted, True, compaction_prefix_count_for_return
 

@@ -6821,7 +6821,7 @@ async def test_compact_body_summary_request_preserves_system_but_checkpoint_iden
     )
 
     assert did_compact is True
-    assert prefix_count == len(request_prefix)
+    assert prefix_count == len(source_messages)
     assert captured["messages"][:-1] == [system, *request_prefix]
     assert captured["messages"][-1]["role"] == "user"
     assert rows[0]["source_message_count"] == len(source_messages)
@@ -6970,7 +6970,7 @@ async def test_compact_body_reuses_checkpoint_when_middle_system_presence_change
 
 
 @pytest.mark.asyncio
-async def test_compact_body_parent_extension_failure_returns_raw_parent_boundary_after_middle_system(
+async def test_compact_body_parent_extension_failure_returns_chain_parent_boundary_after_middle_system(
     monkeypatch,
     pipe_request,
     pipe_user,
@@ -7032,7 +7032,7 @@ async def test_compact_body_parent_extension_failure_returns_raw_parent_boundary
     )
 
     assert did_compact is True
-    assert prefix_count == 2
+    assert prefix_count == 1
     assert store.touched == []
     assert summary_inputs[0][0]["role"] == "user"
     assert "parent summary" in summary_inputs[0][0]["content"]
