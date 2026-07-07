@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.25
+version: 0.5.26
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -913,6 +913,31 @@ def _raw_prefix_len_for_source_count(messages: list[dict[str, Any]], source_mess
     return None
 
 
+def _raw_chain_boundary(db_chain: list[dict[str, Any]], count: int) -> int:
+    # Imported or API-created histories can store their own system rows in
+    # the DB chain, so a non-system source count is not a raw chain index.
+    # Mirrors _raw_prefix_len_for_source_count (including trailing-system
+    # absorption) but tolerates non-dict chain entries, counting them as
+    # pairable positions like the file-backed image cursor does.
+    if count <= 0:
+        return 0
+    seen = 0
+    for index, message in enumerate(db_chain):
+        if isinstance(message, dict) and _is_system_message(message):
+            continue
+        seen += 1
+        if seen == count:
+            boundary = index + 1
+            while (
+                boundary < len(db_chain)
+                and isinstance(db_chain[boundary], dict)
+                and _is_system_message(db_chain[boundary])
+            ):
+                boundary += 1
+            return boundary
+    return len(db_chain)
+
+
 def canonicalize_messages_for_source_hash(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         canonicalize_message_for_source_hash(message)
@@ -1076,13 +1101,20 @@ def _stable_file_backed_image_source_messages(
         return source_messages
 
     normalized = copy.deepcopy(source_messages)
-    # Pair body messages with DB-chain entries by non-system position:
-    # injected system messages exist only in the request body, so a raw
-    # index pairing would shift whenever they churn between turns.
+    # Pair body messages with DB-chain entries by non-system position on
+    # BOTH sides: filter-injected system messages exist only in the request
+    # body and churn between turns, while imported or API-created histories
+    # can store their own system rows in the chain.
     chain_index = 0
     for message in normalized:
         if not isinstance(message, dict) or _is_system_message(message):
             continue
+        while (
+            chain_index < len(db_chain)
+            and isinstance(db_chain[chain_index], dict)
+            and _is_system_message(db_chain[chain_index])
+        ):
+            chain_index += 1
         if chain_index >= len(db_chain):
             break
         db_message = db_chain[chain_index]
@@ -1165,11 +1197,13 @@ def _make_prefix_file_fingerprint_resolver(
     db_chain: list[dict[str, Any]] | None,
     metadata_files: Any,
 ) -> Callable[[int], str | None]:
-    # Fingerprints cover all non-image prefix files in DB-chain positions
-    # [0, count). Counts are non-system source message counts (the same basis
-    # as checkpoint source_message_count): filter-injected system messages
-    # exist only in the request body, never in the DB chain, so a raw body
-    # index would drift with system-message churn and shift this window.
+    # Fingerprints cover all non-image prefix files up to the DB-chain
+    # boundary for `count` non-system entries. Counts are non-system source
+    # message counts (the same basis as checkpoint source_message_count):
+    # filter-injected system messages exist only in the request body and
+    # churn between turns, while imported or API-created histories can store
+    # their own system rows in the chain, so neither side is safe to index
+    # raw; _classify_files_for_summary converts via _raw_chain_boundary.
     # Using the full prefix range (rather than the delta
     # [parent_count, compaction_prefix_count)) keeps the hash basis identical
     # for a checkpoint and any of its potential children, so parent matching
@@ -5990,7 +6024,18 @@ def _classify_files_for_target(
         return retained_files
 
     retained_ids: set[str] = set(current_file_ids)
-    for index in range(compaction_prefix_count, len(db_chain)):
+    # select_safe_message_cut preserves the FIRST system message wherever it
+    # sits and replace_prefix_with_summary restores it verbatim into the
+    # compacted target body, so files referenced by the chain's first system
+    # row must stay in the forward request even when it sits before the
+    # compaction boundary. When the body carries an injected model system
+    # prompt instead, the chain's first system row is not the preserved one;
+    # retaining its files anyway only errs toward keeping context available.
+    for message in db_chain:
+        if isinstance(message, dict) and _is_system_message(message):
+            retained_ids |= _extract_non_image_file_ids(message.get("files"))
+            break
+    for index in range(_raw_chain_boundary(db_chain, compaction_prefix_count), len(db_chain)):
         message = db_chain[index]
         if isinstance(message, dict):
             retained_ids |= _extract_non_image_file_ids(message.get("files"))
@@ -6019,14 +6064,19 @@ def _classify_files_for_summary(
     compaction_prefix_count: int,
     parent_source_message_count: int,
 ) -> set[str]:
-    """Return prefix file ids for summary context, excluding parent-checkpoint absorbed messages."""
+    """Return prefix file ids for summary context, excluding parent-checkpoint absorbed messages and system rows."""
     if not db_chain:
         return set()
     prefix_ids: set[str] = set()
-    for index in range(parent_source_message_count, compaction_prefix_count):
+    for index in range(
+        _raw_chain_boundary(db_chain, parent_source_message_count),
+        _raw_chain_boundary(db_chain, compaction_prefix_count),
+    ):
         if index < len(db_chain):
             message = db_chain[index]
-            if isinstance(message, dict):
+            # System rows feed checkpoint fingerprints through these ids, so
+            # files stored on them must not affect checkpoint identity.
+            if isinstance(message, dict) and not _is_system_message(message):
                 prefix_ids |= _extract_non_image_file_ids(message.get("files"))
     return prefix_ids
 

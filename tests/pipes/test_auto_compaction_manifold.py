@@ -2790,6 +2790,95 @@ def test_classify_summary_skips_parent_absorbed():
     assert prefix_ids == {"delta-1", "delta-2"}
 
 
+def test_classify_target_skips_db_chain_system_rows():
+    metadata_files = [_file("absorbed"), _file("kept")]
+    db_chain = [
+        {"id": "m0", "role": "system", "content": "stored system"},
+        {"id": "m1", "role": "user", "files": [_file("absorbed")]},
+        {"id": "m2", "role": "user", "files": [_file("kept")]},
+    ]
+
+    retained = mod._classify_files_for_target(
+        db_chain=db_chain,
+        compaction_prefix_count=1,
+        metadata_user_message={"files": []},
+        metadata_files=metadata_files,
+    )
+
+    assert retained == [_file("kept")]
+
+
+def test_classify_target_retains_leading_system_files():
+    metadata_files = [_file("sys-doc"), _file("absorbed"), _file("kept")]
+    db_chain = [
+        {"id": "m0", "role": "system", "content": "preserved system", "files": [_file("sys-doc")]},
+        {"id": "m1", "role": "user", "files": [_file("absorbed")]},
+        {"id": "m2", "role": "user", "files": [_file("kept")]},
+    ]
+
+    retained = mod._classify_files_for_target(
+        db_chain=db_chain,
+        compaction_prefix_count=1,
+        metadata_user_message={"files": []},
+        metadata_files=metadata_files,
+    )
+
+    assert retained == [_file("sys-doc"), _file("kept")]
+
+
+def test_classify_target_retains_mid_chain_first_system_files():
+    metadata_files = [_file("absorbed"), _file("sys-doc"), _file("kept")]
+    db_chain = [
+        {"id": "m0", "role": "user", "files": [_file("absorbed")]},
+        {"id": "m1", "role": "system", "content": "preserved system", "files": [_file("sys-doc")]},
+        {"id": "m2", "role": "user", "files": [_file("kept")]},
+    ]
+
+    retained = mod._classify_files_for_target(
+        db_chain=db_chain,
+        compaction_prefix_count=1,
+        metadata_user_message={"files": []},
+        metadata_files=metadata_files,
+    )
+
+    assert retained == [_file("sys-doc"), _file("kept")]
+
+
+def test_classify_target_prunes_second_system_row_files():
+    metadata_files = [_file("preserved"), _file("absorbed-sys"), _file("kept")]
+    db_chain = [
+        {"id": "m0", "role": "system", "content": "preserved system", "files": [_file("preserved")]},
+        {"id": "m1", "role": "system", "content": "absorbed system", "files": [_file("absorbed-sys")]},
+        {"id": "m2", "role": "user", "content": "old"},
+        {"id": "m3", "role": "user", "files": [_file("kept")]},
+    ]
+
+    retained = mod._classify_files_for_target(
+        db_chain=db_chain,
+        compaction_prefix_count=1,
+        metadata_user_message={"files": []},
+        metadata_files=metadata_files,
+    )
+
+    assert retained == [_file("preserved"), _file("kept")]
+
+
+def test_classify_summary_skips_db_chain_system_rows():
+    db_chain = [
+        {"id": "m1", "role": "user", "files": [_file("first")]},
+        {"id": "m2", "role": "system", "content": "stored system", "files": [_file("system-owned")]},
+        {"id": "m3", "role": "user", "files": [_file("second")]},
+    ]
+
+    prefix_ids = mod._classify_files_for_summary(
+        db_chain=db_chain,
+        compaction_prefix_count=2,
+        parent_source_message_count=0,
+    )
+
+    assert prefix_ids == {"first", "second"}
+
+
 def test_wrapper_model_form_inherits_top_level_display_metadata_without_wrapper_description():
     target = {
         "id": "provider-target",
