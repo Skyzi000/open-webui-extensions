@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.6.0
+version: 0.6.1
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -7400,10 +7400,11 @@ async def _generate_summary_text(
 ) -> str:
     summary_metadata = build_summary_task_metadata(metadata)
     summary_metadata.pop("files", None)
+    bypass_system_prompt = _request_bypass_system_prompt(request)
     inner_request = RequestStateProxy(
         request,
         bypass_filter=True,
-        bypass_system_prompt=False,
+        bypass_system_prompt=bypass_system_prompt,
         metadata=summary_metadata,
     )
     from open_webui.utils.chat import generate_chat_completion
@@ -7454,7 +7455,7 @@ async def _generate_summary_text(
         body,
         user=coerce_open_webui_user(user),
         bypass_filter=True,
-        bypass_system_prompt=False,
+        bypass_system_prompt=bypass_system_prompt,
     )
     if is_retryable_context_error(response, status_code=400):
         raise RetryableContextOverflow("Summary model reported a context-window error")
@@ -7470,7 +7471,7 @@ async def _generate_summary_text(
             retry_body,
             user=coerce_open_webui_user(user),
             bypass_filter=True,
-            bypass_system_prompt=False,
+            bypass_system_prompt=bypass_system_prompt,
         )
         if is_retryable_context_error(response, status_code=400):
             raise RetryableContextOverflow("Summary model reported a context-window error")

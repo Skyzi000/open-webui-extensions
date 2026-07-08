@@ -5843,7 +5843,11 @@ async def test_target_completion_uses_forward_body_metadata_for_request_state(mo
 
 
 @pytest.mark.asyncio
-async def test_summary_generation_overrides_request_state_metadata(monkeypatch, pipe_request, pipe_user):
+async def test_summary_generation_overrides_metadata_and_inherits_system_prompt_bypass(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
     captured = {}
 
     async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
@@ -5876,7 +5880,7 @@ async def test_summary_generation_overrides_request_state_metadata(monkeypatch, 
     assert captured["state_metadata"]["tool_ids"] == ["bad"]
     assert "selected_model_id" not in captured["state_metadata"]
     assert captured["form_metadata"] == captured["state_metadata"]
-    assert captured["bypass_system_prompt"] is False
+    assert captured["bypass_system_prompt"] is True
     assert pipe_request.state.metadata == {
         "selected_model_id": "arena-a",
         "tools": {"bad": {}},
@@ -6576,9 +6580,11 @@ async def test_summary_generation_retries_without_tools_after_tool_call_response
     pipe_user,
 ):
     captured = []
+    bypass_values = []
 
     async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
         captured.append(copy.deepcopy(form_data))
+        bypass_values.append(bypass_system_prompt)
         if len(captured) == 1:
             return {
                 "choices": [
@@ -6601,6 +6607,7 @@ async def test_summary_generation_retries_without_tools_after_tool_call_response
     chat_module = types.ModuleType("open_webui.utils.chat")
     chat_module.generate_chat_completion = generate_chat_completion
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    pipe_request.state.bypass_system_prompt = True
 
     source_messages = [
         {"role": "system", "content": "target system"},
@@ -6629,6 +6636,7 @@ async def test_summary_generation_retries_without_tools_after_tool_call_response
 
     assert result == "summary after retry"
     assert len(captured) == 2
+    assert bypass_values == [True, True]
     assert captured[0]["tools"] == tools
     assert captured[0]["tool_choice"] == "auto"
     assert "tools" not in captured[1]
