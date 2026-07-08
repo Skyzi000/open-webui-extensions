@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.5.26
+version: 0.6.0
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -25,6 +25,7 @@ import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import lru_cache
 from html.parser import HTMLParser
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
@@ -891,29 +892,214 @@ def _is_system_message(message: dict[str, Any]) -> bool:
     return message.get("role") == "system"
 
 
-def _source_identity_message_count(messages: list[dict[str, Any]]) -> int:
-    return sum(1 for message in messages if isinstance(message, dict) and not _is_system_message(message))
+TransientMessagePatterns = tuple[re.Pattern[str], ...]
 
 
-def _raw_prefix_len_for_source_count(messages: list[dict[str, Any]], source_message_count: int) -> int | None:
+class _TransientMessageMatcher:
+    def __init__(self, patterns: TransientMessagePatterns):
+        self.patterns = patterns
+        self._masks: dict[int, tuple[list[dict[str, Any]], tuple[bool, ...]]] = {}
+
+    def mask(self, messages: list[dict[str, Any]]) -> tuple[bool, ...] | None:
+        if not self.patterns:
+            return None
+        key = id(messages)
+        cached = self._masks.get(key)
+        if cached is not None and cached[0] is messages:
+            return cached[1]
+        mask = tuple(_is_transient_message(message, self.patterns) for message in messages)
+        self._masks[key] = (messages, mask)
+        return mask
+
+
+@lru_cache(maxsize=128)
+def parse_transient_message_markers(value: str) -> TransientMessagePatterns:
+    patterns: list[re.Pattern[str]] = []
+    for line_number, line in enumerate(str(value or "").splitlines(), start=1):
+        pattern = line.strip()
+        if not pattern:
+            continue
+        try:
+            patterns.append(re.compile(pattern))
+        except re.error as exc:
+            raise ValueError(f"transient_message_markers line {line_number}: {exc}") from exc
+    return tuple(patterns)
+
+
+def _first_text_part_text(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                return part["text"]
+    return None
+
+
+def _first_non_whitespace_index(text: str) -> int:
+    for index, char in enumerate(text):
+        if not char.isspace():
+            return index
+    return len(text)
+
+
+def _is_transient_message(
+    message: Any,
+    transient_message_patterns: TransientMessagePatterns | _TransientMessageMatcher | None = None,
+) -> bool:
+    patterns = (
+        transient_message_patterns.patterns
+        if isinstance(transient_message_patterns, _TransientMessageMatcher)
+        else transient_message_patterns
+    )
+    if not patterns or not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    text = _first_text_part_text(message.get("content"))
+    if text is None:
+        return False
+    pos = _first_non_whitespace_index(text)
+    return any(pattern.match(text, pos) is not None for pattern in patterns)
+
+
+def _messages_for_transient_aware_rag(
+    messages: Any,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> Any:
+    if not isinstance(messages, list) or not transient_message_patterns:
+        return messages
+    filtered = [
+        message
+        for message in messages
+        if not _is_transient_message(message, transient_message_patterns)
+    ]
+    if len(filtered) == len(messages):
+        return messages
+    return copy.deepcopy(filtered)
+
+
+def _merge_rag_messages_preserving_transient_users(
+    original_messages: Any,
+    applied_messages: Any,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> Any:
+    if (
+        not isinstance(original_messages, list)
+        or not isinstance(applied_messages, list)
+        or not transient_message_patterns
+    ):
+        return applied_messages
+    positions = [
+        index
+        for index, message in enumerate(original_messages)
+        if not _is_transient_message(message, transient_message_patterns)
+    ]
+    if len(positions) == len(original_messages):
+        return applied_messages
+    applied_prefix: list[Any] = []
+    applied_core = applied_messages
+    result_offset = 0
+    if (
+        len(applied_messages) > len(positions)
+        and isinstance(applied_messages[0], dict)
+        and applied_messages[0].get("role") == "system"
+        and (
+            not positions
+            or not isinstance(original_messages[positions[0]], dict)
+            or original_messages[positions[0]].get("role") != "system"
+        )
+    ):
+        applied_prefix = [applied_messages[0]]
+        applied_core = applied_messages[1:]
+        result_offset = 1
+    if len(applied_core) < len(positions):
+        return copy.deepcopy(original_messages)
+    result = [*copy.deepcopy(applied_prefix), *copy.deepcopy(original_messages)]
+    for original_index, applied in zip(positions, applied_core[: len(positions)]):
+        result[original_index + result_offset] = copy.deepcopy(applied)
+    result.extend(copy.deepcopy(applied_core[len(positions) :]))
+    return result
+
+
+def _transient_message_mask(
+    messages: list[dict[str, Any]],
+    transient_message_patterns: TransientMessagePatterns | _TransientMessageMatcher | None = None,
+) -> tuple[bool, ...] | None:
+    if isinstance(transient_message_patterns, _TransientMessageMatcher):
+        return transient_message_patterns.mask(messages)
+    if not transient_message_patterns:
+        return None
+    return tuple(_is_transient_message(message, transient_message_patterns) for message in messages)
+
+
+def _is_source_identity_message(
+    message: Any,
+    *,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+    transient_message_mask: tuple[bool, ...] | None = None,
+    index: int | None = None,
+) -> bool:
+    if not isinstance(message, dict) or _is_system_message(message):
+        return False
+    if transient_message_mask is not None and index is not None and index < len(transient_message_mask):
+        return not transient_message_mask[index]
+    return not _is_transient_message(message, transient_message_patterns)
+
+
+def _source_identity_message_count(
+    messages: list[dict[str, Any]],
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> int:
+    mask = _transient_message_mask(messages, transient_message_patterns)
+    return sum(
+        1
+        for index, message in enumerate(messages)
+        if _is_source_identity_message(
+            message,
+            transient_message_patterns=transient_message_patterns,
+            transient_message_mask=mask,
+            index=index,
+        )
+    )
+
+
+def _raw_prefix_len_for_source_count(
+    messages: list[dict[str, Any]],
+    source_message_count: int,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> int | None:
     if source_message_count < 0:
         return None
     if source_message_count == 0:
         return 0
+    mask = _transient_message_mask(messages, transient_message_patterns)
     seen = 0
     for index, message in enumerate(messages):
-        if _is_system_message(message):
+        if not _is_source_identity_message(
+            message,
+            transient_message_patterns=transient_message_patterns,
+            transient_message_mask=mask,
+            index=index,
+        ):
             continue
         seen += 1
         if seen == source_message_count:
             boundary = index + 1
-            while boundary < len(messages) and _is_system_message(messages[boundary]):
+            while boundary < len(messages) and not _is_source_identity_message(
+                messages[boundary],
+                transient_message_patterns=transient_message_patterns,
+                transient_message_mask=mask,
+                index=boundary,
+            ):
                 boundary += 1
             return boundary
     return None
 
 
-def _raw_chain_boundary(db_chain: list[dict[str, Any]], count: int) -> int:
+def _raw_chain_boundary(
+    db_chain: list[dict[str, Any]],
+    count: int,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> int:
     # Imported or API-created histories can store their own system rows in
     # the DB chain, so a non-system source count is not a raw chain index.
     # Mirrors _raw_prefix_len_for_source_count (including trailing-system
@@ -921,9 +1107,15 @@ def _raw_chain_boundary(db_chain: list[dict[str, Any]], count: int) -> int:
     # pairable positions like the file-backed image cursor does.
     if count <= 0:
         return 0
+    mask = _transient_message_mask(db_chain, transient_message_patterns)
     seen = 0
     for index, message in enumerate(db_chain):
-        if isinstance(message, dict) and _is_system_message(message):
+        if isinstance(message, dict) and not _is_source_identity_message(
+            message,
+            transient_message_patterns=transient_message_patterns,
+            transient_message_mask=mask,
+            index=index,
+        ):
             continue
         seen += 1
         if seen == count:
@@ -931,26 +1123,46 @@ def _raw_chain_boundary(db_chain: list[dict[str, Any]], count: int) -> int:
             while (
                 boundary < len(db_chain)
                 and isinstance(db_chain[boundary], dict)
-                and _is_system_message(db_chain[boundary])
+                and not _is_source_identity_message(
+                    db_chain[boundary],
+                    transient_message_patterns=transient_message_patterns,
+                    transient_message_mask=mask,
+                    index=boundary,
+                )
             ):
                 boundary += 1
             return boundary
     return len(db_chain)
 
 
-def canonicalize_messages_for_source_hash(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def canonicalize_messages_for_source_hash(
+    messages: list[dict[str, Any]],
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> list[dict[str, Any]]:
+    mask = _transient_message_mask(messages, transient_message_patterns)
     return [
         canonicalize_message_for_source_hash(message)
-        for message in messages
-        if isinstance(message, dict) and not _is_system_message(message)
+        for index, message in enumerate(messages)
+        if _is_source_identity_message(
+            message,
+            transient_message_patterns=transient_message_patterns,
+            transient_message_mask=mask,
+            index=index,
+        )
     ]
 
 
-def compute_source_hash(messages: list[dict[str, Any]]) -> str:
+def compute_source_hash(
+    messages: list[dict[str, Any]],
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> str:
     return _json_hash(
         {
             "family": SOURCE_HASH_FAMILY,
-            "messages": canonicalize_messages_for_source_hash(messages),
+            "messages": canonicalize_messages_for_source_hash(
+                messages,
+                transient_message_patterns=transient_message_patterns,
+            ),
         }
     )
 
@@ -959,18 +1171,29 @@ def compute_summary_source_hash(
     messages: list[dict[str, Any]],
     prefix_file_fingerprint: str | None = None,
     file_backed_image_db_chain: list[dict[str, Any]] | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> str:
-    source_messages = _stable_file_backed_image_source_messages(messages, file_backed_image_db_chain)
+    source_messages = _stable_file_backed_image_source_messages(
+        messages,
+        file_backed_image_db_chain,
+        transient_message_patterns=transient_message_patterns,
+    )
     # When no prefix files were absorbed (or the DB chain could not be loaded)
     # the fingerprint is empty, so the identity intentionally collapses to the
     # canonical message hash. This keeps existing checkpoints reusable and
     # avoids a family bump.
     if not prefix_file_fingerprint:
-        return compute_source_hash(source_messages)
+        return compute_source_hash(
+            source_messages,
+            transient_message_patterns=transient_message_patterns,
+        )
     return _json_hash(
         {
             "family": SOURCE_HASH_FAMILY,
-            "messages": canonicalize_messages_for_source_hash(source_messages),
+            "messages": canonicalize_messages_for_source_hash(
+                source_messages,
+                transient_message_patterns=transient_message_patterns,
+            ),
             "prefix_file_fingerprint": prefix_file_fingerprint,
         }
     )
@@ -1096,6 +1319,8 @@ def _messages_have_user_image_url_parts(messages: list[dict[str, Any]] | None) -
 def _stable_file_backed_image_source_messages(
     source_messages: list[dict[str, Any]],
     db_chain: list[dict[str, Any]] | None,
+    *,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> list[dict[str, Any]]:
     if not db_chain:
         return source_messages
@@ -1106,13 +1331,25 @@ def _stable_file_backed_image_source_messages(
     # body and churn between turns, while imported or API-created histories
     # can store their own system rows in the chain.
     chain_index = 0
-    for message in normalized:
-        if not isinstance(message, dict) or _is_system_message(message):
+    source_mask = _transient_message_mask(normalized, transient_message_patterns)
+    chain_mask = _transient_message_mask(db_chain, transient_message_patterns)
+    for source_index, message in enumerate(normalized):
+        if not _is_source_identity_message(
+            message,
+            transient_message_patterns=transient_message_patterns,
+            transient_message_mask=source_mask,
+            index=source_index,
+        ):
             continue
         while (
             chain_index < len(db_chain)
             and isinstance(db_chain[chain_index], dict)
-            and _is_system_message(db_chain[chain_index])
+            and not _is_source_identity_message(
+                db_chain[chain_index],
+                transient_message_patterns=transient_message_patterns,
+                transient_message_mask=chain_mask,
+                index=chain_index,
+            )
         ):
             chain_index += 1
         if chain_index >= len(db_chain):
@@ -1183,19 +1420,28 @@ def _prefix_file_fingerprint_resolver_db_chain(
 def _soft_prefetch_inflight_source_hash(
     source_messages: list[dict[str, Any]],
     metadata: dict[str, Any],
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> str:
     files = metadata.get("files")
     if not isinstance(files, list):
-        return compute_source_hash(source_messages)
+        return compute_source_hash(
+            source_messages,
+            transient_message_patterns=transient_message_patterns,
+        )
     fingerprint = _stable_file_fingerprint(
         [item for item in files if isinstance(item, dict) and not _is_image_file_item(item)]
     )
-    return compute_summary_source_hash(source_messages, fingerprint)
+    return compute_summary_source_hash(
+        source_messages,
+        fingerprint,
+        transient_message_patterns=transient_message_patterns,
+    )
 
 
 def _make_prefix_file_fingerprint_resolver(
     db_chain: list[dict[str, Any]] | None,
     metadata_files: Any,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> Callable[[int], str | None]:
     # Fingerprints cover all non-image prefix files up to the DB-chain
     # boundary for `count` non-system entries. Counts are non-system source
@@ -1217,7 +1463,12 @@ def _make_prefix_file_fingerprint_resolver(
         cached = cache.get(count, False)
         if cached is not False:
             return cached
-        prefix_ids = _classify_files_for_summary(db_chain, count, 0)
+        prefix_ids = _classify_files_for_summary(
+            db_chain,
+            count,
+            0,
+            transient_message_patterns=transient_message_patterns,
+        )
         if not prefix_ids:
             result: str | None = None
         else:
@@ -1242,6 +1493,7 @@ async def _build_prefix_file_fingerprint_resolver(
     source_messages: list[dict[str, Any]] | None = None,
     *,
     require_file_context_chain: bool = False,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> Callable[[int], str | None] | None:
     metadata_files = metadata.get("files")
     if not isinstance(metadata_files, list) or not metadata_files:
@@ -1275,7 +1527,11 @@ async def _build_prefix_file_fingerprint_resolver(
         if require_file_context_chain and required_file_ids:
             raise SummaryFileContextUnavailable()
         return None
-    resolver = _make_prefix_file_fingerprint_resolver(db_chain, metadata_files)
+    resolver = _make_prefix_file_fingerprint_resolver(
+        db_chain,
+        metadata_files,
+        transient_message_patterns=transient_message_patterns,
+    )
     if cache is not None:
         with suppress(Exception):
             cache[cache_key] = resolver
@@ -1757,6 +2013,7 @@ async def _estimate_rendered_summary_message_tokens(
     historical_source_messages: list[dict[str, Any]] | None = None,
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> int | None:
     return await estimate_message_tokens_async(
         render_summary_message(
@@ -1765,6 +2022,7 @@ async def _estimate_rendered_summary_message_tokens(
             historical_source_messages=historical_source_messages,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            transient_message_patterns=transient_message_patterns,
         ),
         request=request,
     )
@@ -1809,6 +2067,7 @@ def _remove_orphan_tool_messages(tail: list[dict[str, Any]]) -> list[dict[str, A
 
 def select_safe_message_cut(
     messages: list[dict[str, Any]],
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> MessageCut:
     if not messages:
         return MessageCut(None, [], [], 0)
@@ -1821,8 +2080,19 @@ def select_safe_message_cut(
     if not working:
         return MessageCut(preserved_system, [], [], 0)
 
+    working_transient_mask = _transient_message_mask(working, transient_message_patterns)
     latest_user_index = next(
-        (index for index in range(len(working) - 1, -1, -1) if working[index].get("role") == "user"),
+        (
+            index
+            for index in range(len(working) - 1, -1, -1)
+            if working[index].get("role") == "user"
+            and _is_source_identity_message(
+                working[index],
+                transient_message_patterns=transient_message_patterns,
+                transient_message_mask=working_transient_mask,
+                index=index,
+            )
+        ),
         len(working) - 1,
     )
     tail = copy.deepcopy(working[latest_user_index:])
@@ -1832,12 +2102,21 @@ def select_safe_message_cut(
         preserved_system_message=preserved_system,
         summarization_prefix=prefix,
         tail_messages=tail,
-        source_message_count=_source_identity_message_count(prefix),
+        source_message_count=_source_identity_message_count(
+            prefix,
+            transient_message_patterns=transient_message_patterns,
+        ),
     )
 
 
-def select_retry_tool_result_cut(messages: list[dict[str, Any]]) -> RetryToolResultCut | None:
-    cut = select_tool_result_compaction_cut(messages)
+def select_retry_tool_result_cut(
+    messages: list[dict[str, Any]],
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> RetryToolResultCut | None:
+    cut = select_tool_result_compaction_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
     if cut is None:
         return None
     return RetryToolResultCut(
@@ -1850,14 +2129,26 @@ def select_retry_tool_result_cut(messages: list[dict[str, Any]]) -> RetryToolRes
 
 def select_tool_result_compaction_cut(
     messages: list[dict[str, Any]],
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> ToolResultCompactionCut | None:
     source_messages = [copy.deepcopy(message) for message in messages]
     system_index = _first_system_index(source_messages)
     preserved_system = copy.deepcopy(source_messages[system_index]) if system_index is not None else None
     working = [message for index, message in enumerate(source_messages) if index != system_index]
 
+    working_transient_mask = _transient_message_mask(working, transient_message_patterns)
     latest_user_index = next(
-        (index for index in range(len(working) - 1, -1, -1) if working[index].get("role") == "user"),
+        (
+            index
+            for index in range(len(working) - 1, -1, -1)
+            if working[index].get("role") == "user"
+            and _is_source_identity_message(
+                working[index],
+                transient_message_patterns=transient_message_patterns,
+                transient_message_mask=working_transient_mask,
+                index=index,
+            )
+        ),
         None,
     )
     if latest_user_index is None or latest_user_index >= len(working) - 1:
@@ -1910,7 +2201,10 @@ def select_tool_result_compaction_cut(
         preserved_system_message=preserved_system,
         summarization_prefix=summarization_prefix,
         tail_messages=tail_messages,
-        source_message_count=_source_identity_message_count(summarization_prefix),
+        source_message_count=_source_identity_message_count(
+            summarization_prefix,
+            transient_message_patterns=transient_message_patterns,
+        ),
     )
 
 
@@ -2203,6 +2497,7 @@ def render_historical_user_message_excerpts(
     *,
     excerpt_bytes: int,
     max_messages: int,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> str:
     count_limit = int(max_messages or 0)
     if count_limit <= 0:
@@ -2212,6 +2507,7 @@ def render_historical_user_message_excerpts(
         source_messages,
         excerpt_bytes=excerpt_bytes,
         max_messages=count_limit,
+        transient_message_patterns=transient_message_patterns,
     )]
     if not excerpts:
         return ""
@@ -2240,6 +2536,7 @@ def _build_historical_user_message_excerpt_items(
     *,
     excerpt_bytes: int,
     max_messages: int,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> list[dict[str, Any]]:
     count_limit = _coerce_nonnegative_int(max_messages)
     if count_limit <= 0:
@@ -2248,6 +2545,8 @@ def _build_historical_user_message_excerpt_items(
     excerpts: list[str] = []
     for message in source_messages:
         if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        if _is_transient_message(message, transient_message_patterns):
             continue
         text = _message_content_as_excerpt_text(message).strip()
         if not text:
@@ -2304,6 +2603,7 @@ def enrich_summary_meta_with_historical_excerpts(
     *,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> dict[str, Any]:
     meta = normalize_summary_meta(summary_meta)
     meta[SUMMARY_META_FORMAT_VERSION_KEY] = SUMMARY_META_FORMAT_VERSION
@@ -2318,6 +2618,7 @@ def enrich_summary_meta_with_historical_excerpts(
         source_messages,
         excerpt_bytes=excerpt_bytes,
         max_messages=count_limit,
+        transient_message_patterns=transient_message_patterns,
     )
     if not messages:
         return meta
@@ -2338,12 +2639,14 @@ def build_checkpoint_summary_meta(
     *,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> dict[str, Any]:
     return enrich_summary_meta_with_historical_excerpts(
         {"has_multimodal": _messages_have_multimodal(source_messages)},
         source_messages,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
+        transient_message_patterns=transient_message_patterns,
     )
 
 
@@ -2380,6 +2683,7 @@ def render_summary_message(
     historical_source_messages: list[dict[str, Any]] | None = None,
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> dict[str, Any]:
     meta_section = ""
     if summary_meta and summary_meta.get("has_multimodal"):
@@ -2390,6 +2694,7 @@ def render_summary_message(
             historical_source_messages,
             excerpt_bytes=historical_message_excerpt_bytes,
             max_messages=historical_message_excerpt_count,
+            transient_message_patterns=transient_message_patterns,
         )
     excerpt_section = f"\n{excerpts}" if excerpts else ""
     return {
@@ -2411,6 +2716,7 @@ def render_summary_message_from_checkpoint(
     historical_source_messages: list[dict[str, Any]] | None = None,
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> dict[str, Any]:
     summary_meta = normalize_summary_meta(checkpoint.get("summary_meta") if isinstance(checkpoint, dict) else {})
     fallback_source_messages = None
@@ -2425,6 +2731,7 @@ def render_summary_message_from_checkpoint(
         historical_source_messages=fallback_source_messages,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
+        transient_message_patterns=transient_message_patterns,
     )
 
 
@@ -2440,6 +2747,7 @@ def _render_summary_message_from_result(
     historical_source_messages: list[dict[str, Any]] | None = None,
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> dict[str, Any]:
     checkpoint = _checkpoint_from_summary_result(summary_text)
     if checkpoint is not None:
@@ -2448,6 +2756,7 @@ def _render_summary_message_from_result(
             historical_source_messages=historical_source_messages,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            transient_message_patterns=transient_message_patterns,
         )
     return render_summary_message(
         str(summary_text),
@@ -2455,6 +2764,7 @@ def _render_summary_message_from_result(
         historical_source_messages=historical_source_messages,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
+        transient_message_patterns=transient_message_patterns,
     )
 
 
@@ -2708,6 +3018,7 @@ def replace_prefix_with_summary(
     *,
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> list[dict[str, Any]]:
     compacted: list[dict[str, Any]] = []
     if cut.preserved_system_message is not None:
@@ -2719,6 +3030,7 @@ def replace_prefix_with_summary(
             historical_source_messages=cut.summarization_prefix,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            transient_message_patterns=transient_message_patterns,
         )
     )
     compacted.extend(copy.deepcopy(cut.tail_messages))
@@ -2731,11 +3043,16 @@ def replace_prefix_with_parent_checkpoint_and_delta(
     *,
     prefix_file_fingerprint: str | None = None,
     file_backed_image_db_chain: list[dict[str, Any]] | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
 ) -> list[dict[str, Any]]:
     parent_count = int(parent.get("source_message_count") or 0)
-    raw_parent_count = _raw_prefix_len_for_source_count(cut.summarization_prefix, parent_count)
+    raw_parent_count = _raw_prefix_len_for_source_count(
+        cut.summarization_prefix,
+        parent_count,
+        transient_message_patterns=transient_message_patterns,
+    )
     if parent_count <= 0 or raw_parent_count is None:
         raise UnsupportedCompactionInput(
             "Parent checkpoint cannot be applied safely because its source boundary is invalid",
@@ -2746,6 +3063,7 @@ def replace_prefix_with_parent_checkpoint_and_delta(
             cut.summarization_prefix[:raw_parent_count],
             prefix_file_fingerprint,
             file_backed_image_db_chain,
+            transient_message_patterns=transient_message_patterns,
         )
         != parent.get("source_hash")
     ):
@@ -2776,6 +3094,7 @@ def replace_prefix_with_parent_checkpoint_and_delta(
             historical_source_messages=cut.summarization_prefix[:raw_parent_count],
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            transient_message_patterns=transient_message_patterns,
         )
     )
     compacted.extend(delta_messages)
@@ -2857,18 +3176,26 @@ def select_longest_matching_checkpoint(
     *,
     states: set[str] | None = None,
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> dict[str, Any] | None:
     prefix_hashes: dict[int, str] = {}
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     candidates = sorted(rows, key=lambda row: int(row.get("source_message_count") or 0), reverse=True)
-    source_count = _source_identity_message_count(source_messages)
+    source_count = _source_identity_message_count(
+        source_messages,
+        transient_message_patterns=transient_message_patterns,
+    )
     for row in candidates:
         if states is not None and row.get("state") not in states:
             continue
         count = int(row.get("source_message_count") or 0)
         if count <= 0 or count > source_count:
             continue
-        raw_count = _raw_prefix_len_for_source_count(source_messages, count)
+        raw_count = _raw_prefix_len_for_source_count(
+            source_messages,
+            count,
+            transient_message_patterns=transient_message_patterns,
+        )
         if raw_count is None:
             continue
         if count not in prefix_hashes:
@@ -2881,6 +3208,7 @@ def select_longest_matching_checkpoint(
                 source_messages[:raw_count],
                 fingerprint,
                 file_backed_image_db_chain,
+                transient_message_patterns=transient_message_patterns,
             )
         if prefix_hashes[count] == row.get("source_hash"):
             return row
@@ -2892,12 +3220,14 @@ def select_longest_matching_parent(
     source_messages: list[dict[str, Any]],
     *,
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> dict[str, Any] | None:
     return select_longest_matching_checkpoint(
         rows,
         source_messages,
         states={"ready"},
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        transient_message_patterns=transient_message_patterns,
     )
 
 
@@ -3090,10 +3420,14 @@ class CheckpointStore:
         profile_hash: str,
         source_messages: list[dict[str, Any]],
         prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+        transient_message_patterns: TransientMessagePatterns | None = None,
     ) -> dict[str, Any] | None:
         if not source_messages:
             return None
-        source_count = _source_identity_message_count(source_messages)
+        source_count = _source_identity_message_count(
+            source_messages,
+            transient_message_patterns=transient_message_patterns,
+        )
         async with await self._context() as db:
             result = await db.execute(
                 select(CHECKPOINT_TABLE)
@@ -3115,6 +3449,7 @@ class CheckpointStore:
             rows,
             source_messages,
             prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+            transient_message_patterns=transient_message_patterns,
         )
 
     async def find_longest_pending_parent(
@@ -3127,10 +3462,14 @@ class CheckpointStore:
         profile_hash: str,
         source_messages: list[dict[str, Any]],
         prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+        transient_message_patterns: TransientMessagePatterns | None = None,
     ) -> dict[str, Any] | None:
         if not source_messages:
             return None
-        source_count = _source_identity_message_count(source_messages)
+        source_count = _source_identity_message_count(
+            source_messages,
+            transient_message_patterns=transient_message_patterns,
+        )
         now = int(time.time())
         async with await self._context() as db:
             result = await db.execute(
@@ -3156,6 +3495,7 @@ class CheckpointStore:
             source_messages,
             states={"pending"},
             prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+            transient_message_patterns=transient_message_patterns,
         )
 
     async def claim_pending(self, row: dict[str, Any]) -> bool:
@@ -5744,12 +6084,26 @@ def _usage_total(usage: dict[str, Any] | None) -> int | None:
 _USAGE_ANCHOR_SOURCE = Literal["request", "persisted"]
 
 
-def _latest_user_usage_anchor_delta(messages: Any) -> list[dict[str, Any]] | None:
+def _latest_user_usage_anchor_delta(
+    messages: Any,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> list[dict[str, Any]] | None:
     if not isinstance(messages, list) or not messages:
         return None
-    latest = messages[-1]
-    if isinstance(latest, dict) and latest.get("role") == "user":
-        return [copy.deepcopy(latest)]
+    mask = _transient_message_mask(messages, transient_message_patterns)
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and _is_source_identity_message(
+                message,
+                transient_message_patterns=transient_message_patterns,
+                transient_message_mask=mask,
+                index=index,
+            )
+        ):
+            return [copy.deepcopy(message)]
     return None
 
 
@@ -5781,11 +6135,15 @@ def _trailing_tool_usage_anchor_delta(messages: Any) -> list[dict[str, Any]] | N
 def _usage_anchor_delta_for_source(
     messages: Any,
     usage_source: _USAGE_ANCHOR_SOURCE | None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> list[dict[str, Any]] | None:
     if usage_source == "request":
         return _trailing_tool_usage_anchor_delta(messages)
     if usage_source == "persisted":
-        return _latest_user_usage_anchor_delta(messages) or _trailing_tool_usage_anchor_delta(messages)
+        return _latest_user_usage_anchor_delta(
+            messages,
+            transient_message_patterns=transient_message_patterns,
+        ) or _trailing_tool_usage_anchor_delta(messages)
     return None
 
 
@@ -5795,10 +6153,15 @@ async def _estimate_next_input_tokens_from_usage_anchor(
     last_observed_total_tokens: int | None,
     body: dict[str, Any],
     usage_source: _USAGE_ANCHOR_SOURCE | None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> int | None:
     if last_observed_total_tokens is None or not isinstance(body, dict):
         return None
-    delta_messages = _usage_anchor_delta_for_source(body.get("messages"), usage_source)
+    delta_messages = _usage_anchor_delta_for_source(
+        body.get("messages"),
+        usage_source,
+        transient_message_patterns=transient_message_patterns,
+    )
     if delta_messages is None:
         return None
     delta_tokens = await estimate_messages_tokens_async(delta_messages, request=request)
@@ -5814,11 +6177,32 @@ async def _estimate_next_input_tokens_from_usage_anchor(
 
 def _context_exhaustion_error_response(
     messages: Any,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> dict[str, Any]:
     if isinstance(messages, list):
-        cut = select_safe_message_cut(messages)
-        tool_cut = select_tool_result_compaction_cut(messages)
-        latest_user = next((message for message in reversed(messages) if message.get("role") == "user"), None)
+        cut = select_safe_message_cut(
+            messages,
+            transient_message_patterns=transient_message_patterns,
+        )
+        tool_cut = select_tool_result_compaction_cut(
+            messages,
+            transient_message_patterns=transient_message_patterns,
+        )
+        message_mask = _transient_message_mask(messages, transient_message_patterns)
+        latest_user = next(
+            (
+                message
+                for index, message in reversed(list(enumerate(messages)))
+                if message.get("role") == "user"
+                and _is_source_identity_message(
+                    message,
+                    transient_message_patterns=transient_message_patterns,
+                    transient_message_mask=message_mask,
+                    index=index,
+                )
+            ),
+            None,
+        )
         if latest_user is not None and not cut.summarization_prefix and tool_cut is None:
             return _error_response(
                 "Target model context window was exceeded after all safe compaction options were exhausted; "
@@ -5994,6 +6378,7 @@ def _classify_files_for_target(
     compaction_prefix_count: int,
     metadata_user_message: Any,
     metadata_files: Any,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> list[Any]:
     """Return retained files for target forward injection using only DB-chain positions."""
     if not isinstance(metadata_files, list):
@@ -6035,7 +6420,14 @@ def _classify_files_for_target(
         if isinstance(message, dict) and _is_system_message(message):
             retained_ids |= _extract_non_image_file_ids(message.get("files"))
             break
-    for index in range(_raw_chain_boundary(db_chain, compaction_prefix_count), len(db_chain)):
+    for index in range(
+        _raw_chain_boundary(
+            db_chain,
+            compaction_prefix_count,
+            transient_message_patterns=transient_message_patterns,
+        ),
+        len(db_chain),
+    ):
         message = db_chain[index]
         if isinstance(message, dict):
             retained_ids |= _extract_non_image_file_ids(message.get("files"))
@@ -6063,20 +6455,32 @@ def _classify_files_for_summary(
     db_chain: list[dict[str, Any]] | None,
     compaction_prefix_count: int,
     parent_source_message_count: int,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> set[str]:
     """Return prefix file ids for summary context, excluding parent-checkpoint absorbed messages and system rows."""
     if not db_chain:
         return set()
     prefix_ids: set[str] = set()
     for index in range(
-        _raw_chain_boundary(db_chain, parent_source_message_count),
-        _raw_chain_boundary(db_chain, compaction_prefix_count),
+        _raw_chain_boundary(
+            db_chain,
+            parent_source_message_count,
+            transient_message_patterns=transient_message_patterns,
+        ),
+        _raw_chain_boundary(
+            db_chain,
+            compaction_prefix_count,
+            transient_message_patterns=transient_message_patterns,
+        ),
     ):
         if index < len(db_chain):
             message = db_chain[index]
             # System rows feed checkpoint fingerprints through these ids, so
             # files stored on them must not affect checkpoint identity.
-            if isinstance(message, dict) and not _is_system_message(message):
+            if _is_source_identity_message(
+                message,
+                transient_message_patterns=transient_message_patterns,
+            ):
                 prefix_ids |= _extract_non_image_file_ids(message.get("files"))
     return prefix_ids
 
@@ -6232,6 +6636,7 @@ async def _prepare_summary_file_context(
     compaction_prefix_count: int,
     parent_source_message_count: int,
     file_context_enabled: bool = True,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> str | None:
     if not file_context_enabled:
         return None
@@ -6256,6 +6661,7 @@ async def _prepare_summary_file_context(
             db_chain=db_chain,
             compaction_prefix_count=compaction_prefix_count,
             parent_source_message_count=parent_source_message_count,
+            transient_message_patterns=transient_message_patterns,
         )
         if not prefix_ids:
             return None
@@ -6312,6 +6718,7 @@ async def _inject_target_file_context(
     event_emitter: Callable[[Any], Awaitable[None]] | None,
     file_context_enabled: bool = True,
     emit_source_events: bool = True,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> dict[str, Any]:
     body_metadata = body.get("metadata")
     if isinstance(body_metadata, dict):
@@ -6328,6 +6735,7 @@ async def _inject_target_file_context(
         compaction_prefix_count=compaction_prefix_count,
         metadata_user_message=metadata_user_message,
         metadata_files=metadata_files,
+        transient_message_patterns=transient_message_patterns,
     )
     # Always update body metadata files to retained-only so downstream pipes/functions
     # don't receive absorbed prefix files even if target RAG is disabled.
@@ -6361,8 +6769,11 @@ async def _inject_target_file_context(
             from open_webui.utils.middleware import apply_source_context_to_messages, chat_completion_files_handler
             from open_webui.utils.misc import get_last_user_message
 
+            messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+            rag_messages = _messages_for_transient_aware_rag(messages, transient_message_patterns)
             rag_body = {
                 **body,
+                "messages": rag_messages,
                 "metadata": {
                     **(body.get("metadata") if isinstance(body.get("metadata"), dict) else {}),
                     "files": retained_non_image,
@@ -6372,9 +6783,13 @@ async def _inject_target_file_context(
             _, flags = await chat_completion_files_handler(request, rag_body, extra_params, coerce_open_webui_user(user))
             sources = flags.get("sources", []) if isinstance(flags, dict) else []
             if sources:
-                messages = body.get("messages") or []
-                last_user_msg = get_last_user_message(messages) or ""
-                body["messages"] = await apply_source_context_to_messages(request, messages, sources, last_user_msg)
+                last_user_msg = get_last_user_message(rag_messages) or ""
+                applied_messages = await apply_source_context_to_messages(request, rag_messages, sources, last_user_msg)
+                body["messages"] = _merge_rag_messages_preserving_transient_users(
+                    messages,
+                    applied_messages,
+                    transient_message_patterns,
+                )
                 # Propagate sources to body metadata and event_emitter, matching
                 # Core's behaviour so UI citation/source display and downstream
                 # consumers work the same as non-AutoCompact file-context.
@@ -6981,6 +7396,7 @@ async def _generate_summary_text(
     parent_source_message_count: int = 0,
     file_context_enabled: bool = True,
     summary_prompt: str | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> str:
     summary_metadata = build_summary_task_metadata(metadata)
     summary_metadata.pop("files", None)
@@ -6999,6 +7415,7 @@ async def _generate_summary_text(
         compaction_prefix_count=compaction_prefix_count,
         parent_source_message_count=parent_source_message_count,
         file_context_enabled=file_context_enabled,
+        transient_message_patterns=transient_message_patterns,
     )
     body = build_summary_completion_body(
         base_body,
@@ -7075,12 +7492,22 @@ async def _compact_retry_tool_results(
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
     file_context_enabled: bool = True,
     summary_prompt: str | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> tuple[list[dict[str, Any]], bool, int]:
-    cut = select_tool_result_compaction_cut(messages)
+    cut = select_tool_result_compaction_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
     if cut is None:
         return messages, False, 0
 
     source_messages = copy.deepcopy(cut.summarization_prefix)
+    source_identity_count = _source_identity_message_count(
+        source_messages,
+        transient_message_patterns=transient_message_patterns,
+    )
+    if source_identity_count <= 0:
+        return messages, False, 0
     chat_id = str(metadata.get("chat_id") or "")
     user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
     if not user_id or not _chat_id_supported(chat_id):
@@ -7093,10 +7520,12 @@ async def _compact_retry_tool_results(
         metadata,
         source_messages,
         require_file_context_chain=file_context_enabled,
+        transient_message_patterns=transient_message_patterns,
     )
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     source_identity_fingerprint = _resolve_fingerprint(
-        prefix_file_fingerprint_resolver, _source_identity_message_count(source_messages)
+        prefix_file_fingerprint_resolver,
+        source_identity_count,
     )
     pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
         request=request,
@@ -7105,12 +7534,14 @@ async def _compact_retry_tool_results(
         pipe_function_id=pipe_function_id,
         source_messages=source_messages,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        transient_message_patterns=transient_message_patterns,
     )
     if pending_checkpoint is not None and not _checkpoint_matches_exact_source(
         pending_checkpoint,
         source_messages,
         prefix_file_fingerprint=source_identity_fingerprint,
         file_backed_image_db_chain=file_backed_image_db_chain,
+        transient_message_patterns=transient_message_patterns,
     ):
         ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
         if ready_checkpoint is not None:
@@ -7118,6 +7549,7 @@ async def _compact_retry_tool_results(
             ready_raw_count = _raw_prefix_len_for_source_count(
                 cut.summarization_prefix,
                 ready_count,
+                transient_message_patterns=transient_message_patterns,
             )
             if ready_raw_count is not None:
                 message_cut = MessageCut(
@@ -7135,6 +7567,7 @@ async def _compact_retry_tool_results(
                             ready_count,
                         ),
                         file_backed_image_db_chain=file_backed_image_db_chain,
+                        transient_message_patterns=transient_message_patterns,
                         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                         historical_message_excerpt_count=historical_message_excerpt_count,
                     ),
@@ -7145,6 +7578,7 @@ async def _compact_retry_tool_results(
         source_messages,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
+        transient_message_patterns=transient_message_patterns,
     )
     try:
         summary = await _get_or_create_compaction_summary(
@@ -7165,6 +7599,7 @@ async def _compact_retry_tool_results(
             historical_message_excerpt_count=historical_message_excerpt_count,
             file_context_enabled=file_context_enabled,
             summary_prompt=summary_prompt,
+            transient_message_patterns=transient_message_patterns,
         )
     except Exception as exc:
         if isinstance(exc, ParentCheckpointExtensionFailed) and (
@@ -7191,10 +7626,11 @@ async def _compact_retry_tool_results(
             historical_source_messages=source_messages,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            transient_message_patterns=transient_message_patterns,
         )
     )
     compacted.extend(copy.deepcopy(cut.tail_messages))
-    return compacted, True, _source_identity_message_count(source_messages)
+    return compacted, True, source_identity_count
 
 
 async def _heartbeat_checkpoint_claim(store: Any, checkpoint_id: str, claim_token: str) -> None:
@@ -7275,6 +7711,7 @@ async def _get_or_create_checkpoint_summary(
     parent_checkpoint_guard: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     prefix_file_fingerprint: str | None = None,
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> str:
     profile_hash = compute_profile_hash()
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
@@ -7282,6 +7719,7 @@ async def _get_or_create_checkpoint_summary(
         source_messages,
         prefix_file_fingerprint,
         file_backed_image_db_chain,
+        transient_message_patterns=transient_message_patterns,
     )
     summary_meta = normalize_summary_meta(summary_meta)
     identity = {
@@ -7304,7 +7742,10 @@ async def _get_or_create_checkpoint_summary(
             claimed = await _claim_or_wait_for_checkpoint(
                 store,
                 identity=identity,
-                source_message_count=_source_identity_message_count(source_messages),
+                source_message_count=_source_identity_message_count(
+                    source_messages,
+                    transient_message_patterns=transient_message_patterns,
+                ),
                 summary_meta=summary_meta,
                 claim_token=claim_token,
             )
@@ -7316,7 +7757,11 @@ async def _get_or_create_checkpoint_summary(
             try:
                 if parent_checkpoint is not None:
                     parent_count = int(parent_checkpoint.get("source_message_count") or 0)
-                    raw_parent_count = _raw_prefix_len_for_source_count(source_messages, parent_count)
+                    raw_parent_count = _raw_prefix_len_for_source_count(
+                        source_messages,
+                        parent_count,
+                        transient_message_patterns=transient_message_patterns,
+                    )
                     parent_fingerprint = (
                         prefix_file_fingerprint_resolver(parent_count)
                         if prefix_file_fingerprint_resolver is not None
@@ -7329,6 +7774,7 @@ async def _get_or_create_checkpoint_summary(
                             source_messages[:raw_parent_count],
                             parent_fingerprint,
                             file_backed_image_db_chain,
+                            transient_message_patterns=transient_message_patterns,
                         )
                         != parent_checkpoint.get("source_hash")
                     ):
@@ -7346,6 +7792,7 @@ async def _get_or_create_checkpoint_summary(
                         profile_hash=profile_hash,
                         source_messages=source_messages,
                         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+                        transient_message_patterns=transient_message_patterns,
                     )
                 if parent is not None and parent_checkpoint_guard is not None:
                     await parent_checkpoint_guard(parent)
@@ -7361,6 +7808,7 @@ async def _get_or_create_checkpoint_summary(
                     request=request,
                     summary_text=summary_text,
                     summary_meta=summary_meta,
+                    transient_message_patterns=transient_message_patterns,
                 )
                 completed = await store.complete_pending(
                     checkpoint_id,
@@ -7411,6 +7859,7 @@ async def _get_or_create_compaction_summary(
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
     file_context_enabled: bool = True,
     summary_prompt: str | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> str:
     summary_source_prefix = copy.deepcopy(source_messages)
 
@@ -7419,7 +7868,11 @@ async def _get_or_create_compaction_summary(
         raw_parent_count = 0
         if parent:
             parent_count = int(parent.get("source_message_count") or 0)
-            raw_count = _raw_prefix_len_for_source_count(summary_source_prefix, parent_count)
+            raw_count = _raw_prefix_len_for_source_count(
+                summary_source_prefix,
+                parent_count,
+                transient_message_patterns=transient_message_patterns,
+            )
             if raw_count is None:
                 raise UnsupportedCompactionInput(
                     "Parent checkpoint cannot be applied safely because its source boundary is invalid",
@@ -7432,6 +7885,7 @@ async def _get_or_create_compaction_summary(
                     historical_source_messages=summary_source_prefix[:raw_parent_count],
                     historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                     historical_message_excerpt_count=historical_message_excerpt_count,
+                    transient_message_patterns=transient_message_patterns,
                 ),
                 *copy.deepcopy(summary_source_prefix[raw_parent_count:]),
             ]
@@ -7448,10 +7902,14 @@ async def _get_or_create_compaction_summary(
             pipe_function_id=pipe_function_id,
             on_summary_start=on_summary_start,
             summary_tool_policy=summary_tool_policy,
-            compaction_prefix_count=_source_identity_message_count(summary_source_prefix),
+            compaction_prefix_count=_source_identity_message_count(
+                summary_source_prefix,
+                transient_message_patterns=transient_message_patterns,
+            ),
             parent_source_message_count=parent_count,
             file_context_enabled=file_context_enabled,
             summary_prompt=summary_prompt,
+            transient_message_patterns=transient_message_patterns,
         )
 
     prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
@@ -7459,9 +7917,15 @@ async def _get_or_create_compaction_summary(
         metadata,
         source_messages,
         require_file_context_chain=file_context_enabled,
+        transient_message_patterns=transient_message_patterns,
     )
     identity_fingerprint = (
-        prefix_file_fingerprint_resolver(_source_identity_message_count(source_messages))
+        prefix_file_fingerprint_resolver(
+            _source_identity_message_count(
+                source_messages,
+                transient_message_patterns=transient_message_patterns,
+            )
+        )
         if prefix_file_fingerprint_resolver is not None
         else None
     )
@@ -7478,6 +7942,7 @@ async def _get_or_create_compaction_summary(
         parent_checkpoint_guard=parent_checkpoint_guard,
         prefix_file_fingerprint=identity_fingerprint,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        transient_message_patterns=transient_message_patterns,
     )
 
 
@@ -7490,6 +7955,7 @@ async def _lookup_ready_checkpoint_for_source(
     source_messages: list[dict[str, Any]],
     prefix_file_fingerprint: str | None = None,
     file_backed_image_db_chain: list[dict[str, Any]] | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> dict[str, Any] | None:
     await ensure_checkpoint_table_initialized(request=request)
     return await CheckpointStore().lookup_ready(
@@ -7502,6 +7968,7 @@ async def _lookup_ready_checkpoint_for_source(
             source_messages,
             prefix_file_fingerprint,
             file_backed_image_db_chain,
+            transient_message_patterns=transient_message_patterns,
         ),
     )
 
@@ -7514,6 +7981,7 @@ async def _lookup_pending_checkpoint_for_source_prefix(
     pipe_function_id: str,
     source_messages: list[dict[str, Any]],
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> dict[str, Any] | None:
     if not source_messages:
         return None
@@ -7530,6 +7998,7 @@ async def _lookup_pending_checkpoint_for_source_prefix(
         profile_hash=compute_profile_hash(),
         source_messages=source_messages,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        transient_message_patterns=transient_message_patterns,
     )
 
 
@@ -7550,15 +8019,25 @@ def _checkpoint_matches_exact_source(
     *,
     prefix_file_fingerprint: str | None = None,
     file_backed_image_db_chain: list[dict[str, Any]] | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> bool:
     try:
         source_message_count = int(row.get("source_message_count") or 0)
     except Exception:
         return False
     return (
-        source_message_count == _source_identity_message_count(source_messages)
+        source_message_count
+        == _source_identity_message_count(
+            source_messages,
+            transient_message_patterns=transient_message_patterns,
+        )
         and row.get("source_hash")
-        == compute_summary_source_hash(source_messages, prefix_file_fingerprint, file_backed_image_db_chain)
+        == compute_summary_source_hash(
+            source_messages,
+            prefix_file_fingerprint,
+            file_backed_image_db_chain,
+            transient_message_patterns=transient_message_patterns,
+        )
     )
 
 
@@ -7593,14 +8072,21 @@ async def _wait_for_pending_checkpoint_ready(row: dict[str, Any]) -> dict[str, A
 
 def _soft_prefetch_source_messages(
     body: dict[str, Any],
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None] | None:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
         return None
-    tool_cut = select_tool_result_compaction_cut(messages)
+    tool_cut = select_tool_result_compaction_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
     if tool_cut is not None and tool_cut.summarization_prefix:
         return copy.deepcopy(tool_cut.summarization_prefix), copy.deepcopy(tool_cut.preserved_system_message)
-    cut = select_safe_message_cut(messages)
+    cut = select_safe_message_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
     if cut.summarization_prefix:
         return copy.deepcopy(cut.summarization_prefix), copy.deepcopy(cut.preserved_system_message)
     return None
@@ -7632,13 +8118,23 @@ async def _prefetch_compaction_checkpoint(
     file_context_enabled: bool = True,
     task_estimate_body: dict[str, Any] | None = None,
     summary_prompt: str | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> bool:
     if not source_messages:
+        return False
+    source_identity_count = _source_identity_message_count(
+        source_messages,
+        transient_message_patterns=transient_message_patterns,
+    )
+    if source_identity_count <= 0:
         return False
     if not user_id or not _chat_id_supported(chat_id):
         return False
     prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
-        request, metadata, source_messages
+        request,
+        metadata,
+        source_messages,
+        transient_message_patterns=transient_message_patterns,
     )
     if await _lookup_pending_checkpoint_for_source_prefix(
         request=request,
@@ -7647,18 +8143,23 @@ async def _prefetch_compaction_checkpoint(
         pipe_function_id=pipe_function_id,
         source_messages=source_messages,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        transient_message_patterns=transient_message_patterns,
     ):
         return False
     summary_meta = build_checkpoint_summary_meta(
         source_messages,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
+        transient_message_patterns=transient_message_patterns,
     )
 
     source_kind = "message"
     messages = body.get("messages")
     if isinstance(messages, list):
-        tool_cut = select_tool_result_compaction_cut(messages)
+        tool_cut = select_tool_result_compaction_cut(
+            messages,
+            transient_message_patterns=transient_message_patterns,
+        )
         if tool_cut is not None and tool_cut.summarization_prefix == source_messages:
             source_kind = "tool"
 
@@ -7667,8 +8168,12 @@ async def _prefetch_compaction_checkpoint(
         if match.checkpoint is None or match.source_kind != source_kind:
             return False
         checkpoint_count = int(match.checkpoint.get("source_message_count") or match.source_message_count or 0)
-        source_count = _source_identity_message_count(source_messages)
-        raw_checkpoint_count = _raw_prefix_len_for_source_count(source_messages, checkpoint_count)
+        source_count = source_identity_count
+        raw_checkpoint_count = _raw_prefix_len_for_source_count(
+            source_messages,
+            checkpoint_count,
+            transient_message_patterns=transient_message_patterns,
+        )
         if checkpoint_count <= 0 or checkpoint_count > source_count or raw_checkpoint_count is None:
             return False
         if match.kind == "exact" and checkpoint_count != source_count:
@@ -7683,6 +8188,7 @@ async def _prefetch_compaction_checkpoint(
                 source_messages[:raw_checkpoint_count],
                 checkpoint_fingerprint,
                 file_backed_image_db_chain,
+                transient_message_patterns=transient_message_patterns,
             )
             == match.checkpoint.get("source_hash")
         )
@@ -7701,6 +8207,7 @@ async def _prefetch_compaction_checkpoint(
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
                 file_context_enabled=file_context_enabled,
+                transient_message_patterns=transient_message_patterns,
             )
         if task_metadata_body is not None:
             return None
@@ -7714,6 +8221,7 @@ async def _prefetch_compaction_checkpoint(
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
             file_context_enabled=file_context_enabled,
+            transient_message_patterns=transient_message_patterns,
         )
 
     reusable_checkpoint_match = await _body_reusable_checkpoint_match(
@@ -7722,6 +8230,7 @@ async def _prefetch_compaction_checkpoint(
         metadata=metadata,
         body=body,
         pipe_function_id=pipe_function_id,
+        transient_message_patterns=transient_message_patterns,
     )
     if reusable_checkpoint_match is not None and reusable_match_covers_prefetch_source(reusable_checkpoint_match):
         if reusable_checkpoint_match.kind == "exact":
@@ -7817,6 +8326,7 @@ async def _prefetch_compaction_checkpoint(
             historical_message_excerpt_count=historical_message_excerpt_count,
             file_context_enabled=file_context_enabled,
             summary_prompt=summary_prompt,
+            transient_message_patterns=transient_message_patterns,
         )
     except _CheckpointGenerationSkipped:
         return False
@@ -7867,6 +8377,7 @@ async def _prefetch_compaction_checkpoint(
                         historical_source_messages=source_messages,
                         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                         historical_message_excerpt_count=historical_message_excerpt_count,
+                        transient_message_patterns=transient_message_patterns,
                     )
         await emit_compaction_status(
             event_emitter,
@@ -7914,8 +8425,12 @@ def _start_soft_compaction_prefetch(
     file_context_enabled: bool = True,
     task_estimate_body: dict[str, Any] | None = None,
     summary_prompt: str | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> bool:
-    prefetch_source = _soft_prefetch_source_messages(body)
+    prefetch_source = _soft_prefetch_source_messages(
+        body,
+        transient_message_patterns=transient_message_patterns,
+    )
     if prefetch_source is None:
         return False
     source_messages, preserved_system_message = prefetch_source
@@ -7929,7 +8444,11 @@ def _start_soft_compaction_prefetch(
         chat_id,
         pipe_function_id,
         compute_profile_hash(),
-        _soft_prefetch_inflight_source_hash(source_messages, metadata),
+        _soft_prefetch_inflight_source_hash(
+            source_messages,
+            metadata,
+            transient_message_patterns=transient_message_patterns,
+        ),
     )
     return _launch_soft_prefetch_task(
         key,
@@ -7960,6 +8479,7 @@ def _start_soft_compaction_prefetch(
                 _copy_body_preserving_metadata(task_estimate_body) if task_estimate_body is not None else None
             ),
             summary_prompt=summary_prompt,
+            transient_message_patterns=transient_message_patterns,
         ),
     )
 
@@ -8010,12 +8530,14 @@ async def _find_reusable_checkpoint_for_source(
     source_messages: list[dict[str, Any]],
     prefix_file_fingerprint: str | None = None,
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     source_hash = compute_summary_source_hash(
         source_messages,
         prefix_file_fingerprint,
         file_backed_image_db_chain,
+        transient_message_patterns=transient_message_patterns,
     )
     existing = await store.lookup_ready(
         namespace=CHECKPOINT_NAMESPACE,
@@ -8036,6 +8558,7 @@ async def _find_reusable_checkpoint_for_source(
         profile_hash=profile_hash,
         source_messages=source_messages,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        transient_message_patterns=transient_message_patterns,
     )
     if parent is not None:
         return "parent", parent
@@ -8049,6 +8572,7 @@ async def _body_reusable_checkpoint_match(
     metadata: dict[str, Any],
     body: dict[str, Any],
     pipe_function_id: str,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> ReusableCheckpointMatch | None:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -8059,8 +8583,14 @@ async def _body_reusable_checkpoint_match(
     if not user_id or not _chat_id_supported(chat_id):
         return None
 
-    tool_cut = select_tool_result_compaction_cut(messages)
-    cut = select_safe_message_cut(messages)
+    tool_cut = select_tool_result_compaction_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
+    cut = select_safe_message_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
     if (tool_cut is None or not tool_cut.summarization_prefix) and not cut.summarization_prefix:
         return None
 
@@ -8073,12 +8603,20 @@ async def _body_reusable_checkpoint_match(
     if cut.summarization_prefix:
         resolver_source_messages.extend(cut.summarization_prefix)
     prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
-        request, metadata, resolver_source_messages
+        request,
+        metadata,
+        resolver_source_messages,
+        transient_message_patterns=transient_message_patterns,
     )
 
     if tool_cut is not None and tool_cut.summarization_prefix:
         tool_identity_fingerprint = (
-            prefix_file_fingerprint_resolver(_source_identity_message_count(tool_cut.summarization_prefix))
+            prefix_file_fingerprint_resolver(
+                _source_identity_message_count(
+                    tool_cut.summarization_prefix,
+                    transient_message_patterns=transient_message_patterns,
+                )
+            )
             if prefix_file_fingerprint_resolver is not None
             else None
         )
@@ -8091,6 +8629,7 @@ async def _body_reusable_checkpoint_match(
             source_messages=tool_cut.summarization_prefix,
             prefix_file_fingerprint=tool_identity_fingerprint,
             prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+            transient_message_patterns=transient_message_patterns,
         )
         if tool_match is not None:
             kind, checkpoint = tool_match
@@ -8105,7 +8644,12 @@ async def _body_reusable_checkpoint_match(
         return None
 
     message_identity_fingerprint = (
-        prefix_file_fingerprint_resolver(_source_identity_message_count(cut.summarization_prefix))
+        prefix_file_fingerprint_resolver(
+            _source_identity_message_count(
+                cut.summarization_prefix,
+                transient_message_patterns=transient_message_patterns,
+            )
+        )
         if prefix_file_fingerprint_resolver is not None
         else None
     )
@@ -8118,6 +8662,7 @@ async def _body_reusable_checkpoint_match(
         source_messages=cut.summarization_prefix,
         prefix_file_fingerprint=message_identity_fingerprint,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        transient_message_patterns=transient_message_patterns,
     )
     if message_match is not None:
         kind, checkpoint = message_match
@@ -8137,6 +8682,7 @@ async def _summary_token_count_from_checkpoint(
     historical_source_messages: list[dict[str, Any]] | None,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> int | None:
     stored = checkpoint.get("summary_token_count")
     if isinstance(stored, int) and stored >= 0:
@@ -8149,6 +8695,7 @@ async def _summary_token_count_from_checkpoint(
             historical_source_messages=historical_source_messages,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            transient_message_patterns=transient_message_patterns,
         ),
         request=request,
     )
@@ -8165,17 +8712,24 @@ async def _estimate_checkpoint_applied_body_tokens(
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
     file_context_enabled: bool = True,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> int | None:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
         return None
 
     candidates: list[tuple[MessageCut | ToolResultCompactionCut, list[dict[str, Any]]]] = []
-    tool_cut = select_tool_result_compaction_cut(messages)
+    tool_cut = select_tool_result_compaction_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
     if tool_cut is not None and tool_cut.summarization_prefix and match.source_kind == "tool":
         candidates.append((tool_cut, tool_cut.summarization_prefix))
 
-    cut = select_safe_message_cut(messages)
+    cut = select_safe_message_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
     if cut.summarization_prefix and match.source_kind == "message":
         candidates.append((cut, cut.summarization_prefix))
 
@@ -8190,7 +8744,10 @@ async def _estimate_checkpoint_applied_body_tokens(
     for _candidate_cut, source_messages in candidates:
         resolver_source_messages.extend(source_messages)
     prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
-        request, metadata, resolver_source_messages
+        request,
+        metadata,
+        resolver_source_messages,
+        transient_message_patterns=transient_message_patterns,
     )
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
 
@@ -8198,7 +8755,12 @@ async def _estimate_checkpoint_applied_body_tokens(
         checkpoint = match.checkpoint
         if checkpoint is None:
             identity_fingerprint = (
-                prefix_file_fingerprint_resolver(_source_identity_message_count(source_messages))
+                prefix_file_fingerprint_resolver(
+                    _source_identity_message_count(
+                        source_messages,
+                        transient_message_patterns=transient_message_patterns,
+                    )
+                )
                 if prefix_file_fingerprint_resolver is not None
                 else None
             )
@@ -8211,13 +8773,18 @@ async def _estimate_checkpoint_applied_body_tokens(
                 source_messages=source_messages,
                 prefix_file_fingerprint=identity_fingerprint,
                 prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+                transient_message_patterns=transient_message_patterns,
             )
             checkpoint = checkpoint_match[1] if checkpoint_match is not None else None
         if checkpoint is None:
             continue
 
         parent_count = int(checkpoint.get("source_message_count") or 0)
-        raw_parent_count = _raw_prefix_len_for_source_count(source_messages, parent_count)
+        raw_parent_count = _raw_prefix_len_for_source_count(
+            source_messages,
+            parent_count,
+            transient_message_patterns=transient_message_patterns,
+        )
         if parent_count <= 0 or raw_parent_count is None:
             continue
         parent_fingerprint = (
@@ -8230,6 +8797,7 @@ async def _estimate_checkpoint_applied_body_tokens(
                 source_messages[:raw_parent_count],
                 parent_fingerprint,
                 file_backed_image_db_chain,
+                transient_message_patterns=transient_message_patterns,
             )
             != checkpoint.get("source_hash")
         ):
@@ -8251,6 +8819,7 @@ async def _estimate_checkpoint_applied_body_tokens(
             historical_source_messages=message_cut.summarization_prefix[:raw_parent_count],
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            transient_message_patterns=transient_message_patterns,
         )
         if summary_tokens is None:
             return None
@@ -8280,6 +8849,7 @@ async def _estimate_checkpoint_applied_body_tokens(
                 event_emitter=None,
                 file_context_enabled=True,
                 emit_source_events=False,
+                transient_message_patterns=transient_message_patterns,
             )
         remaining_tokens = await estimate_body_tokens_async(remaining_body, request=request)
         if remaining_tokens is None:
@@ -8299,6 +8869,7 @@ async def _compact_body_with_reusable_checkpoint(
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
     file_context_enabled: bool = True,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> tuple[dict[str, Any], bool, int]:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -8310,11 +8881,17 @@ async def _compact_body_with_reusable_checkpoint(
         return body, False, 0
 
     candidates: list[tuple[str, MessageCut | ToolResultCompactionCut, list[dict[str, Any]]]] = []
-    tool_cut = select_tool_result_compaction_cut(messages)
+    tool_cut = select_tool_result_compaction_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
     if tool_cut is not None and tool_cut.summarization_prefix and match.source_kind == "tool":
         candidates.append(("tool", tool_cut, tool_cut.summarization_prefix))
 
-    cut = select_safe_message_cut(messages)
+    cut = select_safe_message_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
     if cut.summarization_prefix and match.source_kind == "message":
         candidates.append(("message", cut, cut.summarization_prefix))
 
@@ -8329,12 +8906,18 @@ async def _compact_body_with_reusable_checkpoint(
         metadata,
         resolver_source_messages,
         require_file_context_chain=file_context_enabled,
+        transient_message_patterns=transient_message_patterns,
     )
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
 
     for _kind, candidate_cut, source_messages in candidates:
         identity_fingerprint = (
-            prefix_file_fingerprint_resolver(_source_identity_message_count(source_messages))
+            prefix_file_fingerprint_resolver(
+                _source_identity_message_count(
+                    source_messages,
+                    transient_message_patterns=transient_message_patterns,
+                )
+            )
             if prefix_file_fingerprint_resolver is not None
             else None
         )
@@ -8347,6 +8930,7 @@ async def _compact_body_with_reusable_checkpoint(
             source_messages=source_messages,
             prefix_file_fingerprint=identity_fingerprint,
             prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+            transient_message_patterns=transient_message_patterns,
         )
         if checkpoint_match is None:
             continue
@@ -8369,6 +8953,7 @@ async def _compact_body_with_reusable_checkpoint(
         checkpoint_raw_count = _raw_prefix_len_for_source_count(
             message_cut.summarization_prefix,
             checkpoint_count,
+            transient_message_patterns=transient_message_patterns,
         )
         if checkpoint_raw_count is None:
             continue
@@ -8380,6 +8965,7 @@ async def _compact_body_with_reusable_checkpoint(
                 checkpoint_count,
             ),
             file_backed_image_db_chain=file_backed_image_db_chain,
+            transient_message_patterns=transient_message_patterns,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
@@ -8400,6 +8986,7 @@ async def _estimate_task_checkpoint_applied_body_tokens(
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
     file_context_enabled: bool = True,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> int | None:
     task_metadata = metadata
     body_metadata = body.get("metadata")
@@ -8417,6 +9004,7 @@ async def _estimate_task_checkpoint_applied_body_tokens(
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
             file_context_enabled=file_context_enabled,
+            transient_message_patterns=transient_message_patterns,
         )
     except SummaryFileContextUnavailable:
         return None
@@ -8444,6 +9032,7 @@ async def _estimate_task_checkpoint_applied_body_tokens(
             event_emitter=None,
             file_context_enabled=True,
             emit_source_events=False,
+            transient_message_patterns=transient_message_patterns,
         )
     return await estimate_body_tokens_async(rebuilt, request=request)
 
@@ -9019,13 +9608,20 @@ async def _compact_body(
     summary_tool_policy: SummaryToolPolicy = "fallback_on_tool_call",
     file_context_enabled: bool = True,
     summary_prompt: str | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> tuple[dict[str, Any], bool, int]:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
         return body, False, 0
 
-    tool_cut = select_tool_result_compaction_cut(messages)
-    cut = select_safe_message_cut(messages)
+    tool_cut = select_tool_result_compaction_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
+    cut = select_safe_message_cut(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
     chat_id = str(metadata.get("chat_id") or "")
     user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
 
@@ -9045,6 +9641,7 @@ async def _compact_body(
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
                 summary_prompt=summary_prompt,
+                transient_message_patterns=transient_message_patterns,
             )
         except UnsupportedCompactionInput as exc:
             if exc.code != "latest_tool_result_too_large":
@@ -9056,10 +9653,17 @@ async def _compact_body(
                     "Cannot compact tool history without a durable checkpoint identity",
                     code="checkpoint_identity_missing",
                 ) from exc
+            history_source_identity_count = _source_identity_message_count(
+                cut.summarization_prefix,
+                transient_message_patterns=transient_message_patterns,
+            )
+            if history_source_identity_count <= 0:
+                raise
             history_summary_meta = build_checkpoint_summary_meta(
                 cut.summarization_prefix,
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
+                transient_message_patterns=transient_message_patterns,
             )
             await _get_or_create_compaction_summary(
                 request=request,
@@ -9078,9 +9682,13 @@ async def _compact_body(
                 historical_message_excerpt_count=historical_message_excerpt_count,
                 file_context_enabled=file_context_enabled,
                 summary_prompt=summary_prompt,
+                transient_message_patterns=transient_message_patterns,
             )
             history_prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
-                request, metadata, cut.summarization_prefix
+                request,
+                metadata,
+                cut.summarization_prefix,
+                transient_message_patterns=transient_message_patterns,
             )
             history_checkpoint = await _lookup_ready_checkpoint_for_source(
                 request=request,
@@ -9090,11 +9698,12 @@ async def _compact_body(
                 source_messages=cut.summarization_prefix,
                 prefix_file_fingerprint=_resolve_fingerprint(
                     history_prefix_file_fingerprint_resolver,
-                    _source_identity_message_count(cut.summarization_prefix),
+                    history_source_identity_count,
                 ),
                 file_backed_image_db_chain=_prefix_file_fingerprint_resolver_db_chain(
                     history_prefix_file_fingerprint_resolver
                 ),
+                transient_message_patterns=transient_message_patterns,
             )
             if history_checkpoint is None:
                 raise RuntimeError("History checkpoint was not available after creation")
@@ -9112,6 +9721,7 @@ async def _compact_body(
                 historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                 historical_message_excerpt_count=historical_message_excerpt_count,
                 summary_prompt=summary_prompt,
+                transient_message_patterns=transient_message_patterns,
             )
         if did_compact_tools:
             compacted = _copy_body_preserving_metadata(body)
@@ -9121,8 +9731,28 @@ async def _compact_body(
 
     if not cut.summarization_prefix:
         return body, False, 0
+    source_identity_count = _source_identity_message_count(
+        cut.summarization_prefix,
+        transient_message_patterns=transient_message_patterns,
+    )
+    if source_identity_count <= 0:
+        return body, False, 0
 
-    latest_user = next((m for m in reversed(cut.tail_messages) if m.get("role") == "user"), None)
+    tail_transient_mask = _transient_message_mask(cut.tail_messages, transient_message_patterns)
+    latest_user = next(
+        (
+            message
+            for index, message in reversed(list(enumerate(cut.tail_messages)))
+            if message.get("role") == "user"
+            and _is_source_identity_message(
+                message,
+                transient_message_patterns=transient_message_patterns,
+                transient_message_mask=tail_transient_mask,
+                index=index,
+            )
+        ),
+        None,
+    )
     if latest_user is None:
         raise UnsupportedCompactionInput("Cannot compact safely without retaining the active latest user message")
 
@@ -9134,10 +9764,12 @@ async def _compact_body(
         metadata,
         cut.summarization_prefix,
         require_file_context_chain=file_context_enabled,
+        transient_message_patterns=transient_message_patterns,
     )
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     prefix_identity_fingerprint = _resolve_fingerprint(
-        prefix_file_fingerprint_resolver, _source_identity_message_count(cut.summarization_prefix)
+        prefix_file_fingerprint_resolver,
+        source_identity_count,
     )
     pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
         request=request,
@@ -9146,12 +9778,14 @@ async def _compact_body(
         pipe_function_id=pipe_function_id,
         source_messages=cut.summarization_prefix,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+        transient_message_patterns=transient_message_patterns,
     )
     if pending_checkpoint is not None and not _checkpoint_matches_exact_source(
         pending_checkpoint,
         cut.summarization_prefix,
         prefix_file_fingerprint=prefix_identity_fingerprint,
         file_backed_image_db_chain=file_backed_image_db_chain,
+        transient_message_patterns=transient_message_patterns,
     ):
         ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
         if ready_checkpoint is not None:
@@ -9159,6 +9793,7 @@ async def _compact_body(
             ready_raw_count = _raw_prefix_len_for_source_count(
                 cut.summarization_prefix,
                 ready_count,
+                transient_message_patterns=transient_message_patterns,
             )
             if ready_raw_count is not None:
                 compacted = _copy_body_preserving_metadata(body)
@@ -9170,6 +9805,7 @@ async def _compact_body(
                         ready_count,
                     ),
                     file_backed_image_db_chain=file_backed_image_db_chain,
+                    transient_message_patterns=transient_message_patterns,
                     historical_message_excerpt_bytes=historical_message_excerpt_bytes,
                     historical_message_excerpt_count=historical_message_excerpt_count,
                 )
@@ -9180,6 +9816,7 @@ async def _compact_body(
         cut.summarization_prefix,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
+        transient_message_patterns=transient_message_patterns,
     )
 
     compacted = _copy_body_preserving_metadata(body)
@@ -9202,6 +9839,7 @@ async def _compact_body(
             historical_message_excerpt_count=historical_message_excerpt_count,
             file_context_enabled=file_context_enabled,
             summary_prompt=summary_prompt,
+            transient_message_patterns=transient_message_patterns,
         )
         compacted["messages"] = replace_prefix_with_summary(
             messages,
@@ -9210,13 +9848,15 @@ async def _compact_body(
             summary_meta,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
+            transient_message_patterns=transient_message_patterns,
         )
-        compaction_prefix_count_for_return = _source_identity_message_count(cut.summarization_prefix)
+        compaction_prefix_count_for_return = source_identity_count
     except ParentCheckpointExtensionFailed as exc:
         parent_count = int(exc.parent.get("source_message_count") or 0)
         parent_raw_count = _raw_prefix_len_for_source_count(
             cut.summarization_prefix,
             parent_count,
+            transient_message_patterns=transient_message_patterns,
         )
         if parent_raw_count is None:
             raise UnsupportedCompactionInput(
@@ -9231,6 +9871,7 @@ async def _compact_body(
                 parent_count,
             ),
             file_backed_image_db_chain=file_backed_image_db_chain,
+            transient_message_patterns=transient_message_patterns,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
         )
@@ -9250,6 +9891,7 @@ async def _compact_task_body_with_reusable_checkpoint(
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
     file_context_enabled: bool = True,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> tuple[dict[str, Any], bool, int]:
     source_body = _task_history_source_body_for_compaction(body, metadata)
     if source_body is None:
@@ -9264,6 +9906,7 @@ async def _compact_task_body_with_reusable_checkpoint(
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
         file_context_enabled=file_context_enabled,
+        transient_message_patterns=transient_message_patterns,
     )
     if not compacted:
         return body, False, 0
@@ -9293,6 +9936,7 @@ async def _compact_task_body(
     summary_tool_policy: SummaryToolPolicy,
     file_context_enabled: bool = True,
     summary_prompt: str | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> tuple[dict[str, Any], bool, int]:
     source_body = _task_history_source_body_for_compaction(body, metadata)
     if source_body is None:
@@ -9310,6 +9954,7 @@ async def _compact_task_body(
         file_context_enabled=file_context_enabled,
         summary_tool_policy=summary_tool_policy,
         summary_prompt=summary_prompt,
+        transient_message_patterns=transient_message_patterns,
     )
     if not compacted:
         return body, False, 0
@@ -9422,6 +10067,20 @@ class Pipe:
                 "Invalid JSON, non-object roots, unknown keys, or invalid shapes are rejected on save."
             ),
         )
+        transient_message_markers: str = Field(
+            default="",
+            description=(
+                "Newline-separated Python regex patterns, validated on save. A "
+                "user-role message is treated exactly like an injected system message "
+                "(kept in requests and summarization input, excluded from checkpoint "
+                "identity) when any pattern matches from the start of its first text "
+                "part (leading whitespace skipped; re.match semantics, so anchor the "
+                "end with \\Z to require the whole message to be the injected block). "
+                "Example: (?s)<SYSTEM_CONTEXT>.*</SYSTEM_CONTEXT>\\s*\\Z  "
+                "Keep patterns simple and linear; they run against full message text. "
+                "Empty disables this."
+            ),
+        )
         force_include_usage: bool = Field(
             default=True,
             description="Default-on convenience setting: add stream_options.include_usage=true to streaming target requests so supporting providers return usage even if per-model usage was not enabled. Disable to manage usage per model.",
@@ -9509,6 +10168,12 @@ class Pipe:
         @classmethod
         def _validate_trigger_total_tokens_overrides_json(cls, value: str) -> str:
             parse_trigger_total_tokens_overrides(value)
+            return value
+
+        @field_validator("transient_message_markers")
+        @classmethod
+        def _validate_transient_message_markers(cls, value: str) -> str:
+            parse_transient_message_markers(value)
             return value
 
         @classmethod
@@ -9672,6 +10337,17 @@ class Pipe:
         )
         checkpoint_lookup_body = task_source_body if task_source_body is not None else _copy_body_preserving_metadata(inner)
         estimate_lookup_body = checkpoint_lookup_body
+        try:
+            compiled_transient_message_patterns = parse_transient_message_markers(
+                getattr(self.valves, "transient_message_markers", "")
+            )
+            transient_message_patterns = (
+                _TransientMessageMatcher(compiled_transient_message_patterns)
+                if compiled_transient_message_patterns
+                else None
+            )
+        except ValueError as exc:
+            return _error_response(str(exc), code="invalid_transient_message_markers")
         # Token decisions must reflect the body actually forwarded to the target.
         # For task-prompt compaction that is the rebuilt provider prompt (inner),
         # NOT the raw task history — even when the target opted out of file
@@ -9707,6 +10383,7 @@ class Pipe:
                     metadata=metadata,
                     body=checkpoint_lookup_body,
                     pipe_function_id=identity.pipe_function_id,
+                    transient_message_patterns=transient_message_patterns,
                 )
             except Exception as exc:
                 checkpoint_lookup_unavailable = True
@@ -9740,6 +10417,7 @@ class Pipe:
                 event_emitter=None,
                 file_context_enabled=target_file_context_enabled,
                 emit_source_events=False,
+                transient_message_patterns=transient_message_patterns,
             )
             inner_metadata = inner.get("metadata")
             if isinstance(inner_metadata, dict):
@@ -9806,6 +10484,7 @@ class Pipe:
                     historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                     historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                     file_context_enabled=target_file_context_enabled,
+                    transient_message_patterns=transient_message_patterns,
                 )
             return await _estimate_checkpoint_applied_body_tokens(
                 request=__request__,
@@ -9817,6 +10496,7 @@ class Pipe:
                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                 file_context_enabled=target_file_context_enabled,
+                transient_message_patterns=transient_message_patterns,
             )
 
         if supported_context:
@@ -9829,6 +10509,7 @@ class Pipe:
                         last_observed_total_tokens=total_tokens,
                         body=estimate_lookup_body,
                         usage_source=usage_source,
+                        transient_message_patterns=transient_message_patterns,
                     )
                 if estimated_total_tokens is None:
                     estimated_total_tokens = await estimate_body_tokens_async(
@@ -9906,6 +10587,7 @@ class Pipe:
                     metadata=metadata,
                     body=checkpoint_lookup_body,
                     pipe_function_id=identity.pipe_function_id,
+                    transient_message_patterns=transient_message_patterns,
                 )
             except Exception as exc:
                 if not hard_should_compact and soft_should_prefetch:
@@ -9986,6 +10668,7 @@ class Pipe:
                         metadata=metadata,
                         body=checkpoint_lookup_body,
                         pipe_function_id=identity.pipe_function_id,
+                        transient_message_patterns=transient_message_patterns,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -10032,6 +10715,7 @@ class Pipe:
                     event_emitter=__event_emitter__,
                     file_context_enabled=target_file_context_enabled,
                     task_estimate_body=inner if task_source_body is not None else None,
+                    transient_message_patterns=transient_message_patterns,
                 )
 
         async def launch_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
@@ -10085,6 +10769,7 @@ class Pipe:
                 event_emitter=__event_emitter__,
                 file_context_enabled=target_file_context_enabled,
                 task_estimate_body=completed_task_estimate_body,
+                transient_message_patterns=transient_message_patterns,
             )
 
         def schedule_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
@@ -10151,6 +10836,7 @@ class Pipe:
                                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                                 file_context_enabled=target_file_context_enabled,
+                                transient_message_patterns=transient_message_patterns,
                             )
                         else:
                             candidate, compacted, compaction_prefix_count = await _compact_body_with_reusable_checkpoint(
@@ -10163,6 +10849,7 @@ class Pipe:
                                 historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                                 file_context_enabled=target_file_context_enabled,
+                                transient_message_patterns=transient_message_patterns,
                             )
                     else:
                         if task_source_body is not None:
@@ -10179,6 +10866,7 @@ class Pipe:
                                 summary_tool_policy=self.valves.summary_tool_policy,
                                 summary_prompt=self.valves.summary_prompt,
                                 file_context_enabled=target_file_context_enabled,
+                                transient_message_patterns=transient_message_patterns,
                             )
                         else:
                             candidate, compacted, compaction_prefix_count = await _compact_body(
@@ -10194,6 +10882,7 @@ class Pipe:
                                 summary_tool_policy=self.valves.summary_tool_policy,
                                 summary_prompt=self.valves.summary_prompt,
                                 file_context_enabled=target_file_context_enabled,
+                                transient_message_patterns=transient_message_patterns,
                             )
                     compacted_once = compacted_once or compacted
                     if (
@@ -10214,6 +10903,7 @@ class Pipe:
                             event_emitter=None,
                             file_context_enabled=target_file_context_enabled,
                             emit_source_events=False,
+                            transient_message_patterns=transient_message_patterns,
                         )
                         candidate_metadata = candidate.get("metadata")
                         if isinstance(candidate_metadata, dict):
@@ -10364,6 +11054,7 @@ class Pipe:
                 if not supported_context or attempt >= MAX_CONTEXT_RETRY_ATTEMPTS:
                     error_response = _context_exhaustion_error_response(
                         candidate.get("messages"),
+                        transient_message_patterns=transient_message_patterns,
                     )
                     await emit_compaction_status(
                         __event_emitter__,

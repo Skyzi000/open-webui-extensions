@@ -18,6 +18,9 @@ from starlette.responses import JSONResponse, PlainTextResponse, StreamingRespon
 from functions.pipe import auto_compact as mod
 
 
+TRANSIENT_MARKER = r"(?s)<SYSTEM_CONTEXT>.*</SYSTEM_CONTEXT>\s*\Z"
+
+
 class ClaimCheckpointStore:
     """CheckpointStore stand-in implementing the DB claim interface over shared row dicts."""
 
@@ -2790,6 +2793,39 @@ def test_classify_summary_skips_parent_absorbed():
     assert prefix_ids == {"delta-1", "delta-2"}
 
 
+def test_classify_files_treats_transient_user_messages_like_system_boundaries():
+    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    metadata_files = [_file("parent"), _file("volatile"), _file("delta"), _file("tail")]
+    db_chain = [
+        {"id": "m1", "role": "user", "files": [_file("parent")]},
+        {
+            "id": "m2",
+            "role": "user",
+            "content": "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>",
+            "files": [_file("volatile")],
+        },
+        {"id": "m3", "role": "assistant", "files": [_file("delta")]},
+        {"id": "m4", "role": "user", "files": [_file("tail")]},
+    ]
+
+    prefix_ids = mod._classify_files_for_summary(
+        db_chain=db_chain,
+        compaction_prefix_count=2,
+        parent_source_message_count=1,
+        transient_message_patterns=patterns,
+    )
+    retained = mod._classify_files_for_target(
+        db_chain=db_chain,
+        compaction_prefix_count=2,
+        metadata_user_message={"files": []},
+        metadata_files=metadata_files,
+        transient_message_patterns=patterns,
+    )
+
+    assert prefix_ids == {"delta"}
+    assert retained == [_file("tail")]
+
+
 def test_classify_target_skips_db_chain_system_rows():
     metadata_files = [_file("absorbed"), _file("kept")]
     db_chain = [
@@ -4187,6 +4223,13 @@ def test_trigger_total_tokens_overrides_rejects_non_finite_soft_trigger_ratio():
 
     with pytest.raises(ValidationError):
         mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+
+
+def test_transient_message_markers_reject_invalid_regex():
+    with pytest.raises(ValidationError) as exc_info:
+        mod.Pipe.Valves(transient_message_markers="[")
+
+    assert "transient_message_markers line 1" in str(exc_info.value)
 
 
 def test_matches_any_pattern_uses_star_question_wildcards_with_literal_brackets():
@@ -6991,6 +7034,129 @@ async def test_compact_body_reuses_checkpoint_when_only_system_content_changes(
 
 
 @pytest.mark.asyncio
+async def test_compact_body_reuses_checkpoint_when_transient_user_content_changes(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    stable_source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "user", "content": "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(stable_source_messages, transient_message_patterns=patterns),
+        source_message_count=mod._source_identity_message_count(
+            stable_source_messages,
+            transient_message_patterns=patterns,
+        ),
+        summary_text="reused summary",
+        summary_meta=mod.build_checkpoint_summary_meta(
+            stable_source_messages,
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+            transient_message_patterns=patterns,
+        ),
+        parent_checkpoint_id=None,
+        now=123,
+    )
+    store = ClaimCheckpointStore([checkpoint])
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("transient user message changes must not invalidate a reusable checkpoint")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    compacted, did_compact, prefix_count = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body={
+            "model": "target",
+            "messages": [
+                {"role": "system", "content": "first system prompt"},
+                {"role": "user", "content": "old"},
+                {"role": "user", "content": "  <SYSTEM_CONTEXT>now: 10:01</SYSTEM_CONTEXT>\n"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "active"},
+            ],
+        },
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+        transient_message_patterns=patterns,
+    )
+
+    assert did_compact is True
+    assert prefix_count == 2
+    assert store.touched == [checkpoint["id"]]
+    assert compacted["messages"][0] == {"role": "system", "content": "first system prompt"}
+    assert "reused summary" in compacted["messages"][1]["content"]
+    assert "now: 10:00" not in compacted["messages"][1]["content"]
+    assert "now: 10:01" not in compacted["messages"][1]["content"]
+    assert compacted["messages"][2:] == [{"role": "user", "content": "active"}]
+
+
+@pytest.mark.asyncio
+async def test_compact_body_skips_checkpoint_when_prefix_has_only_transient_user(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    rows = []
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("transient-only prefixes must not create checkpoints")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    body = {
+        "model": "target",
+        "messages": [
+            {"role": "user", "content": "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    compacted, did_compact, prefix_count = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+        transient_message_patterns=patterns,
+    )
+
+    assert compacted is body
+    assert did_compact is False
+    assert prefix_count == 0
+    assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_compact_body_reuses_checkpoint_when_middle_system_presence_changes(
     monkeypatch,
     pipe_request,
@@ -7306,6 +7472,55 @@ async def test_tool_history_compaction_summarizes_before_latest_tool_round_and_p
         ],
     }
     assert compacted[3] == original_tool
+
+
+@pytest.mark.asyncio
+async def test_tool_history_checkpoint_render_skips_transient_user_excerpts(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+
+    async def get_or_create_compaction_summary(**kwargs):
+        return SimpleNamespace(
+            checkpoint={
+                "summary_text": "tool summary",
+                "summary_meta": {},
+            }
+        )
+
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+
+    latest_round = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function"}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
+    ]
+    historical = [
+        {"role": "user", "content": "old request"},
+        {"role": "user", "content": "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active request"},
+    ]
+
+    compacted, did_compact, _tool_prefix_count = await mod._compact_retry_tool_results(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        base_body={"model": "target", "messages": [*historical, *latest_round]},
+        messages=[*historical, *latest_round],
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=4,
+        transient_message_patterns=patterns,
+    )
+
+    assert did_compact is True
+    assert "tool summary" in compacted[0]["content"]
+    assert "now: 10:00" not in compacted[0]["content"]
+    assert "old request" in compacted[0]["content"]
+    assert "active request" in compacted[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -8845,6 +9060,108 @@ async def test_inject_target_file_context_skips_manual_rag_when_reentry_guard_ac
     # Pruning of absorbed prefix files still applied even when skipping RAG.
     retained = result["metadata"]["files"]
     assert [file["id"] for file in retained] == ["current-file"]
+
+
+@pytest.mark.asyncio
+async def test_inject_target_file_context_uses_non_transient_user_for_manual_rag(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    captured = {}
+
+    async def chat_completion_files_handler(request, rag_body, extra_params, user):
+        captured["rag_messages"] = copy.deepcopy(rag_body["messages"])
+        return rag_body, {
+            "sources": [
+                {
+                    "source": {"id": "current-file", "name": "current.pdf"},
+                    "document": ["current file context"],
+                    "metadata": [{"source": "current-file"}],
+                }
+            ]
+        }
+
+    async def apply_source_context_to_messages(request, messages, sources, last_user_msg):
+        captured["apply_messages"] = copy.deepcopy(messages)
+        captured["last_user_msg"] = last_user_msg
+        updated = copy.deepcopy(messages)
+        updated[-1]["content"] = f"{updated[-1]['content']}\nTARGET_CONTEXT:current-file"
+        return updated
+
+    def get_last_user_message(messages):
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                return message.get("content") or ""
+        return ""
+
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.chat_completion_files_handler = chat_completion_files_handler
+    middleware_module.apply_source_context_to_messages = apply_source_context_to_messages
+    misc_module = types.ModuleType("open_webui.utils.misc")
+    misc_module.get_last_user_message = get_last_user_message
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", misc_module)
+
+    transient_context = "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"
+    metadata_files = [_file("current-file")]
+    body = {
+        "model": "target",
+        "messages": [
+            {"role": "user", "content": "real question"},
+            {"role": "user", "content": transient_context},
+        ],
+        "metadata": {"files": metadata_files},
+    }
+
+    result = await mod._inject_target_file_context(
+        request=pipe_request,
+        user=pipe_user,
+        body=body,
+        chat_id=None,
+        current_message_id=None,
+        compaction_prefix_count=0,
+        metadata_files=metadata_files,
+        metadata_user_message={"files": metadata_files},
+        event_emitter=None,
+        file_context_enabled=True,
+        emit_source_events=False,
+        transient_message_patterns=patterns,
+    )
+
+    assert captured["rag_messages"] == [{"role": "user", "content": "real question"}]
+    assert captured["apply_messages"] == [{"role": "user", "content": "real question"}]
+    assert captured["last_user_msg"] == "real question"
+    assert result["messages"] == [
+        {"role": "user", "content": "real question\nTARGET_CONTEXT:current-file"},
+        {"role": "user", "content": transient_context},
+    ]
+
+
+def test_merge_rag_messages_preserves_appended_user_context_from_core_default_rag():
+    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    transient_context = "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"
+    original = [
+        {"role": "user", "content": "real question"},
+        {"role": "assistant", "content": "tool loop result"},
+        {"role": "user", "content": transient_context},
+    ]
+    applied = [
+        {"role": "user", "content": "real question"},
+        {"role": "assistant", "content": "tool loop result"},
+        {"role": "user", "content": "TARGET_CONTEXT:current-file"},
+    ]
+
+    result = mod._merge_rag_messages_preserving_transient_users(original, applied, patterns)
+
+    assert result == [
+        {"role": "user", "content": "real question"},
+        {"role": "assistant", "content": "tool loop result"},
+        {"role": "user", "content": transient_context},
+        {"role": "user", "content": "TARGET_CONTEXT:current-file"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -16983,6 +17300,62 @@ async def test_pipe_returns_clear_error_when_latest_tool_result_cannot_be_summar
 
 
 @pytest.mark.asyncio
+async def test_pipe_does_not_create_transient_only_history_checkpoint_for_large_tool_result(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    transient_context = "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"
+    summary_sources = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return None
+
+    async def generate_summary_text(**kwargs):
+        summary_sources.append(copy.deepcopy(kwargs["source_messages"]))
+        raise mod.RetryableContextOverflow("summary context")
+
+    async def forward_target(**kwargs):
+        raise mod.RetryableContextOverflow("target context")
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.transient_message_markers = TRANSIENT_MARKER
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": transient_context},
+            {"role": "user", "content": "active"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "x" * 1000000},
+        ],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result["error"]["code"] == "latest_tool_result_too_large"
+    assert summary_sources == [[body["messages"][0], body["messages"][1]]]
+
+
+@pytest.mark.asyncio
 async def test_pipe_does_not_compact_internal_summary_task(monkeypatch, pipe_request, pipe_user, pipe_metadata):
     captured = {}
 
@@ -17688,6 +18061,75 @@ async def test_pipe_compacts_from_usage_anchor_plus_latest_user_delta_without_fu
 
 
 @pytest.mark.asyncio
+async def test_pipe_usage_anchor_ignores_trailing_transient_user_delta(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    captured = {}
+    estimated_messages = []
+    transient_context = "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 90, "input_tokens": 70, "output_tokens": 20}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def estimate_messages_tokens_async(messages, **kwargs):
+        estimated_messages.extend(copy.deepcopy(messages))
+        if messages == [{"role": "user", "content": "active"}]:
+            return 15
+        if messages == [{"role": "user", "content": transient_context}]:
+            return 1
+        raise AssertionError(f"unexpected usage-anchor delta: {messages!r}")
+
+    async def estimate_body_tokens_async(*args, **kwargs):
+        raise AssertionError("transient-aware usage anchor should avoid full-body token estimation")
+
+    async def get_or_create_compaction_summary(**kwargs):
+        return "anchored hard summary"
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "estimate_messages_tokens_async", estimate_messages_tokens_async)
+    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.transient_message_markers = TRANSIENT_MARKER
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+            {"role": "user", "content": transient_context},
+        ],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+    assert result == {"ok": True}
+    assert estimated_messages == [{"role": "user", "content": "active"}]
+    assert "anchored hard summary" in captured["forward_body"]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
 async def test_pipe_launches_soft_prefetch_from_usage_anchor_plus_latest_user_delta(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
@@ -18240,7 +18682,7 @@ async def test_start_soft_prefetch_passes_selected_source_messages_to_task(monke
     calls = {"source_selection": 0}
     launched = {}
 
-    def soft_prefetch_source_messages(body):
+    def soft_prefetch_source_messages(body, **kwargs):
         calls["source_selection"] += 1
         return copy.deepcopy(selected_source), None
 
@@ -18401,6 +18843,51 @@ async def test_soft_prefetch_summary_request_preserves_system_but_identity_exclu
     assert captured["messages"][-1]["role"] == "user"
     assert rows[0]["source_message_count"] == len(source_messages)
     assert rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_skips_checkpoint_when_prefix_has_only_transient_user(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    transient_context = "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"
+    messages = [
+        {"role": "user", "content": transient_context},
+        {"role": "user", "content": "active"},
+    ]
+    prefetch_source = mod._soft_prefetch_source_messages(
+        {"model": "target", "messages": messages},
+        transient_message_patterns=patterns,
+    )
+    assert prefetch_source == ([messages[0]], None)
+    source_messages, preserved_system_message = prefetch_source
+
+    async def get_or_create_compaction_summary(**kwargs):
+        raise AssertionError("transient-only prefetch prefixes must not create checkpoints")
+
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        metadata=pipe_metadata,
+        body={"model": "target", "messages": messages},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        preserved_system_message=preserved_system_message,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        transient_message_patterns=patterns,
+    )
+
+    assert prefetched is False
 
 
 def test_start_soft_prefetch_preserves_uncopyable_metadata_references(monkeypatch, pipe_user):

@@ -5,6 +5,9 @@ from copy import deepcopy
 from functions.pipe import auto_compact as mod
 
 
+TRANSIENT_MARKER = r"(?s)<SYSTEM_CONTEXT>.*</SYSTEM_CONTEXT>\s*\Z"
+
+
 def test_safe_cut_keeps_only_latest_user_and_following_active_turn_raw():
     messages = [
         {"role": "system", "content": "system stays"},
@@ -67,6 +70,99 @@ def test_source_hash_ignores_all_system_messages():
             {"role": "assistant", "content": "old answer"},
         ]
     )
+
+
+def test_transient_marker_excludes_user_message_from_source_identity():
+    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    stable = [
+        {"role": "user", "content": "old"},
+        {"role": "user", "content": "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    changed = [
+        {"role": "user", "content": "old"},
+        {"role": "user", "content": "  <SYSTEM_CONTEXT>now: 10:01</SYSTEM_CONTEXT>\n"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    assert mod.compute_source_hash(stable) != mod.compute_source_hash(changed)
+    assert mod.compute_source_hash(stable, transient_message_patterns=patterns) == mod.compute_source_hash(
+        changed,
+        transient_message_patterns=patterns,
+    )
+    assert mod.compute_source_hash(stable, transient_message_patterns=patterns) == mod.compute_source_hash(
+        source,
+        transient_message_patterns=patterns,
+    )
+    assert mod._source_identity_message_count(stable, transient_message_patterns=patterns) == len(source)
+
+
+def test_transient_marker_whole_block_pattern_does_not_match_prepend_case():
+    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    messages = [
+        {
+            "role": "user",
+            "content": "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>\nreal question",
+        }
+    ]
+
+    assert mod._source_identity_message_count(messages, transient_message_patterns=patterns) == 1
+    assert mod.compute_source_hash(messages, transient_message_patterns=patterns) != mod.compute_source_hash(
+        [],
+        transient_message_patterns=patterns,
+    )
+
+
+def test_safe_cut_does_not_anchor_on_transient_user_message():
+    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    messages = [
+        {"role": "user", "content": "active request"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"},
+    ]
+
+    cut = mod.select_safe_message_cut(messages, transient_message_patterns=patterns)
+
+    assert cut.summarization_prefix == []
+    assert cut.tail_messages == messages
+    assert cut.source_message_count == 0
+
+
+def test_historical_user_excerpts_skip_transient_user_messages():
+    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "user", "content": "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "newer request"},
+    ]
+
+    summary_meta = mod.build_checkpoint_summary_meta(
+        messages,
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=3,
+        transient_message_patterns=patterns,
+    )
+    rendered = mod.render_summary_message(
+        "Summary",
+        {},
+        historical_source_messages=messages,
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=3,
+        transient_message_patterns=patterns,
+    )["content"]
+
+    assert summary_meta["historical_user_messages"]["messages"] == [
+        {"ordinal": 1, "text": "old request"},
+        {"ordinal": 2, "text": "newer request"},
+    ]
+    assert "now: 10:00" not in rendered
+    assert "old request" in rendered
+    assert "newer request" in rendered
 
 
 def test_summary_insertion_preserves_system_and_adds_chronological_user_excerpts():

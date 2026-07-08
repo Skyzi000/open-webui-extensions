@@ -849,9 +849,9 @@ def test_parent_checkpoint_selection_hashes_only_candidate_counts(monkeypatch):
     real_compute = mod.compute_source_hash
     hashed_counts = []
 
-    def counting_compute(messages):
+    def counting_compute(messages, **kwargs):
         hashed_counts.append(len(messages))
-        return real_compute(messages)
+        return real_compute(messages, **kwargs)
 
     monkeypatch.setattr(mod, "compute_source_hash", counting_compute)
     rows = [
