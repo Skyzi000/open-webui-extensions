@@ -484,34 +484,49 @@ def test_generation_lock_cleanup_removes_unused_lock():
 class ClaimStore:
     """In-memory CheckpointStore stand-in implementing the DB claim interface."""
 
-    def __init__(self, rows=None):
-        self.rows = [dict(row) for row in (rows or [])]
+    def __init__(self, rows=None, *, share_rows=False):
+        self.rows = rows if share_rows and rows is not None else [dict(row) for row in (rows or [])]
         self.claimed_rows = []
         self.completed_rows = []
         self.released = []
+        self.reclaimed = []
         self.touched = []
 
-    def _match(self, source_hash):
+    def _match(self, identity):
+        identity_keys = (
+            "namespace",
+            "user_id",
+            "chat_id",
+            "pipe_function_id",
+            "profile_hash",
+            "source_hash",
+        )
         for row in self.rows:
-            if row.get("source_hash") == source_hash:
+            if all(row.get(key) == identity.get(key) for key in identity_keys):
                 return row
         return None
 
     async def lookup_any(self, **kwargs):
-        row = self._match(kwargs["source_hash"])
+        row = self._match(kwargs)
         return dict(row) if row else None
 
     async def lookup_ready(self, **kwargs):
-        row = self._match(kwargs["source_hash"])
+        row = self._match(kwargs)
         if row is not None and row.get("state") == "ready":
             return dict(row)
         return None
 
     async def find_longest_parent(self, **kwargs):
-        return mod.select_longest_matching_parent(self.rows, kwargs["source_messages"])
+        identity_keys = ("namespace", "user_id", "chat_id", "pipe_function_id", "profile_hash")
+        candidates = [
+            row
+            for row in self.rows
+            if all(row.get(key) == kwargs.get(key) for key in identity_keys)
+        ]
+        return mod.select_longest_matching_parent(candidates, kwargs["source_messages"])
 
     async def claim_pending(self, row):
-        if self._match(row["source_hash"]) is not None:
+        if self._match(row) is not None:
             return False
         stored = dict(row)
         self.rows.append(stored)
@@ -527,6 +542,7 @@ class ClaimStore:
                 return False
             row["claim_token"] = claim_token
             row["claim_expires_at"] = expires_at
+            self.reclaimed.append(checkpoint_id)
             return True
         return False
 
@@ -562,7 +578,25 @@ class ClaimStore:
         parent_checkpoint_id,
         summary_token_count=None,
         now=None,
+        generation_lease_id=None,
+        generation_lease_claim_token=None,
     ):
+        if generation_lease_id is not None:
+            timestamp = int(time.time()) if now is None else int(now)
+            lease = next(
+                (
+                    row
+                    for row in self.rows
+                    if row.get("id") == generation_lease_id
+                    and row.get("state") == "pending"
+                    and row.get("claim_token") == generation_lease_claim_token
+                    and row.get("claim_expires_at") is not None
+                    and int(row["claim_expires_at"]) > timestamp
+                ),
+                None,
+            )
+            if lease is None:
+                return None
         for row in self.rows:
             if (
                 row.get("id") == checkpoint_id
@@ -584,6 +618,28 @@ class ClaimStore:
     async def touch(self, checkpoint_id, *, now=None):
         self.touched.append(checkpoint_id)
         return True
+
+
+def source_claims(store):
+    return [row for row in store.claimed_rows if row["namespace"] == mod.CHECKPOINT_NAMESPACE]
+
+
+def generation_lease_claims(store):
+    return [
+        row
+        for row in store.claimed_rows
+        if row["namespace"] == mod.CHECKPOINT_GENERATION_LEASE_NAMESPACE
+    ]
+
+
+def released_source_claims(store):
+    released = set(store.released)
+    return [row for row in source_claims(store) if row["id"] in released]
+
+
+def released_generation_lease_claims(store):
+    released = set(store.released)
+    return [row for row in generation_lease_claims(store) if row["id"] in released]
 
 
 def make_checkpoint_row(
@@ -610,6 +666,25 @@ def make_checkpoint_row(
         claim_token=claim_token,
         claim_expires_at=claim_expires_at,
         now=now,
+    )
+
+
+def make_generation_lease_row(*, claim_token="lease-owner", claim_expires_at=10**12):
+    return mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_GENERATION_LEASE_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.CHECKPOINT_GENERATION_LEASE_SOURCE_HASH,
+        source_message_count=0,
+        summary_text="",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state="pending",
+        claim_token=claim_token,
+        claim_expires_at=claim_expires_at,
+        now=1,
     )
 
 
@@ -720,6 +795,18 @@ def test_checkpoint_row_supports_pending_claim_state():
     assert row["summary_text"] == ""
     assert row["claim_token"] == "claim-1"
     assert row["claim_expires_at"] == 456
+
+
+@pytest.mark.asyncio
+async def test_claim_store_allows_same_source_hash_in_separate_namespace():
+    source_messages = [{"role": "user", "content": "old"}]
+    summary = make_checkpoint_row(source_messages)
+    lease = dict(make_generation_lease_row(), source_hash=summary["source_hash"])
+    store = ClaimStore()
+
+    assert await store.claim_pending(summary) is True
+    assert await store.claim_pending(lease) is True
+    assert len(store.rows) == 2
 
 
 @pytest.mark.asyncio
@@ -944,12 +1031,16 @@ async def test_checkpoint_miss_claims_generates_and_completes_ready_row(monkeypa
 
     assert result == "generated summary"
     assert calls == [None]
-    assert len(store.claimed_rows) == 1
-    assert store.claimed_rows[0]["state"] == "pending"
-    assert store.claimed_rows[0]["summary_text"] == ""
-    assert store.claimed_rows[0]["claim_token"]
-    assert store.claimed_rows[0]["claim_expires_at"] > int(time.time()) - 5
-    assert store.claimed_rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
+    assert len(source_claims(store)) == 1
+    source_claim = source_claims(store)[0]
+    assert source_claim["state"] == "pending"
+    assert source_claim["summary_text"] == ""
+    assert source_claim["claim_token"]
+    assert source_claim["claim_expires_at"] > int(time.time()) - 5
+    assert source_claim["source_hash"] == mod.compute_source_hash(source_messages)
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert released_source_claims(store) == []
     assert len(store.completed_rows) == 1
     assert store.completed_rows[0]["state"] == "ready"
     assert store.completed_rows[0]["summary_text"] == "generated summary"
@@ -975,6 +1066,8 @@ async def test_pending_checkpoint_waiter_returns_ready_row_without_generating(mo
             self.lookup_calls = 0
 
         async def lookup_any(self, **kwargs):
+            if kwargs["namespace"] == mod.CHECKPOINT_GENERATION_LEASE_NAMESPACE:
+                return await super().lookup_any(**kwargs)
             self.lookup_calls += 1
             if self.lookup_calls >= 3:
                 return dict(ready)
@@ -993,7 +1086,9 @@ async def test_pending_checkpoint_waiter_returns_ready_row_without_generating(mo
 
     assert result == "other worker summary"
     assert store.touched == [ready["id"]]
-    assert store.claimed_rows == []
+    assert source_claims(store) == []
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
 
 
 @pytest.mark.asyncio
@@ -1052,10 +1147,17 @@ async def test_lost_claim_falls_back_to_ready_row_from_other_worker(monkeypatch)
     )
 
     class LostClaimStore(ClaimStore):
+        def __init__(self):
+            super().__init__()
+            self.ready_lookup_calls = 0
+
         async def complete_pending(self, checkpoint_id, **kwargs):
             return None
 
         async def lookup_ready(self, **kwargs):
+            self.ready_lookup_calls += 1
+            if self.ready_lookup_calls == 1:
+                return None
             return dict(other_ready)
 
     store = LostClaimStore()
@@ -1144,19 +1246,25 @@ async def test_checkpoint_summary_surfaces_claim_failure_before_generation(monke
 
     class FailingClaimStore(ClaimStore):
         async def claim_pending(self, row):
-            raise RuntimeError("db down")
+            if row["namespace"] == mod.CHECKPOINT_NAMESPACE:
+                raise RuntimeError("db down")
+            return await super().claim_pending(row)
+
+    store = FailingClaimStore()
 
     async def summary_factory(parent):
         calls.append(parent)
         return "generated summary"
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: FailingClaimStore())
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
 
     with pytest.raises(RuntimeError, match="db down"):
         await run_get_or_create(source_messages, summary_factory)
 
     assert calls == []
+    assert source_claims(store) == []
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
 
 
 @pytest.mark.asyncio
@@ -1177,7 +1285,8 @@ async def test_checkpoint_does_not_store_incomplete_summary_and_releases_claim(m
         await run_get_or_create(source_messages, summary_factory)
 
     assert store.completed_rows == []
-    assert store.released == [store.claimed_rows[0]["id"]]
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
     assert store.rows == []
 
 
@@ -1203,8 +1312,137 @@ async def test_checkpoint_cancellation_releases_claim(monkeypatch):
         await task
 
     assert store.completed_rows == []
-    assert store.released == [store.claimed_rows[0]["id"]]
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
     assert store.rows == []
+
+
+@pytest.mark.asyncio
+async def test_generation_lease_timeout_starts_no_source_claim_or_summary(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    lease = make_generation_lease_row()
+    store = ClaimStore([lease])
+    factory_calls = []
+
+    async def summary_factory(parent):
+        factory_calls.append(parent)
+        return "must not be generated"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+
+    with pytest.raises(RuntimeError, match="[Tt]imed out"):
+        await run_get_or_create(source_messages, summary_factory)
+
+    assert factory_calls == []
+    assert source_claims(store) == []
+
+
+@pytest.mark.asyncio
+async def test_foreground_checkpoint_does_not_wait_for_unrelated_generation_lease(monkeypatch):
+    store = ClaimStore([make_generation_lease_row()])
+    factory_calls = []
+
+    async def summary_factory(parent):
+        factory_calls.append(parent)
+        return "foreground summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+
+    result = await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=[{"role": "user", "content": "new branch"}],
+        summary_meta={},
+        summary_factory=summary_factory,
+        use_generation_lease=False,
+    )
+
+    assert result == "foreground summary"
+    assert factory_calls == [None]
+    assert [row["namespace"] for row in store.claimed_rows] == [mod.CHECKPOINT_NAMESPACE]
+
+
+@pytest.mark.asyncio
+async def test_expired_generation_lease_is_reclaimed_and_removed_after_success(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    lease = make_generation_lease_row(claim_token="crashed-worker", claim_expires_at=1)
+    store = ClaimStore([lease])
+
+    async def summary_factory(parent):
+        assert parent is None
+        return "reclaimed generation"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0)
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+
+    result = await run_get_or_create(source_messages, summary_factory)
+
+    assert result == "reclaimed generation"
+    assert lease["id"] in store.reclaimed
+    assert all(row["id"] != lease["id"] for row in store.rows)
+
+
+@pytest.mark.asyncio
+async def test_generation_lease_is_removed_after_success(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    store = ClaimStore()
+
+    async def summary_factory(parent):
+        assert parent is None
+        return "generated summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+
+    result = await run_get_or_create(source_messages, summary_factory)
+
+    assert result == "generated summary"
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert all(row["id"] != generation_lease_claims(store)[0]["id"] for row in store.rows)
+
+
+@pytest.mark.asyncio
+async def test_generation_lease_is_removed_after_cancellation(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    store = ClaimStore()
+    started = asyncio.Event()
+
+    async def summary_factory(parent):
+        assert parent is None
+        started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+
+    task = asyncio.create_task(run_get_or_create(source_messages, summary_factory))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert all(row["id"] != generation_lease_claims(store)[0]["id"] for row in store.rows)
 
 
 @pytest.mark.asyncio
@@ -1256,12 +1494,12 @@ async def test_checkpoint_reuse_survives_target_and_summary_model_changes(monkey
         claim_token=None,
         claim_expires_at=None,
     )
-    lookup_keys = []
+    ready_lookup_keys = []
 
     class RecordingClaimStore(ClaimStore):
-        async def lookup_any(self, **kwargs):
-            lookup_keys.append(kwargs)
-            return await super().lookup_any(**kwargs)
+        async def lookup_ready(self, **kwargs):
+            ready_lookup_keys.append(kwargs)
+            return await super().lookup_ready(**kwargs)
 
     store = RecordingClaimStore([existing])
 
@@ -1280,8 +1518,9 @@ async def test_checkpoint_reuse_survives_target_and_summary_model_changes(monkey
 
     assert first == "existing summary"
     assert second == "existing summary"
-    assert lookup_keys[0]["profile_hash"] == lookup_keys[1]["profile_hash"]
-    assert lookup_keys[0]["source_hash"] == lookup_keys[1]["source_hash"]
+    assert len(ready_lookup_keys) == 2
+    assert ready_lookup_keys[0]["profile_hash"] == ready_lookup_keys[1]["profile_hash"]
+    assert ready_lookup_keys[0]["source_hash"] == ready_lookup_keys[1]["source_hash"]
 
 
 @pytest.mark.asyncio
@@ -1316,7 +1555,8 @@ async def test_parent_checkpoint_failure_releases_claim_and_does_not_resubmit_ra
     assert len(calls) == 1
     assert exc_info.value.parent["id"] == parent["id"]
     assert store.completed_rows == []
-    assert store.released == [store.claimed_rows[0]["id"]]
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
     assert [row["id"] for row in store.rows] == [parent["id"]]
 
 
@@ -1340,7 +1580,8 @@ async def test_summary_file_context_unavailable_releases_claim_without_ready_che
 
     assert calls == [None]
     assert store.completed_rows == []
-    assert store.released == [store.claimed_rows[0]["id"]]
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
     assert store.rows == []
 
 
@@ -1375,7 +1616,8 @@ async def test_summary_file_context_unavailable_bypasses_parent_extension_fallba
 
     assert len(calls) == 1
     assert store.completed_rows == []
-    assert store.released == [store.claimed_rows[0]["id"]]
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
     assert [row["id"] for row in store.rows] == [parent["id"]]
 
 
@@ -1523,7 +1765,7 @@ async def test_compact_body_uses_raw_summary_source_but_canonical_checkpoint_has
     assert did_compact is True
     summary_file = captured["source_messages"][0]["files"][0]
     assert summary_file == body["messages"][0]["files"][0]
-    assert store.claimed_rows[0]["source_hash"] == mod.compute_source_hash(body["messages"][:2])
+    assert source_claims(store)[0]["source_hash"] == mod.compute_source_hash(body["messages"][:2])
     assert store.completed_rows[0]["summary_text"] == "summary"
     assert "summary" in compacted["messages"][0]["content"]
 
@@ -2479,8 +2721,9 @@ async def test_prefetch_rechecks_parent_after_claim_before_generating_child(monk
 
     assert result is False
     assert len(estimate_calls) == 1
-    assert len(store.claimed_rows) == 1
-    assert store.released == [store.claimed_rows[0]["id"]]
+    assert len(source_claims(store)) == 1
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
     assert store.completed_rows == []
 
 
@@ -2556,7 +2799,9 @@ async def test_prefetch_does_not_skip_tool_prefix_for_mismatched_message_exact_c
     assert result is True
     assert len(summary_calls) == 1
     assert summary_calls[0]["source_messages"] == source_messages
-    assert len(store.claimed_rows) == 1
+    assert len(source_claims(store)) == 1
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
     assert len(store.completed_rows) == 1
     assert store.completed_rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
 
@@ -2644,7 +2889,9 @@ async def test_prefetch_uses_task_estimate_body_for_parent_below_soft_guard(monk
     assert result is True
     assert len(task_estimate_calls) == 2
     assert len(summary_calls) == 1
-    assert len(store.claimed_rows) == 1
+    assert len(source_claims(store)) == 1
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
     assert len(store.completed_rows) == 1
 
 
@@ -2867,6 +3114,76 @@ async def test_concurrent_callers_generate_summary_only_once(claim_engine, monke
 
 
 @pytest.mark.asyncio
+async def test_independent_workers_serialize_parent_and_child_checkpoint_generation(monkeypatch):
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    child_source = [
+        *parent_source,
+        {"role": "user", "content": "new"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+    shared_rows = []
+    parent_store = ClaimStore(shared_rows, share_rows=True)
+    child_db_started = asyncio.Event()
+
+    class ChildStore(ClaimStore):
+        async def lookup_any(self, **kwargs):
+            child_db_started.set()
+            return await super().lookup_any(**kwargs)
+
+    child_store = ChildStore(shared_rows, share_rows=True)
+    stores = iter((parent_store, child_store))
+    parent_llm_started = asyncio.Event()
+    release_parent_llm = asyncio.Event()
+    child_llm_started = asyncio.Event()
+    child_parents = []
+
+    async def parent_summary_factory(parent):
+        assert parent is None
+        parent_llm_started.set()
+        await release_parent_llm.wait()
+        return "parent summary"
+
+    async def child_summary_factory(parent):
+        child_parents.append(parent)
+        child_llm_started.set()
+        return "child summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: next(stores))
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0)
+
+    parent_task = asyncio.create_task(run_get_or_create(parent_source, parent_summary_factory))
+    await asyncio.wait_for(parent_llm_started.wait(), timeout=1)
+    child_task = asyncio.create_task(run_get_or_create(child_source, child_summary_factory))
+
+    try:
+        await asyncio.wait_for(child_db_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not child_llm_started.is_set()
+
+        release_parent_llm.set()
+        parent_result, child_result = await asyncio.gather(parent_task, child_task)
+
+        assert parent_result == "parent summary"
+        assert child_result == "child summary"
+        assert child_llm_started.is_set()
+        assert len(child_parents) == 1
+        assert child_parents[0]["summary_text"] == "parent summary"
+        assert child_result.checkpoint["parent_checkpoint_id"] == parent_result.checkpoint["id"]
+    finally:
+        release_parent_llm.set()
+        for task in (parent_task, child_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(parent_task, child_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_stale_owner_cannot_overwrite_reclaimed_checkpoint(claim_engine):
     await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
     store = _engine_store_factory(claim_engine)()
@@ -2918,6 +3235,71 @@ async def test_stale_owner_cannot_overwrite_reclaimed_checkpoint(claim_engine):
     )
     assert ready is not None
     assert ready["summary_text"] == "fresh summary"
+
+
+@pytest.mark.asyncio
+async def test_stale_generation_lease_owner_cannot_complete_source_checkpoint(
+    claim_engine,
+):
+    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
+    store = _engine_store_factory(claim_engine)()
+    source_messages = [{"role": "user", "content": "old"}]
+    source = make_checkpoint_row(
+        source_messages,
+        claim_token="source-token-a",
+        claim_expires_at=10**12,
+        now=100,
+    )
+    lease = make_generation_lease_row(
+        claim_token="lease-token-a",
+        claim_expires_at=100,
+    )
+
+    assert await store.claim_pending(source) is True
+    assert await store.claim_pending(lease) is True
+    assert (
+        await store.reclaim_pending(
+            lease["id"],
+            claim_token="lease-token-b",
+            expires_at=10**12,
+            now=200,
+        )
+        is True
+    )
+
+    completed = await store.complete_pending(
+        source["id"],
+        claim_token="source-token-a",
+        summary_text="stale summary",
+        parent_checkpoint_id=None,
+        generation_lease_id=lease["id"],
+        generation_lease_claim_token="lease-token-a",
+        now=200,
+    )
+
+    assert completed is None
+    persisted = await store.lookup_any(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages),
+    )
+    assert persisted is not None
+    assert persisted["state"] == "pending"
+    assert persisted["claim_token"] == "source-token-a"
+    assert (
+        await store.lookup_ready(
+            namespace=mod.CHECKPOINT_NAMESPACE,
+            user_id="user-1",
+            chat_id="chat-1",
+            pipe_function_id="auto_compact",
+            profile_hash=mod.compute_profile_hash(),
+            source_hash=mod.compute_source_hash(source_messages),
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

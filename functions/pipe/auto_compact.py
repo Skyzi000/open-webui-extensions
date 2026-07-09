@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.6.2
+version: 0.6.3
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -44,6 +44,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     delete,
+    exists,
     insert,
     or_,
     select,
@@ -64,6 +65,8 @@ except Exception:
 
 PIPE_FUNCTION_ID = "auto_compact"
 CHECKPOINT_NAMESPACE = "skyzi000.open_webui_extensions.auto_compaction_pipe"
+CHECKPOINT_GENERATION_LEASE_NAMESPACE = f"{CHECKPOINT_NAMESPACE}.generation_lease"
+CHECKPOINT_GENERATION_LEASE_SOURCE_HASH = "generation-lease"
 CHECKPOINT_SCHEMA_VERSION = 1
 CHECKPOINT_TABLE_NAME = "skyzi000_owui_ext_autocompact_checkpoint_v1"
 CHECKPOINT_LOOKUP_UQ = "skyzi000_owui_ext_accp_v1_lookup_uq"
@@ -231,6 +234,7 @@ _SCHEMA_INIT_LOCKS: dict[Any, asyncio.Lock] = {}
 _GENERATION_LOCKS: dict[tuple[str, str, str, str, str, str], asyncio.Lock] = {}
 _SOFT_PREFETCH_TASKS: set[asyncio.Task] = set()
 _SOFT_PREFETCH_INFLIGHT_KEYS: set[tuple[str, str, str, str, str, str]] = set()
+_SOFT_PREFETCH_INFLIGHT_TASKS: dict[tuple[str, str, str, str, str, str], asyncio.Task] = {}
 _MESSAGE_TOKEN_ESTIMATE_CACHE: dict[tuple[str, str, str], int] = {}
 # Module-level snapshot of the latest model dict seen during pipe()/pipes()
 # processing. Populated opportunistically so the Valves dropdown for
@@ -256,6 +260,8 @@ def _release_soft_prefetch_task(
     task: asyncio.Task,
 ) -> None:
     _SOFT_PREFETCH_INFLIGHT_KEYS.discard(key)
+    if _SOFT_PREFETCH_INFLIGHT_TASKS.get(key) is task:
+        _SOFT_PREFETCH_INFLIGHT_TASKS.pop(key, None)
     _SOFT_PREFETCH_TASKS.discard(task)
     try:
         exc = task.exception()
@@ -293,6 +299,7 @@ def _launch_soft_prefetch_task(
         return False
     _SOFT_PREFETCH_INFLIGHT_KEYS.add(key)
     task = asyncio.create_task(coro)
+    _SOFT_PREFETCH_INFLIGHT_TASKS[key] = task
     _SOFT_PREFETCH_TASKS.add(task)
     task.add_done_callback(lambda done: _release_soft_prefetch_task(key, done))
     return True
@@ -1459,6 +1466,64 @@ def _soft_prefetch_inflight_source_hash(
         fingerprint,
         transient_message_patterns=transient_message_patterns,
     )
+
+
+def _soft_prefetch_inflight_key_for_body(
+    *,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+    source_messages: list[dict[str, Any]] | None = None,
+) -> tuple[str, str, str, str, str, str] | None:
+    if source_messages is None:
+        prefetch_source = _soft_prefetch_source_messages(
+            body,
+            transient_message_patterns=transient_message_patterns,
+        )
+        if prefetch_source is None:
+            return None
+        source_messages, _ = prefetch_source
+    chat_id = str(metadata.get("chat_id") or "")
+    user_id = str((user or {}).get("id") or "")
+    if not user_id or not _chat_id_supported(chat_id):
+        return None
+    return (
+        CHECKPOINT_NAMESPACE,
+        user_id,
+        chat_id,
+        pipe_function_id,
+        compute_profile_hash(),
+        _soft_prefetch_inflight_source_hash(
+            source_messages,
+            metadata,
+            transient_message_patterns=transient_message_patterns,
+        ),
+    )
+
+
+def _soft_prefetch_inflight_task_for_body(
+    *,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> asyncio.Task | None:
+    key = _soft_prefetch_inflight_key_for_body(
+        user=user,
+        metadata=metadata,
+        body=body,
+        pipe_function_id=pipe_function_id,
+        transient_message_patterns=transient_message_patterns,
+    )
+    if key is None:
+        return None
+    task = _SOFT_PREFETCH_INFLIGHT_TASKS.get(key)
+    if task is None or task.done():
+        return None
+    return task
 
 
 def _make_prefix_file_fingerprint_resolver(
@@ -3691,18 +3756,40 @@ class CheckpointStore:
         summary_text: str,
         parent_checkpoint_id: str | None,
         summary_token_count: int | None = None,
+        generation_lease_id: str | None = None,
+        generation_lease_claim_token: str | None = None,
         now: int | None = None,
     ) -> dict[str, Any] | None:
         timestamp = int(time.time()) if now is None else int(now)
         async with await self._context() as db:
             try:
+                update_conditions = [
+                    CHECKPOINT_TABLE.c.id == checkpoint_id,
+                    CHECKPOINT_TABLE.c.state == "pending",
+                    CHECKPOINT_TABLE.c.claim_token == claim_token,
+                ]
+                if generation_lease_id is not None and generation_lease_claim_token is not None:
+                    lease_table = CHECKPOINT_TABLE.alias("generation_lease")
+                    lease_conditions = [
+                        lease_table.c.id == generation_lease_id,
+                        lease_table.c.namespace == CHECKPOINT_GENERATION_LEASE_NAMESPACE,
+                        lease_table.c.state == "pending",
+                        lease_table.c.claim_token == generation_lease_claim_token,
+                        lease_table.c.claim_expires_at.is_not(None),
+                        lease_table.c.claim_expires_at > timestamp,
+                    ]
+                    lease_result = await db.execute(
+                        select(lease_table.c.id).where(*lease_conditions).with_for_update()
+                    )
+                    if lease_result.scalar_one_or_none() is None:
+                        await db.rollback()
+                        return None
+                    update_conditions.append(
+                        exists(select(1).select_from(lease_table).where(*lease_conditions))
+                    )
                 result = await db.execute(
                     update(CHECKPOINT_TABLE)
-                    .where(
-                        CHECKPOINT_TABLE.c.id == checkpoint_id,
-                        CHECKPOINT_TABLE.c.state == "pending",
-                        CHECKPOINT_TABLE.c.claim_token == claim_token,
-                    )
+                    .where(*update_conditions)
                     .values(
                         state="ready",
                         summary_text=summary_text,
@@ -7753,6 +7840,171 @@ async def _heartbeat_checkpoint_claim(store: Any, checkpoint_id: str, claim_toke
             return
 
 
+async def _await_checkpoint_db_before_deadline(
+    awaitable: Awaitable[Any], deadline: float
+) -> Any:
+    remaining = max(0.0, deadline - time.monotonic())
+    return await asyncio.wait_for(awaitable, timeout=remaining)
+
+
+def _checkpoint_wait_timeout_error(subject: str) -> RuntimeError:
+    return RuntimeError(f"Timed out waiting for {subject}")
+
+
+async def _claim_or_wait_for_generation_lease(
+    store: Any,
+    *,
+    identity: dict[str, str],
+    claim_token: str,
+) -> tuple[str, int]:
+    deadline = time.monotonic() + CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS
+    timeout_error = _checkpoint_wait_timeout_error(
+        "another worker to release the checkpoint generation lease"
+    )
+    try:
+        while True:
+            row = await _await_checkpoint_db_before_deadline(
+                store.lookup_any(**identity),
+                deadline,
+            )
+            now = int(time.time())
+            if row is None:
+                expires_at = now + CHECKPOINT_CLAIM_LEASE_SECONDS
+                pending_row = build_checkpoint_row(
+                    **identity,
+                    source_message_count=0,
+                    summary_text="",
+                    summary_meta={},
+                    parent_checkpoint_id=None,
+                    state="pending",
+                    claim_token=claim_token,
+                    claim_expires_at=expires_at,
+                    now=now,
+                )
+                claimed = await _await_checkpoint_db_before_deadline(
+                    store.claim_pending(pending_row),
+                    deadline,
+                )
+                if claimed:
+                    if time.time() < expires_at:
+                        return pending_row["id"], expires_at
+                    continue
+                continue
+            expires_at = row.get("claim_expires_at")
+            if expires_at is None or int(expires_at) <= now:
+                reclaimed_expires_at = now + CHECKPOINT_CLAIM_LEASE_SECONDS
+                reclaimed = await _await_checkpoint_db_before_deadline(
+                    store.reclaim_pending(
+                        row["id"],
+                        claim_token=claim_token,
+                        expires_at=reclaimed_expires_at,
+                        now=now,
+                    ),
+                    deadline,
+                )
+                if reclaimed:
+                    if time.time() < reclaimed_expires_at:
+                        return row["id"], reclaimed_expires_at
+                    continue
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise timeout_error
+            await asyncio.sleep(min(CHECKPOINT_PENDING_POLL_SECONDS, remaining))
+    except asyncio.TimeoutError as exc:
+        raise timeout_error from exc
+
+
+async def _heartbeat_generation_lease(
+    store: Any,
+    lease_id: str,
+    claim_token: str,
+    claim_expires_at: int,
+    lease_lost: asyncio.Event,
+) -> None:
+    lease_deadline = time.monotonic() + max(
+        0.0,
+        claim_expires_at - time.time(),
+    )
+    try:
+        while True:
+            remaining = lease_deadline - time.monotonic()
+            if remaining <= 0:
+                lease_lost.set()
+                return
+            heartbeat_delay = (
+                CHECKPOINT_CLAIM_HEARTBEAT_SECONDS
+                if remaining > CHECKPOINT_CLAIM_HEARTBEAT_SECONDS
+                else 0.0
+            )
+            await asyncio.sleep(min(heartbeat_delay, remaining))
+
+            while True:
+                remaining = lease_deadline - time.monotonic()
+                if remaining <= 0:
+                    lease_lost.set()
+                    return
+                expires_at = int(time.time()) + CHECKPOINT_CLAIM_LEASE_SECONDS
+                try:
+                    extended = await asyncio.wait_for(
+                        store.extend_claim(
+                            lease_id,
+                            claim_token=claim_token,
+                            expires_at=expires_at,
+                        ),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    lease_lost.set()
+                    return
+                except Exception:
+                    remaining = lease_deadline - time.monotonic()
+                    if remaining <= 0:
+                        lease_lost.set()
+                        return
+                    await asyncio.sleep(min(CHECKPOINT_PENDING_POLL_SECONDS, remaining))
+                    continue
+                if not extended:
+                    lease_lost.set()
+                    return
+                lease_deadline = time.monotonic() + max(0.0, expires_at - time.time())
+                break
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        if not lease_lost.is_set():
+            lease_lost.set()
+
+
+async def _run_summary_factory_with_generation_lease(
+    summary_factory: Callable[[dict[str, Any] | None], Awaitable[str]],
+    parent: dict[str, Any] | None,
+    lease_lost: asyncio.Event,
+) -> str:
+    if lease_lost.is_set():
+        raise RuntimeError(
+            "Checkpoint generation lease was lost before summary generation"
+        )
+    summary_task = asyncio.create_task(summary_factory(parent))
+    lease_loss_task = asyncio.create_task(lease_lost.wait())
+    try:
+        await asyncio.wait(
+            {summary_task, lease_loss_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if lease_lost.is_set():
+            summary_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await summary_task
+            raise RuntimeError("Checkpoint generation lease was lost during summary generation")
+        return await summary_task
+    finally:
+        for task in (summary_task, lease_loss_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(summary_task, lease_loss_task, return_exceptions=True)
+
+
 async def _claim_or_wait_for_checkpoint(
     store: Any,
     *,
@@ -7763,44 +8015,67 @@ async def _claim_or_wait_for_checkpoint(
 ) -> str | dict[str, Any]:
     """Return the claimed pending checkpoint id, or a ready row produced by another worker."""
     deadline = time.monotonic() + CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS
-    while True:
-        row = await store.lookup_any(**identity)
-        if row is None:
+    timeout_error = _checkpoint_wait_timeout_error(
+        "another worker to finish generating this checkpoint summary"
+    )
+    try:
+        while True:
+            row = await _await_checkpoint_db_before_deadline(
+                store.lookup_any(**identity),
+                deadline,
+            )
+            if row is None:
+                now = int(time.time())
+                pending_row = build_checkpoint_row(
+                    **identity,
+                    source_message_count=source_message_count,
+                    summary_text="",
+                    summary_meta=summary_meta,
+                    parent_checkpoint_id=None,
+                    state="pending",
+                    claim_token=claim_token,
+                    claim_expires_at=now + CHECKPOINT_CLAIM_LEASE_SECONDS,
+                    now=now,
+                )
+                claimed = await _await_checkpoint_db_before_deadline(
+                    store.claim_pending(pending_row),
+                    deadline,
+                )
+                if claimed:
+                    return pending_row["id"]
+                continue
+            if row.get("state") == "ready":
+                try:
+                    await _await_checkpoint_db_before_deadline(
+                        store.touch(row["id"]),
+                        deadline,
+                    )
+                except asyncio.TimeoutError:
+                    raise
+                except Exception:
+                    pass
+                return row
             now = int(time.time())
-            pending_row = build_checkpoint_row(
-                **identity,
-                source_message_count=source_message_count,
-                summary_text="",
-                summary_meta=summary_meta,
-                parent_checkpoint_id=None,
-                state="pending",
-                claim_token=claim_token,
-                claim_expires_at=now + CHECKPOINT_CLAIM_LEASE_SECONDS,
-                now=now,
-            )
-            if await store.claim_pending(pending_row):
-                return pending_row["id"]
-            continue
-        if row.get("state") == "ready":
-            with suppress(Exception):
-                await store.touch(row["id"])
-            return row
-        now = int(time.time())
-        expires_at = row.get("claim_expires_at")
-        if expires_at is None or int(expires_at) <= now:
-            if await store.reclaim_pending(
-                row["id"],
-                claim_token=claim_token,
-                expires_at=now + CHECKPOINT_CLAIM_LEASE_SECONDS,
-                now=now,
-            ):
-                return row["id"]
-            continue
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                "Timed out waiting for another worker to finish generating this checkpoint summary"
-            )
-        await asyncio.sleep(CHECKPOINT_PENDING_POLL_SECONDS)
+            expires_at = row.get("claim_expires_at")
+            if expires_at is None or int(expires_at) <= now:
+                reclaimed = await _await_checkpoint_db_before_deadline(
+                    store.reclaim_pending(
+                        row["id"],
+                        claim_token=claim_token,
+                        expires_at=now + CHECKPOINT_CLAIM_LEASE_SECONDS,
+                        now=now,
+                    ),
+                    deadline,
+                )
+                if reclaimed:
+                    return row["id"]
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise timeout_error
+            await asyncio.sleep(min(CHECKPOINT_PENDING_POLL_SECONDS, remaining))
+    except asyncio.TimeoutError as exc:
+        raise timeout_error from exc
 
 
 async def _get_or_create_checkpoint_summary(
@@ -7817,6 +8092,7 @@ async def _get_or_create_checkpoint_summary(
     prefix_file_fingerprint: str | None = None,
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    use_generation_lease: bool = True,
 ) -> str:
     profile_hash = compute_profile_hash()
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
@@ -7842,103 +8118,174 @@ async def _get_or_create_checkpoint_summary(
         async with lock:
             await ensure_checkpoint_table_initialized(request=request)
             store = CheckpointStore()
+            existing = await store.lookup_ready(**identity)
+            if existing is not None:
+                with suppress(Exception):
+                    await store.touch(existing["id"])
+                return CompactionSummaryResult(existing["summary_text"], checkpoint=existing)
+
             claim_token = uuid.uuid4().hex
-
-            claimed = await _claim_or_wait_for_checkpoint(
-                store,
-                identity=identity,
-                source_message_count=_source_identity_message_count(
-                    source_messages,
-                    transient_message_patterns=transient_message_patterns,
-                ),
-                summary_meta=summary_meta,
-                claim_token=claim_token,
-            )
-            if isinstance(claimed, dict):
-                return CompactionSummaryResult(claimed["summary_text"], checkpoint=claimed)
-            checkpoint_id = claimed
-
-            heartbeat = asyncio.create_task(_heartbeat_checkpoint_claim(store, checkpoint_id, claim_token))
+            lease_id: str | None = None
+            lease_claim_token: str | None = None
+            lease_lost = asyncio.Event()
+            generation_heartbeat: asyncio.Task[Any] | None = None
+            if use_generation_lease:
+                lease_claim_token = uuid.uuid4().hex
+                lease_identity = {
+                    "namespace": CHECKPOINT_GENERATION_LEASE_NAMESPACE,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "pipe_function_id": pipe_function_id,
+                    "profile_hash": profile_hash,
+                    "source_hash": CHECKPOINT_GENERATION_LEASE_SOURCE_HASH,
+                }
+                lease_id, lease_expires_at = await _claim_or_wait_for_generation_lease(
+                    store,
+                    identity=lease_identity,
+                    claim_token=lease_claim_token,
+                )
+                generation_heartbeat = asyncio.create_task(
+                    _heartbeat_generation_lease(
+                        store,
+                        lease_id,
+                        lease_claim_token,
+                        lease_expires_at,
+                        lease_lost,
+                    )
+                )
             try:
-                if parent_checkpoint is not None:
-                    parent_count = int(parent_checkpoint.get("source_message_count") or 0)
-                    raw_parent_count = _raw_prefix_len_for_source_count(
+                if lease_lost.is_set():
+                    raise RuntimeError("Checkpoint generation lease was lost before source claim")
+                claimed = await _claim_or_wait_for_checkpoint(
+                    store,
+                    identity=identity,
+                    source_message_count=_source_identity_message_count(
                         source_messages,
-                        parent_count,
                         transient_message_patterns=transient_message_patterns,
-                    )
-                    parent_fingerprint = (
-                        prefix_file_fingerprint_resolver(parent_count)
-                        if prefix_file_fingerprint_resolver is not None
-                        else None
-                    )
-                    if (
-                        parent_count <= 0
-                        or raw_parent_count is None
-                        or compute_summary_source_hash(
-                            source_messages[:raw_parent_count],
-                            parent_fingerprint,
-                            file_backed_image_db_chain,
+                    ),
+                    summary_meta=summary_meta,
+                    claim_token=claim_token,
+                )
+                if isinstance(claimed, dict):
+                    return CompactionSummaryResult(claimed["summary_text"], checkpoint=claimed)
+                checkpoint_id = claimed
+
+                heartbeat = asyncio.create_task(_heartbeat_checkpoint_claim(store, checkpoint_id, claim_token))
+                release_source_claim = False
+                try:
+                    if parent_checkpoint is not None:
+                        parent_count = int(parent_checkpoint.get("source_message_count") or 0)
+                        raw_parent_count = _raw_prefix_len_for_source_count(
+                            source_messages,
+                            parent_count,
                             transient_message_patterns=transient_message_patterns,
                         )
-                        != parent_checkpoint.get("source_hash")
-                    ):
-                        raise UnsupportedCompactionInput(
-                            "Parent checkpoint cannot be applied safely because its source boundary is invalid",
-                            code="unsafe_checkpoint_parent",
+                        parent_fingerprint = (
+                            prefix_file_fingerprint_resolver(parent_count)
+                            if prefix_file_fingerprint_resolver is not None
+                            else None
                         )
-                    parent = parent_checkpoint
-                else:
-                    parent = await store.find_longest_parent(
-                        namespace=CHECKPOINT_NAMESPACE,
-                        user_id=user_id,
-                        chat_id=chat_id,
-                        pipe_function_id=pipe_function_id,
-                        profile_hash=profile_hash,
-                        source_messages=source_messages,
-                        prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+                        if (
+                            parent_count <= 0
+                            or raw_parent_count is None
+                            or compute_summary_source_hash(
+                                source_messages[:raw_parent_count],
+                                parent_fingerprint,
+                                file_backed_image_db_chain,
+                                transient_message_patterns=transient_message_patterns,
+                            )
+                            != parent_checkpoint.get("source_hash")
+                        ):
+                            raise UnsupportedCompactionInput(
+                                "Parent checkpoint cannot be applied safely because its source boundary is invalid",
+                                code="unsafe_checkpoint_parent",
+                            )
+                        parent = parent_checkpoint
+                    else:
+                        parent = await store.find_longest_parent(
+                            namespace=CHECKPOINT_NAMESPACE,
+                            user_id=user_id,
+                            chat_id=chat_id,
+                            pipe_function_id=pipe_function_id,
+                            profile_hash=profile_hash,
+                            source_messages=source_messages,
+                            prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+                            transient_message_patterns=transient_message_patterns,
+                        )
+                    if lease_lost.is_set():
+                        raise RuntimeError("Checkpoint generation lease was lost before summary generation")
+                    if parent is not None and parent_checkpoint_guard is not None:
+                        await parent_checkpoint_guard(parent)
+                    if lease_lost.is_set():
+                        raise RuntimeError("Checkpoint generation lease was lost before summary generation")
+                    try:
+                        summary_text = (
+                            await _run_summary_factory_with_generation_lease(
+                                summary_factory,
+                                parent,
+                                lease_lost,
+                            )
+                            if use_generation_lease
+                            else await summary_factory(parent)
+                        )
+                    except SummaryFileContextUnavailable:
+                        raise
+                    except Exception as exc:
+                        if parent:
+                            raise ParentCheckpointExtensionFailed(parent, exc) from exc
+                        raise
+                    if lease_lost.is_set():
+                        raise RuntimeError("Checkpoint generation lease was lost before summary storage")
+                    summary_token_count = await _estimate_rendered_summary_message_tokens(
+                        request=request,
+                        summary_text=summary_text,
+                        summary_meta=summary_meta,
                         transient_message_patterns=transient_message_patterns,
                     )
-                if parent is not None and parent_checkpoint_guard is not None:
-                    await parent_checkpoint_guard(parent)
-                try:
-                    summary_text = await summary_factory(parent)
-                except SummaryFileContextUnavailable:
+                    if lease_lost.is_set():
+                        raise RuntimeError("Checkpoint generation lease was lost before summary storage")
+                    completed = await store.complete_pending(
+                        checkpoint_id,
+                        claim_token=claim_token,
+                        summary_text=summary_text,
+                        parent_checkpoint_id=parent.get("id") if parent else None,
+                        summary_token_count=summary_token_count,
+                        generation_lease_id=lease_id,
+                        generation_lease_claim_token=lease_claim_token,
+                    )
+                    if completed is not None:
+                        return CompactionSummaryResult(completed["summary_text"], checkpoint=completed)
+                    existing = await store.lookup_ready(**identity)
+                    if existing is not None:
+                        with suppress(Exception):
+                            await store.touch(existing["id"])
+                        return CompactionSummaryResult(existing["summary_text"], checkpoint=existing)
+                    raise RuntimeError("Checkpoint claim was lost before the generated summary could be stored")
+                except (asyncio.CancelledError, Exception):
+                    # asyncio.CancelledError is outside Exception on Python 3.11+.
+                    release_source_claim = True
                     raise
-                except Exception as exc:
-                    if parent:
-                        raise ParentCheckpointExtensionFailed(parent, exc) from exc
-                    raise
-                summary_token_count = await _estimate_rendered_summary_message_tokens(
-                    request=request,
-                    summary_text=summary_text,
-                    summary_meta=summary_meta,
-                    transient_message_patterns=transient_message_patterns,
-                )
-                completed = await store.complete_pending(
-                    checkpoint_id,
-                    claim_token=claim_token,
-                    summary_text=summary_text,
-                    parent_checkpoint_id=parent.get("id") if parent else None,
-                    summary_token_count=summary_token_count,
-                )
-                if completed is not None:
-                    return CompactionSummaryResult(completed["summary_text"], checkpoint=completed)
-                existing = await store.lookup_ready(**identity)
-                if existing is not None:
-                    with suppress(Exception):
-                        await store.touch(existing["id"])
-                    return CompactionSummaryResult(existing["summary_text"], checkpoint=existing)
-                raise RuntimeError("Checkpoint claim was lost before the generated summary could be stored")
-            except (asyncio.CancelledError, Exception):
-                # asyncio.CancelledError is outside Exception on Python 3.11+.
-                with suppress(asyncio.CancelledError, Exception):
-                    await asyncio.shield(store.release_claim(checkpoint_id, claim_token=claim_token))
-                raise
+                finally:
+                    heartbeat.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await heartbeat
+                    if release_source_claim:
+                        with suppress(asyncio.CancelledError, Exception):
+                            await asyncio.shield(
+                                store.release_claim(
+                                    checkpoint_id, claim_token=claim_token
+                                )
+                            )
             finally:
-                heartbeat.cancel()
-                with suppress(asyncio.CancelledError):
-                    await heartbeat
+                if generation_heartbeat is not None:
+                    generation_heartbeat.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await generation_heartbeat
+                if lease_id is not None and lease_claim_token is not None:
+                    with suppress(asyncio.CancelledError, Exception):
+                        await asyncio.shield(
+                            store.release_claim(lease_id, claim_token=lease_claim_token)
+                        )
     finally:
         release_generation_lock(lock_key, lock)
 
@@ -7965,6 +8312,7 @@ async def _get_or_create_compaction_summary(
     file_context_enabled: bool = True,
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    use_generation_lease: bool = False,
 ) -> str:
     summary_source_prefix = copy.deepcopy(source_messages)
 
@@ -8048,6 +8396,7 @@ async def _get_or_create_compaction_summary(
         prefix_file_fingerprint=identity_fingerprint,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
         transient_message_patterns=transient_message_patterns,
+        use_generation_lease=use_generation_lease,
     )
 
 
@@ -8157,12 +8506,25 @@ async def _wait_for_pending_checkpoint_ready(row: dict[str, Any]) -> dict[str, A
     store = CheckpointStore()
     deadline = time.monotonic() + CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS
     while True:
-        current = await store.lookup_any(**identity)
+        try:
+            current = await _await_checkpoint_db_before_deadline(
+                store.lookup_any(**identity),
+                deadline,
+            )
+        except asyncio.TimeoutError:
+            return None
         if current is None:
             return None
         if current.get("state") == "ready":
-            with suppress(Exception):
-                await store.touch(str(current["id"]))
+            try:
+                await _await_checkpoint_db_before_deadline(
+                    store.touch(str(current["id"])),
+                    deadline,
+                )
+            except asyncio.TimeoutError:
+                return None
+            except Exception:
+                pass
             return current
         if current.get("state") != "pending":
             return None
@@ -8170,9 +8532,10 @@ async def _wait_for_pending_checkpoint_ready(row: dict[str, Any]) -> dict[str, A
         now = int(time.time())
         if expires_at is None or int(expires_at) <= now:
             return None
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return None
-        await asyncio.sleep(CHECKPOINT_PENDING_POLL_SECONDS)
+        await asyncio.sleep(min(CHECKPOINT_PENDING_POLL_SECONDS, remaining))
 
 
 def _soft_prefetch_source_messages(
@@ -8241,7 +8604,7 @@ async def _prefetch_compaction_checkpoint(
         source_messages,
         transient_message_patterns=transient_message_patterns,
     )
-    if await _lookup_pending_checkpoint_for_source_prefix(
+    pending_checkpoint = await _lookup_pending_checkpoint_for_source_prefix(
         request=request,
         user_id=user_id,
         chat_id=chat_id,
@@ -8249,8 +8612,11 @@ async def _prefetch_compaction_checkpoint(
         source_messages=source_messages,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
         transient_message_patterns=transient_message_patterns,
-    ):
-        return False
+    )
+    if pending_checkpoint is not None:
+        ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
+        if ready_checkpoint is None:
+            return False
     summary_meta = build_checkpoint_summary_meta(
         source_messages,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
@@ -8341,9 +8707,18 @@ async def _prefetch_compaction_checkpoint(
         if reusable_checkpoint_match.kind == "exact":
             return False
         checkpoint_applied_estimate = await estimate_prefetch_checkpoint_applied_tokens(reusable_checkpoint_match)
+        if checkpoint_applied_estimate is None:
+            LOG.error(
+                "auto-compaction prefetch: checkpoint-applied token estimate was unavailable; "
+                "skipping background checkpoint generation (user_id=%s chat_id=%s source_kind=%s match_kind=%s)",
+                user_id,
+                chat_id,
+                source_kind,
+                reusable_checkpoint_match.kind,
+            )
+            return False
         if (
             effective_soft_trigger_total_tokens is not None
-            and checkpoint_applied_estimate is not None
             and checkpoint_applied_estimate < effective_soft_trigger_total_tokens
         ):
             return False
@@ -8364,7 +8739,17 @@ async def _prefetch_compaction_checkpoint(
                 checkpoint=parent,
             )
         )
-        if checkpoint_applied_estimate is not None and checkpoint_applied_estimate < effective_soft_trigger_total_tokens:
+        if checkpoint_applied_estimate is None:
+            LOG.error(
+                "auto-compaction prefetch: parent checkpoint-applied token estimate was unavailable; "
+                "skipping background checkpoint generation (user_id=%s chat_id=%s source_kind=%s parent_source_message_count=%s)",
+                user_id,
+                chat_id,
+                source_kind,
+                parent_count,
+            )
+            raise _CheckpointGenerationSkipped()
+        if checkpoint_applied_estimate < effective_soft_trigger_total_tokens:
             raise _CheckpointGenerationSkipped()
 
     async def display_token_context() -> DisplayTokenContext:
@@ -8432,6 +8817,7 @@ async def _prefetch_compaction_checkpoint(
             file_context_enabled=file_context_enabled,
             summary_prompt=summary_prompt,
             transient_message_patterns=transient_message_patterns,
+            use_generation_lease=True,
         )
     except _CheckpointGenerationSkipped:
         return False
@@ -8531,6 +8917,7 @@ def _start_soft_compaction_prefetch(
     task_estimate_body: dict[str, Any] | None = None,
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    parent_prefetch_task: asyncio.Task[Any] | None = None,
 ) -> bool:
     prefetch_source = _soft_prefetch_source_messages(
         body,
@@ -8543,27 +8930,43 @@ def _start_soft_compaction_prefetch(
     user_id = str((user or {}).get("id") or "")
     if not user_id or not _chat_id_supported(chat_id):
         return False
-    key = (
-        CHECKPOINT_NAMESPACE,
-        user_id,
-        chat_id,
-        pipe_function_id,
-        compute_profile_hash(),
-        _soft_prefetch_inflight_source_hash(
-            source_messages,
-            metadata,
-            transient_message_patterns=transient_message_patterns,
-        ),
+    key = _soft_prefetch_inflight_key_for_body(
+        user=user,
+        metadata=metadata,
+        body=body,
+        pipe_function_id=pipe_function_id,
+        transient_message_patterns=transient_message_patterns,
+        source_messages=source_messages,
     )
-    return _launch_soft_prefetch_task(
-        key,
-        _prefetch_compaction_checkpoint(
+    if key is None:
+        return False
+    prefetch_user = copy.deepcopy(user)
+    prefetch_metadata = _copy_metadata_preserving_references(metadata)
+    prefetch_body = _copy_body_preserving_metadata(body)
+    prefetch_task_estimate_body = (
+        _copy_body_preserving_metadata(task_estimate_body) if task_estimate_body is not None else None
+    )
+
+    async def run_prefetch() -> bool:
+        if parent_prefetch_task is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(parent_prefetch_task),
+                    CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                return False
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        return await _prefetch_compaction_checkpoint(
             request=request,
-            user=copy.deepcopy(user),
+            user=prefetch_user,
             user_id=user_id,
             chat_id=chat_id,
-            metadata=_copy_metadata_preserving_references(metadata),
-            body=_copy_body_preserving_metadata(body),
+            metadata=prefetch_metadata,
+            body=prefetch_body,
             pipe_function_id=pipe_function_id,
             summary_model_id=summary_model_id,
             source_messages=source_messages,
@@ -8580,13 +8983,12 @@ def _start_soft_compaction_prefetch(
             token_status_compare_estimate=token_status_compare_estimate,
             event_emitter=event_emitter,
             file_context_enabled=file_context_enabled,
-            task_estimate_body=(
-                _copy_body_preserving_metadata(task_estimate_body) if task_estimate_body is not None else None
-            ),
+            task_estimate_body=prefetch_task_estimate_body,
             summary_prompt=summary_prompt,
             transient_message_patterns=transient_message_patterns,
-        ),
-    )
+        )
+
+    return _launch_soft_prefetch_task(key, run_prefetch())
 
 
 def _choice_assistant_message_for_prefetch(choice: Any) -> dict[str, Any] | None:
@@ -10379,6 +10781,7 @@ class Pipe:
             metadata["chat_id"] = chat_id
         message_id = metadata.get("message_id") or metadata.get("user_message_id")
         task_name = _normalized_task_name(metadata.get("task"))
+        is_task_request = bool(task_name) or metadata_task_body is not None
         if task_name == OFFICIAL_CONTEXT_COMPACTION_TASK:
             return _core_context_compaction_conflict_response()
         is_summary_task = task_name == INTERNAL_SUMMARY_TASK
@@ -10823,75 +11226,89 @@ class Pipe:
                     transient_message_patterns=transient_message_patterns,
                 )
 
-        async def launch_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
-            if effective_soft_trigger_total_tokens is None:
-                return
-            # Completed-turn prefetch is grounded ONLY in the just-completed
-            # response's own usage. No usage => no prefetch (never fall back to a
-            # previous turn's observed usage).
-            completion_total_tokens = _usage_total(completion.get("usage"))
-            if completion_total_tokens is None:
-                return
-            if (
-                completion_total_tokens < effective_soft_trigger_total_tokens
-                or completion_total_tokens >= effective_trigger_total_tokens
-            ):
-                return
-            assistant_message = completion.get("assistant_message")
-            if not isinstance(assistant_message, dict):
-                return
-            completed_body = _completed_turn_prefetch_body(checkpoint_lookup_body, assistant_message)
-            if completed_body is None:
-                return
-            completed_task_estimate_body = None
-            if task_source_body is not None:
-                completed_messages = completed_body.get("messages")
-                if isinstance(completed_messages, list):
-                    completed_task_estimate_body = await _rebuild_task_body_from_compacted_history(
+        def schedule_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
+            def prepare_and_start() -> None:
+                try:
+                    if effective_soft_trigger_total_tokens is None:
+                        return
+                    # Completed-turn prefetch is grounded ONLY in the just-completed
+                    # response's own usage. No usage => no prefetch (never fall back to a
+                    # previous turn's observed usage).
+                    completion_total_tokens = _usage_total(completion.get("usage"))
+                    if completion_total_tokens is None:
+                        return
+                    if (
+                        completion_total_tokens < effective_soft_trigger_total_tokens
+                        or completion_total_tokens >= effective_trigger_total_tokens
+                    ):
+                        return
+                    assistant_message = completion.get("assistant_message")
+                    if not isinstance(assistant_message, dict):
+                        assistant_message = _assistant_message_for_completed_prefetch(completion)
+                    if assistant_message is None:
+                        return
+                    completed_body = _completed_turn_prefetch_body(checkpoint_lookup_body, assistant_message)
+                    if completed_body is None:
+                        return
+                    parent_prefetch_task = _soft_prefetch_inflight_task_for_body(
+                        user=user,
+                        metadata=metadata,
+                        body=checkpoint_lookup_body,
+                        pipe_function_id=identity.pipe_function_id,
+                        transient_message_patterns=transient_message_patterns,
+                    )
+                    _start_soft_compaction_prefetch(
                         request=__request__,
                         user=user,
-                        base_body=inner,
                         metadata=metadata,
-                        compacted_history_messages=completed_messages,
+                        body=completed_body,
+                        pipe_function_id=identity.pipe_function_id,
+                        summary_model_id=summary_model_id,
+                        summary_tool_policy=self.valves.summary_tool_policy,
+                        summary_prompt=self.valves.summary_prompt,
+                        historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                        historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                        effective_trigger_total_tokens=effective_trigger_total_tokens,
+                        effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+                        trigger_total_tokens=completion_total_tokens,
+                        trigger_usage_source="request",
+                        token_status_detail=self.valves.token_status_detail,
+                        token_status_compare_estimate=self.valves.token_status_compare_estimate,
+                        event_emitter=__event_emitter__,
+                        file_context_enabled=target_file_context_enabled,
+                        transient_message_patterns=transient_message_patterns,
+                        parent_prefetch_task=parent_prefetch_task,
                     )
-            _start_soft_compaction_prefetch(
-                request=__request__,
-                user=user,
-                metadata=metadata,
-                body=completed_body,
-                pipe_function_id=identity.pipe_function_id,
-                summary_model_id=summary_model_id,
-                summary_tool_policy=self.valves.summary_tool_policy,
-                summary_prompt=self.valves.summary_prompt,
-                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
-                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
-                effective_trigger_total_tokens=effective_trigger_total_tokens,
-                effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
-                trigger_total_tokens=completion_total_tokens,
-                trigger_usage_source="request",
-                token_status_detail=self.valves.token_status_detail,
-                token_status_compare_estimate=self.valves.token_status_compare_estimate,
-                event_emitter=__event_emitter__,
-                file_context_enabled=target_file_context_enabled,
-                task_estimate_body=completed_task_estimate_body,
-                transient_message_patterns=transient_message_patterns,
-            )
+                except Exception as exc:
+                    LOG.exception(
+                        "Completed-turn soft compaction prefetch failed",
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
 
-        def schedule_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
-            task = asyncio.create_task(launch_completed_turn_soft_prefetch(completion))
-            _SOFT_PREFETCH_TASKS.add(task)
+            def call_after_response_return(_done: asyncio.Task[Any]) -> None:
+                try:
+                    asyncio.get_running_loop().call_soon(prepare_and_start)
+                except Exception as exc:
+                    LOG.exception(
+                        "Completed-turn soft compaction prefetch failed",
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
 
-            def observe_result(done: asyncio.Task[Any]) -> None:
-                _SOFT_PREFETCH_TASKS.discard(done)
-                with suppress(asyncio.CancelledError):
-                    exc = done.exception()
-                    if isinstance(exc, BaseException):
-                        LOG.exception(
-                            "Completed-turn soft compaction prefetch failed",
-                            exc_info=(type(exc), exc, exc.__traceback__),
-                        )
-
-            task.add_done_callback(observe_result)
+            try:
+                current_task = asyncio.current_task()
+                current_coro = current_task.get_coro() if current_task is not None else None
+                if (
+                    current_task is not None
+                    and getattr(current_coro, "cr_code", None) is type(self).pipe.__code__
+                ):
+                    current_task.add_done_callback(call_after_response_return)
+                else:
+                    asyncio.get_running_loop().call_soon(prepare_and_start)
+            except Exception as exc:
+                LOG.exception(
+                    "Completed-turn soft compaction prefetch failed",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
 
         attempt = 0
         compacted_once = False
@@ -11117,7 +11534,7 @@ class Pipe:
                     }
                     if (
                         effective_soft_trigger_total_tokens is not None
-                        and not is_summary_task
+                        and not is_task_request
                         and not checkpoint_lookup_unavailable
                     ):
                         streaming_kwargs["on_complete"] = schedule_completed_turn_soft_prefetch
@@ -11134,14 +11551,8 @@ class Pipe:
                     return response
                 await _emit_source_events(__event_emitter__, candidate_source_events)
                 response = _merge_source_events_into_response(response, candidate_source_events)
-                assistant_message = None if is_summary_task else _assistant_message_for_completed_prefetch(response)
-                if assistant_message is not None and not checkpoint_lookup_unavailable:
-                    await launch_completed_turn_soft_prefetch(
-                        {
-                            "assistant_message": assistant_message,
-                            "usage": response.get("usage") if isinstance(response, dict) else None,
-                        }
-                    )
+                if not is_task_request and not checkpoint_lookup_unavailable and isinstance(response, dict):
+                    schedule_completed_turn_soft_prefetch(response)
                 return response
             except RetryableContextOverflow:
                 if checkpoint_lookup_unavailable:

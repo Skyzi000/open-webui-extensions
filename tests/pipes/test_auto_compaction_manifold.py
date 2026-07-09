@@ -91,8 +91,26 @@ class ClaimCheckpointStore:
         summary_text,
         parent_checkpoint_id,
         summary_token_count=None,
+        generation_lease_id=None,
+        generation_lease_claim_token=None,
         now=None,
     ):
+        timestamp = int(mod.time.time()) if now is None else int(now)
+        if generation_lease_id is not None and generation_lease_claim_token is not None:
+            lease = next(
+                (
+                    row
+                    for row in self.rows
+                    if row.get("id") == generation_lease_id
+                    and row.get("namespace") == mod.CHECKPOINT_GENERATION_LEASE_NAMESPACE
+                    and row.get("state") == "pending"
+                    and row.get("claim_token") == generation_lease_claim_token
+                    and int(row.get("claim_expires_at") or 0) > timestamp
+                ),
+                None,
+            )
+            if lease is None:
+                return None
         for row in self.rows:
             if (
                 row.get("id") == checkpoint_id
@@ -114,6 +132,30 @@ class ClaimCheckpointStore:
     async def touch(self, checkpoint_id, *, now=None):
         self.touched.append(checkpoint_id)
         return True
+
+
+class PendingTransitionCheckpointStore(ClaimCheckpointStore):
+    def __init__(self, rows, *, ready_after_lookup):
+        super().__init__(rows)
+        self.ready_after_lookup = ready_after_lookup
+        self.lookup_any_count = 0
+
+    async def lookup_any(self, **kwargs):
+        self.lookup_any_count += 1
+        row = self._match(kwargs["source_hash"])
+        if (
+            row is not None
+            and row.get("state") == "pending"
+            and self.ready_after_lookup is not None
+            and self.lookup_any_count >= self.ready_after_lookup
+        ):
+            row.update(
+                state="ready",
+                summary_text="ready parent summary",
+                claim_token=None,
+                claim_expires_at=None,
+            )
+        return dict(row) if row else None
 
 
 def install_fake_open_webui_user_model(monkeypatch):
@@ -15049,6 +15091,47 @@ async def test_hard_compaction_delegates_exact_pending_to_checkpoint_claim_wait(
 
 
 @pytest.mark.asyncio
+async def test_wait_for_pending_checkpoint_ready_bounds_stalled_lookup(monkeypatch):
+    pending_row = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash="source",
+        source_message_count=1,
+        summary_text="",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state="pending",
+        claim_token="claim-1",
+        claim_expires_at=9999999999,
+    )
+    stalled_lookup = asyncio.get_running_loop().create_future()
+    lookup_started = asyncio.Event()
+
+    class StalledStore:
+        async def lookup_any(self, **kwargs):
+            lookup_started.set()
+            return await stalled_lookup
+
+    monkeypatch.setattr(mod, "CheckpointStore", StalledStore)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS", 0)
+
+    try:
+        result = await asyncio.wait_for(
+            mod._wait_for_pending_checkpoint_ready(pending_row),
+            timeout=0.1,
+        )
+    finally:
+        if not stalled_lookup.done():
+            stalled_lookup.cancel()
+
+    assert result is None
+    assert not lookup_started.is_set()
+
+
+@pytest.mark.asyncio
 async def test_tool_compaction_waits_for_pending_chain_prefix_before_foreground_summary(
     monkeypatch,
     pipe_request,
@@ -17791,73 +17874,262 @@ async def test_soft_prefetch_emits_status_and_embed_when_checkpoint_is_created(
 
 
 @pytest.mark.asyncio
-async def test_soft_prefetch_skips_summary_generation_when_chain_prefix_is_pending(
+async def test_soft_prefetch_waits_for_pending_parent_then_claims_child_at_soft_threshold(
     monkeypatch,
     pipe_request,
     pipe_user,
     pipe_metadata,
 ):
-    pending_source = [{"role": "user", "content": "active request"}]
-    later_source = [
-        *pending_source,
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "call-1", "type": "function"}],
-        },
-        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
     ]
-    rows = [
-        mod.build_checkpoint_row(
-            namespace=mod.CHECKPOINT_NAMESPACE,
-            user_id=pipe_user["id"],
-            chat_id=pipe_metadata["chat_id"],
-            pipe_function_id="auto_compact",
-            profile_hash=mod.compute_profile_hash(),
-            source_hash=mod.compute_source_hash(pending_source),
-            source_message_count=len(pending_source),
-            summary_text="",
-            summary_meta={},
-            parent_checkpoint_id=None,
-            state="pending",
-            claim_token="claim-1",
-            claim_expires_at=9999999999,
-        )
-    ]
-    events = []
-
-    async def event_emitter(event):
-        events.append(event)
+    source_messages = [*parent_source, {"role": "user", "content": "middle"}]
+    pending = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(parent_source),
+        source_message_count=len(parent_source),
+        summary_text="",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state="pending",
+        claim_token="claim-1",
+        claim_expires_at=9999999999,
+    )
+    store = PendingTransitionCheckpointStore([pending], ready_after_lookup=2)
 
     async def noop_initialize(**kwargs):
         return None
 
-    async def get_or_create_compaction_summary(**kwargs):
-        raise AssertionError("a newer soft prefetch must not start while a chain prefix summary is pending")
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        return 100
+
+    async def generate_summary_text(**kwargs):
+        return "child summary"
+
+    async def estimate_rendered_summary_message_tokens(**kwargs):
+        return 5
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "_estimate_rendered_summary_message_tokens", estimate_rendered_summary_message_tokens)
 
-    assert (
-        await mod._prefetch_compaction_checkpoint(
-            request=pipe_request,
-            user=pipe_user,
-            user_id=pipe_user["id"],
-            chat_id=pipe_metadata["chat_id"],
-            metadata=pipe_metadata,
-            body={"model": "target", "messages": later_source},
-            pipe_function_id="auto_compact",
-            summary_model_id="target",
-            source_messages=later_source,
-            summary_tool_policy="fallback_on_tool_call",
-            historical_message_excerpt_bytes=1024,
-            historical_message_excerpt_count=3,
-            event_emitter=event_emitter,
-        )
-        is False
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        metadata=pipe_metadata,
+        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_soft_trigger_total_tokens=100,
     )
-    assert events == []
+
+    assert prefetched is True
+    assert store.lookup_any_count >= 2
+    assert len(
+        [row for row in store.claimed_rows if row["namespace"] == mod.CHECKPOINT_NAMESPACE]
+    ) == 1
+    assert store.completed_rows[0]["parent_checkpoint_id"] == pending["id"]
+    assert store.completed_rows[0]["summary_text"] == "child summary"
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_waits_for_pending_parent_then_skips_below_soft(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    source_messages = [*parent_source, {"role": "user", "content": "middle"}]
+    pending = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(parent_source),
+        source_message_count=len(parent_source),
+        summary_text="",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state="pending",
+        claim_token="claim-1",
+        claim_expires_at=9999999999,
+    )
+    store = PendingTransitionCheckpointStore([pending], ready_after_lookup=2)
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        return 99
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("a below-soft ready parent must skip child generation")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        metadata=pipe_metadata,
+        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_soft_trigger_total_tokens=100,
+    )
+
+    assert prefetched is False
+    assert store.lookup_any_count >= 2
+    assert store.claimed_rows == []
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_waits_for_pending_exact_checkpoint_then_skips(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    pending = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages),
+        source_message_count=len(source_messages),
+        summary_text="",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state="pending",
+        claim_token="claim-1",
+        claim_expires_at=9999999999,
+    )
+    store = PendingTransitionCheckpointStore([pending], ready_after_lookup=2)
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("an exact checkpoint that became ready must skip generation")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        metadata=pipe_metadata,
+        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_soft_trigger_total_tokens=100,
+    )
+
+    assert prefetched is False
+    assert store.lookup_any_count >= 2
+    assert store.claimed_rows == []
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_pending_parent_timeout_is_bounded_and_starts_no_child(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "middle"},
+    ]
+    pending = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages[:2]),
+        source_message_count=2,
+        summary_text="",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state="pending",
+        claim_token="claim-1",
+        claim_expires_at=9999999999,
+    )
+    store = PendingTransitionCheckpointStore([pending], ready_after_lookup=None)
+
+    async def noop_initialize(**kwargs):
+        return None
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("a timed-out pending parent must not start a child")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        metadata=pipe_metadata,
+        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_soft_trigger_total_tokens=100,
+    )
+
+    assert prefetched is False
+    assert store.lookup_any_count <= 1
+    assert store.claimed_rows == []
 
 
 @pytest.mark.asyncio
@@ -19265,7 +19537,7 @@ def test_start_soft_prefetch_preserves_uncopyable_metadata_references(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_pipe_launches_completed_turn_soft_prefetch_for_non_tool_response(
+async def test_pipe_launches_completed_turn_soft_prefetch_when_no_parent_prefetch_is_in_flight(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
     calls = []
@@ -19346,11 +19618,16 @@ async def test_pipe_launches_completed_turn_soft_prefetch_for_non_tool_response(
         __metadata__=pipe_metadata,
         __event_emitter__=event_emitter,
     )
+    await _drain_completed_turn_prefetch_tasks()
 
     assert len(calls) == 2
     assert all(call.get("event_emitter") is event_emitter for call in calls)
-    completed_messages = calls[-1]["body"]["messages"]
-    assert completed_messages == [
+    assert calls[0]["body"]["messages"] == [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    assert calls[1]["body"]["messages"] == [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
         {"role": "user", "content": "active"},
@@ -19360,7 +19637,107 @@ async def test_pipe_launches_completed_turn_soft_prefetch_for_non_tool_response(
 
 
 @pytest.mark.asyncio
-async def test_task_completed_turn_prefetch_passes_rebuilt_prompt_for_checkpoint_estimates(
+async def test_pipe_completed_turn_prefetch_waits_for_in_flight_parent_prefetch(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    calls = []
+    release_parent_prefetch = asyncio.Event()
+
+    async def parent_prefetch():
+        await release_parent_prefetch.wait()
+
+    parent_prefetch_task = asyncio.create_task(parent_prefetch())
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 150, "input_tokens": 150, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 150
+
+    async def forward_target(**kwargs):
+        return {
+            "usage": {"total_tokens": 150, "prompt_tokens": 100, "completion_tokens": 50},
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "answer"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    def in_flight_parent_prefetch(**kwargs):
+        return parent_prefetch_task
+
+    def start_soft_prefetch(**kwargs):
+        call = copy.deepcopy(
+            {
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"event_emitter", "parent_prefetch_task"}
+            }
+        )
+        call["parent_prefetch_task"] = kwargs.get("parent_prefetch_task")
+        calls.append(call)
+        return True
+
+    monkeypatch.setattr(mod, "_SOFT_PREFETCH_TASKS", set())
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_soft_prefetch_inflight_task_for_body", in_flight_parent_prefetch)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    try:
+        result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+
+        assert result["choices"][0]["message"]["content"] == "answer"
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert len(calls) == 2
+        assert calls[0]["parent_prefetch_task"] is None
+        assert calls[1]["parent_prefetch_task"] is parent_prefetch_task
+        assert calls[1]["body"]["messages"][-2:] == [
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": ""},
+        ]
+    finally:
+        release_parent_prefetch.set()
+        await asyncio.gather(parent_prefetch_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_task_completed_turn_prefetch_skips_summary_generation(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
     calls = []
@@ -19379,9 +19756,6 @@ async def test_task_completed_turn_prefetch_passes_rebuilt_prompt_for_checkpoint
 
     async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
         return 10
-
-    async def render_task_prompt_from_messages(**kwargs):
-        return "rebuilt completed task prompt"
 
     async def forward_target(**kwargs):
         return {
@@ -19408,14 +19782,13 @@ async def test_task_completed_turn_prefetch_passes_rebuilt_prompt_for_checkpoint
         estimate_next_input_tokens_from_usage_anchor,
         raising=False,
     )
-    monkeypatch.setattr(mod, "_render_task_prompt_from_messages", render_task_prompt_from_messages)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
     pipe.valves.trigger_total_tokens = 1000
-    pipe.valves.compact_task_prompts_from_task_body = True
+    pipe.valves.compact_task_prompts_from_task_body = False
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     task_history = [
         {"role": "user", "content": "old task input"},
@@ -19438,28 +19811,19 @@ async def test_task_completed_turn_prefetch_passes_rebuilt_prompt_for_checkpoint
     }
 
     result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    await _drain_completed_turn_prefetch_tasks()
 
     assert result["choices"][0]["message"]["content"] == "task answer"
-    assert len(calls) == 1
-    completed_messages = [
-        *task_history,
-        {"role": "assistant", "content": "task answer"},
-        {"role": "user", "content": ""},
-    ]
-    assert calls[0]["body"]["messages"] == completed_messages
-    task_estimate_body = calls[0]["task_estimate_body"]
-    assert task_estimate_body["messages"] == [{"role": "user", "content": "rebuilt completed task prompt"}]
-    assert task_estimate_body["metadata"]["task_body"]["messages"] == completed_messages
+    assert calls == []
 
 
 @pytest.mark.asyncio
-async def test_streaming_completed_turn_prefetch_retains_task_while_rebuilding_task_prompt(
+async def test_streaming_task_completed_turn_prefetch_does_not_register_on_complete(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
     captured = {}
     calls = []
-    rebuild_started = asyncio.Event()
-    release_rebuild = asyncio.Event()
+    rebuild_calls = []
 
     async def validate_target_access(**kwargs):
         return None
@@ -19477,8 +19841,7 @@ async def test_streaming_completed_turn_prefetch_retains_task_while_rebuilding_t
         return 10
 
     async def rebuild_task_body_from_compacted_history(**kwargs):
-        rebuild_started.set()
-        await release_rebuild.wait()
+        rebuild_calls.append(kwargs)
         return {"messages": [{"role": "user", "content": "rebuilt completed task prompt"}]}
 
     async def forward_target(**kwargs):
@@ -19507,7 +19870,7 @@ async def test_streaming_completed_turn_prefetch_retains_task_while_rebuilding_t
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
     pipe.valves.trigger_total_tokens = 1000
-    pipe.valves.compact_task_prompts_from_task_body = True
+    pipe.valves.compact_task_prompts_from_task_body = False
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     task_history = [
         {"role": "user", "content": "old task input"},
@@ -19531,30 +19894,10 @@ async def test_streaming_completed_turn_prefetch_retains_task_while_rebuilding_t
 
     await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
 
-    assert callable(captured["on_complete"])
-    captured["on_complete"](
-        {
-            "assistant_message": {"role": "assistant", "content": "task answer"},
-            "usage": {"total_tokens": 150, "prompt_tokens": 100, "completion_tokens": 50},
-        }
-    )
-    await asyncio.wait_for(rebuild_started.wait(), timeout=1)
-    try:
-        retained_tasks = list(mod._SOFT_PREFETCH_TASKS)
-        assert len(retained_tasks) == 1
-        assert calls == []
-    finally:
-        release_rebuild.set()
-        await asyncio.sleep(0)
-
-    await asyncio.wait_for(asyncio.gather(*retained_tasks), timeout=1)
-    await asyncio.sleep(0)
-
+    assert captured["on_complete"] is None
     assert mod._SOFT_PREFETCH_TASKS == set()
-    assert len(calls) == 1
-    assert calls[0]["task_estimate_body"]["messages"] == [
-        {"role": "user", "content": "rebuilt completed task prompt"}
-    ]
+    assert calls == []
+    assert rebuild_calls == []
 
 
 @pytest.mark.asyncio
@@ -19638,6 +19981,7 @@ async def _run_completed_turn_prefetch_usage_case(
     pipe_metadata,
     *,
     response_usage=None,
+    body_reusable_checkpoint_match=None,
 ):
     calls = []
 
@@ -19673,10 +20017,12 @@ async def _run_completed_turn_prefetch_usage_case(
         calls.append(copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"}))
         return True
 
+    body_reusable_checkpoint_match = body_reusable_checkpoint_match or reusable_checkpoint_match
+
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
     monkeypatch.setattr(
         mod,
         "_estimate_next_input_tokens_from_usage_anchor",
@@ -19705,6 +20051,270 @@ async def _run_completed_turn_prefetch_usage_case(
     return calls
 
 
+async def _drain_completed_turn_prefetch_tasks() -> None:
+    retained_tasks = list(mod._SOFT_PREFETCH_TASKS)
+    if retained_tasks:
+        await asyncio.wait_for(asyncio.gather(*retained_tasks), timeout=1)
+    await asyncio.sleep(0)
+
+
+def _completed_turn_registry_case(monkeypatch):
+    child_calls = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 10, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 10
+
+    async def forward_target(**kwargs):
+        return {
+            "usage": {"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "answer"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    async def prefetch_compaction_checkpoint(**kwargs):
+        child_calls.append(
+            {
+                "body": copy.deepcopy(kwargs["body"]),
+                "source_messages": copy.deepcopy(kwargs["source_messages"]),
+                "trigger_total_tokens": kwargs["trigger_total_tokens"],
+            }
+        )
+        return True
+
+    monkeypatch.setattr(mod, "_SOFT_PREFETCH_TASKS", set())
+    monkeypatch.setattr(mod, "_SOFT_PREFETCH_INFLIGHT_KEYS", set())
+    monkeypatch.setattr(mod, "_SOFT_PREFETCH_INFLIGHT_TASKS", {})
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_prefetch_compaction_checkpoint", prefetch_compaction_checkpoint)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    body = {
+        "model": mod.build_wrapper_model_id("auto_compact", "target"),
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+    return pipe, body, child_calls
+
+
+def _install_registry_parent_prefetch(pipe_identity, body, release_parent):
+    pipe_user, pipe_metadata = pipe_identity
+
+    async def parent_prefetch():
+        await release_parent.wait()
+
+    parent_key = mod._soft_prefetch_inflight_key_for_body(
+        user=pipe_user,
+        metadata=pipe_metadata,
+        body=body,
+        pipe_function_id="auto_compact",
+    )
+    assert parent_key is not None
+    assert mod._launch_soft_prefetch_task(parent_key, parent_prefetch()) is True
+    return mod._SOFT_PREFETCH_INFLIGHT_TASKS[parent_key]
+
+
+def _completed_turn_registry_key(pipe_user, pipe_metadata, body):
+    completed_body = mod._completed_turn_prefetch_body(
+        body,
+        {"role": "assistant", "content": "answer"},
+    )
+    assert completed_body is not None
+    completed_key = mod._soft_prefetch_inflight_key_for_body(
+        user=pipe_user,
+        metadata=pipe_metadata,
+        body=completed_body,
+        pipe_function_id="auto_compact",
+    )
+    assert completed_key is not None
+    return completed_key
+
+
+@pytest.mark.asyncio
+async def test_completed_turn_coordinator_owns_completed_body_key_before_parent_wait(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    pipe, body, child_calls = _completed_turn_registry_case(monkeypatch)
+    release_parent = asyncio.Event()
+    parent_task = _install_registry_parent_prefetch((pipe_user, pipe_metadata), body, release_parent)
+
+    try:
+        result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        await asyncio.sleep(0)
+        completed_key = _completed_turn_registry_key(pipe_user, pipe_metadata, body)
+        coordinator = mod._SOFT_PREFETCH_INFLIGHT_TASKS.get(completed_key)
+
+        assert result["choices"][0]["message"]["content"] == "answer"
+        assert coordinator is not None
+        assert coordinator in mod._SOFT_PREFETCH_TASKS
+        assert completed_key in mod._SOFT_PREFETCH_INFLIGHT_KEYS
+        assert child_calls == []
+    finally:
+        release_parent.set()
+        await asyncio.gather(parent_task, return_exceptions=True)
+        await _drain_completed_turn_prefetch_tasks()
+
+
+@pytest.mark.asyncio
+async def test_completed_turn_coordinator_rejects_duplicate_completed_body_attempts(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    pipe, body, child_calls = _completed_turn_registry_case(monkeypatch)
+    release_parent = asyncio.Event()
+    _install_registry_parent_prefetch((pipe_user, pipe_metadata), body, release_parent)
+
+    try:
+        await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        await asyncio.sleep(0)
+        completed_key = _completed_turn_registry_key(pipe_user, pipe_metadata, body)
+
+        assert completed_key in mod._SOFT_PREFETCH_INFLIGHT_KEYS
+        assert len([task for key, task in mod._SOFT_PREFETCH_INFLIGHT_TASKS.items() if key == completed_key]) == 1
+        assert child_calls == []
+
+        release_parent.set()
+        await _drain_completed_turn_prefetch_tasks()
+
+        assert len(child_calls) == 1
+    finally:
+        release_parent.set()
+        for task in list(mod._SOFT_PREFETCH_TASKS):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*list(mod._SOFT_PREFETCH_TASKS), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_completed_turn_coordinator_parent_wait_timeout_starts_no_child(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    pipe, body, child_calls = _completed_turn_registry_case(monkeypatch)
+    release_parent = asyncio.Event()
+    parent_task = _install_registry_parent_prefetch((pipe_user, pipe_metadata), body, release_parent)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS", 0)
+
+    try:
+        await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        await asyncio.sleep(0)
+        coordinators = [task for task in mod._SOFT_PREFETCH_TASKS if task is not parent_task]
+        assert len(coordinators) == 1
+
+        await asyncio.wait_for(asyncio.shield(coordinators[0]), timeout=0.1)
+
+        assert child_calls == []
+    finally:
+        release_parent.set()
+        for task in list(mod._SOFT_PREFETCH_TASKS):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(parent_task, *list(mod._SOFT_PREFETCH_TASKS), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_completed_turn_coordinator_while_waiting_starts_no_child(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    pipe, body, child_calls = _completed_turn_registry_case(monkeypatch)
+    release_parent = asyncio.Event()
+    parent_task = _install_registry_parent_prefetch((pipe_user, pipe_metadata), body, release_parent)
+
+    try:
+        await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        await asyncio.sleep(0)
+        completed_key = _completed_turn_registry_key(pipe_user, pipe_metadata, body)
+        coordinator = mod._SOFT_PREFETCH_INFLIGHT_TASKS.get(completed_key)
+        assert coordinator is not None
+
+        coordinator.cancel()
+        await asyncio.gather(coordinator, return_exceptions=True)
+        await asyncio.sleep(0)
+
+        assert child_calls == []
+        assert completed_key not in mod._SOFT_PREFETCH_INFLIGHT_KEYS
+        assert completed_key not in mod._SOFT_PREFETCH_INFLIGHT_TASKS
+    finally:
+        release_parent.set()
+        await asyncio.gather(parent_task, return_exceptions=True)
+        await _drain_completed_turn_prefetch_tasks()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_parent_prefetch_starts_no_completed_turn_child(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    pipe, body, child_calls = _completed_turn_registry_case(monkeypatch)
+    release_parent = asyncio.Event()
+    parent_task = _install_registry_parent_prefetch((pipe_user, pipe_metadata), body, release_parent)
+
+    try:
+        await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        await asyncio.sleep(0)
+        completed_key = _completed_turn_registry_key(pipe_user, pipe_metadata, body)
+        coordinator = mod._SOFT_PREFETCH_INFLIGHT_TASKS.get(completed_key)
+        assert coordinator is not None
+
+        parent_task.cancel()
+        await asyncio.gather(parent_task, return_exceptions=True)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(coordinator), timeout=0.1)
+
+        assert coordinator.cancelled()
+        assert child_calls == []
+    finally:
+        release_parent.set()
+        for task in list(mod._SOFT_PREFETCH_TASKS):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*list(mod._SOFT_PREFETCH_TASKS), return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_pipe_completed_turn_prefetch_requires_response_usage(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
@@ -19731,12 +20341,475 @@ async def test_pipe_completed_turn_prefetch_fires_from_response_usage(
         response_usage={"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
     )
 
+    await _drain_completed_turn_prefetch_tasks()
+
     assert len(calls) == 1
     assert calls[0]["trigger_total_tokens"] == 500
     assert calls[0]["body"]["messages"][-2:] == [
         {"role": "assistant", "content": "answer"},
         {"role": "user", "content": ""},
     ]
+
+
+@pytest.mark.asyncio
+async def test_pipe_completed_turn_prefetch_background_error_does_not_block_response(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    exception_logs = []
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 10, "output_tokens": 0}
+
+    async def reusable_checkpoint_match(**kwargs):
+        return None
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 10
+
+    async def forward_target(**kwargs):
+        return {
+            "usage": {"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "answer"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    def start_soft_prefetch(**kwargs):
+        raise RuntimeError("prefetch failed")
+
+    def log_exception(message, *args, **kwargs):
+        exception_logs.append((message, kwargs.get("exc_info")))
+
+    monkeypatch.setattr(mod, "_SOFT_PREFETCH_TASKS", set())
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(mod.LOG, "exception", log_exception)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    retained_tasks = list(mod._SOFT_PREFETCH_TASKS)
+    if retained_tasks:
+        await asyncio.gather(*retained_tasks, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert result["choices"][0]["message"]["content"] == "answer"
+    assert mod._SOFT_PREFETCH_TASKS == set()
+    assert len(exception_logs) == 1
+    assert exception_logs[0][0] == "Completed-turn soft compaction prefetch failed"
+    exc_info = exception_logs[0][1]
+    assert exc_info is not None
+    assert exc_info[0] is RuntimeError
+
+
+@pytest.mark.asyncio
+async def test_pipe_completed_turn_prefetch_does_not_lookup_or_estimate_before_return(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    lookup_started = asyncio.Event()
+    release_lookup = asyncio.Event()
+    preparation_started = asyncio.Event()
+    calls = []
+    completed_turn_prefetch_body = mod._completed_turn_prefetch_body
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def resolve_core_chat_model_route(request, model_id):
+        return mod.CoreChatModelRoute(model_id=model_id)
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 10, "output_tokens": 0}
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        body = kwargs["body"]
+        if len(body["messages"]) < 5:
+            return None
+        lookup_started.set()
+        await release_lookup.wait()
+        return None
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        raise AssertionError("completed-turn prefetch must not estimate before the response returns")
+
+    async def estimate_task_checkpoint_applied_body_tokens(**kwargs):
+        raise AssertionError("completed-turn task prefetch must not estimate before the response returns")
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 10
+
+    async def forward_target(**kwargs):
+        return {
+            "usage": {"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "answer"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    def start_soft_prefetch(**kwargs):
+        calls.append(copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"}))
+        return True
+
+    def prepare_completed_turn_prefetch_body(body, assistant_message):
+        preparation_started.set()
+        return completed_turn_prefetch_body(body, assistant_message)
+
+    monkeypatch.setattr(mod, "_SOFT_PREFETCH_TASKS", set())
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_estimate_task_checkpoint_applied_body_tokens", estimate_task_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_completed_turn_prefetch_body", prepare_completed_turn_prefetch_body)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    pipe_task = asyncio.create_task(pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata))
+    try:
+        result = await asyncio.wait_for(pipe_task, timeout=0.1)
+        assert not lookup_started.is_set()
+        await asyncio.sleep(0)
+        assert preparation_started.is_set()
+    finally:
+        release_lookup.set()
+        if not pipe_task.done():
+            pipe_task.cancel()
+            await asyncio.gather(pipe_task, return_exceptions=True)
+        await _drain_completed_turn_prefetch_tasks()
+
+    assert result["choices"][0]["message"]["content"] == "answer"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_worker_skips_exact_reusable_checkpoint(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    async def build_prefix_file_fingerprint_resolver(*args, **kwargs):
+        return None
+
+    async def lookup_pending_checkpoint_for_source_prefix(**kwargs):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return mod.ReusableCheckpointMatch(
+            kind="exact",
+            source_message_count=len(source_messages),
+            source_kind="message",
+            checkpoint={
+                "source_message_count": len(source_messages),
+                "source_hash": mod.compute_summary_source_hash(source_messages),
+            },
+        )
+
+    async def get_or_create_compaction_summary(**kwargs):
+        raise AssertionError("exact reusable checkpoint must skip background summary generation")
+
+    monkeypatch.setattr(mod, "_build_prefix_file_fingerprint_resolver", build_prefix_file_fingerprint_resolver)
+    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", lookup_pending_checkpoint_for_source_prefix)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        metadata=pipe_metadata,
+        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_soft_trigger_total_tokens=100,
+    )
+
+    assert prefetched is False
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_worker_logs_and_skips_when_parent_applied_estimate_is_unavailable(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    error_logs = []
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "middle"},
+    ]
+
+    async def build_prefix_file_fingerprint_resolver(*args, **kwargs):
+        return None
+
+    async def lookup_pending_checkpoint_for_source_prefix(**kwargs):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return mod.ReusableCheckpointMatch(
+            kind="parent",
+            source_message_count=2,
+            source_kind="message",
+            checkpoint={
+                "source_message_count": 2,
+                "source_hash": mod.compute_summary_source_hash(source_messages[:2]),
+            },
+        )
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        return None
+
+    async def get_or_create_compaction_summary(**kwargs):
+        raise AssertionError("soft prefetch must not generate without a checkpoint-applied threshold estimate")
+
+    def log_error(message, *args, **kwargs):
+        error_logs.append(message % args)
+
+    monkeypatch.setattr(mod, "_build_prefix_file_fingerprint_resolver", build_prefix_file_fingerprint_resolver)
+    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", lookup_pending_checkpoint_for_source_prefix)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(mod.LOG, "error", log_error)
+
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        metadata=pipe_metadata,
+        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_soft_trigger_total_tokens=100,
+    )
+
+    assert prefetched is False
+    assert error_logs == [
+        "auto-compaction prefetch: checkpoint-applied token estimate was unavailable; "
+        "skipping background checkpoint generation "
+        f"(user_id={pipe_user['id']} chat_id={pipe_metadata['chat_id']} source_kind=message match_kind=parent)"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_worker_skips_parent_below_soft(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "middle"},
+    ]
+
+    async def build_prefix_file_fingerprint_resolver(*args, **kwargs):
+        return None
+
+    async def lookup_pending_checkpoint_for_source_prefix(**kwargs):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return mod.ReusableCheckpointMatch(
+            kind="parent",
+            source_message_count=2,
+            source_kind="message",
+            checkpoint={
+                "source_message_count": 2,
+                "source_hash": mod.compute_summary_source_hash(source_messages[:2]),
+            },
+        )
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        return 40
+
+    async def get_or_create_compaction_summary(**kwargs):
+        raise AssertionError("below-soft parent-applied estimate must skip background summary generation")
+
+    monkeypatch.setattr(mod, "_build_prefix_file_fingerprint_resolver", build_prefix_file_fingerprint_resolver)
+    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", lookup_pending_checkpoint_for_source_prefix)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        metadata=pipe_metadata,
+        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_soft_trigger_total_tokens=100,
+    )
+
+    assert prefetched is False
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_worker_proceeds_when_parent_applied_estimate_above_soft(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    captured = {}
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "middle"},
+    ]
+
+    async def build_prefix_file_fingerprint_resolver(*args, **kwargs):
+        return None
+
+    async def lookup_pending_checkpoint_for_source_prefix(**kwargs):
+        return None
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return mod.ReusableCheckpointMatch(
+            kind="parent",
+            source_message_count=2,
+            source_kind="message",
+            checkpoint={
+                "source_message_count": 2,
+                "source_hash": mod.compute_summary_source_hash(source_messages[:2]),
+            },
+        )
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        return 150
+
+    async def get_or_create_compaction_summary(**kwargs):
+        await kwargs["parent_checkpoint_guard"](
+            {
+                "source_message_count": 2,
+                "source_hash": mod.compute_summary_source_hash(source_messages[:2]),
+            }
+        )
+        captured["source_messages"] = copy.deepcopy(kwargs["source_messages"])
+        return "summary"
+
+    monkeypatch.setattr(mod, "_build_prefix_file_fingerprint_resolver", build_prefix_file_fingerprint_resolver)
+    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", lookup_pending_checkpoint_for_source_prefix)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=pipe_request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=pipe_metadata["chat_id"],
+        metadata=pipe_metadata,
+        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_soft_trigger_total_tokens=100,
+    )
+
+    assert prefetched is True
+    assert captured["source_messages"] == source_messages
+
+
+@pytest.mark.asyncio
+async def test_pipe_completed_turn_prefetch_still_requires_usage_even_when_checkpoint_ready(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    async def body_reusable_checkpoint_match(**kwargs):
+        body = kwargs["body"]
+        if len(body["messages"]) < 5:
+            return None
+        return mod.ReusableCheckpointMatch(
+            kind="exact",
+            source_message_count=len(body["messages"]),
+            source_kind="message",
+            checkpoint={"source_message_count": len(body["messages"]), "source_hash": "completed-body"},
+        )
+
+    calls = await _run_completed_turn_prefetch_usage_case(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        body_reusable_checkpoint_match=body_reusable_checkpoint_match,
+    )
+
+    assert calls == []
 
 
 @pytest.mark.asyncio
