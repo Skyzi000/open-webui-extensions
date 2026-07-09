@@ -1853,6 +1853,331 @@ def test_message_token_estimates_are_cached_by_canonical_hash():
     assert len(encoder.calls) == 1
 
 
+def test_message_token_estimate_strips_image_url_data_url_payload():
+    """image_url data URLs must not be tokenized as prose text."""
+
+    class LengthEncoder:
+        def encode(self, text, **kwargs):
+            return [0] * len(text)
+
+    huge_base64 = "A" * 100_000
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "describe this"},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{huge_base64}"},
+            },
+        ],
+    }
+
+    count = mod.estimate_message_tokens(
+        message, encoder=LengthEncoder(), encoding_name="unit-test"
+    )
+
+    assert isinstance(count, int)
+    # Without stripping the 100k-char base64 would dominate the estimate; the
+    # bounded estimate must stay far below the payload size.
+    assert count < len(huge_base64) // 10
+    # A single fixed image overhead is added on top of the surviving text.
+    assert count >= len("describe this") + mod.MESSAGE_TOKEN_IMAGE_OVERHEAD
+
+
+def test_message_token_estimate_strips_image_file_attachment_data_url():
+    """Message-level image file attachments with data URLs must not be tokenized."""
+
+    class LengthEncoder:
+        def encode(self, text, **kwargs):
+            return [0] * len(text)
+
+    huge_base64 = "B" * 100_000
+    message = {
+        "role": "user",
+        "content": "look at this image",
+        "files": [
+            {
+                "type": "image",
+                "id": "img-1",
+                "name": "photo.png",
+                "url": f"data:image/png;base64,{huge_base64}",
+                "file": {"id": "img-1", "hash": "abc", "data": {"content": huge_base64}},
+            }
+        ],
+    }
+
+    count = mod.estimate_message_tokens(
+        message, encoder=LengthEncoder(), encoding_name="unit-test"
+    )
+
+    assert isinstance(count, int)
+    assert count < len(huge_base64) // 10
+    assert count >= len("look at this image") + mod.MESSAGE_TOKEN_IMAGE_OVERHEAD
+
+
+def test_message_token_estimate_strips_image_content_part_payload():
+    class LengthEncoder:
+        def encode(self, text, **kwargs):
+            return [0] * len(text)
+
+    huge_base64 = "I" * 100_000
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "describe this"},
+            {
+                "type": "image",
+                "source": {"media_type": "image/png", "data": huge_base64},
+            },
+        ],
+    }
+
+    count = mod.estimate_message_tokens(
+        message, encoder=LengthEncoder(), encoding_name="unit-test"
+    )
+
+    assert isinstance(count, int)
+    assert count < len(huge_base64) // 10
+    assert count >= len("describe this") + mod.MESSAGE_TOKEN_IMAGE_OVERHEAD
+
+
+def test_message_token_estimate_counts_input_image_content_part_as_image():
+    class LengthEncoder:
+        def encode(self, text, **kwargs):
+            return [0] * len(text)
+
+    huge_base64 = "R" * 100_000
+    message = {
+        "role": "tool",
+        "tool_call_id": "call-image",
+        "content": [
+            {"type": "input_text", "text": "generated image"},
+            {"type": "input_image", "image_url": f"data:image/png;base64,{huge_base64}"},
+        ],
+    }
+
+    count = mod.estimate_message_tokens(
+        message, encoder=LengthEncoder(), encoding_name="unit-test"
+    )
+
+    assert isinstance(count, int)
+    assert count < len(huge_base64) // 10
+    assert count >= len("generated image") + mod.MESSAGE_TOKEN_IMAGE_OVERHEAD
+
+
+def test_message_token_estimate_strips_file_content_part_raw_payloads():
+    class LengthEncoder:
+        def encode(self, text, **kwargs):
+            return [0] * len(text)
+
+    huge_base64 = "F" * 100_000
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "summarize attached files"},
+            {
+                "type": "input_file",
+                "filename": "report.pdf",
+                "file_data": huge_base64,
+                "file": {"id": "file-1", "data": {"content": huge_base64}},
+            },
+            {
+                "type": "file",
+                "name": "notes.txt",
+                "content": huge_base64,
+                "file": {"id": "file-2", "data": {"content": huge_base64}},
+            },
+        ],
+    }
+
+    count = mod.estimate_message_tokens(
+        message, encoder=LengthEncoder(), encoding_name="unit-test"
+    )
+
+    assert isinstance(count, int)
+    assert count < len(huge_base64) // 10
+
+
+def test_message_token_estimate_strips_input_audio_raw_payloads():
+    class LengthEncoder:
+        def encode(self, text, **kwargs):
+            return [0] * len(text)
+
+    huge_base64 = "A" * 100_000
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "transcribe this"},
+            {
+                "type": "input_audio",
+                "input_audio": {"format": "mp3", "data": huge_base64},
+                "content": huge_base64,
+            },
+        ],
+    }
+
+    count = mod.estimate_message_tokens(
+        message, encoder=LengthEncoder(), encoding_name="unit-test"
+    )
+
+    assert isinstance(count, int)
+    assert count < len(huge_base64) // 10
+
+
+def test_message_token_estimate_strips_non_image_file_attachment_raw_bodies():
+    class CaptureEncoder:
+        def __init__(self):
+            self.text = ""
+
+        def encode(self, text, **kwargs):
+            self.text = text
+            return [0] * len(text)
+
+    huge_body = "D" * 100_000
+    metadata_sha = "metadata-only-sha"
+    message = {
+        "role": "user",
+        "content": "use the attached document",
+        "files": [
+            {
+                "type": "file",
+                "id": "doc-1",
+                "name": "brief.txt",
+                "content_type": "text/plain",
+                "hash": "hash-1",
+                "content": huge_body,
+                "context": huge_body,
+                "docs": [huge_body],
+                "document": huge_body,
+                "documents": [huge_body],
+                "file": {
+                    "id": "doc-1",
+                    "hash": "hash-1",
+                    "data": {"content": huge_body, "metadata": {"sha256": metadata_sha}},
+                },
+            }
+        ],
+    }
+
+    encoder = CaptureEncoder()
+    count = mod.estimate_message_tokens(message, encoder=encoder, encoding_name="unit-test")
+
+    assert isinstance(count, int)
+    assert count < len(huge_body) // 10
+    assert huge_body not in encoder.text
+    assert "hash-1" in encoder.text
+    assert metadata_sha in encoder.text
+
+
+def test_message_token_estimate_keeps_text_part_text_payload():
+    class LengthEncoder:
+        def encode(self, text, **kwargs):
+            return [0] * len(text)
+
+    huge_text = "T" * 100_000
+    message = {"role": "user", "content": [{"type": "text", "text": huge_text}]}
+
+    count = mod.estimate_message_tokens(
+        message, encoder=LengthEncoder(), encoding_name="unit-test"
+    )
+
+    assert isinstance(count, int)
+    assert count > len(huge_text) // 2
+
+
+def test_message_token_cache_key_and_source_hash_reflect_raw_file_part_payload():
+    base = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "summarize"},
+            {
+                "type": "input_file",
+                "filename": "report.pdf",
+                "content": "payload-a",
+                "file": {"id": "file-1", "data": {"content": "payload-a"}},
+            },
+        ],
+    }
+    different = copy.deepcopy(base)
+    different["content"][1]["content"] = "payload-b"
+    different["content"][1]["file"]["data"]["content"] = "payload-b"
+
+    assert mod._message_token_cache_key(base, encoding_name="enc") != mod._message_token_cache_key(
+        different, encoding_name="enc"
+    )
+    assert mod.compute_source_hash([base]) != mod.compute_source_hash([different])
+
+
+def test_message_token_estimate_adds_fixed_overhead_per_image():
+    """Each additional image part adds exactly MESSAGE_TOKEN_IMAGE_OVERHEAD."""
+
+    class LengthEncoder:
+        def encode(self, text, **kwargs):
+            return [0] * len(text)
+
+    def build(image_count):
+        parts = [{"type": "text", "text": "caption"}]
+        parts.extend(
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,XYZ"},
+            }
+            for _ in range(image_count)
+        )
+        return {"role": "user", "content": parts}
+
+    single = mod.estimate_message_tokens(
+        build(1), encoder=LengthEncoder(), encoding_name="unit-test"
+    )
+    triple = mod.estimate_message_tokens(
+        build(3), encoder=LengthEncoder(), encoding_name="unit-test"
+    )
+
+    # The surviving text is identical once image parts are dropped, so the only
+    # difference between one and three images is the fixed per-image overhead.
+    assert triple - single == 2 * mod.MESSAGE_TOKEN_IMAGE_OVERHEAD
+
+
+def test_message_token_image_overhead_matches_core_context_compaction():
+    from open_webui.utils.context_compaction import _estimate_messages_tokens
+
+    text_only = [{"role": "user", "content": []}]
+    with_image = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,XYZ"},
+                }
+            ],
+        }
+    ]
+
+    core_image_overhead = _estimate_messages_tokens(with_image) - _estimate_messages_tokens(
+        text_only
+    )
+
+    assert mod.MESSAGE_TOKEN_IMAGE_OVERHEAD == core_image_overhead
+
+
+def test_message_token_cache_key_reflects_full_image_payload():
+    """Cache identity must stay based on the full canonical message (payload included)."""
+    base = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aaa"}},
+        ],
+    }
+    different = copy.deepcopy(base)
+    different["content"][1]["image_url"]["url"] = "data:image/png;base64,bbb"
+
+    assert mod._message_token_cache_key(base, encoding_name="enc") != mod._message_token_cache_key(
+        different, encoding_name="enc"
+    )
+
+
 def test_large_message_token_estimate_uses_sampling_for_large_text():
     """Large messages (>64 KB) use 3-point sampling instead of full encode."""
 

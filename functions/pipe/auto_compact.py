@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.6.1
+version: 0.6.2
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -74,12 +74,13 @@ CHECKPOINT_CLAIM_LEASE_SECONDS = 90
 CHECKPOINT_CLAIM_HEARTBEAT_SECONDS = 30
 CHECKPOINT_PENDING_POLL_SECONDS = 0.25
 CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS = 300.0
-TOKEN_ESTIMATOR_VERSION = "message-canonical-json-v1"
+TOKEN_ESTIMATOR_VERSION = "message-sanitized-media-json-v2"
 MESSAGE_TOKEN_OVERHEAD = 4
 REQUEST_TOKEN_OVERHEAD = 3
 MESSAGE_TOKEN_ESTIMATE_CACHE_MAX_ENTRIES = 8192
 MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES = 64 * 1024
 MESSAGE_TOKEN_SAMPLE_MAX_BYTES = 16 * 1024
+MESSAGE_TOKEN_IMAGE_OVERHEAD = 1000
 BODY_TOKEN_EXTRA_KEYS = (
     "tools",
     "tool_choice",
@@ -635,6 +636,28 @@ _PREFIX_FILE_METADATA_BODY_KEYS = {
 _FILE_CONTENT_PART_TYPES = {
     "file",
     "input_file",
+}
+_TOKEN_RAW_MEDIA_BODY_KEYS = {
+    "base64",
+    "body",
+    "bytes",
+    "buffer",
+    "content",
+    "context",
+    "data",
+    "docs",
+    "document",
+    "documents",
+    "fileData",
+    "file_data",
+}
+_TOKEN_MEDIA_CONTENT_PART_TYPES = {
+    "file",
+    "image",
+    "image_url",
+    "input_audio",
+    "input_file",
+    "input_image",
 }
 _STABLE_MESSAGE_KEYS = {
     "role",
@@ -1655,13 +1678,90 @@ def _message_token_cache_key(message: dict[str, Any], *, encoding_name: str) -> 
     )
 
 
-def _message_token_text(message: dict[str, Any]) -> str:
-    return json.dumps(
-        canonicalize_message_for_source_hash(message),
+def _strip_raw_media_payload_fields_for_token_text(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key == "data":
+                item = _strip_raw_media_payload_fields_for_token_text(value[key])
+                if isinstance(item, dict) and not _is_empty_canonical_value(item):
+                    out[key] = item
+                continue
+            if key in _TOKEN_RAW_MEDIA_BODY_KEYS:
+                continue
+            item = _strip_raw_media_payload_fields_for_token_text(value[key])
+            if _is_empty_canonical_value(item):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            sanitized = _strip_raw_media_payload_fields_for_token_text(item)
+            if not _is_empty_canonical_value(sanitized):
+                out.append(sanitized)
+        return out
+    return value
+
+
+def _sanitize_media_content_part_for_token_text(part: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in sorted(part.keys()):
+        if key in _PROVIDER_PROMPT_CACHE_HINT_KEYS or key in _TOKEN_RAW_MEDIA_BODY_KEYS:
+            continue
+        item = _strip_raw_media_payload_fields_for_token_text(part[key])
+        if _is_empty_canonical_value(item):
+            continue
+        out[key] = item
+    return out
+
+
+def _sanitize_media_payloads_for_token_text(canonical: dict[str, Any]) -> int:
+    """Remove raw media/file payload bytes from token-text canonical JSON.
+
+    Image content parts and image file attachments are counted via
+    ``MESSAGE_TOKEN_IMAGE_OVERHEAD``. Non-image file/audio bodies keep bounded
+    metadata but drop raw content before encoder sizing. Only the encoder-facing
+    text copy is mutated; source-hash and cache-key canonicalization build their
+    own copies and keep the full payload.
+    """
+    count = 0
+    content = canonical.get("content")
+    if isinstance(content, list):
+        kept_content: list[Any] = []
+        for part in content:
+            if isinstance(part, dict):
+                part_type = part.get("type")
+                if part_type in {"image", "image_url", "input_image"}:
+                    count += 1
+                    continue
+                if part_type in _TOKEN_MEDIA_CONTENT_PART_TYPES:
+                    kept_content.append(_sanitize_media_content_part_for_token_text(part))
+                    continue
+            kept_content.append(part)
+        canonical["content"] = kept_content
+    files = canonical.get("files")
+    if isinstance(files, list):
+        kept_files: list[Any] = []
+        for item in files:
+            if isinstance(item, dict) and _is_image_file_item(item):
+                count += 1
+                continue
+            kept_files.append(_strip_raw_media_payload_fields_for_token_text(item))
+        canonical["files"] = kept_files
+    return count
+
+
+def _message_token_image_count_and_text(message: dict[str, Any]) -> tuple[int, str]:
+    canonical = canonicalize_message_for_source_hash(message)
+    image_count = _sanitize_media_payloads_for_token_text(canonical)
+    text = json.dumps(
+        canonical,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     )
+    return image_count, text
 
 
 def _remember_message_token_estimate(key: tuple[str, str, str], count: int) -> None:
@@ -1769,13 +1869,16 @@ def _estimate_message_tokens_with_encoder(
     cached = _MESSAGE_TOKEN_ESTIMATE_CACHE.get(key)
     if cached is not None:
         return cached
+    image_count, text = _message_token_image_count_and_text(message)
     count = _estimate_text_tokens_with_encoder(
-        _message_token_text(message),
+        text,
         encoder=encoder,
         overhead=MESSAGE_TOKEN_OVERHEAD,
     )
     if count is None:
         return None
+    if image_count:
+        count += image_count * MESSAGE_TOKEN_IMAGE_OVERHEAD
     _remember_message_token_estimate(key, count)
     return count
 
@@ -6604,7 +6707,8 @@ async def _generate_summary_file_context(
 
         rerank = None
         if reranking_function is not None:
-            rerank = lambda query, documents: reranking_function(query, documents, user=user_model)
+            def rerank(query: str, documents: list[Any]) -> Any:
+                return reranking_function(query, documents, user=user_model)
 
         sources = await get_sources_from_items(
             request=request,
