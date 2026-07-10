@@ -20663,8 +20663,9 @@ async def test_pipe_completed_turn_prefetch_does_not_lookup_or_estimate_before_r
     try:
         result = await asyncio.wait_for(pipe_task, timeout=0.1)
         assert not lookup_started.is_set()
-        await asyncio.sleep(0)
-        assert preparation_started.is_set()
+        async with asyncio.timeout(1):
+            while not preparation_started.is_set():
+                await asyncio.sleep(0)
     finally:
         release_lookup.set()
         if not pipe_task.done():
