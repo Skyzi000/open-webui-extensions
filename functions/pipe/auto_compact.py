@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.6.3
+version: 0.6.4
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -1510,8 +1510,9 @@ def _soft_prefetch_inflight_task_for_body(
     body: dict[str, Any],
     pipe_function_id: str,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    inflight_key: tuple[str, str, str, str, str, str] | None = None,
 ) -> asyncio.Task | None:
-    key = _soft_prefetch_inflight_key_for_body(
+    key = inflight_key or _soft_prefetch_inflight_key_for_body(
         user=user,
         metadata=metadata,
         body=body,
@@ -8894,7 +8895,13 @@ async def _prefetch_compaction_checkpoint(
     return True
 
 
-def _start_soft_compaction_prefetch(
+@dataclass(frozen=True, slots=True)
+class _PreparedSoftPrefetch:
+    key: tuple[str, str, str, str, str, str]
+    run: Callable[[asyncio.Task[Any] | None], Awaitable[bool]]
+
+
+def _prepare_soft_compaction_prefetch(
     *,
     request: Any,
     user: Any,
@@ -8917,19 +8924,18 @@ def _start_soft_compaction_prefetch(
     task_estimate_body: dict[str, Any] | None = None,
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
-    parent_prefetch_task: asyncio.Task[Any] | None = None,
-) -> bool:
+) -> _PreparedSoftPrefetch | None:
     prefetch_source = _soft_prefetch_source_messages(
         body,
         transient_message_patterns=transient_message_patterns,
     )
     if prefetch_source is None:
-        return False
+        return None
     source_messages, preserved_system_message = prefetch_source
     chat_id = str(metadata.get("chat_id") or "")
     user_id = str((user or {}).get("id") or "")
     if not user_id or not _chat_id_supported(chat_id):
-        return False
+        return None
     key = _soft_prefetch_inflight_key_for_body(
         user=user,
         metadata=metadata,
@@ -8939,7 +8945,7 @@ def _start_soft_compaction_prefetch(
         source_messages=source_messages,
     )
     if key is None:
-        return False
+        return None
     prefetch_user = copy.deepcopy(user)
     prefetch_metadata = _copy_metadata_preserving_references(metadata)
     prefetch_body = _copy_body_preserving_metadata(body)
@@ -8947,7 +8953,7 @@ def _start_soft_compaction_prefetch(
         _copy_body_preserving_metadata(task_estimate_body) if task_estimate_body is not None else None
     )
 
-    async def run_prefetch() -> bool:
+    async def run_prefetch(parent_prefetch_task: asyncio.Task[Any] | None) -> bool:
         if parent_prefetch_task is not None:
             try:
                 await asyncio.wait_for(
@@ -8988,7 +8994,61 @@ def _start_soft_compaction_prefetch(
             transient_message_patterns=transient_message_patterns,
         )
 
-    return _launch_soft_prefetch_task(key, run_prefetch())
+    return _PreparedSoftPrefetch(key=key, run=run_prefetch)
+
+
+def _start_soft_compaction_prefetch(
+    *,
+    request: Any,
+    user: Any,
+    metadata: dict[str, Any],
+    body: dict[str, Any],
+    pipe_function_id: str,
+    summary_model_id: str,
+    summary_tool_policy: SummaryToolPolicy,
+    historical_message_excerpt_bytes: int,
+    historical_message_excerpt_count: int,
+    effective_trigger_total_tokens: int = 100000,
+    effective_soft_trigger_total_tokens: int | None = None,
+    trigger_total_tokens: int | None = None,
+    trigger_estimated_tokens: int | None = None,
+    trigger_usage_source: str | None = None,
+    token_status_detail: Literal["before", "before_after"] = "before",
+    token_status_compare_estimate: bool = False,
+    event_emitter: Callable[[Any], Awaitable[None]] | None = None,
+    file_context_enabled: bool = True,
+    task_estimate_body: dict[str, Any] | None = None,
+    summary_prompt: str | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+    parent_prefetch_task: asyncio.Task[Any] | None = None,
+    _prepared: _PreparedSoftPrefetch | None = None,
+) -> bool:
+    prepared = _prepared or _prepare_soft_compaction_prefetch(
+        request=request,
+        user=user,
+        metadata=metadata,
+        body=body,
+        pipe_function_id=pipe_function_id,
+        summary_model_id=summary_model_id,
+        summary_tool_policy=summary_tool_policy,
+        historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+        historical_message_excerpt_count=historical_message_excerpt_count,
+        effective_trigger_total_tokens=effective_trigger_total_tokens,
+        effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+        trigger_total_tokens=trigger_total_tokens,
+        trigger_estimated_tokens=trigger_estimated_tokens,
+        trigger_usage_source=trigger_usage_source,
+        token_status_detail=token_status_detail,
+        token_status_compare_estimate=token_status_compare_estimate,
+        event_emitter=event_emitter,
+        file_context_enabled=file_context_enabled,
+        task_estimate_body=task_estimate_body,
+        summary_prompt=summary_prompt,
+        transient_message_patterns=transient_message_patterns,
+    )
+    if prepared is None:
+        return False
+    return _launch_soft_prefetch_task(prepared.key, prepared.run(parent_prefetch_task))
 
 
 def _choice_assistant_message_for_prefetch(choice: Any) -> dict[str, Any] | None:
@@ -11227,37 +11287,55 @@ class Pipe:
                 )
 
         def schedule_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
-            def prepare_and_start() -> None:
-                try:
-                    if effective_soft_trigger_total_tokens is None:
-                        return
-                    # Completed-turn prefetch is grounded ONLY in the just-completed
-                    # response's own usage. No usage => no prefetch (never fall back to a
-                    # previous turn's observed usage).
-                    completion_total_tokens = _usage_total(completion.get("usage"))
-                    if completion_total_tokens is None:
-                        return
-                    if (
-                        completion_total_tokens < effective_soft_trigger_total_tokens
-                        or completion_total_tokens >= effective_trigger_total_tokens
-                    ):
-                        return
+            try:
+                if effective_soft_trigger_total_tokens is None:
+                    return
+                # Completed-turn prefetch is grounded ONLY in the just-completed
+                # response's own usage. No usage => no prefetch (never fall back to a
+                # previous turn's observed usage).
+                completion_total_tokens = _usage_total(completion.get("usage"))
+                if completion_total_tokens is None:
+                    return
+                if (
+                    completion_total_tokens < effective_soft_trigger_total_tokens
+                    or completion_total_tokens >= effective_trigger_total_tokens
+                ):
+                    return
+                completed_user_id = str((user or {}).get("id") or "")
+                completed_chat_id = str(metadata.get("chat_id") or "")
+                completed_message_id = str(message_id or "")
+                if not completed_user_id or not _chat_id_supported(completed_chat_id) or not completed_message_id:
+                    return
+                coordinator_key = (
+                    f"{CHECKPOINT_NAMESPACE}.completed_turn",
+                    completed_user_id,
+                    completed_chat_id,
+                    identity.pipe_function_id,
+                    compute_profile_hash(),
+                    completed_message_id,
+                )
+
+                def prepare() -> tuple[
+                    dict[str, Any],
+                    tuple[str, str, str, str, str, str] | None,
+                    _PreparedSoftPrefetch,
+                ] | None:
                     assistant_message = completion.get("assistant_message")
                     if not isinstance(assistant_message, dict):
                         assistant_message = _assistant_message_for_completed_prefetch(completion)
                     if assistant_message is None:
-                        return
+                        return None
                     completed_body = _completed_turn_prefetch_body(checkpoint_lookup_body, assistant_message)
                     if completed_body is None:
-                        return
-                    parent_prefetch_task = _soft_prefetch_inflight_task_for_body(
+                        return None
+                    parent_key = _soft_prefetch_inflight_key_for_body(
                         user=user,
                         metadata=metadata,
                         body=checkpoint_lookup_body,
                         pipe_function_id=identity.pipe_function_id,
                         transient_message_patterns=transient_message_patterns,
                     )
-                    _start_soft_compaction_prefetch(
+                    prepared = _prepare_soft_compaction_prefetch(
                         request=__request__,
                         user=user,
                         metadata=metadata,
@@ -11277,33 +11355,65 @@ class Pipe:
                         event_emitter=__event_emitter__,
                         file_context_enabled=target_file_context_enabled,
                         transient_message_patterns=transient_message_patterns,
-                        parent_prefetch_task=parent_prefetch_task,
                     )
-                except Exception as exc:
-                    LOG.exception(
-                        "Completed-turn soft compaction prefetch failed",
-                        exc_info=(type(exc), exc, exc.__traceback__),
-                    )
+                    if prepared is None:
+                        return None
+                    return completed_body, parent_key, prepared
 
-            def call_after_response_return(_done: asyncio.Task[Any]) -> None:
-                try:
-                    asyncio.get_running_loop().call_soon(prepare_and_start)
-                except Exception as exc:
-                    LOG.exception(
-                        "Completed-turn soft compaction prefetch failed",
-                        exc_info=(type(exc), exc, exc.__traceback__),
-                    )
+                async def prepare_and_start() -> None:
+                    try:
+                        prepared_result = await asyncio.to_thread(prepare)
+                        if prepared_result is None:
+                            return
+                        completed_body, parent_key, prepared = prepared_result
+                        parent_prefetch_task = (
+                            _soft_prefetch_inflight_task_for_body(
+                                user=user,
+                                metadata=metadata,
+                                body=checkpoint_lookup_body,
+                                pipe_function_id=identity.pipe_function_id,
+                                transient_message_patterns=transient_message_patterns,
+                                inflight_key=parent_key,
+                            )
+                            if parent_key is not None
+                            else None
+                        )
+                        started = _start_soft_compaction_prefetch(
+                            request=__request__,
+                            user=user,
+                            metadata=metadata,
+                            body=completed_body,
+                            pipe_function_id=identity.pipe_function_id,
+                            summary_model_id=summary_model_id,
+                            summary_tool_policy=self.valves.summary_tool_policy,
+                            summary_prompt=self.valves.summary_prompt,
+                            historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                            historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                            effective_trigger_total_tokens=effective_trigger_total_tokens,
+                            effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+                            trigger_total_tokens=completion_total_tokens,
+                            trigger_usage_source="request",
+                            token_status_detail=self.valves.token_status_detail,
+                            token_status_compare_estimate=self.valves.token_status_compare_estimate,
+                            event_emitter=__event_emitter__,
+                            file_context_enabled=target_file_context_enabled,
+                            transient_message_patterns=transient_message_patterns,
+                            parent_prefetch_task=parent_prefetch_task,
+                            _prepared=prepared,
+                        )
+                        if started:
+                            child_task = _SOFT_PREFETCH_INFLIGHT_TASKS.get(prepared.key)
+                            if child_task is not None:
+                                await child_task
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        LOG.exception(
+                            "Completed-turn soft compaction prefetch failed",
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
 
-            try:
-                current_task = asyncio.current_task()
-                current_coro = current_task.get_coro() if current_task is not None else None
-                if (
-                    current_task is not None
-                    and getattr(current_coro, "cr_code", None) is type(self).pipe.__code__
-                ):
-                    current_task.add_done_callback(call_after_response_return)
-                else:
-                    asyncio.get_running_loop().call_soon(prepare_and_start)
+                _launch_soft_prefetch_task(coordinator_key, prepare_and_start())
             except Exception as exc:
                 LOG.exception(
                     "Completed-turn soft compaction prefetch failed",

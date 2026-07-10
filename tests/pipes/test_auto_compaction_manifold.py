@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import sys
+import threading
 import types
 
 import pytest
@@ -19722,8 +19723,7 @@ async def test_pipe_completed_turn_prefetch_waits_for_in_flight_parent_prefetch(
         result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
 
         assert result["choices"][0]["message"]["content"] == "answer"
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        await _drain_completed_turn_prefetch_tasks()
         assert len(calls) == 2
         assert calls[0]["parent_prefetch_task"] is None
         assert calls[1]["parent_prefetch_task"] is parent_prefetch_task
@@ -19982,6 +19982,7 @@ async def _run_completed_turn_prefetch_usage_case(
     *,
     response_usage=None,
     body_reusable_checkpoint_match=None,
+    messages=None,
 ):
     calls = []
 
@@ -20039,7 +20040,8 @@ async def _run_completed_turn_prefetch_usage_case(
     body = {
         "model": wrapper_id,
         "stream": False,
-        "messages": [
+        "messages": messages
+        or [
             {"role": "user", "content": "old"},
             {"role": "assistant", "content": "old answer"},
             {"role": "user", "content": "active"},
@@ -20056,6 +20058,15 @@ async def _drain_completed_turn_prefetch_tasks() -> None:
     if retained_tasks:
         await asyncio.wait_for(asyncio.gather(*retained_tasks), timeout=1)
     await asyncio.sleep(0)
+
+
+async def _wait_for_completed_turn_child_task(completed_key):
+    async with asyncio.timeout(1):
+        while True:
+            task = mod._SOFT_PREFETCH_INFLIGHT_TASKS.get(completed_key)
+            if task is not None:
+                return task
+            await asyncio.sleep(0)
 
 
 def _completed_turn_registry_case(monkeypatch):
@@ -20174,9 +20185,8 @@ async def test_completed_turn_coordinator_owns_completed_body_key_before_parent_
 
     try:
         result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
-        await asyncio.sleep(0)
         completed_key = _completed_turn_registry_key(pipe_user, pipe_metadata, body)
-        coordinator = mod._SOFT_PREFETCH_INFLIGHT_TASKS.get(completed_key)
+        coordinator = await _wait_for_completed_turn_child_task(completed_key)
 
         assert result["choices"][0]["message"]["content"] == "answer"
         assert coordinator is not None
@@ -20264,9 +20274,8 @@ async def test_cancelling_completed_turn_coordinator_while_waiting_starts_no_chi
 
     try:
         await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
-        await asyncio.sleep(0)
         completed_key = _completed_turn_registry_key(pipe_user, pipe_metadata, body)
-        coordinator = mod._SOFT_PREFETCH_INFLIGHT_TASKS.get(completed_key)
+        coordinator = await _wait_for_completed_turn_child_task(completed_key)
         assert coordinator is not None
 
         coordinator.cancel()
@@ -20295,9 +20304,8 @@ async def test_cancelled_parent_prefetch_starts_no_completed_turn_child(
 
     try:
         await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
-        await asyncio.sleep(0)
         completed_key = _completed_turn_registry_key(pipe_user, pipe_metadata, body)
-        coordinator = mod._SOFT_PREFETCH_INFLIGHT_TASKS.get(completed_key)
+        coordinator = await _wait_for_completed_turn_child_task(completed_key)
         assert coordinator is not None
 
         parent_task.cancel()
@@ -20349,6 +20357,53 @@ async def test_pipe_completed_turn_prefetch_fires_from_response_usage(
         {"role": "assistant", "content": "answer"},
         {"role": "user", "content": ""},
     ]
+
+
+@pytest.mark.asyncio
+async def test_pipe_completed_turn_prefetch_uses_user_message_id_fallback(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    metadata = {**pipe_metadata, "user_message_id": pipe_metadata["message_id"]}
+    metadata.pop("message_id")
+
+    calls = await _run_completed_turn_prefetch_usage_case(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        metadata,
+        response_usage={"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+    )
+
+    await _drain_completed_turn_prefetch_tasks()
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pipe_completed_turn_prefetch_skips_parent_lookup_without_parent_key(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    parent_lookups = []
+
+    def lookup_parent_task(**kwargs):
+        parent_lookups.append(kwargs)
+        return None
+
+    monkeypatch.setattr(mod, "_soft_prefetch_inflight_task_for_body", lookup_parent_task)
+
+    calls = await _run_completed_turn_prefetch_usage_case(
+        monkeypatch,
+        pipe_request,
+        pipe_user,
+        pipe_metadata,
+        response_usage={"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+        messages=[{"role": "user", "content": "large first turn"}],
+    )
+
+    await _drain_completed_turn_prefetch_tasks()
+
+    assert parent_lookups == []
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
@@ -20440,6 +20495,8 @@ async def test_pipe_completed_turn_prefetch_does_not_lookup_or_estimate_before_r
     lookup_started = asyncio.Event()
     release_lookup = asyncio.Event()
     preparation_started = asyncio.Event()
+    preparation_thread_ids = []
+    event_loop_thread_id = threading.get_ident()
     calls = []
     completed_turn_prefetch_body = mod._completed_turn_prefetch_body
 
@@ -20488,6 +20545,7 @@ async def test_pipe_completed_turn_prefetch_does_not_lookup_or_estimate_before_r
         return True
 
     def prepare_completed_turn_prefetch_body(body, assistant_message):
+        preparation_thread_ids.append(threading.get_ident())
         preparation_started.set()
         return completed_turn_prefetch_body(body, assistant_message)
 
@@ -20538,6 +20596,7 @@ async def test_pipe_completed_turn_prefetch_does_not_lookup_or_estimate_before_r
 
     assert result["choices"][0]["message"]["content"] == "answer"
     assert len(calls) == 1
+    assert preparation_thread_ids and preparation_thread_ids[0] != event_loop_thread_id
 
 
 @pytest.mark.asyncio
