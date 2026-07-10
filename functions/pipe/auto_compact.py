@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.6.4
+version: 0.6.5
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -10897,7 +10897,11 @@ class Pipe:
         # model back into this wrapper (TASK_MODEL pointing here). Injecting
         # target file context then would recurse via chat_completion_files_handler.
         is_query_generation_task = task_name == TASKS.QUERY_GENERATION.value
-        supported_context = _chat_id_supported(chat_id) and not is_summary_task
+        supported_context = (
+            _chat_id_supported(chat_id)
+            and not is_summary_task
+            and (is_task_request or bool(metadata.get("message_id")))
+        )
         task_source_body = (
             _task_history_source_body_for_compaction(inner, metadata)
             if supported_context and self.valves.compact_task_prompts_from_task_body
@@ -11303,7 +11307,7 @@ class Pipe:
                     return
                 completed_user_id = str((user or {}).get("id") or "")
                 completed_chat_id = str(metadata.get("chat_id") or "")
-                completed_message_id = str(message_id or "")
+                completed_message_id = str(metadata.get("message_id") or "")
                 if not completed_user_id or not _chat_id_supported(completed_chat_id) or not completed_message_id:
                     return
                 coordinator_key = (

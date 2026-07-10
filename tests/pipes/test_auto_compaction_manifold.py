@@ -20360,7 +20360,7 @@ async def test_pipe_completed_turn_prefetch_fires_from_response_usage(
 
 
 @pytest.mark.asyncio
-async def test_pipe_completed_turn_prefetch_uses_user_message_id_fallback(
+async def test_pipe_completed_turn_prefetch_requires_core_persisted_message_id(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
     metadata = {**pipe_metadata, "user_message_id": pipe_metadata["message_id"]}
@@ -20376,7 +20376,85 @@ async def test_pipe_completed_turn_prefetch_uses_user_message_id_fallback(
 
     await _drain_completed_turn_prefetch_tasks()
 
-    assert len(calls) == 1
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_skips_checkpoints_without_core_persisted_message_id(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    checkpoint_lookups = []
+    prefetch_calls = []
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 500, "input_tokens": 400, "output_tokens": 100}
+
+    async def reusable_checkpoint_match(**kwargs):
+        checkpoint_lookups.append(kwargs)
+        return None
+
+    async def estimate_next_input_tokens_from_usage_anchor(**kwargs):
+        return 500
+
+    async def forward_target(**kwargs):
+        captured["body"] = copy.deepcopy(kwargs["body"])
+        return {
+            "usage": {"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "answer"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    def start_soft_prefetch(**kwargs):
+        prefetch_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(mod, "_SOFT_PREFETCH_TASKS", set())
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_next_input_tokens_from_usage_anchor",
+        estimate_next_input_tokens_from_usage_anchor,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+
+    pipe = mod.Pipe()
+    pipe.valves.soft_trigger_ratio = 0.1
+    pipe.valves.trigger_total_tokens = 1000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    body = {
+        "model": wrapper_id,
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+    metadata = {"chat_id": pipe_metadata["chat_id"]}
+
+    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    await _drain_completed_turn_prefetch_tasks()
+
+    assert result["choices"][0]["message"]["content"] == "answer"
+    assert checkpoint_lookups == []
+    assert prefetch_calls == []
+    assert captured["body"] == {**body, "model": "target", "metadata": metadata}
 
 
 @pytest.mark.asyncio
