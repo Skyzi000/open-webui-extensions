@@ -20988,6 +20988,58 @@ async def test_streaming_completion_observer_skips_tool_call_completion():
     assert observed == []
 
 
+@pytest.mark.asyncio
+async def test_streaming_completion_observer_closes_inner_iterator_on_early_close():
+    closed = False
+    chunk = b'data: {"choices": [{"delta": {"content": "partial"}}]}\n\n'
+
+    async def chunks():
+        nonlocal closed
+        try:
+            yield chunk
+            await asyncio.Event().wait()
+        finally:
+            closed = True
+
+    observed = []
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+    wrapped = mod._attach_streaming_completion_observer(response, observed.append)
+
+    assert await wrapped.body_iterator.__anext__() == chunk
+    await wrapped.body_iterator.aclose()
+
+    assert closed is True
+    assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_streaming_completion_observer_close_failure_does_not_mask_stream_failure():
+    class StreamFailure(Exception):
+        pass
+
+    class CleanupFailure(Exception):
+        pass
+
+    class FailingIterator:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StreamFailure
+
+        async def aclose(self):
+            raise CleanupFailure
+
+    observed = mod._streaming_completion_observer(
+        FailingIterator(),
+        media_type="text/event-stream",
+        on_complete=lambda _completion: None,
+    )
+
+    with pytest.raises(StreamFailure):
+        await observed.__anext__()
+
+
 # ---------------------------------------------------------------------------
 # summary_model dropdown options
 # ---------------------------------------------------------------------------

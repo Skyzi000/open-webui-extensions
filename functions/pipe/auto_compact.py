@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.6.5
+version: 0.6.6
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -7148,30 +7148,36 @@ async def _streaming_completion_observer(
     state: dict[str, Any] = {"parts": [], "usage": None, "saw_tool_call": False, "saw_error": False}
     is_sse_response = "text/event-stream" in (media_type or "").lower()
     parser = _SSEJSONEventParser() if is_sse_response else None
-    async for raw_chunk in iterator:
-        chunk = _coerce_stream_chunk(raw_chunk)
+    try:
+        async for raw_chunk in iterator:
+            chunk = _coerce_stream_chunk(raw_chunk)
+            if is_sse_response and parser is not None:
+                events = parser.feed(chunk)
+            else:
+                events = extract_sse_json_events(chunk)
+            for payload in events:
+                _observe_streaming_completion_payload(payload, state)
+            yield raw_chunk
         if is_sse_response and parser is not None:
-            events = parser.feed(chunk)
-        else:
-            events = extract_sse_json_events(chunk)
-        for payload in events:
-            _observe_streaming_completion_payload(payload, state)
-        yield raw_chunk
-    if is_sse_response and parser is not None:
-        for payload in parser.flush():
-            _observe_streaming_completion_payload(payload, state)
-    if state.get("saw_tool_call") or state.get("saw_error"):
-        return
-    content = "".join(state.get("parts") or [])
-    if not content:
-        return
-    with suppress(Exception):
-        on_complete(
-            {
-                "assistant_message": {"role": "assistant", "content": content},
-                "usage": state.get("usage"),
-            }
-        )
+            for payload in parser.flush():
+                _observe_streaming_completion_payload(payload, state)
+        if state.get("saw_tool_call") or state.get("saw_error"):
+            return
+        content = "".join(state.get("parts") or [])
+        if not content:
+            return
+        with suppress(Exception):
+            on_complete(
+                {
+                    "assistant_message": {"role": "assistant", "content": content},
+                    "usage": state.get("usage"),
+                }
+            )
+    finally:
+        aclose = getattr(iterator, "aclose", None)
+        if callable(aclose):
+            with suppress(Exception):
+                await aclose()
 
 
 def _attach_streaming_completion_observer(
