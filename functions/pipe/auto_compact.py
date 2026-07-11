@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.6.6
+version: 0.6.7
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -24,6 +24,7 @@ import re
 import time
 import uuid
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from html.parser import HTMLParser
@@ -141,11 +142,13 @@ MISSING_CORE_REQUEST = object()
 TARGET_MODEL_RECORD_UNKNOWN = object()
 AUTO_COMPACTION_TARGET_HIDDEN_META_KEY = "auto_compaction_target_hidden_by"
 TARGET_MODEL_VISIBILITY_LOCKS: dict[str, asyncio.Lock] = {}
-# request.state flag set while AutoCompact is mid target file-context injection
-# (chat_completion_files_handler). When Core re-enters the wrapper via
-# generate_queries (TASK_MODEL pointing at this wrapper), the flag short-
-# circuits the reentrant injection so manual RAG is skipped fail-closed.
-AUTO_COMPACT_FILE_CONTEXT_INJECTION_STATE_KEY = "_auto_compact_target_file_context_injecting"
+# Context-local guard set while AutoCompact is mid target file-context
+# injection. It follows genuine re-entry while keeping concurrent multi-model
+# sibling tasks independent even though Core gives them the same request.
+AUTO_COMPACT_FILE_CONTEXT_INJECTION_ACTIVE: ContextVar[bool] = ContextVar(
+    "auto_compact_file_context_injection_active",
+    default=False,
+)
 AUTO_COMPACT_TIKTOKEN_ENCODING_STATE_KEY = "_auto_compact_tiktoken_encoding_name"
 AUTO_COMPACT_TIKTOKEN_ENCODING_LOADED_STATE_KEY = "_auto_compact_tiktoken_encoding_loaded"
 PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY = "_auto_compact_prefix_file_fingerprint_resolver_cache"
@@ -1625,20 +1628,6 @@ async def _build_prefix_file_fingerprint_resolver(
         with suppress(Exception):
             cache[cache_key] = resolver
     return resolver
-
-
-def _request_file_context_injection_active(request_state: Any) -> bool:
-    try:
-        return getattr(request_state, AUTO_COMPACT_FILE_CONTEXT_INJECTION_STATE_KEY, False) is True
-    except Exception:
-        return False
-
-
-def _set_request_file_context_injection_active(request_state: Any, active: bool) -> None:
-    if request_state is None:
-        return
-    with suppress(Exception):
-        setattr(request_state, AUTO_COMPACT_FILE_CONTEXT_INJECTION_STATE_KEY, bool(active))
 
 
 def _resolve_fingerprint(
@@ -3942,7 +3931,23 @@ def _is_arena_model(model: dict[str, Any]) -> bool:
     return bool(model.get("arena")) or model.get("owned_by") == "arena"
 
 
-def _arena_chat_candidate_model_ids(models: dict[str, Any], arena_model: dict[str, Any]) -> list[str]:
+def _arena_chat_candidate_model_ids(
+    models: dict[str, Any],
+    arena_model: dict[str, Any],
+    *,
+    pipe_function_id: str = PIPE_FUNCTION_ID,
+) -> list[str]:
+    def is_allowed(model_id: str) -> bool:
+        candidate = models.get(model_id)
+        return not (
+            isinstance(candidate, dict)
+            and _is_own_wrapper_or_preset(
+                model_id,
+                candidate,
+                pipe_function_id=pipe_function_id,
+            )
+        )
+
     info = arena_model.get("info")
     meta = info.get("meta") if isinstance(info, dict) else None
     meta = meta if isinstance(meta, dict) else {}
@@ -3957,26 +3962,38 @@ def _arena_chat_candidate_model_ids(models: dict[str, Any], arena_model: dict[st
             and available_model.get("owned_by") != "arena"
             and isinstance((model_id := available_model.get("id")), str)
             and model_id not in excluded_model_ids
+            and is_allowed(model_id)
         ]
     if isinstance(model_ids, list) and model_ids:
-        return [model_id for model_id in model_ids if isinstance(model_id, str) and model_id]
+        return [
+            model_id
+            for model_id in model_ids
+            if isinstance(model_id, str) and model_id and is_allowed(model_id)
+        ]
     return [
         model_id
         for available_model in list(models.values())
         if isinstance(available_model, dict)
         and available_model.get("owned_by") != "arena"
         and isinstance((model_id := available_model.get("id")), str)
+        and is_allowed(model_id)
     ]
 
 
 def _resolve_arena_chat_model_route(
     models: dict[str, Any],
     route: CoreChatModelRoute,
+    *,
+    pipe_function_id: str = PIPE_FUNCTION_ID,
 ) -> tuple[CoreChatModelRoute, str | None]:
     model = models.get(route.model_id)
     if not isinstance(model, dict) or not _is_arena_model(model):
         return route, None
-    candidate_model_ids = _arena_chat_candidate_model_ids(models, model)
+    candidate_model_ids = _arena_chat_candidate_model_ids(
+        models,
+        model,
+        pipe_function_id=pipe_function_id,
+    )
     if not candidate_model_ids:
         raise HTTPException(status_code=403, detail="Model not found")
     selected_model_id = random.choice(candidate_model_ids)
@@ -4024,6 +4041,21 @@ def _model_base_model_id(model: dict[str, Any]) -> str | None:
 
 def _is_based_on_generated_wrapper(model: dict[str, Any], *, pipe_function_id: str = PIPE_FUNCTION_ID) -> bool:
     return is_generated_wrapper_model_id(_model_base_model_id(model), pipe_function_id=pipe_function_id)
+
+
+def _is_own_wrapper_or_preset(
+    model_id: str,
+    model: dict[str, Any],
+    *,
+    pipe_function_id: str = PIPE_FUNCTION_ID,
+) -> bool:
+    return is_generated_wrapper_model_id(
+        model_id,
+        pipe_function_id=pipe_function_id,
+    ) or _is_based_on_generated_wrapper(
+        model,
+        pipe_function_id=pipe_function_id,
+    )
 
 
 def filter_target_models(models: Iterable[dict[str, Any]], valves: Any, *, pipe_function_id: str = PIPE_FUNCTION_ID):
@@ -6948,14 +6980,13 @@ async def _inject_target_file_context(
     if not retained_non_image:
         return body
 
-    request_state = getattr(request, "state", None)
-    if _request_file_context_injection_active(request_state):
-        # Same request re-entered injection (e.g. generate_queries routed the
+    if AUTO_COMPACT_FILE_CONTEXT_INJECTION_ACTIVE.get():
+        # This execution context re-entered injection (e.g. generate_queries routed the
         # task model back into this wrapper). Skip manual RAG fail-closed so we
         # never recurse into chat_completion_files_handler again; the retained
         # metadata files pruning above still applies.
         return body
-    _set_request_file_context_injection_active(request_state, True)
+    injection_token = AUTO_COMPACT_FILE_CONTEXT_INJECTION_ACTIVE.set(True)
     try:
         try:
             from open_webui.utils.middleware import apply_source_context_to_messages, chat_completion_files_handler
@@ -6993,7 +7024,7 @@ async def _inject_target_file_context(
         except Exception:
             LOG.exception("Failed to inject target file context")
     finally:
-        _set_request_file_context_injection_active(request_state, False)
+        AUTO_COMPACT_FILE_CONTEXT_INJECTION_ACTIVE.reset(injection_token)
     return body
 
 
@@ -7511,13 +7542,27 @@ SUMMARY_INHERITED_RESPONSE_CONTROL_KEYS = (
     "max_tokens",
     "max_completion_tokens",
     "max_output_tokens",
+    "num_predict",
     "stop",
+    "response_format",
+    "format",
 )
 
 
 def strip_summary_inherited_response_controls(body: dict[str, Any]) -> None:
-    for key in SUMMARY_INHERITED_RESPONSE_CONTROL_KEYS:
-        body.pop(key, None)
+    def strip(values: Any) -> None:
+        if not isinstance(values, dict):
+            return
+        for key in SUMMARY_INHERITED_RESPONSE_CONTROL_KEYS:
+            values.pop(key, None)
+        custom_params = values.get("custom_params")
+        if isinstance(custom_params, dict):
+            for key in SUMMARY_INHERITED_RESPONSE_CONTROL_KEYS:
+                custom_params.pop(key, None)
+
+    strip(body)
+    strip(body.get("params"))
+    strip(body.get("options"))
 
 
 def neutralize_summary_tool_choice(body: dict[str, Any]) -> None:
@@ -7570,7 +7615,6 @@ def build_summary_completion_body(
     body["metadata"] = build_summary_task_metadata(metadata)
     body["metadata"].pop("files", None)
     body.pop("previous_response_id", None)
-    body.pop("response_format", None)
     strip_summary_inherited_response_controls(body)
     neutralize_summary_tool_choice(body)
     if summary_tool_policy == "always_strip":
@@ -7627,7 +7671,11 @@ async def _generate_summary_text(
         prefix_file_context=prefix_file_context,
         summary_prompt=summary_prompt,
     )
-    route = await _resolve_core_chat_model_route(inner_request, str(body.get("model") or ""))
+    route = await _resolve_core_chat_model_route(
+        inner_request,
+        str(body.get("model") or ""),
+        pipe_function_id=pipe_function_id,
+    )
     models = await _model_dict_from_request(inner_request)
     original_model_id = str(body.get("model") or "")
     route, selected_arena_model_id = await _resolve_arena_chat_model_route_with_access(
@@ -7636,14 +7684,15 @@ async def _generate_summary_text(
         models=models,
         route=route,
         original_model_id=original_model_id,
+        pipe_function_id=pipe_function_id,
     )
     body["model"] = route.model_id
     if selected_arena_model_id:
         body["metadata"]["selected_model_id"] = selected_arena_model_id
-    body = _apply_custom_model_fallback_params(
+    body = _apply_resolved_model_route_params(
         body,
-        fallback_model=route.fallback_model,
-        target_params=route.target_params,
+        models=models,
+        route=route,
     )
     await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
     if on_summary_start is not None:
@@ -9690,27 +9739,42 @@ def _legacy_default_models_config_value(request: Any) -> Any:
     return getattr(config, "DEFAULT_MODELS", None)
 
 
-def _available_custom_model_fallback_id(default_models_value: Any, models: dict[str, Any]) -> str | None:
+def _available_custom_model_fallback_id(
+    default_models_value: Any,
+    models: dict[str, Any],
+    *,
+    pipe_function_id: str = PIPE_FUNCTION_ID,
+) -> str | None:
     default_models = str(default_models_value or "").split(",")
     fallback_model_id = default_models[0].strip() if default_models and default_models[0] else None
-    if fallback_model_id and fallback_model_id in models:
-        return fallback_model_id
-    return None
-
-
-def _custom_model_fallback_model_id(request: Any, models: dict[str, Any]) -> str | None:
-    if not _custom_model_fallback_enabled():
+    fallback_model = models.get(fallback_model_id) if fallback_model_id else None
+    if not fallback_model_id or not isinstance(fallback_model, dict):
         return None
-    return _available_custom_model_fallback_id(_legacy_default_models_config_value(request), models)
+    if _is_own_wrapper_or_preset(
+        fallback_model_id,
+        fallback_model,
+        pipe_function_id=pipe_function_id,
+    ):
+        return None
+    return fallback_model_id
 
 
-async def _custom_model_fallback_model_id_compatible(request: Any, models: dict[str, Any]) -> str | None:
+async def _custom_model_fallback_model_id_compatible(
+    request: Any,
+    models: dict[str, Any],
+    *,
+    pipe_function_id: str = PIPE_FUNCTION_ID,
+) -> str | None:
     if not _custom_model_fallback_enabled():
         return None
     default_models_value = await _open_webui_config_get("ui.default_models")
     if default_models_value is CONFIG_VALUE_MISSING or default_models_value is None:
         default_models_value = _legacy_default_models_config_value(request)
-    return _available_custom_model_fallback_id(default_models_value, models)
+    return _available_custom_model_fallback_id(
+        default_models_value,
+        models,
+        pipe_function_id=pipe_function_id,
+    )
 
 
 def _target_record_params(model_info: Any) -> dict[str, Any]:
@@ -9883,6 +9947,23 @@ def _apply_custom_model_fallback_params(
     return patched
 
 
+def _apply_resolved_model_route_params(
+    body: dict[str, Any],
+    *,
+    models: dict[str, Any],
+    route: CoreChatModelRoute,
+) -> dict[str, Any]:
+    params_model = route.fallback_model
+    if params_model is None:
+        resolved_model = models.get(route.model_id)
+        if isinstance(resolved_model, dict) and resolved_model.get("owned_by") == "ollama":
+            params_model = resolved_model
+    return _apply_custom_model_fallback_params(
+        body,
+        fallback_model=params_model,
+        target_params=route.target_params,
+    )
+
 
 def _global_model_access_bypass_enabled() -> bool:
     try:
@@ -9893,16 +9974,27 @@ def _global_model_access_bypass_enabled() -> bool:
         return False
 
 
-async def _resolve_core_chat_model_route(request: Any, model_id: str) -> CoreChatModelRoute:
+async def _resolve_core_chat_model_route(
+    request: Any,
+    model_id: str,
+    *,
+    pipe_function_id: str = PIPE_FUNCTION_ID,
+) -> CoreChatModelRoute:
     models = await _model_dict_from_request(request)
     if model_id not in models:
         return CoreChatModelRoute(model_id=model_id)
     model_info = await _get_target_db_model_record(model_id)
     base_model_id = _target_record_base_model_id(model_info)
     if base_model_id and base_model_id not in models:
-        fallback_model_id = await _custom_model_fallback_model_id_compatible(request, models)
+        fallback_model_id = await _custom_model_fallback_model_id_compatible(
+            request,
+            models,
+            pipe_function_id=pipe_function_id,
+        )
         fallback_model = models.get(fallback_model_id) if fallback_model_id else None
         if fallback_model_id and isinstance(fallback_model, dict):
+            # Intentional late fallback: wrapper preprocessing already used the selected model's mirrored metadata.
+            # Preserve that logical configuration; do not re-run preprocessing for the fallback route.
             return CoreChatModelRoute(
                 model_id=fallback_model_id,
                 fallback_model=copy.deepcopy(fallback_model),
@@ -9943,8 +10035,13 @@ async def _resolve_arena_chat_model_route_with_access(
     models: dict[str, Any],
     route: CoreChatModelRoute,
     original_model_id: str,
+    pipe_function_id: str = PIPE_FUNCTION_ID,
 ) -> tuple[CoreChatModelRoute, str | None]:
-    route, selected_arena_model_id = _resolve_arena_chat_model_route(models, route)
+    route, selected_arena_model_id = _resolve_arena_chat_model_route(
+        models,
+        route,
+        pipe_function_id=pipe_function_id,
+    )
     if route.model_id != original_model_id:
         await _validate_chat_completion_runtime_model_access(
             request=request,
@@ -9978,7 +10075,11 @@ async def _validate_target_access(
     model_info = await _get_target_db_model_record(target_model_id)
     base_model_id = _target_record_base_model_id(model_info)
     if base_model_id and base_model_id not in models:
-        fallback_model_id = await _custom_model_fallback_model_id_compatible(request, models)
+        fallback_model_id = await _custom_model_fallback_model_id_compatible(
+            request,
+            models,
+            pipe_function_id=pipe_function_id,
+        )
         if fallback_model_id is None:
             raise HTTPException(status_code=403, detail="Model not found")
 
@@ -10881,6 +10982,7 @@ class Pipe:
         target_route = await _resolve_core_chat_model_route(
             __request__,
             identity.target_model_id,
+            pipe_function_id=pipe_function_id,
         )
         try:
             target_route, selected_arena_model_id = await _resolve_arena_chat_model_route_with_access(
@@ -10889,6 +10991,7 @@ class Pipe:
                 models=models,
                 route=target_route,
                 original_model_id=identity.target_model_id,
+                pipe_function_id=pipe_function_id,
             )
         except Exception:
             return _error_response("Model not found", code="model_access_denied")
@@ -11638,10 +11741,10 @@ class Pipe:
                 candidate_source_events = pre_injected_file_context_sources
 
             try:
-                forward_candidate = _apply_custom_model_fallback_params(
+                forward_candidate = _apply_resolved_model_route_params(
                     candidate,
-                    fallback_model=target_route.fallback_model,
-                    target_params=target_route.target_params,
+                    models=models,
+                    route=target_route,
                 )
                 if is_streaming:
                     streaming_kwargs = {

@@ -4010,6 +4010,111 @@ async def test_target_access_rejects_config_disabled_provider_stale_cache_target
     assert captured["config_keys"] == ("openai.enable", "ollama.enable")
 
 
+def test_custom_model_fallback_excludes_only_runtime_own_wrapper_and_presets():
+    own_wrapper_id = mod.build_wrapper_model_id("compact_alias", "target")
+    other_wrapper_id = mod.build_wrapper_model_id("other_pipe", "target")
+    models = {
+        own_wrapper_id: {"id": own_wrapper_id, "owned_by": "openai"},
+        "own-preset": {
+            "id": "own-preset",
+            "owned_by": "openai",
+            "info": {"base_model_id": own_wrapper_id},
+        },
+        other_wrapper_id: {"id": other_wrapper_id, "owned_by": "openai"},
+        "other-preset": {
+            "id": "other-preset",
+            "owned_by": "openai",
+            "info": {"base_model_id": other_wrapper_id},
+        },
+    }
+
+    assert (
+        mod._available_custom_model_fallback_id(
+            own_wrapper_id,
+            models,
+            pipe_function_id="compact_alias",
+        )
+        is None
+    )
+    assert (
+        mod._available_custom_model_fallback_id(
+            "own-preset",
+            models,
+            pipe_function_id="compact_alias",
+        )
+        is None
+    )
+    assert (
+        mod._available_custom_model_fallback_id(
+            other_wrapper_id,
+            models,
+            pipe_function_id="compact_alias",
+        )
+        == other_wrapper_id
+    )
+    assert (
+        mod._available_custom_model_fallback_id(
+            "other-preset",
+            models,
+            pipe_function_id="compact_alias",
+        )
+        == "other-preset"
+    )
+
+
+@pytest.mark.parametrize(
+    "arena_meta",
+    [
+        {"model_ids": ["own-wrapper", "own-preset", "other-wrapper", "other-preset"]},
+        {"model_ids": ["excluded"], "filter_mode": "exclude"},
+        {},
+    ],
+)
+def test_arena_candidates_exclude_only_runtime_own_wrapper_and_presets(arena_meta):
+    own_wrapper_id = mod.build_wrapper_model_id("compact_alias", "target")
+    other_wrapper_id = mod.build_wrapper_model_id("other_pipe", "target")
+    aliases = {
+        "own-wrapper": own_wrapper_id,
+        "other-wrapper": other_wrapper_id,
+    }
+    normalized_meta = copy.deepcopy(arena_meta)
+    if "model_ids" in normalized_meta:
+        normalized_meta["model_ids"] = [aliases.get(model_id, model_id) for model_id in normalized_meta["model_ids"]]
+    arena_model = {
+        "id": "arena",
+        "owned_by": "arena",
+        "arena": True,
+        "info": {"meta": normalized_meta},
+    }
+    models = {
+        "arena": arena_model,
+        own_wrapper_id: {"id": own_wrapper_id, "owned_by": "openai"},
+        "own-preset": {
+            "id": "own-preset",
+            "owned_by": "openai",
+            "base_model_id": own_wrapper_id,
+        },
+        other_wrapper_id: {"id": other_wrapper_id, "owned_by": "openai"},
+        "other-preset": {
+            "id": "other-preset",
+            "owned_by": "openai",
+            "base_model_id": other_wrapper_id,
+        },
+        "excluded": {"id": "excluded", "owned_by": "openai"},
+    }
+
+    candidates = mod._arena_chat_candidate_model_ids(
+        models,
+        arena_model,
+        pipe_function_id="compact_alias",
+    )
+
+    assert own_wrapper_id not in candidates
+    assert "own-preset" not in candidates
+    assert other_wrapper_id in candidates
+    assert "other-preset" in candidates
+
+
 @pytest.mark.asyncio
 async def test_target_access_rejects_custom_model_when_base_model_is_unavailable(
     monkeypatch,
@@ -6266,7 +6371,7 @@ async def test_summary_generation_does_not_emit_summary_start_before_route_resol
 ):
     events = []
 
-    async def resolve_core_chat_model_route(request, model_id):
+    async def resolve_core_chat_model_route(request, model_id, **kwargs):
         raise RuntimeError("route failed")
 
     async def on_summary_start():
@@ -6296,11 +6401,15 @@ async def test_summary_generation_strips_request_response_format_without_overrid
 ):
     captured = {}
     model_response_format = {"type": "json_schema", "json_schema": {"name": "Configured", "schema": {"type": "object"}}}
+    model_max_tokens = 64000
     pipe_request.app.state.MODELS = {
         "summary": {
             "id": "summary",
             "name": "Summary",
-            "params": {"response_format": model_response_format},
+            "params": {
+                "max_tokens": model_max_tokens,
+                "response_format": model_response_format,
+            },
         }
     }
 
@@ -6323,12 +6432,15 @@ async def test_summary_generation_strips_request_response_format_without_overrid
             "model": "target",
             "stream": True,
             "messages": [{"role": "user", "content": "old"}],
+            "max_tokens": 1,
             "response_format": {"type": "json_object"},
         },
     )
 
     assert result == "summary"
+    assert "max_tokens" not in captured["form_body"]
     assert "response_format" not in captured["form_body"]
+    assert captured["model_params"]["max_tokens"] == model_max_tokens
     assert captured["model_params"]["response_format"] is model_response_format
 
 
@@ -6343,7 +6455,7 @@ async def test_summary_generation_applies_fallback_params_when_route_falls_back(
     fallback_model = {"id": "fallback-openai", "name": "Fallback", "owned_by": "openai", "openai": {}}
     pipe_request.app.state.MODELS = {"fallback-openai": fallback_model}
 
-    async def resolve_core_chat_model_route(request, model_id):
+    async def resolve_core_chat_model_route(request, model_id, **kwargs):
         assert model_id == "summary-preset"
         return mod.CoreChatModelRoute(
             model_id="fallback-openai",
@@ -6429,7 +6541,7 @@ async def test_summary_generation_checks_access_for_non_arena_fallback_model(
     pipe_request.app.state.MODELS = {"fallback-openai": fallback_model}
     checked_model_ids = []
 
-    async def resolve_core_chat_model_route(request, model_id):
+    async def resolve_core_chat_model_route(request, model_id, **kwargs):
         assert model_id == "summary-preset"
         return mod.CoreChatModelRoute(
             model_id="fallback-openai",
@@ -6499,7 +6611,7 @@ async def test_summary_generation_resolves_arena_fallback_before_params(
         "arena-selected-ollama": selected_model,
     }
 
-    async def resolve_core_chat_model_route(request, model_id):
+    async def resolve_core_chat_model_route(request, model_id, **kwargs):
         assert model_id == "summary-preset"
         return mod.CoreChatModelRoute(
             model_id="fallback-arena",
@@ -6564,7 +6676,7 @@ async def test_summary_generation_resolves_arena_fallback_before_params(
     assert captured["form_body"]["model"] == "arena-selected-ollama"
     assert captured["form_body"]["metadata"]["selected_model_id"] == "arena-selected-ollama"
     assert captured["form_body"]["options"]["temperature"] == 0.4
-    assert captured["form_body"]["options"]["num_predict"] == 99
+    assert captured["form_body"]["options"]["num_predict"] == 128
     assert captured["form_body"]["options"]["provider_flag"] == "true"
     assert "params" not in captured["form_body"]
     assert "max_tokens" not in captured["form_body"]["options"]
@@ -6595,7 +6707,7 @@ async def test_summary_generation_checks_access_for_selected_arena_fallback_mode
     }
     checked_model_ids = []
 
-    async def resolve_core_chat_model_route(request, model_id):
+    async def resolve_core_chat_model_route(request, model_id, **kwargs):
         assert model_id == "summary-preset"
         return mod.CoreChatModelRoute(
             model_id="fallback-arena",
@@ -6666,7 +6778,7 @@ async def test_summary_generation_rejects_stale_arena_fallback_candidate_before_
         "arena-selected": selected_model,
     }
 
-    async def resolve_core_chat_model_route(request, model_id):
+    async def resolve_core_chat_model_route(request, model_id, **kwargs):
         assert model_id == "summary-preset"
         return mod.CoreChatModelRoute(
             model_id="fallback-arena",
@@ -6746,6 +6858,80 @@ async def test_summary_generation_strips_inherited_response_limits_and_stop(
     assert "stop" not in captured["form_body"]
     assert captured["form_body"]["temperature"] == 0.2
     assert captured["form_body"]["top_p"] == 0.9
+
+
+@pytest.mark.asyncio
+async def test_summary_generation_reshapes_sampling_params_without_inheriting_ollama_response_controls(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    captured = {}
+    pipe_request.app.state.MODELS = {
+        "summary-ollama": {
+            "id": "summary-ollama",
+            "name": "Summary Ollama",
+            "owned_by": "ollama",
+            "ollama": {},
+        }
+    }
+
+    async def model_dict_from_request(request):
+        return dict(pipe_request.app.state.MODELS)
+
+    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+        captured["form_body"] = copy.deepcopy(form_data)
+        return {"choices": [{"message": {"content": "summary"}}]}
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="summary-ollama",
+        source_messages=[{"role": "user", "content": "old"}],
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "num_predict": 1,
+            "format": "json",
+            "options": {
+                "max_tokens": 2,
+                "num_predict": 3,
+                "stop": ["OPTION_STOP"],
+                "response_format": {"type": "json_object"},
+                "format": "json",
+            },
+            "params": {
+                "max_completion_tokens": 4,
+                "custom_params": {
+                    "max_output_tokens": 5,
+                    "num_predict": 6,
+                    "stop": ["CUSTOM_STOP"],
+                    "response_format": {"type": "json_object"},
+                    "format": "json",
+                },
+            },
+        },
+    )
+
+    assert result == "summary"
+    assert captured["form_body"]["model"] == "summary-ollama"
+    assert captured["form_body"]["options"] == {
+        "temperature": 0.2,
+        "top_p": 0.9,
+    }
+    for key in mod.SUMMARY_INHERITED_RESPONSE_CONTROL_KEYS:
+        assert key not in captured["form_body"]
+        assert key not in captured["form_body"]["options"]
+    assert "params" not in captured["form_body"]
 
 
 @pytest.mark.asyncio
@@ -8617,6 +8803,66 @@ async def test_pipe_forwards_below_threshold_to_decoded_target_with_metadata(mon
 
 
 @pytest.mark.asyncio
+async def test_pipe_reshapes_request_params_for_normal_ollama_target(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    captured = {}
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {
+            "target-ollama": {
+                "id": "target-ollama",
+                "name": "Target Ollama",
+                "owned_by": "ollama",
+                "ollama": {},
+            }
+        }
+
+    async def lookup_persisted_usage(chat_id, message_id):
+        return {"total_tokens": 10, "input_tokens": 10, "output_tokens": 0}
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = kwargs["body"]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_total_tokens = 100
+    result = await pipe.pipe(
+        {
+            "model": mod.build_wrapper_model_id("auto_compact", "target-ollama"),
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "options": {"num_predict": 99},
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result == {"ok": True}
+    assert captured["forward_body"]["model"] == "target-ollama"
+    assert captured["forward_body"]["options"] == {
+        "temperature": 0.3,
+        "top_p": 0.8,
+        "num_predict": 99,
+    }
+    assert "params" not in captured["forward_body"]
+
+
+@pytest.mark.asyncio
 async def test_pipe_injects_file_context_for_persisted_chat(monkeypatch, pipe_request, pipe_user, pipe_metadata):
     install_fake_open_webui_user_model(monkeypatch)
     captured = {"target_file_calls": [], "source_events": [], "forward_attempts": 0}
@@ -9415,27 +9661,108 @@ async def test_inject_target_file_context_skips_manual_rag_when_reentry_guard_ac
         "metadata": {"files": metadata_files},
     }
 
-    mod._set_request_file_context_injection_active(pipe_request.state, True)
-    result = await mod._inject_target_file_context(
-        request=pipe_request,
-        user={"id": "user-1"},
-        body=body,
-        chat_id="chat-1",
-        current_message_id="message-1",
-        compaction_prefix_count=2,
-        metadata_files=metadata_files,
-        metadata_user_message={"files": [_file("current-file")]},
-        event_emitter=None,
-        file_context_enabled=True,
-        emit_source_events=False,
-    )
+    token = mod.AUTO_COMPACT_FILE_CONTEXT_INJECTION_ACTIVE.set(True)
+    try:
+        result = await mod._inject_target_file_context(
+            request=pipe_request,
+            user={"id": "user-1"},
+            body=body,
+            chat_id="chat-1",
+            current_message_id="message-1",
+            compaction_prefix_count=2,
+            metadata_files=metadata_files,
+            metadata_user_message={"files": [_file("current-file")]},
+            event_emitter=None,
+            file_context_enabled=True,
+            emit_source_events=False,
+        )
+        assert mod.AUTO_COMPACT_FILE_CONTEXT_INJECTION_ACTIVE.get() is True
+    finally:
+        mod.AUTO_COMPACT_FILE_CONTEXT_INJECTION_ACTIVE.reset(token)
 
     assert captured["handler_calls"] == 0
-    # Guard flag must be left untouched (caller owns it in this scenario).
-    assert mod._request_file_context_injection_active(pipe_request.state) is True
     # Pruning of absorbed prefix files still applied even when skipping RAG.
     retained = result["metadata"]["files"]
     assert [file["id"] for file in retained] == ["current-file"]
+
+
+@pytest.mark.asyncio
+async def test_inject_target_file_context_keeps_concurrent_sibling_tasks_independent(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    install_fake_open_webui_user_model(monkeypatch)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = []
+
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        return [{"id": current_message_id, "role": "user", "content": "active"}]
+
+    def classify_files_for_target(**kwargs):
+        return kwargs["metadata_files"]
+
+    async def chat_completion_files_handler(request, rag_body, extra_params, user):
+        calls.append(rag_body["model"])
+        if rag_body["model"] == "first":
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_started.set()
+        return rag_body, {"sources": []}
+
+    async def apply_source_context_to_messages(request, messages, sources, last_user_msg):
+        return messages
+
+    middleware_module = types.ModuleType("open_webui.utils.middleware")
+    middleware_module.chat_completion_files_handler = chat_completion_files_handler
+    middleware_module.apply_source_context_to_messages = apply_source_context_to_messages
+    misc_module = types.ModuleType("open_webui.utils.misc")
+    misc_module.get_last_user_message = lambda messages: ""
+    monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", misc_module)
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    monkeypatch.setattr(mod, "_classify_files_for_target", classify_files_for_target)
+
+    metadata_files = [_file("current-file")]
+
+    async def inject(model_id):
+        return await mod._inject_target_file_context(
+            request=pipe_request,
+            user=pipe_user,
+            body={
+                "model": model_id,
+                "messages": [{"role": "user", "content": "active"}],
+                "metadata": {"files": metadata_files},
+            },
+            chat_id="chat-1",
+            current_message_id=f"{model_id}-message",
+            compaction_prefix_count=0,
+            metadata_files=metadata_files,
+            metadata_user_message={"files": metadata_files},
+            event_emitter=None,
+            file_context_enabled=True,
+            emit_source_events=False,
+        )
+
+    first_task = asyncio.create_task(inject("first"))
+    second_task = None
+    task_results = []
+    try:
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        second_task = asyncio.create_task(inject("second"))
+        await asyncio.wait_for(second_started.wait(), timeout=1)
+    finally:
+        release_first.set()
+        task_results = await asyncio.gather(
+            *(task for task in (first_task, second_task) if task is not None),
+            return_exceptions=True,
+        )
+
+    assert calls == ["first", "second"]
+    assert not [result for result in task_results if isinstance(result, BaseException)]
 
 
 @pytest.mark.asyncio
@@ -9682,6 +10009,72 @@ async def test_pipe_forwards_custom_model_missing_base_to_core_fallback_default(
     assert captured["forward_model"] == "fallback-ollama"
     assert captured["base_model_id"] is None
     assert result["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.parametrize("fallback_is_preset", [False, True])
+@pytest.mark.asyncio
+async def test_pipe_rejects_runtime_own_wrapper_as_missing_base_fallback(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+    fallback_is_preset,
+):
+    install_unavailable_open_webui_config(monkeypatch)
+    own_wrapper_id = mod.build_wrapper_model_id("compact_alias", "fallback-target")
+    fallback_model_id = "own-wrapper-preset" if fallback_is_preset else own_wrapper_id
+    fallback_model = (
+        {
+            "id": fallback_model_id,
+            "name": "Own Wrapper Preset",
+            "owned_by": "openai",
+            "info": {"base_model_id": own_wrapper_id},
+        }
+        if fallback_is_preset
+        else {"id": own_wrapper_id, "name": "Own Wrapper", "owned_by": "openai"}
+    )
+    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS=fallback_model_id)
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": {
+            "id": "workspace-preset",
+            "name": "Workspace Preset",
+            "owned_by": "openai",
+            "preset": True,
+            "info": {"base_model_id": "stale-openai"},
+        },
+        fallback_model_id: fallback_model,
+    }
+
+    class FakeModels:
+        @staticmethod
+        async def get_model_by_id(model_id):
+            assert model_id == "workspace-preset"
+            return SimpleNamespace(id=model_id, base_model_id="stale-openai")
+
+    async def forward_target(**kwargs):
+        raise AssertionError("own wrapper fallback must be rejected before forwarding")
+
+    env_module = types.ModuleType("open_webui.env")
+    env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
+    models_module = types.ModuleType("open_webui.models.models")
+    models_module.Models = FakeModels
+    monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod.Pipe, "__module__", "function_compact_alias")
+
+    result = await mod.Pipe().pipe(
+        {
+            "model": mod.build_wrapper_model_id("compact_alias", "workspace-preset"),
+            "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result["error"]["code"] == "model_access_denied"
 
 
 @pytest.mark.asyncio
@@ -11247,6 +11640,14 @@ async def test_pipe_uses_runtime_registered_id_for_decode_and_checkpoint_scope(
     async def model_dict_from_request(request):
         return {"target": {"id": "target", "name": "Target"}}
 
+    async def resolve_core_chat_model_route(request, model_id, *, pipe_function_id):
+        captured["route_pipe_function_id"] = pipe_function_id
+        return mod.CoreChatModelRoute(model_id=model_id)
+
+    async def resolve_arena_chat_model_route_with_access(**kwargs):
+        captured["arena_pipe_function_id"] = kwargs["pipe_function_id"]
+        return kwargs["route"], None
+
     async def lookup_persisted_usage(chat_id, message_id):
         return {"total_tokens": 10, "input_tokens": 10, "output_tokens": 0}
 
@@ -11260,6 +11661,12 @@ async def test_pipe_uses_runtime_registered_id_for_decode_and_checkpoint_scope(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(
+        mod,
+        "_resolve_arena_chat_model_route_with_access",
+        resolve_arena_chat_model_route_with_access,
+    )
     monkeypatch.setattr(mod, "lookup_persisted_usage", lookup_persisted_usage)
     monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
@@ -11285,6 +11692,8 @@ async def test_pipe_uses_runtime_registered_id_for_decode_and_checkpoint_scope(
     assert result == {"ok": True}
     assert captured["access_pipe_function_id"] == "compact_alias"
     assert captured["validated_target"] == "target"
+    assert captured["route_pipe_function_id"] == "compact_alias"
+    assert captured["arena_pipe_function_id"] == "compact_alias"
     assert captured["checkpoint_pipe_function_id"] == "compact_alias"
     assert captured["forward_body"]["model"] == "target"
 
@@ -20584,7 +20993,7 @@ async def test_pipe_completed_turn_prefetch_does_not_lookup_or_estimate_before_r
     async def model_dict_from_request(request):
         return {"target": {"id": "target", "name": "Target"}}
 
-    async def resolve_core_chat_model_route(request, model_id):
+    async def resolve_core_chat_model_route(request, model_id, **kwargs):
         return mod.CoreChatModelRoute(model_id=model_id)
 
     async def lookup_persisted_usage(chat_id, message_id):
