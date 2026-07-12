@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.6.7
+version: 0.6.8
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -25,7 +25,7 @@ import time
 import uuid
 from contextlib import suppress
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from html.parser import HTMLParser
 from types import SimpleNamespace
@@ -67,6 +67,7 @@ except Exception:
 PIPE_FUNCTION_ID = "auto_compact"
 CHECKPOINT_NAMESPACE = "skyzi000.open_webui_extensions.auto_compaction_pipe"
 CHECKPOINT_GENERATION_LEASE_NAMESPACE = f"{CHECKPOINT_NAMESPACE}.generation_lease"
+USAGE_ANCHOR_NAMESPACE = f"{CHECKPOINT_NAMESPACE}.usage_anchor"
 CHECKPOINT_GENERATION_LEASE_SOURCE_HASH = "generation-lease"
 CHECKPOINT_SCHEMA_VERSION = 1
 CHECKPOINT_TABLE_NAME = "skyzi000_owui_ext_autocompact_checkpoint_v1"
@@ -78,7 +79,18 @@ CHECKPOINT_CLAIM_LEASE_SECONDS = 90
 CHECKPOINT_CLAIM_HEARTBEAT_SECONDS = 30
 CHECKPOINT_PENDING_POLL_SECONDS = 0.25
 CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS = 300.0
-TOKEN_ESTIMATOR_VERSION = "message-sanitized-media-json-v2"
+TOKEN_ESTIMATOR_VERSION = "message-sanitized-media-json-v3"
+USAGE_ANCHOR_FORMAT_VERSION = 1
+USAGE_ANCHOR_PROFILE_FAMILY = "provider-input-anchor-v1"
+USAGE_ANCHOR_SOURCE_FAMILY = "assistant-message-anchor-v1"
+USAGE_ANCHOR_FINGERPRINT_FAMILY = "provider-input-prefix-v1"
+USAGE_ANCHOR_SHAPING_PROFILE_FAMILY = "provider-shaping-profile-v1"
+USAGE_ANCHOR_SYSTEM_CLOCK_SENTINELS = (
+    ("{{CURRENT_DATE}}", "<auto-compact-current-date>"),
+    ("{{CURRENT_TIME}}", "<auto-compact-current-time>"),
+    ("{{CURRENT_DATETIME}}", "<auto-compact-current-datetime>"),
+    ("{{CURRENT_WEEKDAY}}", "<auto-compact-current-weekday>"),
+)
 MESSAGE_TOKEN_OVERHEAD = 4
 REQUEST_TOKEN_OVERHEAD = 3
 MESSAGE_TOKEN_ESTIMATE_CACHE_MAX_ENTRIES = 8192
@@ -324,6 +336,22 @@ class ReusableCheckpointMatch:
 
 
 @dataclass(frozen=True)
+class UsageAnchor:
+    assistant_message_id: str
+    input_tokens: int
+    stable_message_count: int
+    input_fingerprint: str
+    volatile_message_tokens: int
+
+
+@dataclass(frozen=True)
+class UsageAnchorInput:
+    stable_message_count: int
+    input_fingerprint: str
+    volatile_message_tokens: int
+
+
+@dataclass(frozen=True)
 class TaskPromptSpec:
     config_attr: str
     config_key: str
@@ -390,6 +418,10 @@ class CoreChatModelRoute:
     model_id: str
     fallback_model: dict[str, Any] | None = None
     target_params: dict[str, Any] | None = None
+    token_system_prompt: str | None = None
+    usage_anchor_shaping_hash: str | None = None
+    provider_model_id: str | None = None
+    usage_anchor_dropped_message_keys: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -678,7 +710,9 @@ _STABLE_MESSAGE_KEYS = {
     "function_call",
     "files",
     "sources",
+    "reasoning_content",
 }
+_TOKEN_MESSAGE_KEYS = _STABLE_MESSAGE_KEYS | {"reasoning_details", "thinking"}
 
 
 def _is_empty_canonical_value(value: Any) -> bool:
@@ -911,6 +945,20 @@ def canonicalize_message_for_source_hash(message: dict[str, Any]) -> dict[str, A
         if key in _TOP_LEVEL_MESSAGE_DROP_KEYS:
             continue
         if key not in _STABLE_MESSAGE_KEYS:
+            continue
+        value = _canonicalize_message_value(key, message[key])
+        if _is_empty_canonical_value(value):
+            continue
+        canonical[key] = value
+    canonical.setdefault("role", message.get("role", "assistant"))
+    canonical.setdefault("content", "")
+    return canonical
+
+
+def canonicalize_message_for_token_estimate(message: dict[str, Any]) -> dict[str, Any]:
+    canonical: dict[str, Any] = {}
+    for key in sorted(message.keys()):
+        if key in _TOP_LEVEL_MESSAGE_DROP_KEYS or key not in _TOKEN_MESSAGE_KEYS:
             continue
         value = _canonicalize_message_value(key, message[key])
         if _is_empty_canonical_value(value):
@@ -1725,7 +1773,7 @@ def _get_tiktoken_encoder(request: Any = None) -> tuple[Any | None, str | None]:
 
 
 def _message_token_cache_key(message: dict[str, Any], *, encoding_name: str) -> tuple[str, str, str]:
-    canonical = canonicalize_message_for_source_hash(message)
+    canonical = canonicalize_message_for_token_estimate(message)
     return (
         TOKEN_ESTIMATOR_VERSION,
         encoding_name,
@@ -1808,7 +1856,7 @@ def _sanitize_media_payloads_for_token_text(canonical: dict[str, Any]) -> int:
 
 
 def _message_token_image_count_and_text(message: dict[str, Any]) -> tuple[int, str]:
-    canonical = canonicalize_message_for_source_hash(message)
+    canonical = canonicalize_message_for_token_estimate(message)
     image_count = _sanitize_media_payloads_for_token_text(canonical)
     text = json.dumps(
         canonical,
@@ -2007,6 +2055,11 @@ def _body_token_extra_payload(body: dict[str, Any]) -> dict[str, Any]:
         if _is_empty_canonical_value(value):
             continue
         extra[key] = value
+    options = body.get("options")
+    if isinstance(options, dict) and "think" in options:
+        think = _canonicalize_general_value(options.get("think"))
+        if not _is_empty_canonical_value(think):
+            extra["think"] = think
     return extra
 
 
@@ -2161,6 +2214,212 @@ async def estimate_messages_tokens_async(
         encoder=encoder,
         encoding_name=encoding_name,
     )
+
+
+def _partition_usage_anchor_messages(
+    messages: Any,
+    transient_message_patterns: TransientMessagePatterns | _TransientMessageMatcher | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    if not isinstance(messages, list):
+        return None
+    mask = _transient_message_mask(messages, transient_message_patterns)
+    stable: list[dict[str, Any]] = []
+    volatile: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        if _is_source_identity_message(
+            message,
+            transient_message_patterns=transient_message_patterns,
+            transient_message_mask=mask,
+            index=index,
+        ):
+            stable.append(message)
+        else:
+            volatile.append(message)
+    return stable, volatile
+
+
+def _project_usage_anchor_token_body(
+    body: dict[str, Any],
+    *,
+    dropped_message_keys: frozenset[str],
+) -> dict[str, Any]:
+    if not dropped_message_keys:
+        return body
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not any(
+        isinstance(message, dict) and any(key in message for key in dropped_message_keys) for message in messages
+    ):
+        return body
+    projected = dict(body)
+    projected["messages"] = [
+        {key: value for key, value in message.items() if key not in dropped_message_keys}
+        if isinstance(message, dict) and dropped_message_keys & message.keys()
+        else message
+        for message in messages
+    ]
+    return projected
+
+
+async def _project_system_prompt_for_token_estimate(
+    body: dict[str, Any],
+    *,
+    user: Any,
+    system_prompt: str | None,
+) -> dict[str, Any]:
+    if not system_prompt:
+        return body
+    messages = body.get("messages")
+    projected = dict(body)
+    projected_messages = list(messages) if isinstance(messages, list) else []
+    if projected_messages and isinstance(projected_messages[0], dict) and _is_system_message(projected_messages[0]):
+        projected_messages[0] = copy.deepcopy(projected_messages[0])
+    projected["messages"] = projected_messages
+    from open_webui.utils.payload import apply_system_prompt_to_body
+
+    metadata = projected.get("metadata")
+    return await apply_system_prompt_to_body(
+        system_prompt,
+        projected,
+        metadata if isinstance(metadata, dict) else None,
+        coerce_open_webui_user(user),
+    )
+
+
+async def _estimate_provider_input_tokens_async(
+    body: dict[str, Any],
+    *,
+    request: Any,
+    user: Any,
+    system_prompt: str | None,
+    dropped_message_keys: frozenset[str] = frozenset(),
+) -> int | None:
+    token_body = _project_usage_anchor_token_body(
+        body,
+        dropped_message_keys=dropped_message_keys,
+    )
+    projected = await _project_system_prompt_for_token_estimate(
+        token_body,
+        user=user,
+        system_prompt=system_prompt,
+    )
+    return await estimate_body_tokens_async(projected, request=request)
+
+
+def _compute_usage_anchor_input_fingerprint(
+    body: dict[str, Any],
+    stable_messages: list[dict[str, Any]],
+    *,
+    usage_anchor_shaping_hash: str | None = None,
+    encoding_name: str | None = None,
+) -> str:
+    if encoding_name is None:
+        _, encoding_name = _get_tiktoken_encoder()
+    return _json_hash(
+        {
+            "family": USAGE_ANCHOR_FINGERPRINT_FAMILY,
+            "provider_shaping": usage_anchor_shaping_hash,
+            "token_estimator": {
+                "version": TOKEN_ESTIMATOR_VERSION,
+                "encoding": str(encoding_name or ""),
+            },
+            "model": str(body.get("model") or ""),
+            "messages": [canonicalize_message_for_token_estimate(message) for message in stable_messages],
+            "body_extra": _body_token_extra_payload(body),
+        }
+    )
+
+
+async def _estimate_message_token_sum_async(
+    messages: list[dict[str, Any]],
+    *,
+    request: Any,
+) -> int | None:
+    estimated = await estimate_messages_tokens_async(messages, request=request)
+    if estimated is None or estimated < REQUEST_TOKEN_OVERHEAD:
+        return None
+    return int(estimated) - REQUEST_TOKEN_OVERHEAD
+
+
+async def _build_usage_anchor_input(
+    *,
+    request: Any,
+    body: dict[str, Any],
+    usage_anchor_shaping_hash: str | None = None,
+    transient_message_patterns: TransientMessagePatterns | _TransientMessageMatcher | None = None,
+) -> UsageAnchorInput | None:
+    if not isinstance(body, dict) or body.get("previous_response_id"):
+        return None
+    await _refresh_tiktoken_encoding_config(request)
+    _, encoding_name = await asyncio.to_thread(_get_tiktoken_encoder, request)
+    partitioned = _partition_usage_anchor_messages(body.get("messages"), transient_message_patterns)
+    if partitioned is None:
+        return None
+    stable, volatile = partitioned
+    volatile_tokens = await _estimate_message_token_sum_async(volatile, request=request)
+    if volatile_tokens is None:
+        return None
+    fingerprint = await asyncio.to_thread(
+        _compute_usage_anchor_input_fingerprint,
+        body,
+        stable,
+        usage_anchor_shaping_hash=usage_anchor_shaping_hash,
+        encoding_name=encoding_name,
+    )
+    return UsageAnchorInput(
+        stable_message_count=len(stable),
+        input_fingerprint=fingerprint,
+        volatile_message_tokens=volatile_tokens,
+    )
+
+
+async def _estimate_body_tokens_from_usage_anchor(
+    *,
+    request: Any,
+    body: dict[str, Any],
+    anchor: UsageAnchor,
+    usage_anchor_shaping_hash: str | None = None,
+    transient_message_patterns: TransientMessagePatterns | _TransientMessageMatcher | None = None,
+) -> int | None:
+    if body.get("previous_response_id"):
+        LOG.debug("Auto-compaction usage anchor miss: previous_response_id")
+        return None
+    await _refresh_tiktoken_encoding_config(request)
+    _, encoding_name = await asyncio.to_thread(_get_tiktoken_encoder, request)
+    partitioned = _partition_usage_anchor_messages(body.get("messages"), transient_message_patterns)
+    if partitioned is None:
+        LOG.debug("Auto-compaction usage anchor miss: invalid_messages")
+        return None
+    stable, volatile = partitioned
+    if len(stable) < anchor.stable_message_count:
+        LOG.debug("Auto-compaction usage anchor miss: shorter_prefix")
+        return None
+    prefix = stable[: anchor.stable_message_count]
+    fingerprint = await asyncio.to_thread(
+        _compute_usage_anchor_input_fingerprint,
+        body,
+        prefix,
+        usage_anchor_shaping_hash=usage_anchor_shaping_hash,
+        encoding_name=encoding_name,
+    )
+    if fingerprint != anchor.input_fingerprint:
+        LOG.debug("Auto-compaction usage anchor miss: prefix_mismatch")
+        return None
+    base_tokens = anchor.input_tokens - anchor.volatile_message_tokens
+    if base_tokens < 0:
+        LOG.debug("Auto-compaction usage anchor miss: invalid_measurement")
+        return None
+    current_volatile_tokens = await _estimate_message_token_sum_async(volatile, request=request)
+    suffix_tokens = await _estimate_message_token_sum_async(
+        stable[anchor.stable_message_count :],
+        request=request,
+    )
+    if current_volatile_tokens is None or suffix_tokens is None:
+        LOG.debug("Auto-compaction usage anchor miss: estimate_unavailable")
+        return None
+    LOG.debug("Auto-compaction usage anchor hit")
+    return base_tokens + current_volatile_tokens + suffix_tokens
 
 
 async def _estimate_rendered_summary_message_tokens(
@@ -3328,6 +3587,75 @@ def build_checkpoint_row(
     }
 
 
+def _usage_anchor_profile_hash() -> str:
+    return _json_hash({"family": USAGE_ANCHOR_PROFILE_FAMILY, "format_version": USAGE_ANCHOR_FORMAT_VERSION})
+
+
+def _usage_anchor_source_hash(assistant_message_id: str) -> str:
+    return _json_hash({"family": USAGE_ANCHOR_SOURCE_FAMILY, "assistant_message_id": assistant_message_id})
+
+
+def build_usage_anchor_row(
+    *,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    assistant_message_id: str,
+    input_tokens: int,
+    anchor_input: UsageAnchorInput,
+) -> dict[str, Any]:
+    return build_checkpoint_row(
+        namespace=USAGE_ANCHOR_NAMESPACE,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        profile_hash=_usage_anchor_profile_hash(),
+        source_hash=_usage_anchor_source_hash(assistant_message_id),
+        source_message_count=anchor_input.stable_message_count,
+        summary_text="",
+        summary_meta={
+            "format_version": USAGE_ANCHOR_FORMAT_VERSION,
+            "assistant_message_id": assistant_message_id,
+            "input_tokens": input_tokens,
+            "input_fingerprint": anchor_input.input_fingerprint,
+            "volatile_message_tokens": anchor_input.volatile_message_tokens,
+        },
+        summary_token_count=None,
+        parent_checkpoint_id=None,
+    )
+
+
+def usage_anchor_from_row(row: dict[str, Any] | None) -> UsageAnchor | None:
+    if not isinstance(row, dict) or row.get("namespace") != USAGE_ANCHOR_NAMESPACE:
+        return None
+    meta = row.get("summary_meta")
+    if not isinstance(meta, dict) or meta.get("format_version") != USAGE_ANCHOR_FORMAT_VERSION:
+        return None
+    assistant_message_id = meta.get("assistant_message_id")
+    input_fingerprint = meta.get("input_fingerprint")
+    input_tokens = meta.get("input_tokens")
+    stable_message_count = row.get("source_message_count")
+    volatile_message_tokens = meta.get("volatile_message_tokens")
+    numeric_values = (input_tokens, stable_message_count, volatile_message_tokens)
+    if (
+        not isinstance(assistant_message_id, str)
+        or not assistant_message_id
+        or not isinstance(input_fingerprint, str)
+        or not input_fingerprint
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in numeric_values)
+    ):
+        return None
+    if input_tokens <= 0 or input_tokens < volatile_message_tokens:
+        return None
+    return UsageAnchor(
+        assistant_message_id=assistant_message_id,
+        input_tokens=input_tokens,
+        stable_message_count=stable_message_count,
+        input_fingerprint=input_fingerprint,
+        volatile_message_tokens=volatile_message_tokens,
+    )
+
+
 def select_longest_matching_checkpoint(
     rows: Iterable[dict[str, Any]],
     source_messages: list[dict[str, Any]],
@@ -3666,6 +3994,38 @@ class CheckpointStore:
                 await db.rollback()
                 return False
 
+    async def upsert_ready(self, row: dict[str, Any]) -> None:
+        update_values = {key: value for key, value in row.items() if key not in {"id", "created_at"}}
+        async with await self._context() as db:
+            try:
+                result = await db.execute(
+                    update(CHECKPOINT_TABLE)
+                    .where(CHECKPOINT_TABLE.c.id == row["id"])
+                    .values(**update_values)
+                )
+                if (result.rowcount or 0) == 1:
+                    await db.commit()
+                    return
+                await db.rollback()
+                try:
+                    await db.execute(insert(CHECKPOINT_TABLE).values(**row))
+                    await db.commit()
+                    return
+                except IntegrityError:
+                    await db.rollback()
+                result = await db.execute(
+                    update(CHECKPOINT_TABLE)
+                    .where(CHECKPOINT_TABLE.c.id == row["id"])
+                    .values(**update_values)
+                )
+                if (result.rowcount or 0) != 1:
+                    await db.rollback()
+                    raise RuntimeError("Usage anchor upsert lost its conflicting row")
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
     async def reclaim_pending(
         self,
         checkpoint_id: str,
@@ -3816,6 +4176,91 @@ class CheckpointStore:
             except Exception:
                 await db.rollback()
                 return False
+
+
+async def lookup_usage_anchor(
+    *,
+    request: Any,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    assistant_message_id: str,
+) -> UsageAnchor | None:
+    if not user_id or not assistant_message_id or not _chat_id_supported(chat_id):
+        return None
+    await ensure_checkpoint_table_initialized(request=request)
+    row = await CheckpointStore().lookup_ready(
+        namespace=USAGE_ANCHOR_NAMESPACE,
+        user_id=user_id,
+        chat_id=chat_id,
+        pipe_function_id=pipe_function_id,
+        profile_hash=_usage_anchor_profile_hash(),
+        source_hash=_usage_anchor_source_hash(assistant_message_id),
+    )
+    anchor = usage_anchor_from_row(row)
+    if anchor is None or anchor.assistant_message_id != assistant_message_id:
+        LOG.debug("Auto-compaction usage anchor miss: not_found_or_invalid")
+        return None
+    return anchor
+
+
+async def persist_usage_anchor(
+    *,
+    request: Any,
+    user_id: str,
+    chat_id: str,
+    pipe_function_id: str,
+    assistant_message_id: str,
+    anchor_input: UsageAnchorInput | None,
+    raw_usage: dict[str, Any] | None,
+) -> bool:
+    if anchor_input is None or not user_id or not assistant_message_id or not _chat_id_supported(chat_id):
+        return False
+    input_tokens = _strict_usage_input_tokens(raw_usage)
+    if input_tokens is None:
+        LOG.debug("Auto-compaction usage anchor not persisted: unsupported_usage_shape")
+        return False
+    if input_tokens < anchor_input.volatile_message_tokens:
+        LOG.debug("Auto-compaction usage anchor not persisted: inconsistent_input_measurement")
+        return False
+    await ensure_checkpoint_table_initialized(request=request)
+    await CheckpointStore().upsert_ready(
+        build_usage_anchor_row(
+            user_id=user_id,
+            chat_id=chat_id,
+            pipe_function_id=pipe_function_id,
+            assistant_message_id=assistant_message_id,
+            input_tokens=input_tokens,
+            anchor_input=anchor_input,
+        )
+    )
+    return True
+
+
+async def _usage_anchor_parent_assistant_message_id(
+    *,
+    metadata: dict[str, Any],
+    chat_id: str,
+) -> str | None:
+    continued_assistant_id = metadata.get("assistant_message_id")
+    if isinstance(continued_assistant_id, str) and continued_assistant_id:
+        return continued_assistant_id
+    user_message = metadata.get("user_message")
+    if isinstance(user_message, dict):
+        parent_id = user_message.get("parentId")
+        if isinstance(parent_id, str) and parent_id:
+            return parent_id
+    user_message_id = metadata.get("user_message_id")
+    if not _chat_id_supported(chat_id) or not isinstance(user_message_id, str) or not user_message_id:
+        return None
+    try:
+        from open_webui.models.chats import Chats
+
+        stored = await Chats.get_message_by_id_and_message_id(chat_id, user_message_id)
+    except Exception:
+        return None
+    parent_id = stored.get("parentId") if isinstance(stored, dict) else None
+    return parent_id if isinstance(parent_id, str) and parent_id else None
 
 
 def _split_patterns(text: str) -> list[str]:
@@ -4006,6 +4451,8 @@ def _resolve_arena_chat_model_route(
             model_id=selected_model_id,
             fallback_model=fallback_model,
             target_params=route.target_params,
+            usage_anchor_shaping_hash=route.usage_anchor_shaping_hash,
+            provider_model_id=selected_model_id,
         ),
         selected_model_id,
     )
@@ -5318,17 +5765,95 @@ def _normalize_usage(usage: dict[str, Any]) -> dict[str, Any]:
         return result
 
 
-def extract_usage_from_stream_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+def _raw_usage_from_stream_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
-    usage = payload.get("usage")
-    if not usage and isinstance(payload.get("response"), dict):
-        usage = payload["response"].get("usage")
-    if not usage and isinstance(payload.get("data"), dict):
-        usage = payload["data"].get("usage")
-    if isinstance(usage, dict) and usage:
-        return _normalize_usage(usage)
+    raw_usage: dict[str, Any] = {}
+    containers = [
+        payload.get("message"),
+        payload.get("response"),
+        payload.get("data"),
+        payload,
+    ]
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        usage = container.get("usage")
+        if isinstance(usage, dict):
+            raw_usage = _merge_usage_fields(raw_usage, usage)
+    # llama.cpp emits token counters in a top-level `timings` object. Match
+    # Core's raw extraction, but keep the fields unnormalized so prompt_n can
+    # never masquerade as a complete input count without cache_n.
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        timings = container.get("timings")
+        if isinstance(timings, dict):
+            raw_usage = _merge_usage_fields(raw_usage, timings)
+    return raw_usage or None
+
+
+def extract_usage_from_stream_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    usage = _raw_usage_from_stream_payload(payload)
+    return _normalize_usage(usage) if usage else None
+
+
+def _strict_usage_token_value(usage: dict[str, Any], key: str) -> int | None:
+    if key not in usage:
+        return None
+    value = usage.get(key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or int(value) != value
+    ):
+        return None
+    value = int(value)
+    return value if value >= 0 else None
+
+
+def _strict_usage_input_tokens(usage: dict[str, Any] | None) -> int | None:
+    if not isinstance(usage, dict) or not usage:
+        return None
+
+    def positive(value: int | None) -> int | None:
+        return value if value is not None and value > 0 else None
+
+    if "prompt_tokens" in usage:
+        return positive(_strict_usage_token_value(usage, "prompt_tokens"))
+
+    if "prompt_eval_count" in usage:
+        return positive(_strict_usage_token_value(usage, "prompt_eval_count"))
+
+    if "prompt_n" in usage:
+        prompt_n = _strict_usage_token_value(usage, "prompt_n")
+        cache_n = _strict_usage_token_value(usage, "cache_n")
+        if prompt_n is None or cache_n is None:
+            return None
+        return positive(prompt_n + cache_n)
+
+    if "input_tokens" in usage:
+        input_tokens = _strict_usage_token_value(usage, "input_tokens")
+        if input_tokens is None:
+            return None
+        cache_creation = _strict_usage_token_value(usage, "cache_creation_input_tokens")
+        cache_read = _strict_usage_token_value(usage, "cache_read_input_tokens")
+        if "cache_creation_input_tokens" in usage and cache_creation is None:
+            return None
+        if "cache_read_input_tokens" in usage and cache_read is None:
+            return None
+        return positive(input_tokens + (cache_creation or 0) + (cache_read or 0))
     return None
+
+
+def _merge_usage_fields(current: dict[str, Any] | None, incoming: dict[str, Any] | None) -> dict[str, Any]:
+    merged = dict(current or {})
+    if isinstance(incoming, dict):
+        for key, value in incoming.items():
+            if value is not None:
+                merged[key] = copy.deepcopy(value)
+    return merged
 
 
 def usage_state_key(chat_id: str | None, message_id: str | None, wrapper_model_id: str | None) -> str:
@@ -5338,6 +5863,14 @@ def usage_state_key(chat_id: str | None, message_id: str | None, wrapper_model_i
     return f"_auto_compact_usage_{digest}"
 
 
+def usage_anchor_input_state_key(
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str | None,
+) -> str:
+    return f"{usage_state_key(chat_id, message_id, wrapper_model_id)}_anchor_input"
+
+
 def store_request_scoped_usage(
     *,
     request: Any,
@@ -5345,11 +5878,36 @@ def store_request_scoped_usage(
     message_id: str | None,
     wrapper_model_id: str | None,
     usage: dict[str, Any],
+    anchor_input: UsageAnchorInput | None = None,
 ) -> None:
     state = getattr(request, "state", None)
     if state is None:
         return
-    setattr(state, usage_state_key(chat_id, message_id, wrapper_model_id), _normalize_usage(usage))
+    key = usage_state_key(chat_id, message_id, wrapper_model_id)
+    current = getattr(state, key, None)
+    setattr(state, key, _merge_usage_fields(current if isinstance(current, dict) else None, usage))
+    anchor_key = usage_anchor_input_state_key(chat_id, message_id, wrapper_model_id)
+    if anchor_input is not None:
+        setattr(state, anchor_key, anchor_input)
+    else:
+        with suppress(Exception):
+            delattr(state, anchor_key)
+
+
+def clear_request_scoped_usage(
+    *,
+    request: Any,
+    chat_id: str | None,
+    message_id: str | None,
+    wrapper_model_id: str | None,
+) -> None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    with suppress(Exception):
+        delattr(state, usage_state_key(chat_id, message_id, wrapper_model_id))
+    with suppress(Exception):
+        delattr(state, usage_anchor_input_state_key(chat_id, message_id, wrapper_model_id))
 
 
 def get_request_scoped_usage(
@@ -5364,54 +5922,38 @@ def get_request_scoped_usage(
         return None
     usage = getattr(state, usage_state_key(chat_id, message_id, wrapper_model_id), None)
     if isinstance(usage, dict) and usage:
-        return _normalize_usage(usage)
+        return _normalize_usage(dict(usage))
     return None
 
 
-def choose_usage_signal(
+def get_request_scoped_usage_anchor(
     *,
     request: Any,
     chat_id: str | None,
     message_id: str | None,
     wrapper_model_id: str | None,
-    persisted_usage: dict[str, Any] | None,
-    messages: list[dict[str, Any]] | None,
-) -> dict[str, Any] | None:
-    usage = get_request_scoped_usage(
-        request=request,
-        chat_id=chat_id,
-        message_id=message_id,
-        wrapper_model_id=wrapper_model_id,
+) -> UsageAnchor | None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    raw_usage = getattr(state, usage_state_key(chat_id, message_id, wrapper_model_id), None)
+    anchor_input = getattr(
+        state,
+        usage_anchor_input_state_key(chat_id, message_id, wrapper_model_id),
+        None,
     )
-    if usage:
-        return usage
-    if isinstance(persisted_usage, dict) and persisted_usage:
-        return _normalize_usage(persisted_usage)
-    return None
-
-
-async def lookup_persisted_usage(chat_id: str | None, message_id: str | None) -> dict[str, Any] | None:
-    if not chat_id:
+    if not isinstance(raw_usage, dict) or not isinstance(anchor_input, UsageAnchorInput):
         return None
-    try:
-        from open_webui.models.chats import Chats
-        from open_webui.utils.misc import get_message_list
-
-        messages_map = await Chats.get_messages_map_by_chat_id(chat_id)
-        if not isinstance(messages_map, dict) or not messages_map:
-            return None
-        branch: list[dict[str, Any]]
-        if message_id and message_id in messages_map:
-            branch = get_message_list(messages_map, message_id)
-        else:
-            branch = list(messages_map.values())
-        for message in reversed(branch):
-            usage = message.get("usage") or (message.get("info") or {}).get("usage")
-            if isinstance(usage, dict) and usage:
-                return _normalize_usage(usage)
-    except Exception:
+    input_tokens = _strict_usage_input_tokens(raw_usage)
+    if input_tokens is None or input_tokens < anchor_input.volatile_message_tokens:
         return None
-    return None
+    return UsageAnchor(
+        assistant_message_id="request",
+        input_tokens=input_tokens,
+        stable_message_count=anchor_input.stable_message_count,
+        input_fingerprint=anchor_input.input_fingerprint,
+        volatile_message_tokens=anchor_input.volatile_message_tokens,
+    )
 
 
 _METADATA_VALUE_DROPPED = object()
@@ -5686,14 +6228,14 @@ def _sse_data_chunk(data: str) -> str:
 
 def _immediate_response_is_error(response: Any) -> bool:
     if isinstance(response, dict):
-        return bool(response.get("error"))
+        return _stream_payload_error_source(response) is not None
     if isinstance(response, (JSONResponse, PlainTextResponse)):
         status_code = getattr(response, "status_code", None)
         if isinstance(status_code, int) and status_code >= 400:
             return True
         parsed = _json_from_response(response)
         if isinstance(parsed, dict):
-            return bool(parsed.get("error"))
+            return _stream_payload_error_source(parsed) is not None
         if isinstance(parsed, list):
             return False
         return isinstance(response, PlainTextResponse)
@@ -6054,11 +6596,6 @@ def _sse_values_include_unstructured_output(values: Iterable[str]) -> bool:
     return any(value != "" for value in values)
 
 
-def _request_bypass_system_prompt(request: Any) -> bool:
-    state = getattr(request, "state", None)
-    return bool(getattr(state, "bypass_system_prompt", False))
-
-
 def _iter_request_state_items(state: Any) -> Iterable[tuple[str, Any]]:
     if state is None:
         return ()
@@ -6169,15 +6706,6 @@ async def prepare_streaming_response(
                 if payload is None:
                     can_retry_context_error = False
                     continue
-                usage = extract_usage_from_stream_payload(payload)
-                if usage:
-                    store_request_scoped_usage(
-                        request=request,
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        wrapper_model_id=wrapper_model_id,
-                        usage=usage,
-                    )
                 if can_retry_context_error:
                     error_source = _stream_payload_error_source(payload)
                     if error_source is not None and is_retryable_context_error(error_source, status_code=400):
@@ -6204,15 +6732,6 @@ async def prepare_streaming_response(
     except StopAsyncIteration:
         events = sse_parser.flush()
         for payload in events:
-            usage = extract_usage_from_stream_payload(payload)
-            if usage:
-                store_request_scoped_usage(
-                    request=request,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    wrapper_model_id=wrapper_model_id,
-                    usage=usage,
-                )
             if can_retry_context_error:
                 error_source = _stream_payload_error_source(payload)
                 if error_source is not None and is_retryable_context_error(error_source, status_code=400):
@@ -6241,30 +6760,7 @@ async def prepare_streaming_response(
 
             async for raw_chunk in iterator:
                 chunk = _coerce_stream_chunk(raw_chunk)
-                if is_sse_response:
-                    events = sse_parser.feed(chunk)
-                    for payload in events:
-                        usage = extract_usage_from_stream_payload(payload)
-                        if usage:
-                            store_request_scoped_usage(
-                                request=request,
-                                chat_id=chat_id,
-                                message_id=message_id,
-                                wrapper_model_id=wrapper_model_id,
-                                usage=usage,
-                            )
                 yield chunk
-            if is_sse_response:
-                for payload in sse_parser.flush():
-                    usage = extract_usage_from_stream_payload(payload)
-                    if usage:
-                        store_request_scoped_usage(
-                            request=request,
-                            chat_id=chat_id,
-                            message_id=message_id,
-                            wrapper_model_id=wrapper_model_id,
-                            usage=usage,
-                        )
         finally:
             if restore:
                 restore()
@@ -6292,6 +6788,32 @@ def _chat_id_supported(chat_id: str | None) -> bool:
 def _usage_total(usage: dict[str, Any] | None) -> int | None:
     if not usage:
         return None
+    input_tokens = _strict_usage_input_tokens(usage)
+    output_tokens = None
+    output_present = False
+    for key in ("output_tokens", "completion_tokens", "eval_count", "predicted_n"):
+        if key not in usage:
+            continue
+        output_present = True
+        output_tokens = _strict_usage_token_value(usage, key)
+        if output_tokens is None:
+            return None
+        break
+    if input_tokens is not None and output_present:
+        return input_tokens + (output_tokens or 0)
+    cache_sensitive_input = any(
+        key in usage
+        for key in (
+            "prompt_n",
+            "cache_n",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+    )
+    if cache_sensitive_input:
+        if input_tokens is None:
+            return None
+        return input_tokens + (output_tokens or 0)
     total = usage.get("total_tokens")
     if isinstance(total, bool):
         return None
@@ -6302,100 +6824,6 @@ def _usage_total(usage: dict[str, Any] | None) -> int | None:
     if isinstance(input_tokens, (int, float)) and isinstance(output_tokens, (int, float)):
         return int(input_tokens + output_tokens)
     return None
-
-
-_USAGE_ANCHOR_SOURCE = Literal["request", "persisted"]
-
-
-def _latest_user_usage_anchor_delta(
-    messages: Any,
-    transient_message_patterns: TransientMessagePatterns | None = None,
-) -> list[dict[str, Any]] | None:
-    if not isinstance(messages, list) or not messages:
-        return None
-    mask = _transient_message_mask(messages, transient_message_patterns)
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if (
-            isinstance(message, dict)
-            and message.get("role") == "user"
-            and _is_source_identity_message(
-                message,
-                transient_message_patterns=transient_message_patterns,
-                transient_message_mask=mask,
-                index=index,
-            )
-        ):
-            return [copy.deepcopy(message)]
-    return None
-
-
-def _trailing_tool_usage_anchor_delta(messages: Any) -> list[dict[str, Any]] | None:
-    if not isinstance(messages, list) or not messages:
-        return None
-    trailing_tools: list[dict[str, Any]] = []
-    index = len(messages) - 1
-    while index >= 0:
-        message = messages[index]
-        if not isinstance(message, dict) or message.get("role") != "tool":
-            break
-        trailing_tools.append(copy.deepcopy(message))
-        index -= 1
-    if not trailing_tools or index < 0:
-        return None
-    anchor = messages[index]
-    if not isinstance(anchor, dict) or anchor.get("role") != "assistant":
-        return None
-    tool_call_ids = _tool_call_ids(anchor)
-    if not tool_call_ids:
-        return None
-    trailing_tools.reverse()
-    if any(message.get("tool_call_id") not in tool_call_ids for message in trailing_tools):
-        return None
-    return trailing_tools
-
-
-def _usage_anchor_delta_for_source(
-    messages: Any,
-    usage_source: _USAGE_ANCHOR_SOURCE | None,
-    transient_message_patterns: TransientMessagePatterns | None = None,
-) -> list[dict[str, Any]] | None:
-    if usage_source == "request":
-        return _trailing_tool_usage_anchor_delta(messages)
-    if usage_source == "persisted":
-        return _latest_user_usage_anchor_delta(
-            messages,
-            transient_message_patterns=transient_message_patterns,
-        ) or _trailing_tool_usage_anchor_delta(messages)
-    return None
-
-
-async def _estimate_next_input_tokens_from_usage_anchor(
-    *,
-    request: Any,
-    last_observed_total_tokens: int | None,
-    body: dict[str, Any],
-    usage_source: _USAGE_ANCHOR_SOURCE | None,
-    transient_message_patterns: TransientMessagePatterns | None = None,
-) -> int | None:
-    if last_observed_total_tokens is None or not isinstance(body, dict):
-        return None
-    delta_messages = _usage_anchor_delta_for_source(
-        body.get("messages"),
-        usage_source,
-        transient_message_patterns=transient_message_patterns,
-    )
-    if delta_messages is None:
-        return None
-    delta_tokens = await estimate_messages_tokens_async(delta_messages, request=request)
-    if delta_tokens is None:
-        return None
-    # Do not add current body extras here. Provider-reported usage for the
-    # anchor request already counted that request's tool/function/response
-    # schemas, and those extras are usually stable across adjacent turns. Adding
-    # the full current payload again would double-count large stable tool
-    # schemas and trigger avoidable prefetch/foreground compaction.
-    return int(last_observed_total_tokens) + int(delta_tokens)
 
 
 def _context_exhaustion_error_response(
@@ -7087,6 +7515,11 @@ def _stream_payload_has_tool_call(payload: dict[str, Any]) -> bool:
     item = payload.get("item")
     if isinstance(item, dict) and item.get("type") in {"function_call", "tool_call"}:
         return True
+    if _responses_output_has_tool_call(payload):
+        return True
+    nested_response = payload.get("response")
+    if isinstance(nested_response, dict) and _responses_output_has_tool_call(nested_response):
+        return True
     choices = payload.get("choices")
     return isinstance(choices, list) and any(_choice_has_tool_call(choice) for choice in choices)
 
@@ -7153,6 +7586,9 @@ def _stream_payload_text(payload: dict[str, Any]) -> str | None:
         delta = payload.get("delta")
         if isinstance(delta, str):
             return delta
+    delta = payload.get("delta")
+    if isinstance(delta, dict) and delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+        return delta["text"]
     return None
 
 
@@ -7160,12 +7596,17 @@ def _observe_streaming_completion_payload(payload: dict[str, Any], state: dict[s
     if _stream_payload_error_source(payload) is not None:
         state["saw_error"] = True
         return
-    usage = extract_usage_from_stream_payload(payload)
-    if usage:
-        state["usage"] = usage
+    raw_usage = _raw_usage_from_stream_payload(payload)
+    if raw_usage:
+        state["raw_usage"] = _merge_usage_fields(state.get("raw_usage"), raw_usage)
     if _stream_payload_has_tool_call(payload):
         state["saw_tool_call"] = True
     text = _stream_payload_text(payload)
+    if text is None and not state.get("parts"):
+        text = _responses_output_text(payload)
+        nested_response = payload.get("response")
+        if text is None and isinstance(nested_response, dict):
+            text = _responses_output_text(nested_response)
     if text:
         state.setdefault("parts", []).append(text)
 
@@ -7174,9 +7615,19 @@ async def _streaming_completion_observer(
     iterator: AsyncIterator[bytes | str],
     *,
     media_type: str,
-    on_complete: Callable[[dict[str, Any]], Any],
+    request: Any = None,
+    chat_id: str | None = None,
+    message_id: str | None = None,
+    wrapper_model_id: str | None = None,
+    anchor_input: UsageAnchorInput | None = None,
+    on_complete: Callable[[dict[str, Any]], Any] | None = None,
 ) -> AsyncIterator[bytes | str]:
-    state: dict[str, Any] = {"parts": [], "usage": None, "saw_tool_call": False, "saw_error": False}
+    state: dict[str, Any] = {
+        "parts": [],
+        "raw_usage": None,
+        "saw_tool_call": False,
+        "saw_error": False,
+    }
     is_sse_response = "text/event-stream" in (media_type or "").lower()
     parser = _SSEJSONEventParser() if is_sse_response else None
     try:
@@ -7192,18 +7643,34 @@ async def _streaming_completion_observer(
         if is_sse_response and parser is not None:
             for payload in parser.flush():
                 _observe_streaming_completion_payload(payload, state)
-        if state.get("saw_tool_call") or state.get("saw_error"):
+        if state.get("saw_error"):
+            return
+        raw_usage = state.get("raw_usage")
+        if isinstance(raw_usage, dict) and raw_usage:
+            store_request_scoped_usage(
+                request=request,
+                chat_id=chat_id,
+                message_id=message_id,
+                wrapper_model_id=wrapper_model_id,
+                usage=raw_usage,
+                anchor_input=anchor_input,
+            )
+        if state.get("saw_tool_call") or on_complete is None:
             return
         content = "".join(state.get("parts") or [])
-        if not content:
+        if not content and not raw_usage:
             return
+        assistant_message = {"role": "assistant", "content": content}
         with suppress(Exception):
-            on_complete(
+            result = on_complete(
                 {
-                    "assistant_message": {"role": "assistant", "content": content},
-                    "usage": state.get("usage"),
+                    "assistant_message": assistant_message,
+                    "usage": _normalize_usage(raw_usage) if raw_usage else None,
+                    "raw_usage": raw_usage,
                 }
             )
+            if inspect.isawaitable(result):
+                await result
     finally:
         aclose = getattr(iterator, "aclose", None)
         if callable(aclose):
@@ -7213,12 +7680,23 @@ async def _streaming_completion_observer(
 
 def _attach_streaming_completion_observer(
     response: StreamingResponse,
-    on_complete: Callable[[dict[str, Any]], Any],
+    on_complete: Callable[[dict[str, Any]], Any] | None = None,
+    *,
+    request: Any = None,
+    chat_id: str | None = None,
+    message_id: str | None = None,
+    wrapper_model_id: str | None = None,
+    anchor_input: UsageAnchorInput | None = None,
 ) -> StreamingResponse:
     media_type = response.headers.get("content-type", getattr(response, "media_type", "") or "")
     response.body_iterator = _streaming_completion_observer(
         response.body_iterator,
         media_type=media_type,
+        request=request,
+        chat_id=chat_id,
+        message_id=message_id,
+        wrapper_model_id=wrapper_model_id,
+        anchor_input=anchor_input,
         on_complete=on_complete,
     )
     return response
@@ -7240,7 +7718,7 @@ def _stream_payload_is_known_transport_event(payload: dict[str, Any]) -> bool:
 
 
 def _stream_payload_error_source(payload: dict[str, Any]) -> Any | None:
-    if payload.get("error") is not None:
+    if payload.get("error"):
         return payload
     payload_type = payload.get("type")
     if payload_type == "error":
@@ -7642,11 +8120,10 @@ async def _generate_summary_text(
 ) -> str:
     summary_metadata = build_summary_task_metadata(metadata)
     summary_metadata.pop("files", None)
-    bypass_system_prompt = _request_bypass_system_prompt(request)
     inner_request = RequestStateProxy(
         request,
         bypass_filter=True,
-        bypass_system_prompt=bypass_system_prompt,
+        bypass_system_prompt=False,
         metadata=summary_metadata,
     )
     from open_webui.utils.chat import generate_chat_completion
@@ -7694,6 +8171,11 @@ async def _generate_summary_text(
         models=models,
         route=route,
     )
+    retry_body = (
+        _copy_body_preserving_metadata(body)
+        if summary_tool_policy == "fallback_on_tool_call" and (body.get("tools") or body.get("functions"))
+        else None
+    )
     await _ensure_model_in_request_models(inner_request, str(body.get("model") or ""))
     if on_summary_start is not None:
         await on_summary_start()
@@ -7702,23 +8184,22 @@ async def _generate_summary_text(
         body,
         user=coerce_open_webui_user(user),
         bypass_filter=True,
-        bypass_system_prompt=bypass_system_prompt,
+        bypass_system_prompt=False,
     )
     if is_retryable_context_error(response, status_code=400):
         raise RetryableContextOverflow("Summary model reported a context-window error")
     try:
         return await extract_text_from_completion_response(response, tools_enabled=bool(body.get("tools")))
     except SummaryToolCallError:
-        if summary_tool_policy != "fallback_on_tool_call" or (not body.get("tools") and not body.get("functions")):
+        if retry_body is None:
             raise
-        retry_body = copy.deepcopy(body)
         strip_summary_tools_for_retry(retry_body)
         response = await generate_chat_completion(
             inner_request,
             retry_body,
             user=coerce_open_webui_user(user),
             bypass_filter=True,
-            bypass_system_prompt=bypass_system_prompt,
+            bypass_system_prompt=False,
         )
         if is_retryable_context_error(response, status_code=400):
             raise RetryableContextOverflow("Summary model reported a context-window error")
@@ -8643,6 +9124,8 @@ async def _prefetch_compaction_checkpoint(
     task_estimate_body: dict[str, Any] | None = None,
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    token_system_prompt: str | None = None,
+    dropped_message_keys: frozenset[str] = frozenset(),
 ) -> bool:
     if not source_messages:
         return False
@@ -8735,6 +9218,8 @@ async def _prefetch_compaction_checkpoint(
                 historical_message_excerpt_count=historical_message_excerpt_count,
                 file_context_enabled=file_context_enabled,
                 transient_message_patterns=transient_message_patterns,
+                token_system_prompt=token_system_prompt,
+                dropped_message_keys=dropped_message_keys,
             )
         if task_metadata_body is not None:
             return None
@@ -8749,6 +9234,8 @@ async def _prefetch_compaction_checkpoint(
             historical_message_excerpt_count=historical_message_excerpt_count,
             file_context_enabled=file_context_enabled,
             transient_message_patterns=transient_message_patterns,
+            token_system_prompt=token_system_prompt,
+            dropped_message_keys=dropped_message_keys,
         )
 
     reusable_checkpoint_match = await _body_reusable_checkpoint_match(
@@ -8822,7 +9309,13 @@ async def _prefetch_compaction_checkpoint(
                         user_id,
                         chat_id,
                     )
-                    estimated = await estimate_body_tokens_async(body, request=request)
+                    estimated = await _estimate_provider_input_tokens_async(
+                        body,
+                        request=request,
+                        user=user,
+                        system_prompt=token_system_prompt,
+                        dropped_message_keys=dropped_message_keys,
+                    )
                 usage_src = "estimate" if estimated is not None else None
             prefetch_display_context = _build_display_token_context(
                 estimated_total_tokens=estimated,
@@ -8979,6 +9472,8 @@ def _prepare_soft_compaction_prefetch(
     task_estimate_body: dict[str, Any] | None = None,
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    token_system_prompt: str | None = None,
+    dropped_message_keys: frozenset[str] = frozenset(),
 ) -> _PreparedSoftPrefetch | None:
     prefetch_source = _soft_prefetch_source_messages(
         body,
@@ -9047,6 +9542,8 @@ def _prepare_soft_compaction_prefetch(
             task_estimate_body=prefetch_task_estimate_body,
             summary_prompt=summary_prompt,
             transient_message_patterns=transient_message_patterns,
+            token_system_prompt=token_system_prompt,
+            dropped_message_keys=dropped_message_keys,
         )
 
     return _PreparedSoftPrefetch(key=key, run=run_prefetch)
@@ -9075,6 +9572,8 @@ def _start_soft_compaction_prefetch(
     task_estimate_body: dict[str, Any] | None = None,
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    token_system_prompt: str | None = None,
+    dropped_message_keys: frozenset[str] = frozenset(),
     parent_prefetch_task: asyncio.Task[Any] | None = None,
     _prepared: _PreparedSoftPrefetch | None = None,
 ) -> bool:
@@ -9100,6 +9599,8 @@ def _start_soft_compaction_prefetch(
         task_estimate_body=task_estimate_body,
         summary_prompt=summary_prompt,
         transient_message_patterns=transient_message_patterns,
+        token_system_prompt=token_system_prompt,
+        dropped_message_keys=dropped_message_keys,
     )
     if prepared is None:
         return False
@@ -9335,6 +9836,8 @@ async def _estimate_checkpoint_applied_body_tokens(
     historical_message_excerpt_count: int,
     file_context_enabled: bool = True,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    token_system_prompt: str | None = None,
+    dropped_message_keys: frozenset[str] = frozenset(),
 ) -> int | None:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -9473,7 +9976,13 @@ async def _estimate_checkpoint_applied_body_tokens(
                 emit_source_events=False,
                 transient_message_patterns=transient_message_patterns,
             )
-        remaining_tokens = await estimate_body_tokens_async(remaining_body, request=request)
+        remaining_tokens = await _estimate_provider_input_tokens_async(
+            remaining_body,
+            request=request,
+            user=user,
+            system_prompt=token_system_prompt,
+            dropped_message_keys=dropped_message_keys,
+        )
         if remaining_tokens is None:
             return None
         return summary_tokens + remaining_tokens
@@ -9609,6 +10118,8 @@ async def _estimate_task_checkpoint_applied_body_tokens(
     historical_message_excerpt_count: int,
     file_context_enabled: bool = True,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    token_system_prompt: str | None = None,
+    dropped_message_keys: frozenset[str] = frozenset(),
 ) -> int | None:
     task_metadata = metadata
     body_metadata = body.get("metadata")
@@ -9656,7 +10167,13 @@ async def _estimate_task_checkpoint_applied_body_tokens(
             emit_source_events=False,
             transient_message_patterns=transient_message_patterns,
         )
-    return await estimate_body_tokens_async(rebuilt, request=request)
+    return await _estimate_provider_input_tokens_async(
+        rebuilt,
+        request=request,
+        user=user,
+        system_prompt=token_system_prompt,
+        dropped_message_keys=dropped_message_keys,
+    )
 
 
 async def _model_dict_from_request(request: Any) -> dict[str, Any]:
@@ -9669,6 +10186,23 @@ async def _model_dict_from_request(request: Any) -> dict[str, Any]:
         if model_id is not None and model_id not in models:
             models[model_id] = model
     return models
+
+
+def _provider_cache_model_from_request(
+    request: Any,
+    cache_attr: str,
+    model_id: str,
+) -> dict[str, Any] | None:
+    state = getattr(getattr(request, "app", None), "state", None)
+    if state is None:
+        return None
+    for model in _iter_model_cache_values(getattr(state, cache_attr, None)):
+        if not isinstance(model, dict):
+            continue
+        cached_model_id = model.get("model") if cache_attr == "OLLAMA_MODELS" else _model_id(model)
+        if cached_model_id == model_id:
+            return model
+    return None
 
 
 async def _ensure_model_in_request_models(request: Any, model_id: str) -> dict[str, Any] | None:
@@ -9785,6 +10319,90 @@ def _target_record_params(model_info: Any) -> dict[str, Any]:
     params = getattr(model_info, "params", None)
     dumped = _dump_model_value(params)
     return copy.deepcopy(dumped) if isinstance(dumped, dict) else {}
+
+
+def _target_record_system_prompt(model_info: Any) -> str | None:
+    system = _target_record_params(model_info).get("system")
+    return system if isinstance(system, str) and system else None
+
+
+async def _usage_anchor_resolved_system_identity(
+    system: str,
+    *,
+    metadata: dict[str, Any] | None,
+    user: Any,
+) -> str:
+    from open_webui.utils.task import prompt_template, prompt_variables_template
+
+    variables = metadata.get("variables", {}) if isinstance(metadata, dict) else {}
+    if variables:
+        if not isinstance(variables, dict):
+            raise TypeError("metadata variables must be an object")
+        normalized_variables = dict(variables)
+        for placeholder, sentinel in USAGE_ANCHOR_SYSTEM_CLOCK_SENTINELS:
+            if placeholder in normalized_variables:
+                normalized_variables[placeholder] = sentinel
+        system = prompt_variables_template(system, normalized_variables)
+
+    # Mirror Core's prompt expansion while keeping its per-request clock values
+    # stable. A future clock placeholder omitted here only causes safe misses.
+    for placeholder, sentinel in USAGE_ANCHOR_SYSTEM_CLOCK_SENTINELS:
+        system = system.replace(placeholder, sentinel)
+    return await prompt_template(system, coerce_open_webui_user(user))
+
+
+async def _usage_anchor_model_shaping_profile(
+    request: Any,
+    model_id: str,
+    model_info: Any,
+    *,
+    metadata: dict[str, Any] | None = None,
+    user: Any = None,
+) -> dict[str, Any] | None:
+    if model_info is TARGET_MODEL_RECORD_UNKNOWN:
+        return None
+    configured_base_model_id = _target_record_base_model_id(model_info)
+    request_base_model_id = getattr(request, "base_model_id", None)
+    effective_base_model_id = (
+        request_base_model_id
+        if configured_base_model_id and isinstance(request_base_model_id, str) and request_base_model_id
+        else configured_base_model_id
+    )
+    params = _target_record_params(model_info)
+    profile = {
+        "model_id": model_id,
+        "base_model_id": effective_base_model_id,
+        "params": _canonicalize_general_value(params),
+    }
+    system = params.get("system")
+    if system is None or system == "" or (metadata is None and user is None):
+        return profile
+    if not isinstance(system, str):
+        return None
+    try:
+        profile["resolved_system"] = await _usage_anchor_resolved_system_identity(
+            system,
+            metadata=metadata,
+            user=user,
+        )
+    except Exception:
+        LOG.debug("Auto-compaction usage anchor disabled: system prompt expansion failed", exc_info=True)
+        return None
+    return profile
+
+
+def _usage_anchor_shaping_hash(
+    profiles: list[dict[str, Any]],
+    *,
+    transport_profile: dict[str, Any],
+) -> str:
+    return _json_hash(
+        {
+            "family": USAGE_ANCHOR_SHAPING_PROFILE_FAMILY,
+            "models": profiles,
+            "transport": transport_profile,
+        }
+    )
 
 
 FALLBACK_OPEN_WEBUI_PARAM_KEYS = frozenset(
@@ -9965,6 +10583,135 @@ def _apply_resolved_model_route_params(
     )
 
 
+def _legacy_provider_transport_config(
+    request: Any,
+    *,
+    base_urls_attr: str,
+    api_configs_attr: str,
+) -> tuple[list[Any], dict[Any, Any]] | None:
+    state = getattr(getattr(request, "app", None), "state", None)
+    config = getattr(state, "config", None)
+    base_urls = getattr(config, base_urls_attr, None)
+    api_configs = getattr(config, api_configs_attr, None)
+    if not isinstance(base_urls, list) or not isinstance(api_configs, dict):
+        return None
+    return base_urls, api_configs
+
+
+async def _usage_anchor_transport_profile(
+    request: Any,
+    models: dict[str, Any],
+    provider_model_id: str,
+) -> tuple[dict[str, Any] | None, frozenset[str]]:
+    provider_model = models.get(provider_model_id)
+    if not isinstance(provider_model, dict):
+        return None, frozenset()
+    owned_by = str(provider_model.get("owned_by") or "")
+    if provider_model.get("owned_by") == "ollama":
+        dropped_message_keys = frozenset({"reasoning_content", "reasoning_details"})
+        provider_cache_model = _provider_cache_model_from_request(request, "OLLAMA_MODELS", provider_model_id)
+        digest = provider_cache_model.get("digest") if provider_cache_model is not None else None
+        if not isinstance(digest, str) or not digest:
+            return None, dropped_message_keys
+        urls = provider_cache_model.get("urls") if provider_cache_model is not None else None
+        if not isinstance(urls, list) or not urls or any(
+            not isinstance(url_idx, int) or isinstance(url_idx, bool) for url_idx in urls
+        ):
+            return None, dropped_message_keys
+        url_indices = sorted(set(urls))
+        try:
+            from open_webui.routers import ollama as ollama_router
+        except Exception:
+            LOG.debug("Could not resolve Ollama transport for usage-anchor identity", exc_info=True)
+            return None, dropped_message_keys
+        get_runtime_config = getattr(ollama_router, "get_ollama_runtime_config", None)
+        if callable(get_runtime_config):
+            try:
+                _, base_urls, api_configs = await get_runtime_config()
+            except Exception:
+                LOG.debug("Could not resolve Ollama transport for usage-anchor identity", exc_info=True)
+                return None, dropped_message_keys
+        else:
+            legacy_config = _legacy_provider_transport_config(
+                request,
+                base_urls_attr="OLLAMA_BASE_URLS",
+                api_configs_attr="OLLAMA_API_CONFIGS",
+            )
+            if legacy_config is None:
+                return None, dropped_message_keys
+            base_urls, api_configs = legacy_config
+        if not isinstance(base_urls, list) or not isinstance(api_configs, dict):
+            return None, dropped_message_keys
+        backends = []
+        for url_idx in url_indices:
+            if url_idx < 0 or url_idx >= len(base_urls):
+                return None, dropped_message_keys
+            url = str(base_urls[url_idx])
+            api_config = api_configs.get(str(url_idx), api_configs.get(url, {}))
+            if not isinstance(api_config, dict):
+                return None, dropped_message_keys
+            backends.append(
+                {
+                    "url_idx": url_idx,
+                    "url": str(url),
+                    "api_config": _canonicalize_general_value(api_config),
+                }
+            )
+        return {
+            "owned_by": "ollama",
+            "digest": digest,
+            # Core treats identical model IDs across these backends as one
+            # load-balanced logical model. Track the complete eligible set so
+            # config changes invalidate anchors without disabling HA replicas.
+            "backends": backends,
+        }, dropped_message_keys
+    if provider_model.get("pipe") or owned_by == "arena":
+        return None, frozenset()
+    provider_cache_model = _provider_cache_model_from_request(request, "OPENAI_MODELS", provider_model_id)
+    url_idx = provider_cache_model.get("urlIdx") if provider_cache_model is not None else None
+    if not isinstance(url_idx, int) or isinstance(url_idx, bool):
+        return None, frozenset()
+    try:
+        from open_webui.routers import openai as openai_router
+    except Exception:
+        LOG.debug("Could not resolve OpenAI transport for usage-anchor identity", exc_info=True)
+        return None, frozenset()
+    get_connection = getattr(openai_router, "get_openai_connection", None)
+    if callable(get_connection):
+        try:
+            url, _, api_config = await get_connection(url_idx)
+        except Exception:
+            LOG.debug("Could not resolve OpenAI transport for usage-anchor identity", exc_info=True)
+            return None, frozenset()
+    else:
+        legacy_config = _legacy_provider_transport_config(
+            request,
+            base_urls_attr="OPENAI_API_BASE_URLS",
+            api_configs_attr="OPENAI_API_CONFIGS",
+        )
+        if legacy_config is None:
+            return None, frozenset()
+        base_urls, api_configs = legacy_config
+        if url_idx < 0 or url_idx >= len(base_urls):
+            return None, frozenset()
+        url = str(base_urls[url_idx])
+        api_config = api_configs.get(str(url_idx), api_configs.get(url, {}))
+    api_type = str(api_config.get("api_type") or "chat_completions") if isinstance(api_config, dict) else "chat_completions"
+    transport = {
+        "owned_by": owned_by or "openai",
+        "url_idx": url_idx,
+        "url": str(url),
+        "api_type": api_type,
+        "api_config": _canonicalize_general_value(api_config) if isinstance(api_config, dict) else {},
+    }
+    dropped_message_keys = (
+        frozenset({"reasoning_content", "reasoning_details", "thinking"})
+        if api_type == "responses"
+        else frozenset()
+    )
+    return transport, dropped_message_keys
+
+
 def _global_model_access_bypass_enabled() -> bool:
     try:
         from open_webui.env import BYPASS_MODEL_ACCESS_CONTROL
@@ -9979,11 +10726,20 @@ async def _resolve_core_chat_model_route(
     model_id: str,
     *,
     pipe_function_id: str = PIPE_FUNCTION_ID,
+    metadata: dict[str, Any] | None = None,
+    user: Any = None,
 ) -> CoreChatModelRoute:
     models = await _model_dict_from_request(request)
     if model_id not in models:
         return CoreChatModelRoute(model_id=model_id)
     model_info = await _get_target_db_model_record(model_id)
+    target_shaping_profile = await _usage_anchor_model_shaping_profile(
+        request,
+        model_id,
+        model_info,
+        metadata=metadata,
+        user=user,
+    )
     base_model_id = _target_record_base_model_id(model_info)
     if base_model_id and base_model_id not in models:
         fallback_model_id = await _custom_model_fallback_model_id_compatible(
@@ -9993,14 +10749,71 @@ async def _resolve_core_chat_model_route(
         )
         fallback_model = models.get(fallback_model_id) if fallback_model_id else None
         if fallback_model_id and isinstance(fallback_model, dict):
+            fallback_model_info = await _get_target_db_model_record(fallback_model_id)
+            fallback_shaping_profile = await _usage_anchor_model_shaping_profile(
+                request,
+                fallback_model_id,
+                fallback_model_info,
+                metadata=metadata,
+                user=user,
+            )
+            shaping_profiles = (
+                [target_shaping_profile, fallback_shaping_profile]
+                if target_shaping_profile is not None and fallback_shaping_profile is not None
+                else None
+            )
+            provider_model_id = (
+                str(fallback_shaping_profile.get("base_model_id") or fallback_model_id)
+                if fallback_shaping_profile is not None
+                else fallback_model_id
+            )
+            transport_profile, dropped_message_keys = await _usage_anchor_transport_profile(
+                request,
+                models,
+                provider_model_id,
+            )
             # Intentional late fallback: wrapper preprocessing already used the selected model's mirrored metadata.
             # Preserve that logical configuration; do not re-run preprocessing for the fallback route.
             return CoreChatModelRoute(
                 model_id=fallback_model_id,
                 fallback_model=copy.deepcopy(fallback_model),
                 target_params=_target_record_params(model_info),
+                token_system_prompt=_target_record_system_prompt(fallback_model_info),
+                usage_anchor_shaping_hash=(
+                    _usage_anchor_shaping_hash(
+                        shaping_profiles,
+                        transport_profile=transport_profile,
+                    )
+                    if shaping_profiles is not None and transport_profile is not None
+                    else None
+                ),
+                provider_model_id=provider_model_id,
+                usage_anchor_dropped_message_keys=dropped_message_keys,
             )
-    return CoreChatModelRoute(model_id=model_id)
+    provider_model_id = (
+        str(target_shaping_profile.get("base_model_id") or model_id)
+        if target_shaping_profile is not None
+        else model_id
+    )
+    transport_profile, dropped_message_keys = await _usage_anchor_transport_profile(
+        request,
+        models,
+        provider_model_id,
+    )
+    return CoreChatModelRoute(
+        model_id=model_id,
+        token_system_prompt=_target_record_system_prompt(model_info),
+        usage_anchor_shaping_hash=(
+            _usage_anchor_shaping_hash(
+                [target_shaping_profile],
+                transport_profile=transport_profile,
+            )
+            if target_shaping_profile is not None and transport_profile is not None
+            else None
+        ),
+        provider_model_id=provider_model_id,
+        usage_anchor_dropped_message_keys=dropped_message_keys,
+    )
 
 
 async def _validate_chat_completion_runtime_model_access(
@@ -10047,6 +10860,12 @@ async def _resolve_arena_chat_model_route_with_access(
             request=request,
             user=user,
             model_id=route.model_id,
+        )
+    if selected_arena_model_id is not None:
+        selected_model_info = await _get_target_db_model_record(route.model_id)
+        route = replace(
+            route,
+            token_system_prompt=_target_record_system_prompt(selected_model_info),
         )
     return route, selected_arena_model_id
 
@@ -10106,10 +10925,9 @@ async def _call_target_completion(
     user: Any,
     body: dict[str, Any],
 ) -> Any:
-    bypass_system_prompt = _request_bypass_system_prompt(request)
     state_overrides: dict[str, Any] = {
         "bypass_filter": True,
-        "bypass_system_prompt": bypass_system_prompt,
+        "bypass_system_prompt": False,
     }
     body_metadata = body.get("metadata")
     if isinstance(body_metadata, dict):
@@ -10124,7 +10942,7 @@ async def _call_target_completion(
             body,
             user=coerce_open_webui_user(user),
             bypass_filter=True,
-            bypass_system_prompt=bypass_system_prompt,
+            bypass_system_prompt=False,
         )
         return response
     except Exception as exc:
@@ -10141,8 +10959,17 @@ async def _forward_streaming_target(
     chat_id: str | None,
     message_id: str | None,
     wrapper_model_id: str,
+    anchor_input: UsageAnchorInput | None = None,
     on_complete: Callable[[dict[str, Any]], Any] | None = None,
+    track_request_usage: bool = True,
 ) -> StreamingResponse:
+    if track_request_usage:
+        clear_request_scoped_usage(
+            request=request,
+            chat_id=chat_id,
+            message_id=message_id,
+            wrapper_model_id=wrapper_model_id,
+        )
     response = await _call_target_completion(request=request, user=user, body=body)
     prepared = await prepare_streaming_response(
         response,
@@ -10151,34 +10978,57 @@ async def _forward_streaming_target(
         message_id=message_id,
         wrapper_model_id=wrapper_model_id,
     )
-    if on_complete is not None:
-        return _attach_streaming_completion_observer(prepared, on_complete)
-    return prepared
+    return _attach_streaming_completion_observer(
+        prepared,
+        request=request if track_request_usage else None,
+        chat_id=chat_id,
+        message_id=message_id,
+        wrapper_model_id=wrapper_model_id,
+        anchor_input=anchor_input,
+        on_complete=on_complete,
+    )
 
 
-async def _coerce_non_streaming_completion_response(response: Any, *, model_id: str) -> dict[str, Any]:
+async def _coerce_non_streaming_completion_response(
+    response: Any,
+    *,
+    model_id: str,
+    raw_usage_out: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    def merge_raw_usage(payload: dict[str, Any]) -> None:
+        if raw_usage_out is None:
+            return
+        raw_usage = _raw_usage_from_stream_payload(payload)
+        if not raw_usage:
+            return
+        merged = _merge_usage_fields(raw_usage_out, raw_usage)
+        raw_usage_out.clear()
+        raw_usage_out.update(merged)
+
     if isinstance(response, dict):
+        merge_raw_usage(response)
         if response.get("error") and is_retryable_context_error(response, status_code=400):
             raise RetryableContextOverflow(str(response.get("error")))
         return response
 
     if isinstance(response, StreamingResponse):
         parts: list[str] = []
-        usage: dict[str, Any] | None = None
+        raw_usage: dict[str, Any] = {}
         tool_calls: list[dict[str, Any]] = []
         finish_reason: str | None = None
         provider_error: dict[str, Any] | None = None
 
         def process_payload(payload: dict[str, Any]) -> None:
-            nonlocal finish_reason, provider_error, usage
-            if payload.get("error"):
-                if is_retryable_context_error(payload, status_code=400):
-                    raise RetryableContextOverflow(str(payload.get("error")))
-                provider_error = _error_response(_completion_error_message(payload), code="provider_error")
+            nonlocal finish_reason, provider_error, raw_usage
+            error_source = _stream_payload_error_source(payload)
+            if error_source is not None:
+                if is_retryable_context_error(error_source, status_code=400):
+                    raise RetryableContextOverflow(_completion_error_message(error_source))
+                provider_error = _error_response(_completion_error_message(error_source), code="provider_error")
                 return
-            chunk_usage = extract_usage_from_stream_payload(payload)
+            chunk_usage = _raw_usage_from_stream_payload(payload)
             if chunk_usage:
-                usage = chunk_usage
+                raw_usage = _merge_usage_fields(raw_usage, chunk_usage)
             choices = payload.get("choices")
             if isinstance(choices, list) and choices:
                 choice = choices[0]
@@ -10226,10 +11076,12 @@ async def _coerce_non_streaming_completion_response(response: Any, *, model_id: 
             await _close_stream_response(response)
         if provider_error is not None:
             return provider_error
+        if raw_usage_out is not None:
+            raw_usage_out.update(raw_usage)
         return _chat_completion_message_response(
             model_id,
             "".join(parts).strip(),
-            usage=usage,
+            usage=_normalize_usage(raw_usage) if raw_usage else None,
             tool_calls=tool_calls or None,
             finish_reason=finish_reason,
         )
@@ -10241,12 +11093,14 @@ async def _coerce_non_streaming_completion_response(response: Any, *, model_id: 
         if response.status_code >= 400:
             return _error_response(_completion_error_message(parsed), code="provider_error")
         if isinstance(parsed, dict) and not parsed.get("error"):
+            merge_raw_usage(parsed)
             return parsed
         return _error_response(_completion_error_message(parsed), code="provider_error")
 
     if isinstance(response, BaseModel):
         dumped = response.model_dump()
         if isinstance(dumped, dict):
+            merge_raw_usage(dumped)
             return dumped
 
     if isinstance(response, str):
@@ -10263,9 +11117,60 @@ async def _forward_non_streaming_target(
     request: Any,
     user: Any,
     body: dict[str, Any],
+    chat_id: str | None = None,
+    message_id: str | None = None,
+    wrapper_model_id: str | None = None,
+    anchor_input: UsageAnchorInput | None = None,
+    on_complete: Callable[[dict[str, Any]], Any] | None = None,
+    track_request_usage: bool = True,
 ) -> dict[str, Any]:
+    if track_request_usage:
+        clear_request_scoped_usage(
+            request=request,
+            chat_id=chat_id,
+            message_id=message_id,
+            wrapper_model_id=wrapper_model_id,
+        )
     response = await _call_target_completion(request=request, user=user, body=body)
-    return await _coerce_non_streaming_completion_response(response, model_id=str(body.get("model") or ""))
+    raw_usage: dict[str, Any] = {}
+    coerced = await _coerce_non_streaming_completion_response(
+        response,
+        model_id=str(body.get("model") or ""),
+        raw_usage_out=raw_usage,
+    )
+    error_source = _stream_payload_error_source(coerced)
+    if error_source is not None:
+        if is_retryable_context_error(error_source, status_code=400):
+            raise RetryableContextOverflow(_completion_error_message(error_source))
+        if coerced.get("error"):
+            return coerced
+        return _error_response(_completion_error_message(error_source), code="provider_error")
+    if coerced.get("error"):
+        return coerced
+    if raw_usage and track_request_usage:
+        store_request_scoped_usage(
+            request=request,
+            chat_id=chat_id,
+            message_id=message_id,
+            wrapper_model_id=wrapper_model_id,
+            usage=raw_usage,
+            anchor_input=anchor_input,
+        )
+    has_tool_call = _responses_output_has_tool_call(coerced)
+    choices = coerced.get("choices")
+    if isinstance(choices, list):
+        has_tool_call = has_tool_call or any(_choice_has_tool_call(choice) for choice in choices)
+    if has_tool_call or on_complete is None:
+        return coerced
+    completion = dict(coerced)
+    completion["raw_usage"] = raw_usage or None
+    if raw_usage:
+        completion["usage"] = _normalize_usage(raw_usage)
+    with suppress(Exception):
+        result = on_complete(completion)
+        if inspect.isawaitable(result):
+            await result
+    return coerced
 
 
 async def _compact_body(
@@ -10983,6 +11888,8 @@ class Pipe:
             __request__,
             identity.target_model_id,
             pipe_function_id=pipe_function_id,
+            metadata=metadata,
+            user=user,
         )
         try:
             target_route, selected_arena_model_id = await _resolve_arena_chat_model_route_with_access(
@@ -11001,14 +11908,21 @@ class Pipe:
             inner["metadata"]["selected_model_id"] = selected_arena_model_id
         if is_streaming and self.valves.force_include_usage:
             inner = inject_stream_usage_options(inner, force_include_usage=True)
+        usage_anchor_dropped_message_keys = target_route.usage_anchor_dropped_message_keys
 
         # query_generation runs Core generate_queries, which may route the task
         # model back into this wrapper (TASK_MODEL pointing here). Injecting
         # target file context then would recurse via chat_completion_files_handler.
         is_query_generation_task = task_name == TASKS.QUERY_GENERATION.value
+        # Stateful Responses continuations expose only the new tool-loop items;
+        # sizing, compacting, or reinjecting RAG against that partial history is unsafe.
+        is_stateful_responses_continuation = bool(inner.get("previous_response_id"))
+        if is_stateful_responses_continuation:
+            LOG.debug("Auto-compaction skipped: previous_response_id")
         supported_context = (
             _chat_id_supported(chat_id)
             and not is_summary_task
+            and not is_stateful_responses_continuation
             and (is_task_request or bool(metadata.get("message_id")))
         )
         task_source_body = (
@@ -11081,6 +11995,7 @@ class Pipe:
         if (
             not is_summary_task
             and not is_query_generation_task
+            and not is_stateful_responses_continuation
             and target_file_context_enabled
             and reusable_checkpoint_match is None
         ):
@@ -11115,24 +12030,47 @@ class Pipe:
             message_id=str(message_id) if message_id else None,
             wrapper_model_id=selected_wrapper_id,
         )
-        persisted_usage = None
-        usage_source: _USAGE_ANCHOR_SOURCE | None = "request" if request_usage is not None else None
-        if request_usage is None:
-            persisted_usage = await lookup_persisted_usage(
-                str(chat_id) if chat_id else None,
-                str(message_id) if message_id else None,
-            )
-            if persisted_usage is not None:
-                usage_source = "persisted"
-        usage = choose_usage_signal(
+        request_usage_anchor = get_request_scoped_usage_anchor(
             request=__request__,
             chat_id=str(chat_id) if chat_id else None,
             message_id=str(message_id) if message_id else None,
             wrapper_model_id=selected_wrapper_id,
-            persisted_usage=persisted_usage or request_usage,
-            messages=inner.get("messages") if isinstance(inner.get("messages"), list) else [],
         )
-        total_tokens = _usage_total(usage)
+        total_tokens = _usage_total(request_usage)
+        usage_source: str | None = "request" if total_tokens is not None else None
+
+        durable_usage_anchor = None
+        anchor_user_id = str((user or {}).get("id") or "")
+        if (
+            supported_context
+            and not is_task_request
+            and not checkpoint_lookup_unavailable
+            and target_route.usage_anchor_shaping_hash is not None
+            and anchor_user_id
+            and chat_id
+        ):
+            parent_assistant_message_id = await _usage_anchor_parent_assistant_message_id(
+                metadata=metadata,
+                chat_id=str(chat_id),
+            )
+            if parent_assistant_message_id:
+                try:
+                    durable_usage_anchor = await lookup_usage_anchor(
+                        request=__request__,
+                        user_id=anchor_user_id,
+                        chat_id=str(chat_id),
+                        pipe_function_id=identity.pipe_function_id,
+                        assistant_message_id=parent_assistant_message_id,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Auto-compaction usage anchor lookup failed (chat_id=%s, assistant_message_id=%s)",
+                        chat_id,
+                        parent_assistant_message_id,
+                        exc_info=True,
+                    )
+            else:
+                LOG.debug("Auto-compaction usage anchor miss: parent_assistant_unknown")
         target_model_for_limits = models.get(identity.target_model_id) or {
             "id": identity.target_model_id,
             "name": identity.target_model_id,
@@ -11152,51 +12090,154 @@ class Pipe:
         # candidate estimate (decision_total), never by raw observed usage.
         checkpoint_applied_estimate = None
         estimated_total_tokens = None
+        prepared_reusable_key = None
+        prepared_reusable_candidate = None
+        prepared_reusable_forward_candidate = None
+        prepared_reusable_prefix_count = 0
+        prepared_reusable_source_events = None
 
-        async def estimate_reusable_checkpoint_match(match: ReusableCheckpointMatch) -> int | None:
-            if task_source_body is not None:
-                return await _estimate_task_checkpoint_applied_body_tokens(
+        def reusable_match_key(match: ReusableCheckpointMatch) -> tuple[Any, ...]:
+            checkpoint = match.checkpoint or {}
+            return (
+                match.kind,
+                match.source_kind,
+                match.source_message_count,
+                checkpoint.get("id"),
+            )
+
+        async def prepare_reusable_checkpoint_match(
+            match: ReusableCheckpointMatch,
+        ) -> tuple[dict[str, Any], dict[str, Any], int, Any] | None:
+            nonlocal prepared_reusable_key
+            nonlocal prepared_reusable_candidate
+            nonlocal prepared_reusable_forward_candidate
+            nonlocal prepared_reusable_prefix_count
+            nonlocal prepared_reusable_source_events
+
+            match_key = reusable_match_key(match)
+            if prepared_reusable_key == match_key and prepared_reusable_candidate is not None:
+                return (
+                    prepared_reusable_candidate,
+                    prepared_reusable_forward_candidate,
+                    prepared_reusable_prefix_count,
+                    prepared_reusable_source_events,
+                )
+
+            candidate = _copy_body_preserving_metadata(inner)
+            if pre_rag_messages is not None:
+                candidate["messages"] = copy.deepcopy(pre_rag_messages)
+            try:
+                if task_source_body is not None:
+                    candidate, compacted, prefix_count = await _compact_task_body_with_reusable_checkpoint(
+                        request=__request__,
+                        user=user,
+                        metadata=metadata,
+                        body=candidate,
+                        pipe_function_id=identity.pipe_function_id,
+                        match=match,
+                        historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                        historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                        file_context_enabled=target_file_context_enabled,
+                        transient_message_patterns=transient_message_patterns,
+                    )
+                else:
+                    candidate, compacted, prefix_count = await _compact_body_with_reusable_checkpoint(
+                        request=__request__,
+                        user=user,
+                        metadata=metadata,
+                        body=candidate,
+                        pipe_function_id=identity.pipe_function_id,
+                        match=match,
+                        historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
+                        historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                        file_context_enabled=target_file_context_enabled,
+                        transient_message_patterns=transient_message_patterns,
+                    )
+            except (SummaryFileContextUnavailable, RuntimeError):
+                return None
+            if not compacted:
+                return None
+
+            source_events = None
+            if not is_summary_task and not is_query_generation_task:
+                candidate = await _inject_target_file_context(
                     request=__request__,
                     user=user,
-                    metadata=metadata,
-                    body=inner,
-                    pipe_function_id=identity.pipe_function_id,
-                    match=match,
-                    historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
-                    historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
+                    body=candidate,
+                    chat_id=str(chat_id) if chat_id else None,
+                    current_message_id=str(metadata.get("user_message_id") or message_id or "") or None,
+                    compaction_prefix_count=prefix_count,
+                    metadata_files=metadata.get("files"),
+                    metadata_user_message=metadata.get("user_message"),
+                    event_emitter=None,
                     file_context_enabled=target_file_context_enabled,
+                    emit_source_events=False,
                     transient_message_patterns=transient_message_patterns,
                 )
-            return await _estimate_checkpoint_applied_body_tokens(
+                candidate_metadata = candidate.get("metadata")
+                if isinstance(candidate_metadata, dict):
+                    source_events = candidate_metadata.get("sources")
+            forward_candidate = _apply_resolved_model_route_params(
+                candidate,
+                models=models,
+                route=target_route,
+            )
+            prepared_reusable_key = match_key
+            prepared_reusable_candidate = candidate
+            prepared_reusable_forward_candidate = forward_candidate
+            prepared_reusable_prefix_count = prefix_count
+            prepared_reusable_source_events = source_events
+            return candidate, forward_candidate, prefix_count, source_events
+
+        async def estimate_candidate(candidate: dict[str, Any]) -> int | None:
+            token_candidate = _project_usage_anchor_token_body(
+                candidate,
+                dropped_message_keys=usage_anchor_dropped_message_keys,
+            )
+            if target_route.usage_anchor_shaping_hash is not None and request_usage_anchor is not None:
+                request_anchor_estimate = await _estimate_body_tokens_from_usage_anchor(
+                    request=__request__,
+                    body=token_candidate,
+                    anchor=request_usage_anchor,
+                    usage_anchor_shaping_hash=target_route.usage_anchor_shaping_hash,
+                    transient_message_patterns=transient_message_patterns,
+                )
+                if request_anchor_estimate is not None:
+                    return request_anchor_estimate
+            if target_route.usage_anchor_shaping_hash is not None and durable_usage_anchor is not None:
+                durable_estimate = await _estimate_body_tokens_from_usage_anchor(
+                    request=__request__,
+                    body=token_candidate,
+                    anchor=durable_usage_anchor,
+                    usage_anchor_shaping_hash=target_route.usage_anchor_shaping_hash,
+                    transient_message_patterns=transient_message_patterns,
+                )
+                if durable_estimate is not None:
+                    return durable_estimate
+            return await _estimate_provider_input_tokens_async(
+                candidate,
                 request=__request__,
                 user=user,
-                metadata=metadata,
-                body=checkpoint_lookup_body,
-                pipe_function_id=identity.pipe_function_id,
-                match=match,
-                historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
-                historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
-                file_context_enabled=target_file_context_enabled,
-                transient_message_patterns=transient_message_patterns,
+                system_prompt=target_route.token_system_prompt,
+                dropped_message_keys=usage_anchor_dropped_message_keys,
             )
+
+        async def estimate_reusable_checkpoint_match(match: ReusableCheckpointMatch) -> int | None:
+            prepared = await prepare_reusable_checkpoint_match(match)
+            if prepared is None:
+                return None
+            return await estimate_candidate(prepared[1])
 
         if supported_context:
             if reusable_checkpoint_match is not None:
                 checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(reusable_checkpoint_match)
             else:
-                if total_tokens is not None:
-                    estimated_total_tokens = await _estimate_next_input_tokens_from_usage_anchor(
-                        request=__request__,
-                        last_observed_total_tokens=total_tokens,
-                        body=estimate_lookup_body,
-                        usage_source=usage_source,
-                        transient_message_patterns=transient_message_patterns,
-                    )
-                if estimated_total_tokens is None:
-                    estimated_total_tokens = await estimate_body_tokens_async(
-                        estimate_lookup_body,
-                        request=__request__,
-                    )
+                estimate_candidate_body = _apply_resolved_model_route_params(
+                    estimate_lookup_body,
+                    models=models,
+                    route=target_route,
+                )
+                estimated_total_tokens = await estimate_candidate(estimate_candidate_body)
         # decision_total: checkpoint-applied estimate (the compacted body we
         # would actually forward) takes priority over the usage-anchor / full-body
         # estimate. It NEVER falls back to raw observed total_tokens.
@@ -11303,9 +12344,12 @@ class Pipe:
             and total_tokens is not None
         ):
             with suppress(Exception):
-                compare_estimate_tokens = await estimate_body_tokens_async(
+                compare_estimate_tokens = await _estimate_provider_input_tokens_async(
                     estimate_lookup_body,
                     request=__request__,
+                    user=user,
+                    system_prompt=target_route.token_system_prompt,
+                    dropped_message_keys=usage_anchor_dropped_message_keys,
                 )
         display_token_context = _build_display_token_context(
             estimated_total_tokens=decision_total,
@@ -11397,6 +12441,8 @@ class Pipe:
                     file_context_enabled=target_file_context_enabled,
                     task_estimate_body=inner if task_source_body is not None else None,
                     transient_message_patterns=transient_message_patterns,
+                    token_system_prompt=target_route.token_system_prompt,
+                    dropped_message_keys=usage_anchor_dropped_message_keys,
                 )
 
         def schedule_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
@@ -11468,6 +12514,8 @@ class Pipe:
                         event_emitter=__event_emitter__,
                         file_context_enabled=target_file_context_enabled,
                         transient_message_patterns=transient_message_patterns,
+                        token_system_prompt=target_route.token_system_prompt,
+                        dropped_message_keys=usage_anchor_dropped_message_keys,
                     )
                     if prepared is None:
                         return None
@@ -11511,6 +12559,8 @@ class Pipe:
                             event_emitter=__event_emitter__,
                             file_context_enabled=target_file_context_enabled,
                             transient_message_patterns=transient_message_patterns,
+                            token_system_prompt=target_route.token_system_prompt,
+                            dropped_message_keys=usage_anchor_dropped_message_keys,
                             parent_prefetch_task=parent_prefetch_task,
                             _prepared=prepared,
                         )
@@ -11533,6 +12583,48 @@ class Pipe:
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
 
+        current_assistant_message_id = str(metadata.get("message_id") or "")
+        continued_assistant_message_id = str(metadata.get("assistant_message_id") or "")
+        # Continue Response extends this assistant in place, so its completed-turn
+        # anchor/prefetch body cannot represent the next persisted history.
+        is_continue_response = bool(
+            continued_assistant_message_id
+            and current_assistant_message_id == continued_assistant_message_id
+        )
+
+        async def handle_completed_turn(
+            completion: dict[str, Any],
+            anchor_input: UsageAnchorInput | None,
+        ) -> None:
+            if (
+                anchor_input is not None
+                and anchor_user_id
+                and current_assistant_message_id
+                and _chat_id_supported(str(chat_id or ""))
+            ):
+                try:
+                    await persist_usage_anchor(
+                        request=__request__,
+                        user_id=anchor_user_id,
+                        chat_id=str(chat_id),
+                        pipe_function_id=identity.pipe_function_id,
+                        assistant_message_id=current_assistant_message_id,
+                        anchor_input=anchor_input,
+                        raw_usage=completion.get("raw_usage"),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOG.warning(
+                        "Auto-compaction usage anchor persistence failed "
+                        "(chat_id=%s, assistant_message_id=%s)",
+                        chat_id,
+                        current_assistant_message_id,
+                        exc_info=True,
+                    )
+            if not is_task_request and not checkpoint_lookup_unavailable:
+                schedule_completed_turn_soft_prefetch(completion)
+
         attempt = 0
         compacted_once = False
         compaction_prefix_count = 0
@@ -11545,6 +12637,7 @@ class Pipe:
                 candidate["messages"] = copy.deepcopy(pre_rag_messages)
             compaction_prefix_count = 0
             candidate_source_events = None
+            used_prepared_reusable_candidate = False
             if should_compact or compacted_once:
                 try:
                     checkpoint_only_attempt = reusable_checkpoint_only is not None and not compacted_once
@@ -11570,7 +12663,14 @@ class Pipe:
                             ),
                         )
                     if reusable_checkpoint_only is not None and not compacted_once:
-                        if task_source_body is not None:
+                        prepared = await prepare_reusable_checkpoint_match(reusable_checkpoint_only)
+                        if prepared is not None:
+                            candidate = _copy_body_preserving_metadata(prepared[0])
+                            compacted = True
+                            compaction_prefix_count = prepared[2]
+                            candidate_source_events = prepared[3]
+                            used_prepared_reusable_candidate = True
+                        elif task_source_body is not None:
                             candidate, compacted, compaction_prefix_count = await _compact_task_body_with_reusable_checkpoint(
                                 request=__request__,
                                 user=user,
@@ -11634,6 +12734,7 @@ class Pipe:
                         not is_summary_task
                         and not is_query_generation_task
                         and (should_compact or compacted_once)
+                        and not used_prepared_reusable_candidate
                     ):
                         target_user_message_id = str(metadata.get("user_message_id") or message_id or "") or None
                         candidate = await _inject_target_file_context(
@@ -11658,7 +12759,13 @@ class Pipe:
                             after_tokens = None
                             if self.valves.token_status_detail == "before_after":
                                 with suppress(Exception):
-                                    after_tokens = await estimate_body_tokens_async(candidate, request=__request__)
+                                    after_tokens = await _estimate_provider_input_tokens_async(
+                                        candidate,
+                                        request=__request__,
+                                        user=user,
+                                        system_prompt=target_route.token_system_prompt,
+                                        dropped_message_keys=usage_anchor_dropped_message_keys,
+                                    )
                             await emit_compaction_status(
                                 __event_emitter__,
                                 action="compacted",
@@ -11746,6 +12853,41 @@ class Pipe:
                     models=models,
                     route=target_route,
                 )
+                forward_anchor_input = None
+                if (
+                    supported_context
+                    and not is_task_request
+                    and target_route.usage_anchor_shaping_hash is not None
+                    and anchor_user_id
+                    and metadata.get("message_id")
+                    and _chat_id_supported(str(chat_id or ""))
+                ):
+                    forward_anchor_input = await _build_usage_anchor_input(
+                        request=__request__,
+                        body=_project_usage_anchor_token_body(
+                            forward_candidate,
+                            dropped_message_keys=usage_anchor_dropped_message_keys,
+                        ),
+                        usage_anchor_shaping_hash=target_route.usage_anchor_shaping_hash,
+                        transient_message_patterns=transient_message_patterns,
+                    )
+
+                async def on_forward_complete(
+                    completion: dict[str, Any],
+                    anchor_input: UsageAnchorInput | None = forward_anchor_input,
+                ) -> None:
+                    await handle_completed_turn(completion, anchor_input)
+
+                completion_callback = (
+                    on_forward_complete
+                    if (
+                        not is_task_request
+                        and supported_context
+                        and not checkpoint_lookup_unavailable
+                        and not is_continue_response
+                    )
+                    else None
+                )
                 if is_streaming:
                     streaming_kwargs = {
                         "request": __request__,
@@ -11754,13 +12896,10 @@ class Pipe:
                         "chat_id": str(chat_id) if chat_id else None,
                         "message_id": str(message_id) if message_id else None,
                         "wrapper_model_id": selected_wrapper_id,
+                        "anchor_input": forward_anchor_input,
+                        "on_complete": completion_callback,
+                        "track_request_usage": not is_task_request,
                     }
-                    if (
-                        effective_soft_trigger_total_tokens is not None
-                        and not is_task_request
-                        and not checkpoint_lookup_unavailable
-                    ):
-                        streaming_kwargs["on_complete"] = schedule_completed_turn_soft_prefetch
                     streaming_response = await _forward_streaming_target(**streaming_kwargs)
                     if not getattr(streaming_response, "_auto_compact_immediate_error", False):
                         await _emit_source_events(__event_emitter__, candidate_source_events)
@@ -11769,13 +12908,17 @@ class Pipe:
                     request=__request__,
                     user=user,
                     body=forward_candidate,
+                    chat_id=str(chat_id) if chat_id else None,
+                    message_id=str(message_id) if message_id else None,
+                    wrapper_model_id=selected_wrapper_id,
+                    anchor_input=forward_anchor_input,
+                    on_complete=completion_callback,
+                    track_request_usage=not is_task_request,
                 )
                 if isinstance(response, dict) and response.get("error"):
                     return response
                 await _emit_source_events(__event_emitter__, candidate_source_events)
                 response = _merge_source_events_into_response(response, candidate_source_events)
-                if not is_task_request and not checkpoint_lookup_unavailable and isinstance(response, dict):
-                    schedule_completed_turn_soft_prefetch(response)
                 return response
             except RetryableContextOverflow:
                 if checkpoint_lookup_unavailable:
