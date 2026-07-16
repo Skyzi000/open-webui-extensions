@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.6.8
+version: 0.6.9
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -4505,18 +4505,35 @@ def _is_own_wrapper_or_preset(
     )
 
 
+def _is_auto_compaction_wrapper(model: dict[str, Any]) -> bool:
+    info = model.get("info")
+    if not isinstance(info, dict):
+        info = _payload_dict(info)
+    for raw_meta in (model.get("meta"), info.get("meta")):
+        meta = raw_meta if isinstance(raw_meta, dict) else _payload_dict(raw_meta)
+        if isinstance(meta.get("auto_compaction"), dict):
+            return True
+    return False
+
+
 def filter_target_models(models: Iterable[dict[str, Any]], valves: Any, *, pipe_function_id: str = PIPE_FUNCTION_ID):
     include_patterns = _split_patterns(getattr(valves, "include_model_patterns", ""))
     exclude_patterns = _split_patterns(getattr(valves, "exclude_model_patterns", ""))
     seen: set[str] = set()
     targets: list[dict[str, Any]] = []
+    model_candidates = [model for model in models if isinstance(model, dict)]
+    auto_compaction_wrapper_ids = {
+        model_id
+        for model in model_candidates
+        if (model_id := _model_id(model)) is not None and _is_auto_compaction_wrapper(model)
+    }
 
-    for raw_model in models:
-        if not isinstance(raw_model, dict):
-            continue
+    for raw_model in model_candidates:
         model = copy.deepcopy(raw_model)
         model_id = _model_id(model)
         if model_id is None or model_id in seen:
+            continue
+        if model_id in auto_compaction_wrapper_ids:
             continue
         if is_generated_wrapper_model_id(model_id, pipe_function_id=pipe_function_id):
             continue
@@ -4945,11 +4962,10 @@ def _target_hidden_marker_owner_ids(marker: dict[str, Any]) -> list[str]:
     return owner_ids
 
 
-def _target_hidden_marker_restore_state(marker: dict[str, Any]) -> tuple[bool, bool, bool]:
+def _target_hidden_marker_restore_state(marker: dict[str, Any]) -> tuple[bool, bool]:
     return (
         bool(marker.get("had_hidden", False)),
         bool(marker.get("previous_hidden", False)),
-        bool(marker.get("created_model_record", False)),
     )
 
 
@@ -4958,7 +4974,6 @@ def _build_target_hidden_marker(
     pipe_function_ids: list[str],
     had_hidden: bool,
     previous_hidden: bool,
-    created_model_record: bool,
 ) -> dict[str, Any]:
     if len(pipe_function_ids) == 1:
         marker = {
@@ -4972,8 +4987,6 @@ def _build_target_hidden_marker(
             "had_hidden": had_hidden,
             "previous_hidden": previous_hidden,
         }
-    if created_model_record:
-        marker["created_model_record"] = True
     return marker
 
 
@@ -4981,62 +4994,53 @@ def _mark_target_model_hidden_by_pipe(
     meta: dict[str, Any],
     *,
     pipe_function_id: str,
-    created_model_record: bool,
 ) -> None:
     marker = _target_hidden_marker(meta)
     if marker is None:
         owner_ids = [pipe_function_id]
         had_hidden = "hidden" in meta
         previous_hidden = bool(meta.get("hidden", False))
-        owns_created_model_record = created_model_record
     else:
         owner_ids = _target_hidden_marker_owner_ids(marker)
         if owner_ids and pipe_function_id not in owner_ids:
             return
-        had_hidden, previous_hidden, owns_created_model_record = _target_hidden_marker_restore_state(marker)
+        had_hidden, previous_hidden = _target_hidden_marker_restore_state(marker)
         if not owner_ids:
             had_hidden = "hidden" in meta
             previous_hidden = bool(meta.get("hidden", False))
-            owns_created_model_record = created_model_record
             owner_ids = [pipe_function_id]
     marker = _build_target_hidden_marker(
         pipe_function_ids=owner_ids,
         had_hidden=had_hidden,
         previous_hidden=previous_hidden,
-        created_model_record=owns_created_model_record,
     )
     meta[AUTO_COMPACTION_TARGET_HIDDEN_META_KEY] = marker
     meta["hidden"] = True
 
 
-def _restore_target_model_hidden_by_pipe(meta: dict[str, Any], *, pipe_function_id: str) -> tuple[bool, bool]:
+def _restore_target_model_hidden_by_pipe(meta: dict[str, Any], *, pipe_function_id: str) -> bool:
     marker = _target_hidden_marker(meta)
     if marker is None:
-        return False, False
+        return False
     owner_ids = _target_hidden_marker_owner_ids(marker)
     if pipe_function_id not in owner_ids:
-        return False, False
-    had_hidden, previous_hidden, created_model_record = _target_hidden_marker_restore_state(marker)
+        return False
+    had_hidden, previous_hidden = _target_hidden_marker_restore_state(marker)
     remaining_owner_ids = [owner_id for owner_id in owner_ids if owner_id != pipe_function_id]
     if remaining_owner_ids:
         meta[AUTO_COMPACTION_TARGET_HIDDEN_META_KEY] = _build_target_hidden_marker(
             pipe_function_ids=remaining_owner_ids,
             had_hidden=had_hidden,
             previous_hidden=previous_hidden,
-            created_model_record=created_model_record,
         )
         meta["hidden"] = True
-    elif created_model_record:
-        meta.pop("hidden", None)
-        meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
-        return True, True
     elif had_hidden:
         meta["hidden"] = previous_hidden
         meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
     else:
         meta.pop("hidden", None)
         meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
-    return True, False
+    return True
 
 
 def _wrapper_model_record_matches_form(existing: Any, model_form: Any) -> bool:
@@ -5106,7 +5110,6 @@ def _target_model_override_form_payload(
     _mark_target_model_hidden_by_pipe(
         meta,
         pipe_function_id=pipe_function_id,
-        created_model_record=existing_record is None,
     )
     return {
         "id": target.id,
@@ -5140,12 +5143,8 @@ async def _hide_target_model_record(
             existing = await Models.get_model_by_id(target_id)
         except Exception:
             existing = None
-        if (
-            existing is None
-            and target_model_info is not None
-            and target_model_info is not TARGET_MODEL_RECORD_UNKNOWN
-        ):
-            existing = target_model_info
+        if existing is None and target_model_info is not None:
+            return
         payload = _target_model_override_form_payload(
             pipe_function_id=pipe_function_id,
             target_model=target_model,
@@ -5179,28 +5178,12 @@ async def _restore_target_model_hidden_record(
             existing = await Models.get_model_by_id(target_model_id)
         except Exception:
             existing = None
-        if (
-            existing is None
-            and target_model_info is not None
-            and target_model_info is not TARGET_MODEL_RECORD_UNKNOWN
-        ):
-            existing = target_model_info
-        if existing is None or existing is TARGET_MODEL_RECORD_UNKNOWN:
-            return True
+        if existing is None:
+            return target_model_info is None
         meta = _record_meta_dict(existing)
-        restored, delete_created_record = _restore_target_model_hidden_by_pipe(
-            meta, pipe_function_id=pipe_function_id
-        )
+        restored = _restore_target_model_hidden_by_pipe(meta, pipe_function_id=pipe_function_id)
         if not restored:
             return True
-        if delete_created_record:
-            delete_model_by_id = getattr(Models, "delete_model_by_id", None)
-            if not callable(delete_model_by_id):
-                return False
-            try:
-                return bool(await delete_model_by_id(target_model_id))
-            except Exception:
-                return False
         model_form = _model_form_from_record(
             ModelForm=ModelForm,
             ModelMeta=ModelMeta,
@@ -5222,16 +5205,21 @@ async def _deactivate_stale_wrapper_model_records(
     ModelParams: Any,
     pipe_function_id: str,
     desired_wrapper_ids: set[str],
+    existing_models_by_id: dict[str, Any],
 ) -> None:
-    try:
-        existing_models = await Models.get_all_models()
-    except Exception:
-        return
-    for existing in existing_models:
+    for snapshot in existing_models_by_id.values():
         try:
-            existing_id = _record_field(existing, "id")
+            existing_id = _record_field(snapshot, "id")
             if (
                 not isinstance(existing_id, str)
+                or existing_id in desired_wrapper_ids
+                or _managed_wrapper_pipe_function_id(snapshot) != pipe_function_id
+                or _record_field(snapshot, "is_active") is False
+            ):
+                continue
+            existing = await Models.get_model_by_id(existing_id)
+            if (
+                existing is None
                 or existing_id in desired_wrapper_ids
                 or _managed_wrapper_pipe_function_id(existing) != pipe_function_id
                 or _record_field(existing, "is_active") is False
@@ -5245,6 +5233,7 @@ async def _deactivate_stale_wrapper_model_records(
                 ModelParams=ModelParams,
                 pipe_function_id=pipe_function_id,
                 target_model_id=target_model_id,
+                target_model_info=existing_models_by_id.get(target_model_id),
             ):
                 continue
             model_form = _model_form_from_record(
@@ -5276,17 +5265,42 @@ async def sync_wrapper_model_records(
     if not owner_user_id:
         return
 
+    try:
+        existing_models: list[Any] | None = list(await Models.get_all_models())
+    except Exception:
+        existing_models = None
+    existing_models_by_id = (
+        {
+            existing_id: existing
+            for existing in existing_models
+            if isinstance(existing_id := _record_field(existing, "id"), str) and existing_id
+        }
+        if existing_models is not None
+        else {}
+    )
+
     desired_wrapper_ids: set[str] = set()
+    hide_wrapped_target_models = bool(getattr(valves, "hide_wrapped_target_models", False))
     for target_model in target_models:
         target_id = _model_id(target_model)
-        hide_wrapped_target_models = bool(getattr(valves, "hide_wrapped_target_models", False))
         try:
             target_model_info = None
             if target_id:
                 desired_wrapper_ids.add(build_wrapper_model_id(pipe_function_id, target_id))
-                with suppress(Exception):
-                    target_model_info = await Models.get_model_by_id(target_id)
-            if not hide_wrapped_target_models and target_id:
+                if existing_models is not None:
+                    target_model_info = existing_models_by_id.get(target_id)
+                else:
+                    with suppress(Exception):
+                        target_model_info = await Models.get_model_by_id(target_id)
+            target_marker = _target_hidden_marker(_record_meta_dict(target_model_info))
+            should_restore_target = (
+                existing_models is None
+                or (
+                    target_marker is not None
+                    and pipe_function_id in _target_hidden_marker_owner_ids(target_marker)
+                )
+            )
+            if not hide_wrapped_target_models and target_id and should_restore_target:
                 with suppress(Exception):
                     await _restore_target_model_hidden_record(
                         Models=Models,
@@ -5304,24 +5318,38 @@ async def sync_wrapper_model_records(
                 target_model_info=target_model_info,
                 valves=valves,
             )
-            existing = await Models.get_model_by_id(form_payload["id"])
+            existing = (
+                existing_models_by_id.get(form_payload["id"])
+                if existing_models is not None
+                else await Models.get_model_by_id(form_payload["id"])
+            )
             if existing and _record_has_meta_key(existing, "hidden"):
                 form_payload["meta"]["hidden"] = _record_meta_value(existing, "hidden")
-            model_form = ModelForm(
-                id=form_payload["id"],
-                base_model_id=None,
-                name=form_payload["name"],
-                params=ModelParams(**form_payload["params"]),
-                meta=ModelMeta(**form_payload["meta"]),
-                access_grants=form_payload["access_grants"],
-                is_active=True,
+            model_form = _model_form_from_payload(
+                ModelForm=ModelForm,
+                ModelMeta=ModelMeta,
+                ModelParams=ModelParams,
+                payload=form_payload,
             )
-            if existing:
-                if not _wrapper_model_record_matches_form(existing, model_form):
-                    if await Models.update_model_by_id(form_payload["id"], model_form) is None:
+            if not existing or not _wrapper_model_record_matches_form(existing, model_form):
+                if existing_models is not None:
+                    existing = await Models.get_model_by_id(form_payload["id"])
+                    form_payload["meta"].pop("hidden", None)
+                    if existing and _record_has_meta_key(existing, "hidden"):
+                        form_payload["meta"]["hidden"] = _record_meta_value(existing, "hidden")
+                    model_form = _model_form_from_payload(
+                        ModelForm=ModelForm,
+                        ModelMeta=ModelMeta,
+                        ModelParams=ModelParams,
+                        payload=form_payload,
+                    )
+                if existing:
+                    if (
+                        not _wrapper_model_record_matches_form(existing, model_form)
+                        and await Models.update_model_by_id(form_payload["id"], model_form) is None
+                    ):
                         raise RuntimeError("wrapper model update failed")
-            else:
-                if await Models.insert_new_model(model_form, user_id=owner_user_id) is None:
+                elif await Models.insert_new_model(model_form, user_id=owner_user_id) is None:
                     raise RuntimeError("wrapper model insert failed")
             if hide_wrapped_target_models:
                 with suppress(Exception):
@@ -5348,14 +5376,16 @@ async def sync_wrapper_model_records(
                         target_model_info=target_model_info,
                     )
             continue
-    await _deactivate_stale_wrapper_model_records(
-        Models=Models,
-        ModelForm=ModelForm,
-        ModelMeta=ModelMeta,
-        ModelParams=ModelParams,
-        pipe_function_id=pipe_function_id,
-        desired_wrapper_ids=desired_wrapper_ids,
-    )
+    if existing_models is not None:
+        await _deactivate_stale_wrapper_model_records(
+            Models=Models,
+            ModelForm=ModelForm,
+            ModelMeta=ModelMeta,
+            ModelParams=ModelParams,
+            pipe_function_id=pipe_function_id,
+            desired_wrapper_ids=desired_wrapper_ids,
+            existing_models_by_id=existing_models_by_id,
+        )
 
 
 def _iter_model_cache_values(value: Any) -> Any:
@@ -6412,7 +6442,7 @@ _SSE_FIELD_MARKERS = tuple(f"{name}:" for name in _SSE_FIELD_NAMES) + (":",)
 def _text_can_start_sse_field(stripped: str) -> bool:
     if not stripped:
         return False
-    first_line = stripped.splitlines()[0]
+    first_line = stripped.split("\n", 1)[0].split("\r", 1)[0]
     return (
         first_line in _SSE_FIELD_NAMES
         or first_line.startswith(_SSE_FIELD_MARKERS)
@@ -6426,29 +6456,51 @@ class _SSEDataParser:
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._buffer = ""
         self._data_lines: list[str] = []
+        self._previous_chunk_ended_with_cr = False
 
     def has_pending_event_or_field(self) -> bool:
         return bool(self._data_lines) or _text_can_start_sse_field(self._buffer.lstrip())
 
     def feed(self, chunk: bytes | str) -> tuple[list[str], bool]:
         text = self._decoder.decode(chunk, final=False) if isinstance(chunk, bytes) else str(chunk)
+        return self._process_text(text)
+
+    def _process_text(self, text: str) -> tuple[list[str], bool]:
+        if self._previous_chunk_ended_with_cr:
+            if not text:
+                return [], False
+            if text.startswith("\n"):
+                text = text[1:]
+            self._previous_chunk_ended_with_cr = False
         self._buffer += text
-        lines = self._buffer.splitlines(keepends=True)
-        if lines and not lines[-1].endswith(("\n", "\r")):
-            self._buffer = lines.pop()
-        else:
+        if not self._buffer:
+            return [], False
+        self._previous_chunk_ended_with_cr = self._buffer.endswith("\r")
+        normalized = self._buffer
+        if "\r" in normalized:
+            normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+        lines = normalized.split("\n")
+        if normalized.endswith("\n"):
+            lines.pop()
             self._buffer = ""
-        return self._process_lines([line.rstrip("\r\n") for line in lines])
+        else:
+            self._buffer = lines.pop()
+        return self._process_lines(lines)
 
     def flush(self) -> tuple[list[str], bool]:
         lines = []
         remaining_text = self._decoder.decode(b"", final=True)
         if remaining_text:
-            self._buffer += remaining_text
+            values, saw_data_field = self._process_text(remaining_text)
+        else:
+            values, saw_data_field = [], False
         if self._buffer:
             lines.append(self._buffer)
             self._buffer = ""
-        values, saw_data_field = self._process_lines(lines)
+        trailing_values, trailing_saw_data_field = self._process_lines(lines)
+        values.extend(trailing_values)
+        saw_data_field = saw_data_field or trailing_saw_data_field
+        self._previous_chunk_ended_with_cr = False
         final_value = self._consume_event()
         if final_value is not None:
             values.append(final_value)

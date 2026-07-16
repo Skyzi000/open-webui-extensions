@@ -203,6 +203,10 @@ def _file(file_id, *, file_type="file"):
 class FakeModelMeta(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    profile_image_url: str | None = None
+    description: str | None = None
+    capabilities: dict | None = None
+
 
 class FakeModelParams(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -226,6 +230,8 @@ def install_fake_open_webui_model_modules(monkeypatch, records=None):
         "inserted": [],
         "updated": [],
         "deleted": [],
+        "get_by_id": [],
+        "get_all": 0,
     }
 
     class FakeFunctions:
@@ -236,10 +242,12 @@ def install_fake_open_webui_model_modules(monkeypatch, records=None):
     class FakeModels:
         @staticmethod
         async def get_model_by_id(model_id):
+            calls["get_by_id"].append(model_id)
             return records.get(model_id)
 
         @staticmethod
         async def get_all_models():
+            calls["get_all"] += 1
             return list(records.values())
 
         @staticmethod
@@ -287,6 +295,42 @@ def test_target_filter_excludes_own_wrappers_and_arena_but_allows_other_pipes():
     targets = mod.filter_target_models(models.values(), mod.Pipe.Valves())
 
     assert [m["id"] for m in targets] == ["gpt-4.1", "other_pipe.child"]
+
+
+def test_target_filter_excludes_other_auto_compaction_wrappers_across_cache_representations():
+    wrapper_id = mod.build_wrapper_model_id("compact_b", "gpt-4.1")
+    state = SimpleNamespace(
+        MODELS={
+            wrapper_id: {
+                "id": wrapper_id,
+                "name": "Compact B",
+                "info": {
+                    "meta": {
+                        "auto_compaction": {
+                            "pipe_function_id": "compact_b",
+                            "target_model_id": "gpt-4.1",
+                        }
+                    }
+                },
+            },
+            "gpt-4.1": {"id": "gpt-4.1", "name": "GPT"},
+            "other_pipe.child": {
+                "id": "other_pipe.child",
+                "name": "Other Pipe",
+                "pipe": {"type": "pipe"},
+            },
+        },
+        BASE_MODELS=[{"id": wrapper_id, "name": "Compact B"}],
+        OPENAI_MODELS=[],
+        OLLAMA_MODELS=[],
+    )
+
+    candidates = mod._iter_cache_models_from_state(state, disabled_provider_attrs=set())
+    assert [model["id"] for model in candidates].count(wrapper_id) == 2
+
+    targets = mod.filter_target_models(candidates, mod.Pipe.Valves())
+
+    assert [model["id"] for model in targets] == ["gpt-4.1", "other_pipe.child"]
 
 
 def test_target_filter_excludes_presets_based_on_own_wrappers():
@@ -362,6 +406,156 @@ async def test_sync_wrapper_model_records_preserves_existing_wrapper_hidden_when
     assert updated_id == wrapper_id
     assert updated_form.name == "Target (AutoCompact)"
     assert updated_form.meta.hidden is True
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_reuses_bulk_snapshot_on_steady_state(monkeypatch):
+    records, calls = install_fake_open_webui_model_modules(monkeypatch)
+    targets = [
+        {"id": "target-a", "name": "Target A"},
+        {"id": "target-b", "name": "Target B"},
+    ]
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=targets,
+        valves=mod.Pipe.Valves(),
+    )
+
+    for key in ("inserted", "updated", "deleted", "get_by_id"):
+        calls[key].clear()
+    calls["get_all"] = 0
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=targets,
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert calls["get_all"] == 1
+    assert calls["get_by_id"] == []
+    assert calls["inserted"] == []
+    assert calls["updated"] == []
+    assert calls["deleted"] == []
+    assert set(records) == {
+        mod.build_wrapper_model_id("auto_compact", "target-a"),
+        mod.build_wrapper_model_id("auto_compact", "target-b"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_keeps_fresh_target_reads_when_hiding(monkeypatch):
+    _, calls = install_fake_open_webui_model_modules(monkeypatch)
+    targets = [
+        {"id": "target-a", "name": "Target A"},
+        {"id": "target-b", "name": "Target B"},
+    ]
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=targets,
+        valves=valves,
+    )
+
+    for key in ("inserted", "updated", "deleted", "get_by_id"):
+        calls[key].clear()
+    calls["get_all"] = 0
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=targets,
+        valves=valves,
+    )
+
+    assert calls["get_all"] == 1
+    assert calls["get_by_id"] == ["target-a", "target-b"]
+    assert calls["inserted"] == []
+    assert calls["updated"] == []
+    assert calls["deleted"] == []
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_does_not_hide_target_from_stale_snapshot_when_fresh_read_fails(
+    monkeypatch,
+):
+    records = {
+        "provider-target": FakeModelForm(
+            id="provider-target",
+            base_model_id=None,
+            name="Admin Target",
+            params=FakeModelParams(temperature=0.7),
+            meta=FakeModelMeta(description="admin description"),
+            access_grants=[],
+            is_active=True,
+        )
+    }
+    records, calls = install_fake_open_webui_model_modules(monkeypatch, records)
+    Models = sys.modules["open_webui.models.models"].Models
+    original_get_model_by_id = Models.get_model_by_id
+
+    async def fail_target_read(model_id):
+        if model_id == "provider-target":
+            calls["get_by_id"].append(model_id)
+            return None
+        return await original_get_model_by_id(model_id)
+
+    monkeypatch.setattr(Models, "get_model_by_id", staticmethod(fail_target_read))
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "provider-target", "name": "Provider Target"}],
+        valves=valves,
+    )
+
+    target = records["provider-target"]
+    target_meta = target.meta.model_dump(exclude_unset=True)
+    assert target.name == "Admin Target"
+    assert target.params.temperature == 0.7
+    assert target.meta.description == "admin description"
+    assert "hidden" not in target_meta
+    assert "auto_compaction_target_hidden_by" not in target_meta
+    assert calls["updated"] == []
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_skips_stale_cleanup_when_bulk_read_fails(monkeypatch):
+    stale_wrapper_id = mod.build_wrapper_model_id("auto_compact", "stale-target")
+    records = {
+        stale_wrapper_id: FakeModelForm(
+            id=stale_wrapper_id,
+            base_model_id=None,
+            name="Stale Target (AutoCompact)",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                auto_compaction={
+                    "pipe_function_id": "auto_compact",
+                    "target_model_id": "stale-target",
+                }
+            ),
+            access_grants=[],
+            is_active=True,
+        )
+    }
+    records, _ = install_fake_open_webui_model_modules(monkeypatch, records)
+    Models = sys.modules["open_webui.models.models"].Models
+
+    async def fail_bulk_read():
+        raise RuntimeError("bulk read failed")
+
+    monkeypatch.setattr(Models, "get_all_models", staticmethod(fail_bulk_read))
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "active-target", "name": "Active Target"}],
+        valves=mod.Pipe.Valves(),
+    )
+
+    assert records[stale_wrapper_id].is_active is True
+    assert mod.build_wrapper_model_id("auto_compact", "active-target") in records
 
 
 @pytest.mark.asyncio
@@ -746,14 +940,26 @@ async def test_sync_wrapper_model_records_restores_hidden_target_before_deactiva
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_deletes_pipe_created_target_override_when_stale(monkeypatch):
+async def test_sync_wrapper_model_records_retains_pipe_created_target_override_when_stale(monkeypatch):
     records, calls = install_fake_open_webui_model_modules(monkeypatch)
     valves = mod.Pipe.Valves()
     valves.hide_wrapped_target_models = True
 
     await mod.sync_wrapper_model_records(
         pipe_function_id="auto_compact",
-        target_models=[{"id": "provider-target", "name": "Provider Target"}],
+        target_models=[
+            {
+                "id": "provider-target",
+                "name": "Provider Target",
+                "access_grants": [
+                    {
+                        "principal_type": "group",
+                        "principal_id": "team",
+                        "permission": "read",
+                    }
+                ],
+            }
+        ],
         valves=valves,
     )
 
@@ -763,7 +969,6 @@ async def test_sync_wrapper_model_records_deletes_pipe_created_target_override_w
         "pipe_function_id": "auto_compact",
         "had_hidden": False,
         "previous_hidden": False,
-        "created_model_record": True,
     }
 
     calls["inserted"].clear()
@@ -777,13 +982,120 @@ async def test_sync_wrapper_model_records_deletes_pipe_created_target_override_w
     )
 
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "provider-target")
-    assert calls["deleted"] == ["provider-target"]
-    assert "provider-target" not in records
+    restored_meta = records["provider-target"].meta.model_dump(exclude_unset=True)
+    assert calls["deleted"] == []
+    assert "hidden" not in restored_meta
+    assert "auto_compaction_target_hidden_by" not in restored_meta
     assert records[wrapper_id].is_active is False
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_deletes_pipe_created_target_override_when_hide_valve_disabled(
+async def test_sync_wrapper_model_records_preserves_admin_edited_target_override(monkeypatch):
+    records, calls = install_fake_open_webui_model_modules(monkeypatch)
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+    target = {"id": "provider-target", "name": "Provider Target"}
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[target],
+        valves=valves,
+    )
+
+    original_marker = copy.deepcopy(
+        records["provider-target"].meta.auto_compaction_target_hidden_by
+    )
+    records["provider-target"] = FakeModelForm(
+        id="provider-target",
+        base_model_id=None,
+        name="Admin Edited Target",
+        params=FakeModelParams(temperature=0.7),
+        meta=FakeModelMeta(
+            hidden=True,
+            description="admin description",
+            auto_compaction_target_hidden_by=original_marker,
+        ),
+        access_grants=[
+            {
+                "id": "admin-grant-id",
+                "principal_type": "user",
+                "principal_id": "admin-user",
+                "permission": "write",
+            }
+        ],
+        is_active=False,
+    )
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[target],
+        valves=valves,
+    )
+
+    assert records["provider-target"].meta.auto_compaction_target_hidden_by == original_marker
+    for key in ("inserted", "updated", "deleted", "get_by_id"):
+        calls[key].clear()
+    calls["get_all"] = 0
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[],
+        valves=mod.Pipe.Valves(),
+    )
+
+    restored = records["provider-target"]
+    restored_meta = restored.meta.model_dump(exclude_unset=True)
+    assert calls["deleted"] == []
+    assert restored.name == "Admin Edited Target"
+    assert restored.params.temperature == 0.7
+    assert restored_meta["description"] == "admin description"
+    assert "hidden" not in restored_meta
+    assert "auto_compaction_target_hidden_by" not in restored_meta
+    assert {
+        (grant["principal_type"], grant["principal_id"], grant["permission"])
+        for grant in restored.access_grants
+    } == {("user", "admin-user", "write")}
+    assert restored.is_active is False
+    assert records[mod.build_wrapper_model_id("auto_compact", "provider-target")].is_active is False
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_restores_previous_created_marker_without_deleting_override(monkeypatch):
+    records, calls = install_fake_open_webui_model_modules(monkeypatch)
+    valves = mod.Pipe.Valves()
+    valves.hide_wrapped_target_models = True
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[{"id": "provider-target", "name": "Provider Target"}],
+        valves=valves,
+    )
+
+    records["provider-target"].meta.auto_compaction_target_hidden_by.update(
+        {
+            "created_model_record": True,
+            "created_model_record_fingerprint": "sha256:previous-version",
+        }
+    )
+    for key in ("inserted", "updated", "deleted", "get_by_id"):
+        calls[key].clear()
+    calls["get_all"] = 0
+
+    await mod.sync_wrapper_model_records(
+        pipe_function_id="auto_compact",
+        target_models=[],
+        valves=mod.Pipe.Valves(),
+    )
+
+    restored_meta = records["provider-target"].meta.model_dump(exclude_unset=True)
+    assert calls["deleted"] == []
+    assert "hidden" not in restored_meta
+    assert "auto_compaction_target_hidden_by" not in restored_meta
+    assert records[mod.build_wrapper_model_id("auto_compact", "provider-target")].is_active is False
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_model_records_retains_pipe_created_target_override_when_hide_valve_disabled(
     monkeypatch,
 ):
     records, calls = install_fake_open_webui_model_modules(monkeypatch)
@@ -807,8 +1119,10 @@ async def test_sync_wrapper_model_records_deletes_pipe_created_target_override_w
     )
 
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "provider-target")
-    assert calls["deleted"] == ["provider-target"]
-    assert "provider-target" not in records
+    restored_meta = records["provider-target"].meta.model_dump(exclude_unset=True)
+    assert calls["deleted"] == []
+    assert "hidden" not in restored_meta
+    assert "auto_compaction_target_hidden_by" not in restored_meta
     assert records[wrapper_id].is_active is True
 
 
@@ -861,7 +1175,7 @@ async def test_sync_wrapper_model_records_keeps_preexisting_hidden_target_when_r
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("restore_failure", ["exception", "none"])
+@pytest.mark.parametrize("restore_failure", ["exception", "none", "read_none"])
 async def test_sync_wrapper_model_records_keeps_stale_wrapper_active_when_target_restore_fails(
     monkeypatch, restore_failure
 ):
@@ -900,15 +1214,23 @@ async def test_sync_wrapper_model_records_keeps_stale_wrapper_active_when_target
     }
     records, calls = install_fake_open_webui_model_modules(monkeypatch, records)
     Models = sys.modules["open_webui.models.models"].Models
+    original_get_model_by_id = Models.get_model_by_id
     original_update_model_by_id = Models.update_model_by_id
 
+    async def fail_target_restore_read(model_id):
+        if restore_failure == "read_none" and model_id == "stale-target":
+            calls["get_by_id"].append(model_id)
+            return None
+        return await original_get_model_by_id(model_id)
+
     async def fail_target_restore_update(model_id, model_form):
-        if model_id == "stale-target":
+        if restore_failure != "read_none" and model_id == "stale-target":
             if restore_failure == "none":
                 return None
             raise RuntimeError("restore failed")
         return await original_update_model_by_id(model_id, model_form)
 
+    monkeypatch.setattr(Models, "get_model_by_id", staticmethod(fail_target_restore_read))
     monkeypatch.setattr(Models, "update_model_by_id", staticmethod(fail_target_restore_update))
 
     await mod.sync_wrapper_model_records(
@@ -5886,6 +6208,36 @@ def test_context_window_classifier_rejects_input_length_validation_errors():
         {"error": {"message": "max_completion_tokens exceeds the maximum number of tokens"}},
         status_code=422,
     )
+
+
+def test_sse_json_parser_preserves_unicode_line_separator():
+    payload = {"choices": [{"delta": {"content": "before\u2028after"}}]}
+    chunk = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    assert mod.extract_sse_json_events(chunk) == [payload]
+
+
+def test_sse_parser_swallows_split_crlf_across_empty_chunk():
+    parser = mod._SSEDataParser()
+
+    assert parser.feed("data: first\r")[0] == []
+    assert parser.feed("")[0] == []
+    assert parser.feed("\ndata: second\r\n\r\n")[0] == ["first\nsecond"]
+
+
+def test_sse_parser_accepts_bare_cr_immediately():
+    parser = mod._SSEDataParser()
+
+    assert parser.feed("data: first\rdata: second\r\r")[0] == ["first\nsecond"]
+
+
+@pytest.mark.parametrize("tail", ["data: final", "data: final\r"])
+def test_sse_parser_flushes_incomplete_final_event_once(tail):
+    parser = mod._SSEDataParser()
+
+    assert parser.feed(tail)[0] == []
+    assert parser.flush()[0] == ["final"]
+    assert parser.flush()[0] == []
 
 
 def test_sse_error_payload_is_classified_before_any_content():
