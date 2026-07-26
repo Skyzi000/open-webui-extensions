@@ -73,7 +73,7 @@ def test_source_hash_ignores_all_system_messages():
 
 
 def test_transient_marker_excludes_user_message_from_source_identity():
-    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    patterns = mod.parse_transient_message_patterns(TRANSIENT_MARKER)
     stable = [
         {"role": "user", "content": "old"},
         {"role": "user", "content": "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"},
@@ -102,7 +102,7 @@ def test_transient_marker_excludes_user_message_from_source_identity():
 
 
 def test_transient_marker_whole_block_pattern_does_not_match_prepend_case():
-    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    patterns = mod.parse_transient_message_patterns(TRANSIENT_MARKER)
     messages = [
         {
             "role": "user",
@@ -118,7 +118,7 @@ def test_transient_marker_whole_block_pattern_does_not_match_prepend_case():
 
 
 def test_safe_cut_does_not_anchor_on_transient_user_message():
-    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    patterns = mod.parse_transient_message_patterns(TRANSIENT_MARKER)
     messages = [
         {"role": "user", "content": "active request"},
         {"role": "assistant", "content": "answer"},
@@ -133,7 +133,7 @@ def test_safe_cut_does_not_anchor_on_transient_user_message():
 
 
 def test_historical_user_excerpts_skip_transient_user_messages():
-    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    patterns = mod.parse_transient_message_patterns(TRANSIENT_MARKER)
     messages = [
         {"role": "user", "content": "old request"},
         {"role": "user", "content": "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"},

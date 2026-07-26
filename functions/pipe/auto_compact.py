@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.6.10
+version: 0.7.0
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -125,7 +125,7 @@ SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
 SOURCE_HASH_FAMILY = "canonical-json-v1"
 PROFILE_HASH_FAMILY = "checkpoint-profile-v1"
 MAX_CONTEXT_RETRY_ATTEMPTS = 2
-DEFAULT_TRIGGER_TOTAL_TOKENS = 180000
+DEFAULT_TRIGGER_INPUT_TOKENS = 180000
 DEFAULT_SOFT_TRIGGER_RATIO = 0.5
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES = 512
 DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT = 32
@@ -996,7 +996,7 @@ class _TransientMessageMatcher:
 
 
 @lru_cache(maxsize=128)
-def parse_transient_message_markers(value: str) -> TransientMessagePatterns:
+def parse_transient_message_patterns(value: str) -> TransientMessagePatterns:
     patterns: list[re.Pattern[str]] = []
     for line_number, line in enumerate(str(value or "").splitlines(), start=1):
         pattern = line.strip()
@@ -1005,7 +1005,7 @@ def parse_transient_message_markers(value: str) -> TransientMessagePatterns:
         try:
             patterns.append(re.compile(pattern))
         except re.error as exc:
-            raise ValueError(f"transient_message_markers line {line_number}: {exc}") from exc
+            raise ValueError(f"transient_message_patterns line {line_number}: {exc}") from exc
     return tuple(patterns)
 
 
@@ -4293,41 +4293,41 @@ def _matches_any_pattern(model: dict[str, Any], patterns: list[str]) -> bool:
     return False
 
 
-def parse_trigger_total_tokens_overrides(value: str) -> list[dict[str, Any]]:
+def parse_per_model_overrides(value: str) -> list[dict[str, Any]]:
     text = str(value or "").strip()
     if not text:
         return []
     try:
         root = json.loads(text)
     except ValueError as exc:
-        raise ValueError(f"trigger_total_tokens_overrides_json must be valid JSON: {exc}") from exc
+        raise ValueError(f"per_model_overrides_json must be valid JSON: {exc}") from exc
     if not isinstance(root, dict):
-        raise ValueError("trigger_total_tokens_overrides_json must be a JSON object")
+        raise ValueError("per_model_overrides_json must be a JSON object")
     unknown_root_keys = set(root) - {"schema_version", "overrides"}
     if unknown_root_keys:
-        raise ValueError(f"trigger_total_tokens_overrides_json has unknown keys: {sorted(unknown_root_keys)}")
+        raise ValueError(f"per_model_overrides_json has unknown keys: {sorted(unknown_root_keys)}")
     schema_version = root.get("schema_version", 1)
     if schema_version != 1:
-        raise ValueError("trigger_total_tokens_overrides_json schema_version must be 1")
+        raise ValueError("per_model_overrides_json schema_version must be 1")
     raw_overrides = root.get("overrides", [])
     if not isinstance(raw_overrides, list):
-        raise ValueError("trigger_total_tokens_overrides_json overrides must be a list")
+        raise ValueError("per_model_overrides_json overrides must be a list")
     overrides: list[dict[str, Any]] = []
     for index, raw in enumerate(raw_overrides):
         if not isinstance(raw, dict):
             raise ValueError(f"overrides[{index}] must be an object")
-        unknown_override_keys = set(raw) - {"model_patterns", "trigger_total_tokens", "soft_trigger_ratio"}
+        unknown_override_keys = set(raw) - {"model_patterns", "trigger_input_tokens", "soft_trigger_ratio"}
         if unknown_override_keys:
             raise ValueError(f"overrides[{index}] has unknown keys: {sorted(unknown_override_keys)}")
         patterns = raw.get("model_patterns")
         if not isinstance(patterns, list) or not patterns or not all(isinstance(p, str) and p for p in patterns):
             raise ValueError(f"overrides[{index}].model_patterns must be a non-empty list of strings")
         override: dict[str, Any] = {"model_patterns": list(patterns)}
-        if "trigger_total_tokens" in raw:
-            threshold = raw.get("trigger_total_tokens")
+        if "trigger_input_tokens" in raw:
+            threshold = raw.get("trigger_input_tokens")
             if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 1:
-                raise ValueError(f"overrides[{index}].trigger_total_tokens must be an integer >= 1")
-            override["trigger_total_tokens"] = threshold
+                raise ValueError(f"overrides[{index}].trigger_input_tokens must be an integer >= 1")
+            override["trigger_input_tokens"] = threshold
         if "soft_trigger_ratio" in raw:
             ratio = raw.get("soft_trigger_ratio")
             if (
@@ -4339,39 +4339,39 @@ def parse_trigger_total_tokens_overrides(value: str) -> list[dict[str, Any]]:
             ):
                 raise ValueError(f"overrides[{index}].soft_trigger_ratio must be a number >= 0 and < 1")
             override["soft_trigger_ratio"] = float(ratio)
-        if "trigger_total_tokens" not in override and "soft_trigger_ratio" not in override:
-            raise ValueError(f"overrides[{index}] must set trigger_total_tokens or soft_trigger_ratio")
+        if "trigger_input_tokens" not in override and "soft_trigger_ratio" not in override:
+            raise ValueError(f"overrides[{index}] must set trigger_input_tokens or soft_trigger_ratio")
         overrides.append(override)
     return overrides
 
 
-def resolve_trigger_total_tokens(valves: Any, target_model: dict[str, Any]) -> int:
-    overrides = parse_trigger_total_tokens_overrides(getattr(valves, "trigger_total_tokens_overrides_json", ""))
+def resolve_trigger_input_tokens(valves: Any, target_model: dict[str, Any]) -> int:
+    overrides = parse_per_model_overrides(getattr(valves, "per_model_overrides_json", ""))
     for override in overrides:
-        if "trigger_total_tokens" in override and _matches_any_pattern(target_model, override["model_patterns"]):
-            return int(override["trigger_total_tokens"])
-    return int(valves.trigger_total_tokens)
+        if "trigger_input_tokens" in override and _matches_any_pattern(target_model, override["model_patterns"]):
+            return int(override["trigger_input_tokens"])
+    return int(valves.trigger_input_tokens)
 
 
 def resolve_soft_trigger_ratio(valves: Any, target_model: dict[str, Any]) -> float:
-    overrides = parse_trigger_total_tokens_overrides(getattr(valves, "trigger_total_tokens_overrides_json", ""))
+    overrides = parse_per_model_overrides(getattr(valves, "per_model_overrides_json", ""))
     for override in overrides:
         if "soft_trigger_ratio" in override and _matches_any_pattern(target_model, override["model_patterns"]):
             return float(override["soft_trigger_ratio"])
     return float(getattr(valves, "soft_trigger_ratio", DEFAULT_SOFT_TRIGGER_RATIO) or 0)
 
 
-def resolve_soft_trigger_total_tokens(
+def resolve_soft_trigger_input_tokens(
     valves: Any,
     target_model: dict[str, Any],
-    hard_trigger_total_tokens: int,
+    hard_trigger_input_tokens: int,
 ) -> int | None:
     soft_trigger_ratio = resolve_soft_trigger_ratio(valves, target_model)
-    hard_trigger_total_tokens = int(hard_trigger_total_tokens)
-    soft_trigger_total_tokens = int(hard_trigger_total_tokens * soft_trigger_ratio)
-    if soft_trigger_total_tokens <= 0 or soft_trigger_total_tokens >= hard_trigger_total_tokens:
+    hard_trigger_input_tokens = int(hard_trigger_input_tokens)
+    soft_trigger_input_tokens = int(hard_trigger_input_tokens * soft_trigger_ratio)
+    if soft_trigger_input_tokens <= 0 or soft_trigger_input_tokens >= hard_trigger_input_tokens:
         return None
-    return soft_trigger_total_tokens
+    return soft_trigger_input_tokens
 
 
 def _is_arena_model(model: dict[str, Any]) -> bool:
@@ -4833,7 +4833,7 @@ def build_wrapper_model_form(
     hide_wrapped_target_models = bool(getattr(valves, "hide_wrapped_target_models", False))
     wrapper_name = format_wrapper_model_name(
         target,
-        template=getattr(valves, "model_name_template", "auto"),
+        template=getattr(valves, "wrapper_model_name_template", "auto"),
         hide_wrapped_target_models=hide_wrapped_target_models,
     )
     access_grants = copy.deepcopy(target.access_grants)
@@ -7828,8 +7828,8 @@ def _build_display_token_context(
     *,
     estimated_total_tokens: int | None,
     total_tokens: int | None,
-    effective_trigger_total_tokens: int,
-    effective_soft_trigger_total_tokens: int | None,
+    effective_trigger_input_tokens: int,
+    effective_soft_trigger_input_tokens: int | None,
     usage_source: str | None,
 ) -> DisplayTokenContext:
     before = None
@@ -7842,15 +7842,15 @@ def _build_display_token_context(
         before = total_tokens
 
     pct_of_hard = None
-    if before is not None and effective_trigger_total_tokens > 0:
-        pct_of_hard = round(before / effective_trigger_total_tokens * 100, 1)
+    if before is not None and effective_trigger_input_tokens > 0:
+        pct_of_hard = round(before / effective_trigger_input_tokens * 100, 1)
 
     return DisplayTokenContext(
         before=before,
         usage=total_tokens,
         estimate=estimated_total_tokens,
-        hard_limit=effective_trigger_total_tokens,
-        soft_limit=effective_soft_trigger_total_tokens,
+        hard_limit=effective_trigger_input_tokens,
+        soft_limit=effective_soft_trigger_input_tokens,
         usage_source=display_usage_source,
         pct_of_hard=pct_of_hard,
     )
@@ -7890,7 +7890,7 @@ def _format_token_suffix(
     ctx: DisplayTokenContext,
     *,
     after: int | None,
-    compare_estimate: bool,
+    show_usage_and_estimate: bool,
     summary: int | None = None,
 ) -> str:
     hard_limit = f"{ctx.hard_limit:,}"
@@ -7898,7 +7898,7 @@ def _format_token_suffix(
 
     if summary is not None:
         summary_part = f"summary {_format_token_count(summary, approximate=True)} tokens"
-        if compare_estimate and ctx.usage is not None and ctx.estimate is not None:
+        if show_usage_and_estimate and ctx.usage is not None and ctx.estimate is not None:
             estimate_part = f"candidate ≈{ctx.estimate:,}"
             pct_part = f" · {before_pct}%" if before_pct is not None else ""
             return f"(observed usage {ctx.usage:,} · {estimate_part} / {hard_limit}{pct_part} · {summary_part})"
@@ -7907,7 +7907,7 @@ def _format_token_suffix(
         pct_part = f" · {before_pct}%" if before_pct is not None and ctx.hard_limit > 0 else ""
         return f"({before} / {hard_limit} tokens{pct_part} · {summary_part})"
 
-    if compare_estimate and ctx.usage is not None and ctx.estimate is not None:
+    if show_usage_and_estimate and ctx.usage is not None and ctx.estimate is not None:
         estimate_part = f"candidate ≈{ctx.estimate:,}"
         pct_part = f" · {before_pct}%" if before_pct is not None else ""
         if after is not None:
@@ -7933,7 +7933,7 @@ def _tokens_status_payload(
     ctx: DisplayTokenContext,
     *,
     after: int | None,
-    compare_estimate: bool,
+    show_usage_and_estimate: bool,
     summary: int | None = None,
 ) -> dict[str, Any]:
     tokens: dict[str, Any] = {
@@ -7947,9 +7947,9 @@ def _tokens_status_payload(
         tokens["summary"] = summary
     elif after is not None:
         tokens["after"] = after
-    if compare_estimate and ctx.usage is not None:
+    if show_usage_and_estimate and ctx.usage is not None:
         tokens["usage"] = ctx.usage
-    if compare_estimate and ctx.estimate is not None:
+    if show_usage_and_estimate and ctx.estimate is not None:
         tokens["estimate"] = ctx.estimate
     return tokens
 
@@ -7959,10 +7959,10 @@ def _description_with_token_suffix(
     ctx: DisplayTokenContext,
     *,
     after: int | None = None,
-    compare_estimate: bool = False,
+    show_usage_and_estimate: bool = False,
     summary: int | None = None,
 ) -> str:
-    return f"{description} {_format_token_suffix(ctx, after=after, compare_estimate=compare_estimate, summary=summary)}"
+    return f"{description} {_format_token_suffix(ctx, after=after, show_usage_and_estimate=show_usage_and_estimate, summary=summary)}"
 
 
 async def emit_compaction_status(
@@ -9166,13 +9166,13 @@ async def _prefetch_compaction_checkpoint(
     summary_tool_policy: SummaryToolPolicy,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
-    effective_trigger_total_tokens: int = 100000,
-    effective_soft_trigger_total_tokens: int | None = None,
-    trigger_total_tokens: int | None = None,
+    effective_trigger_input_tokens: int = 100000,
+    effective_soft_trigger_input_tokens: int | None = None,
+    trigger_observed_tokens: int | None = None,
     trigger_estimated_tokens: int | None = None,
     trigger_usage_source: str | None = None,
     token_status_detail: Literal["before", "before_after"] = "before",
-    token_status_compare_estimate: bool = False,
+    token_status_show_usage_and_estimate: bool = False,
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
     file_context_enabled: bool = True,
     task_estimate_body: dict[str, Any] | None = None,
@@ -9315,8 +9315,8 @@ async def _prefetch_compaction_checkpoint(
             )
             return False
         if (
-            effective_soft_trigger_total_tokens is not None
-            and checkpoint_applied_estimate < effective_soft_trigger_total_tokens
+            effective_soft_trigger_input_tokens is not None
+            and checkpoint_applied_estimate < effective_soft_trigger_input_tokens
         ):
             return False
 
@@ -9325,7 +9325,7 @@ async def _prefetch_compaction_checkpoint(
     prefetch_display_context_ready = False
 
     async def skip_child_generation_if_parent_below_soft(parent: dict[str, Any]) -> None:
-        if effective_soft_trigger_total_tokens is None:
+        if effective_soft_trigger_input_tokens is None:
             return
         parent_count = int(parent.get("source_message_count") or 0)
         checkpoint_applied_estimate = await estimate_prefetch_checkpoint_applied_tokens(
@@ -9346,14 +9346,14 @@ async def _prefetch_compaction_checkpoint(
                 parent_count,
             )
             raise _CheckpointGenerationSkipped()
-        if checkpoint_applied_estimate < effective_soft_trigger_total_tokens:
+        if checkpoint_applied_estimate < effective_soft_trigger_input_tokens:
             raise _CheckpointGenerationSkipped()
 
     async def display_token_context() -> DisplayTokenContext:
         nonlocal prefetch_display_context, prefetch_display_context_ready
         if not prefetch_display_context_ready:
             estimated = trigger_estimated_tokens
-            total = trigger_total_tokens
+            total = trigger_observed_tokens
             usage_src = trigger_usage_source
             if estimated is None and total is None:
                 with suppress(Exception):
@@ -9374,8 +9374,8 @@ async def _prefetch_compaction_checkpoint(
             prefetch_display_context = _build_display_token_context(
                 estimated_total_tokens=estimated,
                 total_tokens=total,
-                effective_trigger_total_tokens=effective_trigger_total_tokens,
-                effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+                effective_trigger_input_tokens=effective_trigger_input_tokens,
+                effective_soft_trigger_input_tokens=effective_soft_trigger_input_tokens,
                 usage_source=usage_src,
             )
             prefetch_display_context_ready = True
@@ -9396,7 +9396,7 @@ async def _prefetch_compaction_checkpoint(
                 token_context,
             ),
             done=False,
-            tokens=_tokens_status_payload(token_context, after=None, compare_estimate=False),
+            tokens=_tokens_status_payload(token_context, after=None, show_usage_and_estimate=False),
         )
 
     try:
@@ -9436,7 +9436,7 @@ async def _prefetch_compaction_checkpoint(
                 ),
                 done=True,
                 error=True,
-                tokens=_tokens_status_payload(token_context, after=None, compare_estimate=False),
+                tokens=_tokens_status_payload(token_context, after=None, show_usage_and_estimate=False),
             )
         raise
     except Exception as exc:
@@ -9451,7 +9451,7 @@ async def _prefetch_compaction_checkpoint(
                 ),
                 done=True,
                 error=True,
-                tokens=_tokens_status_payload(token_context, after=None, compare_estimate=False),
+                tokens=_tokens_status_payload(token_context, after=None, show_usage_and_estimate=False),
             )
         raise
     if summary_started and event_emitter is not None:
@@ -9480,13 +9480,13 @@ async def _prefetch_compaction_checkpoint(
                 "Auto-compaction checkpoint is ready",
                 token_context,
                 summary=summary_tokens,
-                compare_estimate=token_status_compare_estimate,
+                show_usage_and_estimate=token_status_show_usage_and_estimate,
             ),
             done=True,
             tokens=_tokens_status_payload(
                 token_context,
                 after=None,
-                compare_estimate=token_status_compare_estimate,
+                show_usage_and_estimate=token_status_show_usage_and_estimate,
                 summary=summary_tokens,
             ),
         )
@@ -9514,13 +9514,13 @@ def _prepare_soft_compaction_prefetch(
     summary_tool_policy: SummaryToolPolicy,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
-    effective_trigger_total_tokens: int = 100000,
-    effective_soft_trigger_total_tokens: int | None = None,
-    trigger_total_tokens: int | None = None,
+    effective_trigger_input_tokens: int = 100000,
+    effective_soft_trigger_input_tokens: int | None = None,
+    trigger_observed_tokens: int | None = None,
     trigger_estimated_tokens: int | None = None,
     trigger_usage_source: str | None = None,
     token_status_detail: Literal["before", "before_after"] = "before",
-    token_status_compare_estimate: bool = False,
+    token_status_show_usage_and_estimate: bool = False,
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
     file_context_enabled: bool = True,
     task_estimate_body: dict[str, Any] | None = None,
@@ -9584,13 +9584,13 @@ def _prepare_soft_compaction_prefetch(
             summary_tool_policy=summary_tool_policy,
             historical_message_excerpt_bytes=historical_message_excerpt_bytes,
             historical_message_excerpt_count=historical_message_excerpt_count,
-            effective_trigger_total_tokens=effective_trigger_total_tokens,
-            effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
-            trigger_total_tokens=trigger_total_tokens,
+            effective_trigger_input_tokens=effective_trigger_input_tokens,
+            effective_soft_trigger_input_tokens=effective_soft_trigger_input_tokens,
+            trigger_observed_tokens=trigger_observed_tokens,
             trigger_estimated_tokens=trigger_estimated_tokens,
             trigger_usage_source=trigger_usage_source,
             token_status_detail=token_status_detail,
-            token_status_compare_estimate=token_status_compare_estimate,
+            token_status_show_usage_and_estimate=token_status_show_usage_and_estimate,
             event_emitter=event_emitter,
             file_context_enabled=file_context_enabled,
             task_estimate_body=prefetch_task_estimate_body,
@@ -9614,13 +9614,13 @@ def _start_soft_compaction_prefetch(
     summary_tool_policy: SummaryToolPolicy,
     historical_message_excerpt_bytes: int,
     historical_message_excerpt_count: int,
-    effective_trigger_total_tokens: int = 100000,
-    effective_soft_trigger_total_tokens: int | None = None,
-    trigger_total_tokens: int | None = None,
+    effective_trigger_input_tokens: int = 100000,
+    effective_soft_trigger_input_tokens: int | None = None,
+    trigger_observed_tokens: int | None = None,
     trigger_estimated_tokens: int | None = None,
     trigger_usage_source: str | None = None,
     token_status_detail: Literal["before", "before_after"] = "before",
-    token_status_compare_estimate: bool = False,
+    token_status_show_usage_and_estimate: bool = False,
     event_emitter: Callable[[Any], Awaitable[None]] | None = None,
     file_context_enabled: bool = True,
     task_estimate_body: dict[str, Any] | None = None,
@@ -9641,13 +9641,13 @@ def _start_soft_compaction_prefetch(
         summary_tool_policy=summary_tool_policy,
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
-        effective_trigger_total_tokens=effective_trigger_total_tokens,
-        effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
-        trigger_total_tokens=trigger_total_tokens,
+        effective_trigger_input_tokens=effective_trigger_input_tokens,
+        effective_soft_trigger_input_tokens=effective_soft_trigger_input_tokens,
+        trigger_observed_tokens=trigger_observed_tokens,
         trigger_estimated_tokens=trigger_estimated_tokens,
         trigger_usage_source=trigger_usage_source,
         token_status_detail=token_status_detail,
-        token_status_compare_estimate=token_status_compare_estimate,
+        token_status_show_usage_and_estimate=token_status_show_usage_and_estimate,
         event_emitter=event_emitter,
         file_context_enabled=file_context_enabled,
         task_estimate_body=task_estimate_body,
@@ -11605,7 +11605,7 @@ async def _compact_task_body(
 
 class Pipe:
     class Valves(BaseModel):
-        model_name_template: str = Field(
+        wrapper_model_name_template: str = Field(
             default="auto",
             description=(
                 "Wrapper display name template. Use 'auto' to show the raw target name when hide_wrapped_target_models is on, "
@@ -11622,8 +11622,8 @@ class Pipe:
             description=(
                 "Comma/newline-separated patterns matched against the full target model id or name. "
                 "Only * and ? are wildcards; all other characters are literal. Empty wraps every eligible "
-                "target model except this Pipe's own AutoCompact wrappers, models/presets based on them, and "
-                "arena models; models from other pipes can still be wrapped."
+                "target model except AutoCompact wrappers from any Pipe, models/presets based on this Pipe's "
+                "own wrappers, and arena models; other pipe-backed models can still be wrapped."
             ),
         )
         exclude_model_patterns: str = Field(
@@ -11662,15 +11662,17 @@ class Pipe:
                 }
             },
         )
-        trigger_total_tokens: int = Field(
-            default=DEFAULT_TRIGGER_TOTAL_TOKENS,
+        trigger_input_tokens: int = Field(
+            default=DEFAULT_TRIGGER_INPUT_TOKENS,
             ge=1,
             description=(
-                f"Global candidate-token threshold for foreground compaction. Default {DEFAULT_TRIGGER_TOTAL_TOKENS:,} "
-                "is intentionally below a 256k context window to leave output-token budget. Decisions use the "
-                "checkpoint-applied, usage-anchored, or full-body local estimate for the payload about "
-                "to be sent; observed provider/Open WebUI usage is an anchor/context signal, not a "
-                "direct trigger by itself. Override per model with trigger_total_tokens_overrides_json."
+                "Input-token threshold applied to the current candidate estimate to decide whether "
+                f"foreground compaction is required. The default {DEFAULT_TRIGGER_INPUT_TOKENS:,} leaves "
+                "output-token headroom in a 256k context window. Very low values are outside this Pipe's "
+                "intended operating range: reaching the threshold triggers a foreground compaction attempt, "
+                "but the resulting request is not guaranteed to fall below it, and required active input may "
+                "still exceed the model's context limit and prevent continuation. Override per model with "
+                "per_model_overrides_json."
             ),
         )
         soft_trigger_ratio: float = Field(
@@ -11678,29 +11680,31 @@ class Pipe:
             ge=0,
             lt=1,
             description=(
-                "Ratio of the effective trigger_total_tokens that starts asynchronous background "
+                "Ratio of the effective trigger_input_tokens that starts asynchronous background "
                 "summary generation without pausing the current request. Before forwarding, this uses the "
-                "candidate estimate; after a target response completes, that response's own usage can also "
-                "start it when it is >= soft and < hard. The summary is saved as a checkpoint and reused by "
+                "candidate estimate; after a target response completes, that response's own input-plus-output "
+                "usage can also start it as a proxy for the next request's input when it is >= soft and < hard. "
+                "The summary is saved as a checkpoint and reused by "
                 "a later request if ready. Set 0, or a value that rounds to 0, to disable. Override per "
-                "model with soft_trigger_ratio in trigger_total_tokens_overrides_json."
+                "model with soft_trigger_ratio in per_model_overrides_json."
             ),
         )
-        trigger_total_tokens_overrides_json: str = Field(
+        per_model_overrides_json: str = Field(
             default="",
             description=(
-                "Optional JSON object overriding trigger_total_tokens and/or soft_trigger_ratio per model. Shape: "
-                '{"overrides": [{"model_patterns": ["claude-*", "Claude *"], "trigger_total_tokens": 160000, "soft_trigger_ratio": 0.75}]}. '
+                "Optional JSON object containing sparse per-target-model setting overrides. Currently supports "
+                "trigger_input_tokens and soft_trigger_ratio. Shape: "
+                '{"overrides": [{"model_patterns": ["claude-*", "Claude *"], "trigger_input_tokens": 160000, "soft_trigger_ratio": 0.75}]}. '
                 "model_patterns match against target model id/name (same as include/exclude); only * (any run) "
                 'and ? (single char) are wildcards and everything else is literal, so "[" needs no escaping: '
                 '"claude-opus-4-8[1m]" matches that exact id and "*[1m]" matches every id ending in "[1m]". '
-                "Each override requires non-empty model_patterns and at least one of trigger_total_tokens (integer >= 1) "
+                "Each override requires non-empty model_patterns and at least one of trigger_input_tokens (integer >= 1) "
                 "or soft_trigger_ratio (finite number >= 0 and < 1); optional schema_version must be 1. For each setting, "
                 "overrides are evaluated top-to-bottom and the first matching override containing that setting wins. Empty disables overrides. "
                 "Invalid JSON, non-object roots, unknown keys, or invalid shapes are rejected on save."
             ),
         )
-        transient_message_markers: str = Field(
+        transient_message_patterns: str = Field(
             default="",
             description=(
                 "Newline-separated Python regex patterns, validated on save. A "
@@ -11708,9 +11712,9 @@ class Pipe:
                 "(kept in requests and summarization input, excluded from checkpoint "
                 "identity) when any pattern matches from the start of its first text "
                 "part (leading whitespace skipped; re.match semantics, so anchor the "
-                "end with \\Z to require the whole message to be the injected block). "
+                "end with \\Z to require the whole first text part to be the injected block). "
                 "Example: (?s)<SYSTEM_CONTEXT>.*</SYSTEM_CONTEXT>\\s*\\Z  "
-                "Keep patterns simple and linear; they run against full message text. "
+                "Keep patterns simple and linear; they run against the entire first text part. "
                 "Empty disables this."
             ),
         )
@@ -11785,28 +11789,35 @@ class Pipe:
                 "count on completed 'prefetched' events, when those estimates are available."
             ),
         )
-        token_status_compare_estimate: bool = Field(
+        token_status_show_usage_and_estimate: bool = Field(
             default=False,
             description=(
-                "When true, include both the observed provider/Open WebUI usage anchor and the "
-                "candidate token estimate in status payloads when available. These usually count "
-                "different request points, so use them for provenance/debugging, not as a direct "
-                "provider-vs-tiktoken accuracy comparison. If the candidate decision estimate is "
-                "otherwise unavailable but observed usage exists, enabling this computes a local "
-                "estimate purely for display and does not affect compaction decisions."
+                "When true, include the observed input-plus-output token total from the preceding target "
+                "response and the current candidate input estimate in token status payloads when available. "
+                "In a tool loop the values are staggered: a status shows usage for the preceding target "
+                "request and an estimate for the current one. With token_status_visibility='always', compare "
+                "the estimate for a candidate forwarded without further compaction or retry with the usage in "
+                "the following target request's status, not with the usage shown beside it. The observed total "
+                "includes reported output tokens, while the estimate may "
+                "combine an input count from an earlier target response, held in request-local state or in "
+                "this Pipe's durable usage anchor, with a locally estimated delta; therefore the gap is not "
+                "a pure full-body tiktoken accuracy figure. The first target request and some retry or "
+                "prefetch paths may show only one value. If no decision estimate is available but observed "
+                "usage exists, this Valve attempts a local display-only estimate; compaction decisions are "
+                "unchanged."
             ),
         )
 
-        @field_validator("trigger_total_tokens_overrides_json")
+        @field_validator("per_model_overrides_json")
         @classmethod
-        def _validate_trigger_total_tokens_overrides_json(cls, value: str) -> str:
-            parse_trigger_total_tokens_overrides(value)
+        def _validate_per_model_overrides_json(cls, value: str) -> str:
+            parse_per_model_overrides(value)
             return value
 
-        @field_validator("transient_message_markers")
+        @field_validator("transient_message_patterns")
         @classmethod
-        def _validate_transient_message_markers(cls, value: str) -> str:
-            parse_transient_message_markers(value)
+        def _validate_transient_message_patterns(cls, value: str) -> str:
+            parse_transient_message_patterns(value)
             return value
 
         @classmethod
@@ -11867,7 +11878,7 @@ class Pipe:
                     "id": encode_target_model_id(target_contract.id),
                     "name": format_wrapper_model_name(
                         target_contract,
-                        template=getattr(self.valves, "model_name_template", "auto"),
+                        template=getattr(self.valves, "wrapper_model_name_template", "auto"),
                         hide_wrapped_target_models=hide_wrapped_target_models,
                     ),
                 }
@@ -11987,8 +11998,8 @@ class Pipe:
         checkpoint_lookup_body = task_source_body if task_source_body is not None else _copy_body_preserving_metadata(inner)
         estimate_lookup_body = checkpoint_lookup_body
         try:
-            compiled_transient_message_patterns = parse_transient_message_markers(
-                getattr(self.valves, "transient_message_markers", "")
+            compiled_transient_message_patterns = parse_transient_message_patterns(
+                getattr(self.valves, "transient_message_patterns", "")
             )
             transient_message_patterns = (
                 _TransientMessageMatcher(compiled_transient_message_patterns)
@@ -11996,7 +12007,7 @@ class Pipe:
                 else None
             )
         except ValueError as exc:
-            return _error_response(str(exc), code="invalid_transient_message_markers")
+            return _error_response(str(exc), code="invalid_transient_message_patterns")
         # Token decisions must reflect the body actually forwarded to the target.
         # For task-prompt compaction that is the rebuilt provider prompt (inner),
         # NOT the raw task history — even when the target opted out of file
@@ -12130,13 +12141,13 @@ class Pipe:
             "name": identity.target_model_id,
         }
         try:
-            effective_trigger_total_tokens = resolve_trigger_total_tokens(self.valves, target_model_for_limits)
+            effective_trigger_input_tokens = resolve_trigger_input_tokens(self.valves, target_model_for_limits)
         except ValueError as exc:
-            return _error_response(str(exc), code="invalid_trigger_total_tokens_overrides")
-        effective_soft_trigger_total_tokens = resolve_soft_trigger_total_tokens(
+            return _error_response(str(exc), code="invalid_per_model_overrides")
+        effective_soft_trigger_input_tokens = resolve_soft_trigger_input_tokens(
             self.valves,
             target_model_for_limits,
-            effective_trigger_total_tokens,
+            effective_trigger_input_tokens,
         )
         # --- candidate-payload estimate: the decision basis ---
         # total_tokens is an OBSERVATION of a past payload, not the size of the
@@ -12314,17 +12325,17 @@ class Pipe:
             hard = (
                 supported_context
                 and (
-                    (decision_total is not None and decision_total >= effective_trigger_total_tokens)
+                    (decision_total is not None and decision_total >= effective_trigger_input_tokens)
                     or checkpoint_applied_unknown_needs_foreground
                 )
             )
             soft = (
                 supported_context
                 and not is_summary_task
-                and effective_soft_trigger_total_tokens is not None
+                and effective_soft_trigger_input_tokens is not None
                 and decision_total is not None
-                and decision_total >= effective_soft_trigger_total_tokens
-                and decision_total < effective_trigger_total_tokens
+                and decision_total >= effective_soft_trigger_input_tokens
+                and decision_total < effective_trigger_input_tokens
             )
             should = hard or reusable_checkpoint_match is not None
             return hard, soft, should
@@ -12339,7 +12350,7 @@ class Pipe:
             if (
                 hard_should_compact
                 or decision_total is None
-                or decision_total >= effective_trigger_total_tokens
+                or decision_total >= effective_trigger_input_tokens
             ):
                 return _error_response(
                     f"Failed to access auto-compaction checkpoints: {checkpoint_lookup_error}",
@@ -12390,15 +12401,15 @@ class Pipe:
                 decision_total = checkpoint_applied_estimate
                 hard_should_compact, soft_should_prefetch, should_compact = compute_threshold_decisions()
 
-        compare_estimate_tokens = None
+        status_estimate_tokens = None
         if (
             supported_context
-            and self.valves.token_status_compare_estimate
+            and self.valves.token_status_show_usage_and_estimate
             and decision_total is None
             and total_tokens is not None
         ):
             with suppress(Exception):
-                compare_estimate_tokens = await _estimate_provider_input_tokens_async(
+                status_estimate_tokens = await _estimate_provider_input_tokens_async(
                     estimate_lookup_body,
                     request=__request__,
                     user=user,
@@ -12408,12 +12419,12 @@ class Pipe:
         display_token_context = _build_display_token_context(
             estimated_total_tokens=decision_total,
             total_tokens=total_tokens,
-            effective_trigger_total_tokens=effective_trigger_total_tokens,
-            effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+            effective_trigger_input_tokens=effective_trigger_input_tokens,
+            effective_soft_trigger_input_tokens=effective_soft_trigger_input_tokens,
             usage_source=usage_source,
         )
-        display_token_context = _display_context_with_estimate(display_token_context, compare_estimate_tokens)
-        compare_estimate_status = bool(self.valves.token_status_compare_estimate)
+        display_token_context = _display_context_with_estimate(display_token_context, status_estimate_tokens)
+        show_usage_and_estimate = bool(self.valves.token_status_show_usage_and_estimate)
         should_compact = hard_should_compact or reusable_checkpoint_match is not None
         reusable_checkpoint_only = None
         if reusable_checkpoint_match is not None and not hard_should_compact:
@@ -12429,13 +12440,13 @@ class Pipe:
                 description=_description_with_token_suffix(
                     "Context pressure",
                     display_token_context,
-                    compare_estimate=compare_estimate_status,
+                    show_usage_and_estimate=show_usage_and_estimate,
                 ),
                 done=True,
                 tokens=_tokens_status_payload(
                     display_token_context,
                     after=None,
-                    compare_estimate=compare_estimate_status,
+                    show_usage_and_estimate=show_usage_and_estimate,
                 ),
             )
         if not hard_should_compact and soft_should_prefetch and not checkpoint_lookup_unavailable:
@@ -12486,11 +12497,11 @@ class Pipe:
                     summary_prompt=self.valves.summary_prompt,
                     historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                     historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
-                    effective_trigger_total_tokens=effective_trigger_total_tokens,
-                    effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
+                    effective_trigger_input_tokens=effective_trigger_input_tokens,
+                    effective_soft_trigger_input_tokens=effective_soft_trigger_input_tokens,
                     trigger_estimated_tokens=decision_total,
                     token_status_detail=self.valves.token_status_detail,
-                    token_status_compare_estimate=self.valves.token_status_compare_estimate,
+                    token_status_show_usage_and_estimate=self.valves.token_status_show_usage_and_estimate,
                     event_emitter=__event_emitter__,
                     file_context_enabled=target_file_context_enabled,
                     task_estimate_body=inner if task_source_body is not None else None,
@@ -12501,17 +12512,18 @@ class Pipe:
 
         def schedule_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
             try:
-                if effective_soft_trigger_total_tokens is None:
+                if effective_soft_trigger_input_tokens is None:
                     return
                 # Completed-turn prefetch is grounded ONLY in the just-completed
                 # response's own usage. No usage => no prefetch (never fall back to a
-                # previous turn's observed usage).
+                # previous turn's observed usage). Its input-plus-output total is a
+                # proxy for the next request input after appending the assistant reply.
                 completion_total_tokens = _usage_total(completion.get("usage"))
                 if completion_total_tokens is None:
                     return
                 if (
-                    completion_total_tokens < effective_soft_trigger_total_tokens
-                    or completion_total_tokens >= effective_trigger_total_tokens
+                    completion_total_tokens < effective_soft_trigger_input_tokens
+                    or completion_total_tokens >= effective_trigger_input_tokens
                 ):
                     return
                 completed_user_id = str((user or {}).get("id") or "")
@@ -12559,12 +12571,12 @@ class Pipe:
                         summary_prompt=self.valves.summary_prompt,
                         historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                         historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
-                        effective_trigger_total_tokens=effective_trigger_total_tokens,
-                        effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
-                        trigger_total_tokens=completion_total_tokens,
+                        effective_trigger_input_tokens=effective_trigger_input_tokens,
+                        effective_soft_trigger_input_tokens=effective_soft_trigger_input_tokens,
+                        trigger_observed_tokens=completion_total_tokens,
                         trigger_usage_source="request",
                         token_status_detail=self.valves.token_status_detail,
-                        token_status_compare_estimate=self.valves.token_status_compare_estimate,
+                        token_status_show_usage_and_estimate=self.valves.token_status_show_usage_and_estimate,
                         event_emitter=__event_emitter__,
                         file_context_enabled=target_file_context_enabled,
                         transient_message_patterns=transient_message_patterns,
@@ -12604,12 +12616,12 @@ class Pipe:
                             summary_prompt=self.valves.summary_prompt,
                             historical_message_excerpt_bytes=self.valves.historical_message_excerpt_bytes,
                             historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
-                            effective_trigger_total_tokens=effective_trigger_total_tokens,
-                            effective_soft_trigger_total_tokens=effective_soft_trigger_total_tokens,
-                            trigger_total_tokens=completion_total_tokens,
+                            effective_trigger_input_tokens=effective_trigger_input_tokens,
+                            effective_soft_trigger_input_tokens=effective_soft_trigger_input_tokens,
+                            trigger_observed_tokens=completion_total_tokens,
                             trigger_usage_source="request",
                             token_status_detail=self.valves.token_status_detail,
-                            token_status_compare_estimate=self.valves.token_status_compare_estimate,
+                            token_status_show_usage_and_estimate=self.valves.token_status_show_usage_and_estimate,
                             event_emitter=__event_emitter__,
                             file_context_enabled=target_file_context_enabled,
                             transient_message_patterns=transient_message_patterns,
@@ -12707,13 +12719,13 @@ class Pipe:
                             description=_description_with_token_suffix(
                                 "Compacting chat history before forwarding to the target model",
                                 display_token_context,
-                                compare_estimate=compare_estimate_status,
+                                show_usage_and_estimate=show_usage_and_estimate,
                             ),
                             done=False,
                             tokens=_tokens_status_payload(
                                 display_token_context,
                                 after=None,
-                                compare_estimate=compare_estimate_status,
+                                show_usage_and_estimate=show_usage_and_estimate,
                             ),
                         )
                     if reusable_checkpoint_only is not None and not compacted_once:
@@ -12827,13 +12839,13 @@ class Pipe:
                                     "Compacted chat history is ready for the target model",
                                     display_token_context,
                                     after=after_tokens,
-                                    compare_estimate=compare_estimate_status,
+                                    show_usage_and_estimate=show_usage_and_estimate,
                                 ),
                                 done=True,
                                 tokens=_tokens_status_payload(
                                     display_token_context,
                                     after=after_tokens,
-                                    compare_estimate=compare_estimate_status,
+                                    show_usage_and_estimate=show_usage_and_estimate,
                                 ),
                             )
                             summary_text = extract_compaction_summary_text_from_messages(candidate.get("messages"))
@@ -12848,13 +12860,13 @@ class Pipe:
                                 description=_description_with_token_suffix(
                                     "Could not compact chat history safely; forwarding unchanged",
                                     display_token_context,
-                                    compare_estimate=compare_estimate_status,
+                                    show_usage_and_estimate=show_usage_and_estimate,
                                 ),
                                 done=True,
                                 tokens=_tokens_status_payload(
                                     display_token_context,
                                     after=None,
-                                    compare_estimate=compare_estimate_status,
+                                    show_usage_and_estimate=show_usage_and_estimate,
                                 ),
                             )
                 except UnsupportedCompactionInput as exc:
@@ -12864,14 +12876,14 @@ class Pipe:
                         description=_description_with_token_suffix(
                             str(exc),
                             display_token_context,
-                            compare_estimate=compare_estimate_status,
+                            show_usage_and_estimate=show_usage_and_estimate,
                         ),
                         done=True,
                         error=True,
                         tokens=_tokens_status_payload(
                             display_token_context,
                             after=None,
-                            compare_estimate=compare_estimate_status,
+                            show_usage_and_estimate=show_usage_and_estimate,
                         ),
                     )
                     return _error_response(str(exc), code=exc.code)
@@ -12882,14 +12894,14 @@ class Pipe:
                         description=_description_with_token_suffix(
                             f"Failed to compact chat history: {exc}",
                             display_token_context,
-                            compare_estimate=compare_estimate_status,
+                            show_usage_and_estimate=show_usage_and_estimate,
                         ),
                         done=True,
                         error=True,
                         tokens=_tokens_status_payload(
                             display_token_context,
                             after=None,
-                            compare_estimate=compare_estimate_status,
+                            show_usage_and_estimate=show_usage_and_estimate,
                         ),
                     )
                     return _error_response(f"Failed to compact chat history: {exc}", code="summary_failed")
@@ -12998,14 +13010,14 @@ class Pipe:
                         description=_description_with_token_suffix(
                             error_response["error"]["message"],
                             display_token_context,
-                            compare_estimate=compare_estimate_status,
+                            show_usage_and_estimate=show_usage_and_estimate,
                         ),
                         done=True,
                         error=True,
                         tokens=_tokens_status_payload(
                             display_token_context,
                             after=None,
-                            compare_estimate=compare_estimate_status,
+                            show_usage_and_estimate=show_usage_and_estimate,
                         ),
                     )
                     return error_response
@@ -13015,13 +13027,13 @@ class Pipe:
                     description=_description_with_token_suffix(
                         "Target context window was exceeded before output; compacting and retrying",
                         display_token_context,
-                        compare_estimate=compare_estimate_status,
+                        show_usage_and_estimate=show_usage_and_estimate,
                     ),
                     done=False,
                     tokens=_tokens_status_payload(
                         display_token_context,
                         after=None,
-                        compare_estimate=compare_estimate_status,
+                        show_usage_and_estimate=show_usage_and_estimate,
                     ),
                 )
                 should_compact = True

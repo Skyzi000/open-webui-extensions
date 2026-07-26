@@ -3021,7 +3021,7 @@ def test_wrapper_model_name_template_supports_postfix_template():
         pipe_function_id="auto_compact",
         function_owner_user_id="owner-1",
         target_model={"id": "gpt-4.1", "name": "GPT"},
-        valves=mod.Pipe.Valves(model_name_template="{target_name} (AutoCompact)"),
+        valves=mod.Pipe.Valves(wrapper_model_name_template="{target_name} (AutoCompact)"),
     )
 
     assert form["name"] == "GPT (AutoCompact)"
@@ -3033,7 +3033,7 @@ def test_wrapper_model_name_template_falls_back_for_unsupported_format_syntax(te
         pipe_function_id="auto_compact",
         function_owner_user_id="owner-1",
         target_model={"id": "gpt-4.1", "name": "GPT"},
-        valves=mod.Pipe.Valves(model_name_template=template),
+        valves=mod.Pipe.Valves(wrapper_model_name_template=template),
     )
 
     assert form["name"] == "GPT (AutoCompact)"
@@ -3044,7 +3044,7 @@ def test_wrapper_model_name_template_rejects_format_width_specs():
         pipe_function_id="auto_compact",
         function_owner_user_id="owner-1",
         target_model={"id": "gpt-4.1", "name": "GPT"},
-        valves=mod.Pipe.Valves(model_name_template="{target_name:>100000}"),
+        valves=mod.Pipe.Valves(wrapper_model_name_template="{target_name:>100000}"),
     )
 
     assert len(form["name"]) < 1000
@@ -3057,7 +3057,7 @@ def test_wrapper_model_name_template_does_not_reinterpret_target_name_braces(tar
         pipe_function_id="auto_compact",
         function_owner_user_id="owner-1",
         target_model={"id": "gpt-4.1", "name": target_name},
-        valves=mod.Pipe.Valves(model_name_template="Wrapped: {target_name}"),
+        valves=mod.Pipe.Valves(wrapper_model_name_template="Wrapped: {target_name}"),
     )
 
     assert form["name"] == f"Wrapped: {target_name}"
@@ -3068,7 +3068,7 @@ def test_wrapper_model_name_template_does_not_reinterpret_target_id_braces():
         pipe_function_id="auto_compact",
         function_owner_user_id="owner-1",
         target_model={"id": "provider/{target_name}", "name": "GPT"},
-        valves=mod.Pipe.Valves(model_name_template="Wrapped: {target_id}"),
+        valves=mod.Pipe.Valves(wrapper_model_name_template="Wrapped: {target_id}"),
     )
 
     assert form["name"] == "Wrapped: provider/{target_name}"
@@ -3489,7 +3489,7 @@ def test_classify_summary_skips_parent_absorbed():
 
 
 def test_classify_files_treats_transient_user_messages_like_system_boundaries():
-    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    patterns = mod.parse_transient_message_patterns(TRANSIENT_MARKER)
     metadata_files = [_file("parent"), _file("volatile"), _file("delta"), _file("tail")]
     db_chain = [
         {"id": "m1", "role": "user", "files": [_file("parent")]},
@@ -5005,7 +5005,7 @@ async def test_summary_model_validation_rejects_config_disabled_provider_cache_m
 def test_valve_defaults_are_conservative_for_v1_continuation():
     valves = mod.Pipe.Valves()
 
-    assert valves.trigger_total_tokens == mod.DEFAULT_TRIGGER_TOTAL_TOKENS
+    assert valves.trigger_input_tokens == mod.DEFAULT_TRIGGER_INPUT_TOKENS
     assert valves.force_include_usage is True
     assert valves.compact_task_prompts_from_task_body is False
     assert valves.summary_tool_policy == "fallback_on_tool_call"
@@ -5015,10 +5015,31 @@ def test_valve_defaults_are_conservative_for_v1_continuation():
     assert not hasattr(valves, "preserve_latest_tool_rounds")
 
 
-def test_trigger_total_tokens_overrides_default_is_empty_string():
+def test_valve_schema_uses_release_field_names():
+    fields = set(mod.Pipe.Valves.model_fields)
+
+    assert {
+        "wrapper_model_name_template",
+        "trigger_input_tokens",
+        "per_model_overrides_json",
+        "transient_message_patterns",
+        "token_status_show_usage_and_estimate",
+    } <= fields
+    assert fields.isdisjoint(
+        {
+            "model_name_template",
+            "trigger_total_tokens",
+            "trigger_total_tokens_overrides_json",
+            "transient_message_markers",
+            "token_status_compare_estimate",
+        }
+    )
+
+
+def test_per_model_overrides_default_is_empty_string():
     valves = mod.Pipe.Valves()
 
-    assert valves.trigger_total_tokens_overrides_json == ""
+    assert valves.per_model_overrides_json == ""
 
 
 def test_soft_trigger_ratio_default_resolves_against_hard_trigger():
@@ -5026,107 +5047,107 @@ def test_soft_trigger_ratio_default_resolves_against_hard_trigger():
 
     assert valves.soft_trigger_ratio == mod.DEFAULT_SOFT_TRIGGER_RATIO
     assert (
-        mod.resolve_soft_trigger_total_tokens(
+        mod.resolve_soft_trigger_input_tokens(
             valves,
             {"id": "target", "name": "Target"},
-            valves.trigger_total_tokens,
+            valves.trigger_input_tokens,
         )
-        == int(mod.DEFAULT_TRIGGER_TOTAL_TOKENS * mod.DEFAULT_SOFT_TRIGGER_RATIO)
+        == int(mod.DEFAULT_TRIGGER_INPUT_TOKENS * mod.DEFAULT_SOFT_TRIGGER_RATIO)
     )
 
 
 def test_soft_trigger_ratio_missing_field_falls_back_to_default_constant():
-    valves = SimpleNamespace(trigger_total_tokens_overrides_json="")
+    valves = SimpleNamespace(per_model_overrides_json="")
 
-    resolved = mod.resolve_soft_trigger_total_tokens(valves, {"id": "target", "name": "Target"}, 1000)
+    resolved = mod.resolve_soft_trigger_input_tokens(valves, {"id": "target", "name": "Target"}, 1000)
 
     assert resolved == int(1000 * mod.DEFAULT_SOFT_TRIGGER_RATIO)
 
 
-def test_trigger_total_tokens_overrides_empty_string_is_valid():
-    valves = mod.Pipe.Valves(trigger_total_tokens_overrides_json="")
+def test_per_model_overrides_empty_string_is_valid():
+    valves = mod.Pipe.Valves(per_model_overrides_json="")
 
-    assert valves.trigger_total_tokens_overrides_json == ""
+    assert valves.per_model_overrides_json == ""
 
 
-def test_trigger_total_tokens_overrides_accepts_valid_ordered_json():
+def test_per_model_overrides_accepts_valid_ordered_json():
     payload = json.dumps(
         {
             "schema_version": 1,
             "overrides": [
-                {"model_patterns": ["claude-fable-5[1m]"], "trigger_total_tokens": 950000},
-                {"model_patterns": ["claude-*", "Claude *"], "trigger_total_tokens": 160000},
+                {"model_patterns": ["claude-fable-5[1m]"], "trigger_input_tokens": 950000},
+                {"model_patterns": ["claude-*", "Claude *"], "trigger_input_tokens": 160000},
             ],
         }
     )
 
-    valves = mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+    valves = mod.Pipe.Valves(per_model_overrides_json=payload)
 
-    assert valves.trigger_total_tokens_overrides_json == payload
+    assert valves.per_model_overrides_json == payload
 
 
-def test_trigger_total_tokens_overrides_rejects_non_json_string():
+def test_per_model_overrides_rejects_non_json_string():
     with pytest.raises(ValidationError):
-        mod.Pipe.Valves(trigger_total_tokens_overrides_json="not json")
+        mod.Pipe.Valves(per_model_overrides_json="not json")
 
 
-def test_trigger_total_tokens_overrides_rejects_non_list_overrides():
-    payload = json.dumps({"overrides": {"model_patterns": ["claude-*"], "trigger_total_tokens": 1}})
-
-    with pytest.raises(ValidationError):
-        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
-
-
-def test_trigger_total_tokens_overrides_rejects_empty_model_patterns():
-    payload = json.dumps({"overrides": [{"model_patterns": [], "trigger_total_tokens": 160000}]})
+def test_per_model_overrides_rejects_non_list_overrides():
+    payload = json.dumps({"overrides": {"model_patterns": ["claude-*"], "trigger_input_tokens": 1}})
 
     with pytest.raises(ValidationError):
-        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+        mod.Pipe.Valves(per_model_overrides_json=payload)
 
 
-def test_trigger_total_tokens_overrides_rejects_zero_trigger_total_tokens():
-    payload = json.dumps({"overrides": [{"model_patterns": ["claude-*"], "trigger_total_tokens": 0}]})
+def test_per_model_overrides_rejects_empty_model_patterns():
+    payload = json.dumps({"overrides": [{"model_patterns": [], "trigger_input_tokens": 160000}]})
 
     with pytest.raises(ValidationError):
-        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+        mod.Pipe.Valves(per_model_overrides_json=payload)
 
 
-def test_trigger_total_tokens_overrides_rejects_unknown_root_key():
+def test_per_model_overrides_rejects_zero_trigger_input_tokens():
+    payload = json.dumps({"overrides": [{"model_patterns": ["claude-*"], "trigger_input_tokens": 0}]})
+
+    with pytest.raises(ValidationError):
+        mod.Pipe.Valves(per_model_overrides_json=payload)
+
+
+def test_per_model_overrides_rejects_unknown_root_key():
     payload = json.dumps(
         {
-            "overrides": [{"model_patterns": ["claude-*"], "trigger_total_tokens": 100}],
-            "soft_trigger_total_tokens": 50,
+            "overrides": [{"model_patterns": ["claude-*"], "trigger_input_tokens": 100}],
+            "soft_trigger_input_tokens": 50,
         }
     )
 
     with pytest.raises(ValidationError):
-        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+        mod.Pipe.Valves(per_model_overrides_json=payload)
 
 
-def test_trigger_total_tokens_overrides_rejects_unknown_override_key():
+def test_per_model_overrides_rejects_legacy_trigger_total_tokens():
     payload = json.dumps(
         {
             "overrides": [
-                {"model_patterns": ["*"], "trigger_total_tokens": 100, "soft_trigger_total_tokens": 50}
+                {"model_patterns": ["*"], "trigger_total_tokens": 100}
             ]
         }
     )
 
     with pytest.raises(ValidationError):
-        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+        mod.Pipe.Valves(per_model_overrides_json=payload)
 
 
-def test_trigger_total_tokens_overrides_accepts_soft_trigger_ratio_without_hard_threshold():
+def test_per_model_overrides_accepts_soft_trigger_ratio_without_hard_threshold():
     payload = json.dumps({"overrides": [{"model_patterns": ["claude-*"], "soft_trigger_ratio": 0.5}]})
 
-    valves = mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+    valves = mod.Pipe.Valves(per_model_overrides_json=payload)
 
     assert (
-        mod.resolve_trigger_total_tokens(valves, {"id": "claude-sonnet", "name": "Sonnet"})
-        == valves.trigger_total_tokens
+        mod.resolve_trigger_input_tokens(valves, {"id": "claude-sonnet", "name": "Sonnet"})
+        == valves.trigger_input_tokens
     )
     assert (
-        mod.resolve_soft_trigger_total_tokens(
+        mod.resolve_soft_trigger_input_tokens(
             valves,
             {"id": "claude-sonnet", "name": "Sonnet"},
             100000,
@@ -5135,98 +5156,98 @@ def test_trigger_total_tokens_overrides_accepts_soft_trigger_ratio_without_hard_
     )
 
 
-def test_resolve_trigger_total_tokens_matches_target_model_id_and_name():
+def test_resolve_trigger_input_tokens_matches_target_model_id_and_name():
     valves = mod.Pipe.Valves(
-        trigger_total_tokens=100000,
-        trigger_total_tokens_overrides_json=json.dumps(
-            {"overrides": [{"model_patterns": ["claude-*"], "trigger_total_tokens": 160000}]}
+        trigger_input_tokens=100000,
+        per_model_overrides_json=json.dumps(
+            {"overrides": [{"model_patterns": ["claude-*"], "trigger_input_tokens": 160000}]}
         ),
     )
 
-    by_id = mod.resolve_trigger_total_tokens(valves, {"id": "claude-sonnet", "name": "Anthropic"})
-    by_name = mod.resolve_trigger_total_tokens(valves, {"id": "anthropic-1", "name": "claude-opus"})
+    by_id = mod.resolve_trigger_input_tokens(valves, {"id": "claude-sonnet", "name": "Anthropic"})
+    by_name = mod.resolve_trigger_input_tokens(valves, {"id": "anthropic-1", "name": "claude-opus"})
 
     assert by_id == 160000
     assert by_name == 160000
 
 
-def test_resolve_trigger_total_tokens_first_match_wins():
+def test_resolve_trigger_input_tokens_first_match_wins():
     valves = mod.Pipe.Valves(
-        trigger_total_tokens=100000,
-        trigger_total_tokens_overrides_json=json.dumps(
+        trigger_input_tokens=100000,
+        per_model_overrides_json=json.dumps(
             {
                 "overrides": [
-                    {"model_patterns": ["claude-opus"], "trigger_total_tokens": 950000},
-                    {"model_patterns": ["claude-*"], "trigger_total_tokens": 160000},
+                    {"model_patterns": ["claude-opus"], "trigger_input_tokens": 950000},
+                    {"model_patterns": ["claude-*"], "trigger_input_tokens": 160000},
                 ]
             }
         ),
     )
 
-    resolved = mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus", "name": "Opus"})
+    resolved = mod.resolve_trigger_input_tokens(valves, {"id": "claude-opus", "name": "Opus"})
 
     assert resolved == 950000
 
 
-def test_resolve_trigger_total_tokens_matches_literal_bracket_id_without_escaping():
+def test_resolve_trigger_input_tokens_matches_literal_bracket_id_without_escaping():
     # "[" and "]" are literal (not glob classes), so a bracketed id matches as-is and a
     # different id does not accidentally match via character-class expansion.
     valves = mod.Pipe.Valves(
-        trigger_total_tokens=100000,
-        trigger_total_tokens_overrides_json=json.dumps(
-            {"overrides": [{"model_patterns": ["claude-opus-4-8[1m]"], "trigger_total_tokens": 950000}]}
+        trigger_input_tokens=100000,
+        per_model_overrides_json=json.dumps(
+            {"overrides": [{"model_patterns": ["claude-opus-4-8[1m]"], "trigger_input_tokens": 950000}]}
         ),
     )
 
-    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-8[1m]", "name": "Opus 1M"}) == 950000
-    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-81", "name": "Opus"}) == 100000
+    assert mod.resolve_trigger_input_tokens(valves, {"id": "claude-opus-4-8[1m]", "name": "Opus 1M"}) == 950000
+    assert mod.resolve_trigger_input_tokens(valves, {"id": "claude-opus-4-81", "name": "Opus"}) == 100000
 
 
-def test_resolve_trigger_total_tokens_bulk_matches_bracket_suffix_with_wildcard():
+def test_resolve_trigger_input_tokens_bulk_matches_bracket_suffix_with_wildcard():
     # Motivating bulk case: one override for every "[1m]" model id via "*[1m]".
     valves = mod.Pipe.Valves(
-        trigger_total_tokens=100000,
-        trigger_total_tokens_overrides_json=json.dumps(
-            {"overrides": [{"model_patterns": ["*[1m]"], "trigger_total_tokens": 950000}]}
+        trigger_input_tokens=100000,
+        per_model_overrides_json=json.dumps(
+            {"overrides": [{"model_patterns": ["*[1m]"], "trigger_input_tokens": 950000}]}
         ),
     )
 
-    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-8[1m]", "name": "Opus"}) == 950000
-    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-fable-5[1m]", "name": "Fable"}) == 950000
-    assert mod.resolve_trigger_total_tokens(valves, {"id": "claude-opus-4-8", "name": "Opus"}) == 100000
+    assert mod.resolve_trigger_input_tokens(valves, {"id": "claude-opus-4-8[1m]", "name": "Opus"}) == 950000
+    assert mod.resolve_trigger_input_tokens(valves, {"id": "claude-fable-5[1m]", "name": "Fable"}) == 950000
+    assert mod.resolve_trigger_input_tokens(valves, {"id": "claude-opus-4-8", "name": "Opus"}) == 100000
 
 
-def test_resolve_soft_trigger_total_tokens_uses_effective_hard_threshold():
+def test_resolve_soft_trigger_input_tokens_uses_effective_hard_threshold():
     valves = mod.Pipe.Valves(soft_trigger_ratio=0.75)
 
-    assert mod.resolve_soft_trigger_total_tokens(valves, {"id": "target", "name": "Target"}, 1000) == 750
-    assert mod.resolve_soft_trigger_total_tokens(valves, {"id": "target", "name": "Target"}, 1001) == 750
+    assert mod.resolve_soft_trigger_input_tokens(valves, {"id": "target", "name": "Target"}, 1000) == 750
+    assert mod.resolve_soft_trigger_input_tokens(valves, {"id": "target", "name": "Target"}, 1001) == 750
 
 
-def test_resolve_soft_trigger_total_tokens_uses_model_ratio_override():
+def test_resolve_soft_trigger_input_tokens_uses_model_ratio_override():
     valves = mod.Pipe.Valves(
         soft_trigger_ratio=0.8,
-        trigger_total_tokens_overrides_json=json.dumps(
+        per_model_overrides_json=json.dumps(
             {"overrides": [{"model_patterns": ["claude-*"], "soft_trigger_ratio": 0.5}]}
         ),
     )
 
-    assert mod.resolve_soft_trigger_total_tokens(valves, {"id": "claude-sonnet", "name": "Sonnet"}, 1000) == 500
-    assert mod.resolve_soft_trigger_total_tokens(valves, {"id": "other", "name": "Other"}, 1000) == 800
+    assert mod.resolve_soft_trigger_input_tokens(valves, {"id": "claude-sonnet", "name": "Sonnet"}, 1000) == 500
+    assert mod.resolve_soft_trigger_input_tokens(valves, {"id": "other", "name": "Other"}, 1000) == 800
 
 
-def test_resolve_soft_trigger_total_tokens_zero_ratio_disables_prefetch():
+def test_resolve_soft_trigger_input_tokens_zero_ratio_disables_prefetch():
     global_disabled = mod.Pipe.Valves(soft_trigger_ratio=0)
     override_disabled = mod.Pipe.Valves(
         soft_trigger_ratio=0.8,
-        trigger_total_tokens_overrides_json=json.dumps(
+        per_model_overrides_json=json.dumps(
             {"overrides": [{"model_patterns": ["claude-*"], "soft_trigger_ratio": 0}]}
         ),
     )
 
-    assert mod.resolve_soft_trigger_total_tokens(global_disabled, {"id": "target", "name": "Target"}, 1000) is None
+    assert mod.resolve_soft_trigger_input_tokens(global_disabled, {"id": "target", "name": "Target"}, 1000) is None
     assert (
-        mod.resolve_soft_trigger_total_tokens(
+        mod.resolve_soft_trigger_input_tokens(
             override_disabled,
             {"id": "claude-sonnet", "name": "Sonnet"},
             1000,
@@ -5243,18 +5264,18 @@ def test_soft_trigger_ratio_rejects_one_or_greater():
         mod.Pipe.Valves(soft_trigger_ratio=math.nan)
 
 
-def test_trigger_total_tokens_overrides_rejects_non_finite_soft_trigger_ratio():
+def test_per_model_overrides_rejects_non_finite_soft_trigger_ratio():
     payload = json.dumps({"overrides": [{"model_patterns": ["claude-*"], "soft_trigger_ratio": math.nan}]})
 
     with pytest.raises(ValidationError):
-        mod.Pipe.Valves(trigger_total_tokens_overrides_json=payload)
+        mod.Pipe.Valves(per_model_overrides_json=payload)
 
 
-def test_transient_message_markers_reject_invalid_regex():
+def test_transient_message_patterns_reject_invalid_regex():
     with pytest.raises(ValidationError) as exc_info:
-        mod.Pipe.Valves(transient_message_markers="[")
+        mod.Pipe.Valves(transient_message_patterns="[")
 
-    assert "transient_message_markers line 1" in str(exc_info.value)
+    assert "transient_message_patterns line 1" in str(exc_info.value)
 
 
 def test_matches_any_pattern_uses_star_question_wildcards_with_literal_brackets():
@@ -5270,23 +5291,23 @@ def test_matches_any_pattern_uses_star_question_wildcards_with_literal_brackets(
     assert not mod._matches_any_pattern({"id": "claude-opus-4-81", "name": "Opus"}, ["claude-opus-4-8[1m]"])
 
 
-def test_resolve_trigger_total_tokens_falls_back_to_global_default_on_no_match():
+def test_resolve_trigger_input_tokens_falls_back_to_global_default_on_no_match():
     valves = mod.Pipe.Valves(
-        trigger_total_tokens=100000,
-        trigger_total_tokens_overrides_json=json.dumps(
-            {"overrides": [{"model_patterns": ["claude-*"], "trigger_total_tokens": 160000}]}
+        trigger_input_tokens=100000,
+        per_model_overrides_json=json.dumps(
+            {"overrides": [{"model_patterns": ["claude-*"], "trigger_input_tokens": 160000}]}
         ),
     )
 
-    resolved = mod.resolve_trigger_total_tokens(valves, {"id": "gpt-4.1", "name": "GPT"})
+    resolved = mod.resolve_trigger_input_tokens(valves, {"id": "gpt-4.1", "name": "GPT"})
 
     assert resolved == 100000
 
 
-def test_resolve_trigger_total_tokens_falls_back_when_overrides_empty():
-    valves = mod.Pipe.Valves(trigger_total_tokens=123456)
+def test_resolve_trigger_input_tokens_falls_back_when_overrides_empty():
+    valves = mod.Pipe.Valves(trigger_input_tokens=123456)
 
-    resolved = mod.resolve_trigger_total_tokens(valves, {"id": "claude-sonnet", "name": "Anthropic"})
+    resolved = mod.resolve_trigger_input_tokens(valves, {"id": "claude-sonnet", "name": "Anthropic"})
 
     assert resolved == 123456
 
@@ -8950,7 +8971,7 @@ async def test_compact_body_reuses_checkpoint_when_transient_user_content_change
     pipe_request,
     pipe_user,
 ):
-    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    patterns = mod.parse_transient_message_patterns(TRANSIENT_MARKER)
     stable_source_messages = [
         {"role": "user", "content": "old"},
         {"role": "user", "content": "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"},
@@ -9027,7 +9048,7 @@ async def test_compact_body_skips_checkpoint_when_prefix_has_only_transient_user
     pipe_request,
     pipe_user,
 ):
-    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    patterns = mod.parse_transient_message_patterns(TRANSIENT_MARKER)
     rows = []
 
     async def noop_initialize(**kwargs):
@@ -9391,7 +9412,7 @@ async def test_tool_history_checkpoint_render_skips_transient_user_excerpts(
     pipe_request,
     pipe_user,
 ):
-    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    patterns = mod.parse_transient_message_patterns(TRANSIENT_MARKER)
 
     async def get_or_create_compaction_summary(**kwargs):
         return SimpleNamespace(
@@ -10264,7 +10285,7 @@ async def test_pipe_forwards_below_threshold_to_decoded_target_with_metadata(mon
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target.model")
     body = {
         "model": wrapper_id,
@@ -10325,7 +10346,7 @@ async def test_pipe_reshapes_request_params_for_normal_ollama_target(
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     result = await pipe.pipe(
         {
             "model": mod.build_wrapper_model_id("auto_compact", "target-ollama"),
@@ -10489,7 +10510,7 @@ async def test_pipe_injects_file_context_for_persisted_chat(monkeypatch, pipe_re
         "user_message": {"files": [_file("current-file")]},
     }
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -10585,7 +10606,7 @@ async def test_pipe_non_streaming_merges_manual_rag_sources_into_response(
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     result = await pipe.pipe(
         {
@@ -10658,7 +10679,7 @@ async def test_pipe_non_streaming_source_event_failure_still_returns_response(
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     result = await pipe.pipe(
         {
@@ -10721,7 +10742,7 @@ async def test_pipe_non_streaming_error_does_not_merge_or_emit_manual_rag_source
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     result = await pipe.pipe(
         {
@@ -10785,7 +10806,7 @@ async def test_pipe_streaming_immediate_error_does_not_emit_manual_file_sources(
     monkeypatch.setattr(mod, "_call_target_completion", call_target_completion)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     result = await pipe.pipe(
         {
@@ -10849,7 +10870,7 @@ async def test_pipe_streaming_plaintext_non_json_error_does_not_emit_manual_file
     monkeypatch.setattr(mod, "_call_target_completion", call_target_completion)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     result = await pipe.pipe(
         {
@@ -10913,7 +10934,7 @@ async def test_pipe_streaming_immediate_success_dict_emits_manual_file_sources(
     monkeypatch.setattr(mod, "_call_target_completion", call_target_completion)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     result = await pipe.pipe(
         {
@@ -10979,7 +11000,7 @@ async def test_pipe_skips_file_context_injection_for_query_generation_task(
         "user_message": {"files": [_file("current-file")]},
     }
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -11023,7 +11044,7 @@ async def test_pipe_rejects_official_context_compaction_task_as_dict_error(
         "user_message": {"files": [_file("current-file")]},
     }
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     pipe.valves.summary_model = "missing-summary"
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
@@ -11225,7 +11246,7 @@ async def test_inject_target_file_context_uses_non_transient_user_for_manual_rag
     pipe_user,
 ):
     install_fake_open_webui_user_model(monkeypatch)
-    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    patterns = mod.parse_transient_message_patterns(TRANSIENT_MARKER)
     captured = {}
 
     async def chat_completion_files_handler(request, rag_body, extra_params, user):
@@ -11297,7 +11318,7 @@ async def test_inject_target_file_context_uses_non_transient_user_for_manual_rag
 
 
 def test_merge_rag_messages_preserves_appended_user_context_from_core_default_rag():
-    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    patterns = mod.parse_transient_message_patterns(TRANSIENT_MARKER)
     transient_context = "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"
     original = [
         {"role": "user", "content": "real question"},
@@ -12372,7 +12393,7 @@ async def test_pipe_uses_fallback_model_file_context_capability_after_missing_ba
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
     result = await pipe.pipe(
         {
@@ -12495,7 +12516,7 @@ async def test_pipe_resolves_arena_fallback_before_file_context_capability_check
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
     result = await pipe.pipe(
         {
@@ -12593,7 +12614,7 @@ async def test_pipe_checks_access_for_selected_arena_fallback_model(
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
     result = await pipe.pipe(
         {
@@ -12684,7 +12705,7 @@ async def test_pipe_rejects_stale_arena_fallback_candidate_before_forwarding(
     monkeypatch.setattr(mod.random, "choice", lambda items: "stale-id")
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
     result = await pipe.pipe(
         {
@@ -12782,7 +12803,7 @@ async def test_pipe_rejects_nested_arena_fallback_candidate_before_forwarding(
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
     result = await pipe.pipe(
         {
@@ -13279,7 +13300,7 @@ async def test_pipe_uses_runtime_registered_id_for_decode_and_checkpoint_scope(
     monkeypatch.setattr(mod.Pipe, "__module__", "function_compact_alias")
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
 
     result = await pipe.pipe(
         {
@@ -13357,7 +13378,7 @@ async def test_pipe_forwards_metadata_with_unpickleable_core_values(monkeypatch,
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
 
     result = await pipe.pipe(
@@ -13409,7 +13430,7 @@ async def test_pipe_forwarding_passes_open_webui_user_model_to_inner_completion(
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
 
     result = await pipe.pipe(
@@ -13478,7 +13499,7 @@ async def test_pipe_non_streaming_forwards_to_decoded_target_completion(
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -13896,7 +13917,7 @@ async def test_pipe_skips_auto_compaction_for_stateful_responses_continuation(
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 1
+    pipe.valves.trigger_input_tokens = 1
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -14049,7 +14070,7 @@ async def test_pipe_reuses_existing_checkpoint_even_when_previous_compacted_usag
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -14144,7 +14165,7 @@ async def test_pipe_newly_ready_checkpoint_does_not_reuse_previous_raw_candidate
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     raw_messages = [
         *parent_source,
@@ -14306,7 +14327,7 @@ async def test_pipe_same_checkpoint_tool_loop_reuses_request_usage_anchor(
     _install_known_openai_usage_anchor_transport(monkeypatch)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     mod.store_request_scoped_usage(
         request=pipe_request,
@@ -14409,7 +14430,7 @@ async def test_pipe_applies_parent_checkpoint_when_hard_observed_total_but_check
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     events = []
 
@@ -14507,7 +14528,7 @@ async def test_pipe_applies_parent_checkpoint_when_estimate_just_below_hard_no_f
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     pipe.valves.soft_trigger_ratio = 0
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     events = []
@@ -14549,7 +14570,7 @@ async def _run_parent_checkpoint_decision_case(
     *,
     persisted_total_tokens,
     checkpoint_applied_estimate,
-    trigger_total_tokens,
+    trigger_input_tokens,
     soft_trigger_ratio,
     foreground_summary_text=None,
 ):
@@ -14630,7 +14651,7 @@ async def _run_parent_checkpoint_decision_case(
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = trigger_total_tokens
+    pipe.valves.trigger_input_tokens = trigger_input_tokens
     pipe.valves.soft_trigger_ratio = soft_trigger_ratio
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     events = []
@@ -14678,7 +14699,7 @@ async def test_pipe_skips_compaction_and_prefetch_when_checkpoint_estimate_below
         pipe_metadata,
         persisted_total_tokens=500,
         checkpoint_applied_estimate=5,
-        trigger_total_tokens=100,
+        trigger_input_tokens=100,
         soft_trigger_ratio=0.5,
     )
 
@@ -14702,7 +14723,7 @@ async def test_pipe_skips_prefetch_when_checkpoint_estimate_below_soft_despite_h
         pipe_metadata,
         persisted_total_tokens=500,
         checkpoint_applied_estimate=40,
-        trigger_total_tokens=1000,
+        trigger_input_tokens=1000,
         soft_trigger_ratio=0.1,
     )
 
@@ -14725,7 +14746,7 @@ async def test_pipe_prefetches_when_checkpoint_estimate_between_soft_and_hard(
         pipe_metadata,
         persisted_total_tokens=50,
         checkpoint_applied_estimate=500,
-        trigger_total_tokens=1000,
+        trigger_input_tokens=1000,
         soft_trigger_ratio=0.1,
     )
 
@@ -14735,7 +14756,7 @@ async def test_pipe_prefetches_when_checkpoint_estimate_between_soft_and_hard(
     assert "existing parent summary" in forwarded["messages"][0]["content"]
     assert len(case["prefetch_calls"]) == 1
     assert case["prefetch_calls"][0]["trigger_estimated_tokens"] == 500
-    assert "trigger_total_tokens" not in case["prefetch_calls"][0]
+    assert "trigger_observed_tokens" not in case["prefetch_calls"][0]
 
 
 @pytest.mark.asyncio
@@ -14828,7 +14849,7 @@ async def test_pipe_rechecks_ready_checkpoint_before_soft_prefetch(
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     pipe.valves.soft_trigger_ratio = 0.1
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     events = []
@@ -14907,7 +14928,7 @@ async def test_pipe_keeps_forwarding_when_soft_only_late_checkpoint_recheck_fail
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     pipe.valves.soft_trigger_ratio = 0.1
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
@@ -14968,7 +14989,7 @@ async def test_pipe_keeps_forwarding_when_prefetch_launch_recheck_fails(
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     pipe.valves.soft_trigger_ratio = 0.1
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
@@ -15057,7 +15078,7 @@ async def test_pipe_rechecks_ready_checkpoint_after_token_status_before_soft_pre
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     pipe.valves.soft_trigger_ratio = 0.1
     pipe.valves.token_status_visibility = "always"
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
@@ -15171,7 +15192,7 @@ async def test_pipe_rechecks_better_checkpoint_after_token_status_when_parent_wa
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     pipe.valves.soft_trigger_ratio = 0.1
     pipe.valves.token_status_visibility = "always"
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
@@ -15216,7 +15237,7 @@ async def test_pipe_compacts_foreground_when_checkpoint_estimate_at_or_above_har
         pipe_metadata,
         persisted_total_tokens=50,
         checkpoint_applied_estimate=150,
-        trigger_total_tokens=100,
+        trigger_input_tokens=100,
         soft_trigger_ratio=0.1,
         foreground_summary_text="fresh checkpoint summary",
     )
@@ -15272,7 +15293,7 @@ async def test_pipe_raw_usage_alone_does_not_trigger_compaction_without_candidat
     monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     pipe.valves.soft_trigger_ratio = 0.1
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
@@ -15351,9 +15372,9 @@ async def test_pipe_override_lowers_threshold_and_triggers_compaction(monkeypatc
 
     pipe = mod.Pipe()
     # Global default would NOT compact 500 tokens, but the per-model override (100) does.
-    pipe.valves.trigger_total_tokens = 100000
-    pipe.valves.trigger_total_tokens_overrides_json = json.dumps(
-        {"overrides": [{"model_patterns": ["target"], "trigger_total_tokens": 100}]}
+    pipe.valves.trigger_input_tokens = 100000
+    pipe.valves.per_model_overrides_json = json.dumps(
+        {"overrides": [{"model_patterns": ["target"], "trigger_input_tokens": 100}]}
     )
 
     events = []
@@ -15383,9 +15404,9 @@ async def test_pipe_override_raises_threshold_and_skips_compaction(monkeypatch, 
 
     pipe = mod.Pipe()
     # Global default would compact 500 tokens, but the per-model override (1000000) keeps it forwarding.
-    pipe.valves.trigger_total_tokens = 100
-    pipe.valves.trigger_total_tokens_overrides_json = json.dumps(
-        {"overrides": [{"model_patterns": ["target"], "trigger_total_tokens": 1000000}]}
+    pipe.valves.trigger_input_tokens = 100
+    pipe.valves.per_model_overrides_json = json.dumps(
+        {"overrides": [{"model_patterns": ["target"], "trigger_input_tokens": 1000000}]}
     )
 
     events = []
@@ -15407,15 +15428,15 @@ async def test_pipe_override_raises_threshold_and_skips_compaction(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_pipe_override_non_match_uses_global_trigger_total_tokens(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_override_non_match_uses_global_trigger_input_tokens(monkeypatch, pipe_request, pipe_user, pipe_metadata):
     captured = {}
     _install_threshold_decision_stubs(monkeypatch, captured, total_tokens=500)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     # Override targets a different model, so the global default (100) is used and 500 tokens compacts.
-    pipe.valves.trigger_total_tokens_overrides_json = json.dumps(
-        {"overrides": [{"model_patterns": ["other-*"], "trigger_total_tokens": 1000000}]}
+    pipe.valves.per_model_overrides_json = json.dumps(
+        {"overrides": [{"model_patterns": ["other-*"], "trigger_input_tokens": 1000000}]}
     )
 
     events = []
@@ -15443,8 +15464,8 @@ async def test_pipe_empty_overrides_json_preserves_global_threshold_behavior(mon
     _install_threshold_decision_stubs(monkeypatch, captured, total_tokens=500)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
-    assert pipe.valves.trigger_total_tokens_overrides_json == ""
+    pipe.valves.trigger_input_tokens = 100
+    assert pipe.valves.per_model_overrides_json == ""
 
     events = []
 
@@ -15485,7 +15506,7 @@ async def test_pipe_returns_error_when_overrides_json_invalid_at_runtime(monkeyp
 
     pipe = mod.Pipe()
     # Bypass save-time validation (validate_assignment is off) to simulate a tampered stored value.
-    pipe.valves.trigger_total_tokens_overrides_json = "not json"
+    pipe.valves.per_model_overrides_json = "not json"
 
     result = await pipe.pipe(
         _compactable_body(),
@@ -15495,7 +15516,7 @@ async def test_pipe_returns_error_when_overrides_json_invalid_at_runtime(monkeyp
         __event_emitter__=None,
     )
 
-    assert result["error"]["code"] == "invalid_trigger_total_tokens_overrides"
+    assert result["error"]["code"] == "invalid_per_model_overrides"
     assert "forwarded" not in captured
 
 
@@ -15733,7 +15754,7 @@ async def test_pipe_does_not_rebuild_task_prompt_from_task_body_by_default(
 
     pipe_request.app.state.config = SimpleNamespace(TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}")
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     task_history = [*exact_source, {"role": "user", "content": "active task input"}]
     body = {
@@ -15802,7 +15823,7 @@ async def test_task_prompt_estimate_uses_provider_body_when_file_context_disable
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     pipe.valves.compact_task_prompts_from_task_body = True
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
@@ -15896,7 +15917,7 @@ async def test_pipe_rebuilds_open_webui_task_prompt_with_reusable_checkpoint(
 
     pipe_request.app.state.config = SimpleNamespace(TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}")
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     pipe.valves.compact_task_prompts_from_task_body = True
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     task_history = [*exact_source, {"role": "user", "content": "active task input"}]
@@ -16104,7 +16125,7 @@ async def test_pipe_uses_task_checkpoint_applied_estimate_for_reusable_checkpoin
 
     pipe_request.app.state.config = SimpleNamespace(TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}")
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     pipe.valves.compact_task_prompts_from_task_body = True
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     metadata = {
@@ -16177,7 +16198,7 @@ async def test_task_soft_prefetch_passes_rebuilt_prompt_for_checkpoint_estimates
 
     pipe_request.app.state.config = SimpleNamespace(TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}")
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 200
+    pipe.valves.trigger_input_tokens = 200
     pipe.valves.soft_trigger_ratio = 0.5
     pipe.valves.compact_task_prompts_from_task_body = True
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
@@ -16254,7 +16275,7 @@ async def test_pipe_forwards_unchanged_when_checkpoint_lookup_fails_and_request_
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     pipe.valves.soft_trigger_ratio = 0.5
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     messages = [
@@ -16309,7 +16330,7 @@ async def test_pipe_fails_closed_when_checkpoint_lookup_fails_and_hard_compactio
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 200
+    pipe.valves.trigger_input_tokens = 200
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
 
     result = await pipe.pipe(
@@ -16372,7 +16393,7 @@ async def test_pipe_forwards_unchanged_when_checkpoint_lookup_fails_and_request_
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     pipe.valves.soft_trigger_ratio = 0.5
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     messages = [
@@ -16445,7 +16466,7 @@ async def test_pipe_db_down_lookup_creates_no_checkpoint_and_skips_completed_tur
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     pipe.valves.soft_trigger_ratio = 0.5
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     messages = [
@@ -16501,7 +16522,7 @@ async def test_pipe_fails_closed_when_checkpoint_lookup_fails_and_decision_total
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
 
     result = await pipe.pipe(
@@ -16567,7 +16588,7 @@ async def test_pipe_fails_closed_on_overflow_retry_when_checkpoint_lookup_was_un
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     pipe.valves.soft_trigger_ratio = 0.5
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     messages = [
@@ -16632,7 +16653,7 @@ async def test_pipe_creates_tool_checkpoint_without_history_parent_when_summary_
     _install_candidate_token_estimate(monkeypatch, 250000)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     tool_message = {"role": "tool", "tool_call_id": "call-1", "content": "x" * 200000}
     body = {
@@ -17480,7 +17501,7 @@ async def test_pipe_reuses_exact_tool_checkpoint_without_creating_history_checkp
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     latest_round = [
         {
@@ -17583,7 +17604,7 @@ async def test_pipe_reuses_exact_tool_checkpoint_even_when_usage_is_below_thresh
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     latest_round = [
         {
@@ -17675,7 +17696,7 @@ async def test_pipe_reuses_history_checkpoint_for_tool_loop_when_usage_is_below_
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     latest_round = [
         {
@@ -17763,7 +17784,7 @@ async def test_pipe_reuses_longest_history_parent_for_tool_loop_when_usage_is_be
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     latest_round = [
         {
@@ -17840,7 +17861,7 @@ async def test_pipe_falls_back_to_history_parent_when_direct_tool_summary_overfl
     _install_candidate_token_estimate(monkeypatch, 250000)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -18275,7 +18296,7 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_prior_checkpo
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     tool_message = {"role": "tool", "tool_call_id": "call-1", "content": "x" * 200000}
     body = {
@@ -18383,7 +18404,7 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_checkpoint_pa
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100000
+    pipe.valves.trigger_input_tokens = 100000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     tool_message = {"role": "tool", "tool_call_id": "call-1", "content": "x" * 200000}
     body = {
@@ -18671,7 +18692,7 @@ async def test_pipe_reemits_latest_compaction_summary_embed_on_retry_after_initi
     _install_candidate_token_estimate(monkeypatch, 500)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     events = []
 
@@ -18773,7 +18794,7 @@ async def _run_token_status_pipe(
     estimate_sequence=None,
     pipe=None,
     body=None,
-    trigger_total_tokens=1000,
+    trigger_input_tokens=1000,
     forward_raises_once=False,
 ):
     captured = {"forward_bodies": []}
@@ -18830,7 +18851,7 @@ async def _run_token_status_pipe(
     _install_known_openai_usage_anchor_transport(monkeypatch)
 
     pipe = pipe or mod.Pipe()
-    pipe.valves.trigger_total_tokens = trigger_total_tokens
+    pipe.valves.trigger_input_tokens = trigger_input_tokens
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = body or {
         "model": wrapper_id,
@@ -18842,12 +18863,12 @@ async def _run_token_status_pipe(
         ],
     }
     if usage is not None:
-        compare_uses_local_estimate = (
-            pipe.valves.token_status_compare_estimate
+        status_uses_local_estimate = (
+            pipe.valves.token_status_show_usage_and_estimate
             and (estimate_tokens is not None or estimate_sequence is not None)
         )
         anchor_input = None
-        if not compare_uses_local_estimate:
+        if not status_uses_local_estimate:
             target_body = copy.deepcopy(body)
             target_body["model"] = "target"
             anchor_input = await mod._build_usage_anchor_input(
@@ -18883,7 +18904,7 @@ async def test_status_shows_before_tokens_by_default(monkeypatch, pipe_request, 
         pipe_user,
         pipe_metadata,
         usage={"total_tokens": 1500, "input_tokens": 1500, "output_tokens": 0},
-        trigger_total_tokens=1000,
+        trigger_input_tokens=1000,
     )
 
     assert result == {"ok": True}
@@ -18913,7 +18934,7 @@ async def test_status_before_after_mode(monkeypatch, pipe_request, pipe_user, pi
         pipe=pipe,
         usage={"total_tokens": 1500, "input_tokens": 1500, "output_tokens": 0},
         estimate_sequence=[120],
-        trigger_total_tokens=1000,
+        trigger_input_tokens=1000,
     )
 
     assert result == {"ok": True}
@@ -18927,9 +18948,9 @@ async def test_status_before_after_mode(monkeypatch, pipe_request, pipe_user, pi
 
 
 @pytest.mark.asyncio
-async def test_status_compare_estimate_mode(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_show_usage_and_estimate_mode(monkeypatch, pipe_request, pipe_user, pipe_metadata):
     pipe = mod.Pipe()
-    pipe.valves.token_status_compare_estimate = True
+    pipe.valves.token_status_show_usage_and_estimate = True
 
     result, events, _captured, estimate_calls = await _run_token_status_pipe(
         monkeypatch,
@@ -18939,7 +18960,7 @@ async def test_status_compare_estimate_mode(monkeypatch, pipe_request, pipe_user
         pipe=pipe,
         usage={"total_tokens": 1250, "input_tokens": 1250, "output_tokens": 0},
         estimate_tokens=1280,
-        trigger_total_tokens=1000,
+        trigger_input_tokens=1000,
     )
 
     assert result == {"ok": True}
@@ -18954,9 +18975,11 @@ async def test_status_compare_estimate_mode(monkeypatch, pipe_request, pipe_user
 
 
 @pytest.mark.asyncio
-async def test_status_compare_estimate_and_before_after_combined(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_show_usage_and_estimate_and_before_after_combined(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     pipe = mod.Pipe()
-    pipe.valves.token_status_compare_estimate = True
+    pipe.valves.token_status_show_usage_and_estimate = True
     pipe.valves.token_status_detail = "before_after"
 
     result, events, _captured, estimate_calls = await _run_token_status_pipe(
@@ -18967,7 +18990,7 @@ async def test_status_compare_estimate_and_before_after_combined(monkeypatch, pi
         pipe=pipe,
         usage={"total_tokens": 1250, "input_tokens": 1250, "output_tokens": 0},
         estimate_sequence=[1280, 500],
-        trigger_total_tokens=1000,
+        trigger_input_tokens=1000,
     )
 
     assert result == {"ok": True}
@@ -18994,12 +19017,12 @@ def test_format_token_suffix_summary_mode_distinguishes_summary_from_after():
     )
 
     assert (
-        mod._format_token_suffix(ctx, after=None, compare_estimate=False, summary=50)
+        mod._format_token_suffix(ctx, after=None, show_usage_and_estimate=False, summary=50)
         == "(≈850 / 1,000 tokens · 85% · summary ≈50 tokens)"
     )
 
 
-def test_format_token_suffix_summary_mode_with_compare_estimate():
+def test_format_token_suffix_summary_mode_with_usage_and_estimate():
     ctx = mod.DisplayTokenContext(
         before=850,
         usage=850,
@@ -19011,7 +19034,7 @@ def test_format_token_suffix_summary_mode_with_compare_estimate():
     )
 
     assert (
-        mod._format_token_suffix(ctx, after=50, compare_estimate=True, summary=50)
+        mod._format_token_suffix(ctx, after=50, show_usage_and_estimate=True, summary=50)
         == "(observed usage 850 · candidate ≈860 / 1,000 · 85% · summary ≈50 tokens)"
     )
 
@@ -19029,7 +19052,7 @@ async def test_status_always_mode_emits_pressure(monkeypatch, pipe_request, pipe
         pipe=pipe,
         usage=None,
         estimate_tokens=450,
-        trigger_total_tokens=1000,
+        trigger_input_tokens=1000,
     )
 
     assert result == {"ok": True}
@@ -19050,7 +19073,7 @@ async def test_status_compaction_only_silent_below_threshold(monkeypatch, pipe_r
         pipe_metadata,
         usage=None,
         estimate_tokens=450,
-        trigger_total_tokens=1000,
+        trigger_input_tokens=1000,
     )
 
     assert result == {"ok": True}
@@ -19066,7 +19089,7 @@ async def test_status_unknown_tokens_render(monkeypatch, pipe_request, pipe_user
         pipe_metadata,
         usage=None,
         estimate_tokens=None,
-        trigger_total_tokens=1000,
+        trigger_input_tokens=1000,
         forward_raises_once=True,
     )
 
@@ -19117,9 +19140,9 @@ async def test_status_prefetch_shows_trigger_tokens(monkeypatch, pipe_request, p
             summary_tool_policy="fallback_on_tool_call",
             historical_message_excerpt_bytes=1024,
             historical_message_excerpt_count=3,
-            effective_trigger_total_tokens=1000,
-            effective_soft_trigger_total_tokens=800,
-            trigger_total_tokens=850,
+            effective_trigger_input_tokens=1000,
+            effective_soft_trigger_input_tokens=800,
+            trigger_observed_tokens=850,
             trigger_usage_source="request",
             event_emitter=event_emitter,
         )
@@ -19194,9 +19217,9 @@ async def test_status_prefetched_shows_summary_in_before_after_mode(
             summary_tool_policy="fallback_on_tool_call",
             historical_message_excerpt_bytes=1024,
             historical_message_excerpt_count=3,
-            effective_trigger_total_tokens=1000,
-            effective_soft_trigger_total_tokens=800,
-            trigger_total_tokens=850,
+            effective_trigger_input_tokens=1000,
+            effective_soft_trigger_input_tokens=800,
+            trigger_observed_tokens=850,
             trigger_usage_source="request",
             token_status_detail="before_after",
             event_emitter=event_emitter,
@@ -19277,9 +19300,9 @@ async def test_status_prefetched_estimates_summary_when_checkpoint_count_is_miss
             summary_tool_policy="fallback_on_tool_call",
             historical_message_excerpt_bytes=1024,
             historical_message_excerpt_count=3,
-            effective_trigger_total_tokens=1000,
-            effective_soft_trigger_total_tokens=800,
-            trigger_total_tokens=850,
+            effective_trigger_input_tokens=1000,
+            effective_soft_trigger_input_tokens=800,
+            trigger_observed_tokens=850,
             trigger_usage_source="request",
             token_status_detail="before_after",
             event_emitter=event_emitter,
@@ -19301,7 +19324,7 @@ async def test_status_prefetched_estimates_summary_when_checkpoint_count_is_miss
 @pytest.mark.asyncio
 async def test_status_skipped_action_carries_tokens(monkeypatch, pipe_request, pipe_user, pipe_metadata):
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
 
     captured = {"forward_bodies": []}
     events = []
@@ -19365,7 +19388,7 @@ async def test_summary_file_context_unavailable_stops_before_target_forward(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     captured = {"forward_called": False}
     events = []
 
@@ -19436,7 +19459,7 @@ async def test_status_before_after_renders_when_after_estimate_fails(monkeypatch
         pipe=pipe,
         usage={"total_tokens": 1500, "input_tokens": 1500, "output_tokens": 0},
         estimate_sequence=[None],
-        trigger_total_tokens=1000,
+        trigger_input_tokens=1000,
     )
 
     assert result == {"ok": True}
@@ -19450,7 +19473,7 @@ async def test_status_before_after_renders_when_after_estimate_fails(monkeypatch
 async def test_status_always_mode_plus_compaction_emits_both(monkeypatch, pipe_request, pipe_user, pipe_metadata):
     pipe = mod.Pipe()
     pipe.valves.token_status_visibility = "always"
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
 
     result, events, captured, _estimate_calls = await _run_token_status_pipe(
         monkeypatch,
@@ -19459,7 +19482,7 @@ async def test_status_always_mode_plus_compaction_emits_both(monkeypatch, pipe_r
         pipe_metadata,
         pipe=pipe,
         usage={"total_tokens": 1500, "input_tokens": 1500, "output_tokens": 0},
-        trigger_total_tokens=1000,
+        trigger_input_tokens=1000,
     )
 
     assert result == {"ok": True}
@@ -19528,7 +19551,7 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     events = []
 
     async def event_emitter(event):
@@ -19612,7 +19635,7 @@ async def test_pipe_closes_compaction_status_when_usage_threshold_has_no_safe_pr
     _install_candidate_token_estimate(monkeypatch, 500)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     events = []
 
@@ -19745,7 +19768,7 @@ async def test_pipe_does_not_create_transient_only_history_checkpoint_for_large_
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.transient_message_markers = TRANSIENT_MARKER
+    pipe.valves.transient_message_patterns = TRANSIENT_MARKER
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -19791,7 +19814,7 @@ async def test_pipe_does_not_compact_internal_summary_task(monkeypatch, pipe_req
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -19927,7 +19950,7 @@ async def test_soft_prefetch_waits_for_pending_parent_then_claims_child_at_soft_
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_soft_trigger_total_tokens=100,
+        effective_soft_trigger_input_tokens=100,
     )
 
     assert prefetched is True
@@ -19996,7 +20019,7 @@ async def test_soft_prefetch_waits_for_pending_parent_then_skips_below_soft(
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_soft_trigger_total_tokens=100,
+        effective_soft_trigger_input_tokens=100,
     )
 
     assert prefetched is False
@@ -20056,7 +20079,7 @@ async def test_soft_prefetch_waits_for_pending_exact_checkpoint_then_skips(
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_soft_trigger_total_tokens=100,
+        effective_soft_trigger_input_tokens=100,
     )
 
     assert prefetched is False
@@ -20117,7 +20140,7 @@ async def test_soft_prefetch_pending_parent_timeout_is_bounded_and_starts_no_chi
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_soft_trigger_total_tokens=100,
+        effective_soft_trigger_input_tokens=100,
     )
 
     assert prefetched is False
@@ -20212,7 +20235,7 @@ async def test_pipe_does_not_launch_completed_turn_soft_prefetch_for_internal_su
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     metadata = {"chat_id": "chat-1", "message_id": "msg-1", "task": mod.INTERNAL_SUMMARY_TASK}
     body = {
@@ -20272,7 +20295,7 @@ async def test_pipe_launches_soft_prefetch_below_hard_without_foreground_compact
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -20345,7 +20368,7 @@ async def test_pipe_logs_late_parent_checkpoint_lookup_failure_for_soft_prefetch
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -20419,7 +20442,7 @@ async def test_pipe_uses_full_body_estimate_for_request_usage_without_tool_suffi
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     mod.store_request_scoped_usage(
         request=pipe_request,
@@ -20488,7 +20511,7 @@ async def test_pipe_ignores_body_message_usage_without_request_or_persisted_usag
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -20556,7 +20579,7 @@ async def test_pipe_does_not_prefetch_from_stable_body_extras_already_counted_by
     _install_durable_usage_anchor_estimate(monkeypatch, 750)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     pipe.valves.soft_trigger_ratio = 0.8
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
@@ -20625,7 +20648,7 @@ async def test_pipe_compacts_from_usage_anchor_plus_latest_user_delta_without_fu
     _install_durable_usage_anchor_estimate(monkeypatch, 105)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -20688,8 +20711,8 @@ async def test_pipe_usage_anchor_ignores_trailing_transient_user_delta(
     _install_durable_usage_anchor_estimate(monkeypatch, 105)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
-    pipe.valves.transient_message_markers = TRANSIENT_MARKER
+    pipe.valves.trigger_input_tokens = 100
+    pipe.valves.transient_message_patterns = TRANSIENT_MARKER
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -20748,7 +20771,7 @@ async def test_pipe_launches_soft_prefetch_from_usage_anchor_plus_latest_user_de
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -20812,7 +20835,7 @@ async def test_pipe_compacts_from_request_anchor_plus_tool_loop_suffix_without_f
     _install_known_openai_usage_anchor_transport(monkeypatch)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     previous_messages = [{"role": "user", "content": "old"}]
     mod.store_request_scoped_usage(
@@ -20903,7 +20926,7 @@ async def test_pipe_uses_full_body_estimate_when_visible_usage_suffix_is_not_anc
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -20959,7 +20982,7 @@ async def test_pipe_launches_soft_prefetch_from_estimate_when_usage_is_missing(
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -21020,7 +21043,7 @@ async def test_pipe_does_not_launch_soft_prefetch_when_hard_compaction_will_run(
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.2
-    pipe.valves.trigger_total_tokens = 100
+    pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -21084,7 +21107,7 @@ async def test_pipe_does_not_launch_seed_prefetch_below_soft_when_no_reusable_ch
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.5
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -21155,7 +21178,7 @@ async def test_pipe_does_not_launch_seed_prefetch_when_soft_prefetch_disabled(
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -21431,7 +21454,7 @@ async def test_soft_prefetch_skips_checkpoint_when_prefix_has_only_transient_use
     pipe_user,
     pipe_metadata,
 ):
-    patterns = mod.parse_transient_message_markers(TRANSIENT_MARKER)
+    patterns = mod.parse_transient_message_patterns(TRANSIENT_MARKER)
     transient_context = "<SYSTEM_CONTEXT>now: 10:00</SYSTEM_CONTEXT>"
     messages = [
         {"role": "user", "content": transient_context},
@@ -21558,7 +21581,7 @@ async def test_pipe_launches_completed_turn_soft_prefetch_when_no_parent_prefetc
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -21660,7 +21683,7 @@ async def test_pipe_completed_turn_prefetch_waits_for_in_flight_parent_prefetch(
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -21727,7 +21750,7 @@ async def test_task_completed_turn_prefetch_skips_summary_generation(
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     pipe.valves.compact_task_prompts_from_task_body = False
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     task_history = [
@@ -21796,7 +21819,7 @@ async def test_streaming_task_completed_turn_prefetch_does_not_register_on_compl
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     pipe.valves.compact_task_prompts_from_task_body = False
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     task_history = [
@@ -21873,7 +21896,7 @@ async def test_pipe_skips_completed_turn_soft_prefetch_for_tool_call_response(
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -21940,7 +21963,7 @@ async def _run_completed_turn_prefetch_usage_case(
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -22004,7 +22027,7 @@ def _completed_turn_registry_case(monkeypatch):
             {
                 "body": copy.deepcopy(kwargs["body"]),
                 "source_messages": copy.deepcopy(kwargs["source_messages"]),
-                "trigger_total_tokens": kwargs["trigger_total_tokens"],
+                "trigger_observed_tokens": kwargs["trigger_observed_tokens"],
             }
         )
         return True
@@ -22020,7 +22043,7 @@ def _completed_turn_registry_case(monkeypatch):
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     body = {
         "model": mod.build_wrapper_model_id("auto_compact", "target"),
         "stream": False,
@@ -22246,7 +22269,7 @@ async def test_pipe_completed_turn_prefetch_fires_from_response_usage(
     await _drain_completed_turn_prefetch_tasks()
 
     assert len(calls) == 1
-    assert calls[0]["trigger_total_tokens"] == 500
+    assert calls[0]["trigger_observed_tokens"] == 500
     assert calls[0]["body"]["messages"][-2:] == [
         {"role": "assistant", "content": "answer"},
         {"role": "user", "content": ""},
@@ -22316,7 +22339,7 @@ async def test_pipe_skips_checkpoints_without_core_persisted_message_id(
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -22408,7 +22431,7 @@ async def test_pipe_completed_turn_prefetch_background_error_does_not_block_resp
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -22504,7 +22527,7 @@ async def test_pipe_completed_turn_prefetch_does_not_lookup_or_estimate_before_r
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
-    pipe.valves.trigger_total_tokens = 1000
+    pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     body = {
         "model": wrapper_id,
@@ -22582,7 +22605,7 @@ async def test_soft_prefetch_worker_skips_exact_reusable_checkpoint(
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_soft_trigger_total_tokens=100,
+        effective_soft_trigger_input_tokens=100,
     )
 
     assert prefetched is False
@@ -22645,7 +22668,7 @@ async def test_soft_prefetch_worker_logs_and_skips_when_parent_applied_estimate_
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_soft_trigger_total_tokens=100,
+        effective_soft_trigger_input_tokens=100,
     )
 
     assert prefetched is False
@@ -22710,7 +22733,7 @@ async def test_soft_prefetch_worker_skips_parent_below_soft(
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_soft_trigger_total_tokens=100,
+        effective_soft_trigger_input_tokens=100,
         token_system_prompt="target system",
         dropped_message_keys=frozenset({"reasoning_details"}),
     )
@@ -22778,7 +22801,7 @@ async def test_soft_prefetch_worker_proceeds_when_parent_applied_estimate_above_
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_soft_trigger_total_tokens=100,
+        effective_soft_trigger_input_tokens=100,
     )
 
     assert prefetched is True

@@ -2644,8 +2644,8 @@ async def test_prefetch_skips_child_checkpoint_when_ready_parent_estimate_is_bel
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_trigger_total_tokens=1000,
-        effective_soft_trigger_total_tokens=100,
+        effective_trigger_input_tokens=1000,
+        effective_soft_trigger_input_tokens=100,
         trigger_estimated_tokens=500,
     )
 
@@ -2714,8 +2714,8 @@ async def test_prefetch_rechecks_parent_after_claim_before_generating_child(monk
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_trigger_total_tokens=1000,
-        effective_soft_trigger_total_tokens=100,
+        effective_trigger_input_tokens=1000,
+        effective_soft_trigger_input_tokens=100,
         trigger_estimated_tokens=500,
     )
 
@@ -2791,8 +2791,8 @@ async def test_prefetch_does_not_skip_tool_prefix_for_mismatched_message_exact_c
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_trigger_total_tokens=1000,
-        effective_soft_trigger_total_tokens=100,
+        effective_trigger_input_tokens=1000,
+        effective_soft_trigger_input_tokens=100,
         trigger_estimated_tokens=500,
     )
 
@@ -2881,8 +2881,8 @@ async def test_prefetch_uses_task_estimate_body_for_parent_below_soft_guard(monk
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
-        effective_trigger_total_tokens=1000,
-        effective_soft_trigger_total_tokens=100,
+        effective_trigger_input_tokens=1000,
+        effective_soft_trigger_input_tokens=100,
         trigger_estimated_tokens=500,
     )
 
