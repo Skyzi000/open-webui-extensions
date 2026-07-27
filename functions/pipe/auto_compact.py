@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.7.1
+version: 0.7.2
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -58,6 +58,11 @@ from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+
+try:
+    from open_webui.utils.chat_variables import render_chat_variables as _render_chat_variables
+except ImportError:
+    _render_chat_variables = None
 
 try:
     import markdown as _markdown_mod
@@ -119,7 +124,7 @@ CORE_CONTEXT_COMPACTION_CONFLICT_MESSAGE = (
 )
 
 
-TEMP_CHAT_PREFIXES = ("local:", "channel:")
+TEMP_CHAT_PREFIXES = ("temporary:", "local:", "channel:")
 SUMMARY_FORMAT_FAMILY = "compact-user-summary-v1"
 SOURCE_HASH_FAMILY = "canonical-json-v1"
 PROFILE_HASH_FAMILY = "checkpoint-profile-v1"
@@ -10370,6 +10375,13 @@ async def _usage_anchor_resolved_system_identity(
     user: Any,
 ) -> str:
     from open_webui.utils.task import prompt_template, prompt_variables_template
+
+    if _render_chat_variables is not None and metadata:
+        system = _render_chat_variables(
+            system,
+            metadata.get("chat_variables", {}),
+            required=False,
+        )
 
     variables = metadata.get("variables", {}) if isinstance(metadata, dict) else {}
     if variables:

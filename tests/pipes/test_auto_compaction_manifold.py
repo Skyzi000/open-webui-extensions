@@ -4222,6 +4222,7 @@ async def test_target_access_allows_admin_raw_provider_target_without_model_reco
 @pytest.mark.asyncio
 async def test_target_access_rejects_disabled_provider_stale_cache_target(monkeypatch, pipe_request, pipe_user):
     install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
     pipe_request.app.state.config = SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False)
     pipe_request.app.state.MODELS = {
         "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}}
@@ -4412,6 +4413,7 @@ async def test_target_access_rejects_custom_model_when_base_model_is_unavailable
     pipe_user,
 ):
     install_fake_open_webui_user_model(monkeypatch)
+    install_unavailable_open_webui_config(monkeypatch)
     pipe_request.app.state.config = SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False)
     pipe_request.app.state.MODELS = {
         "workspace-preset": {
@@ -4728,11 +4730,16 @@ def _install_real_core_provider_capture(
 
         request.app.state.OPENAI_MODELS = {"target": {"urlIdx": 0}}
 
+        async def config_get(key, default=None):
+            if key == "openai.enable":
+                return True
+            return default
+
         class FakeResponse:
             status = 200
             headers = {"Content-Type": "application/json"}
 
-            async def json(self):
+            async def json(self, **kwargs):
                 if queued_responses:
                     return queued_responses.pop(0)
                 return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
@@ -4761,6 +4768,7 @@ def _install_real_core_provider_capture(
         async def check_model_access(*args, **kwargs):
             return None
 
+        monkeypatch.setattr(provider_router, "Config", SimpleNamespace(get=config_get), raising=False)
         monkeypatch.setattr(provider_router, "get_openai_connection", get_openai_connection)
         monkeypatch.setattr(provider_router, "get_headers_and_cookies", get_headers_and_cookies)
         monkeypatch.setattr(provider_router, "get_session", get_session)
@@ -4786,7 +4794,7 @@ def _install_real_core_provider_capture(
         async def check_model_access(*args, **kwargs):
             return None
 
-        monkeypatch.setattr(provider_router, "Config", SimpleNamespace(get=config_get))
+        monkeypatch.setattr(provider_router, "Config", SimpleNamespace(get=config_get), raising=False)
         monkeypatch.setattr(provider_router, "get_ollama_url", get_ollama_url)
         monkeypatch.setattr(provider_router, "resolve_api_config", lambda *args, **kwargs: {})
         monkeypatch.setattr(provider_router, "get_api_key", lambda *args, **kwargs: None)
@@ -5336,6 +5344,11 @@ def test_strict_usage_input_tokens_rejects_ambiguous_or_empty_measurements(usage
 def test_usage_total_recomputes_split_fields_and_rejects_incomplete_llama_cache_usage():
     assert mod._usage_total({"total_tokens": 100, "input_tokens": 100, "output_tokens": 20}) == 120
     assert mod._usage_total({"total_tokens": 100, "prompt_n": 100, "output_tokens": 0}) is None
+
+
+@pytest.mark.parametrize("chat_id", ["local:socket", "channel:thread", "temporary:session"])
+def test_chat_id_supported_rejects_core_non_saved_prefixes(chat_id):
+    assert not mod._chat_id_supported(chat_id)
 
 
 @pytest.mark.asyncio
@@ -13003,6 +13016,20 @@ async def test_resolved_route_usage_anchor_hash_tracks_downstream_model_shaping(
 
 
 @pytest.mark.asyncio
+async def test_usage_anchor_system_identity_keeps_chat_variables_without_core_support(monkeypatch):
+    monkeypatch.setattr(mod, "_render_chat_variables", None)
+
+    assert (
+        await mod._usage_anchor_resolved_system_identity(
+            "Project={{ chat.variables.project }}",
+            metadata={"chat_variables": {"project": "alpha"}},
+            user=None,
+        )
+        == "Project={{ chat.variables.project }}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_resolved_route_usage_anchor_hash_normalizes_clock_but_tracks_expanded_system(
     monkeypatch,
     pipe_request,
@@ -13013,7 +13040,10 @@ async def test_resolved_route_usage_anchor_hash_normalizes_clock_but_tracks_expa
 
     pipe_request.app.state.MODELS = {"target": {"id": "target", "owned_by": "openai"}}
     params = {
-        "system": "{{CURRENT_DATETIME}} {{USER_BIO}} {{USER_GROUPS}} {{CUSTOM}}",
+        "system": (
+            "{{CURRENT_DATETIME}} {{USER_BIO}} {{USER_GROUPS}} {{CUSTOM}} "
+            "{{ chat.variables.project }}"
+        ),
     }
     group_names = ["group-a"]
 
@@ -13032,12 +13062,19 @@ async def test_resolved_route_usage_anchor_hash_normalizes_clock_but_tracks_expa
         assert user_id == pipe_user["id"]
         return [SimpleNamespace(name=name) for name in group_names]
 
+    def render_chat_variables(system, variables, *, required=True):
+        assert required is False
+        return system.replace("{{ chat.variables.project }}", variables.get("project", ""))
+
     monkeypatch.setattr(mod, "_get_target_db_model_record", get_target_db_model_record)
     monkeypatch.setattr(mod, "_usage_anchor_transport_profile", transport_profile)
+    if mod._render_chat_variables is None:
+        monkeypatch.setattr(mod, "_render_chat_variables", render_chat_variables)
     monkeypatch.setattr(groups_module.Groups, "get_groups_by_member_id", get_groups_by_member_id)
 
     user = {**pipe_user, "bio": "bio-a"}
     metadata = {
+        "chat_variables": {"project": "project-a"},
         "variables": {
             "{{CURRENT_DATETIME}}": "clock-a",
             "{{CUSTOM}}": "custom-a",
@@ -13064,6 +13101,14 @@ async def test_resolved_route_usage_anchor_hash_normalizes_clock_but_tracks_expa
     changed_metadata = copy.deepcopy(metadata)
     changed_metadata["variables"]["{{CUSTOM}}"] = "custom-b"
     assert await shaping_hash(resolved_metadata=changed_metadata) != original
+
+    changed_metadata = copy.deepcopy(metadata)
+    changed_metadata["chat_variables"]["project"] = "project-b"
+    assert await shaping_hash(resolved_metadata=changed_metadata) != original
+
+    # No user-variable counterpart: UserModel.variables is exclude=True, so the
+    # Pipe-injected user never carries them and Core renders them to '' for our
+    # forwards. Add identity coverage here once Core exposes them to Pipes.
 
     group_names[:] = ["group-b"]
     assert await shaping_hash() != original
