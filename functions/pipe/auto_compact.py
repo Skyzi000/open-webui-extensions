@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.7.0
+version: 0.7.1
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -35,6 +35,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
 
 from fastapi import HTTPException
 from open_webui.constants import TASKS
+from open_webui.utils.misc import sanitize_text_for_db
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     BigInteger,
@@ -51,10 +52,8 @@ from sqlalchemy import (
     insert,
     or_,
     select,
-    text as sql_text,
     update,
 )
-from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -3719,13 +3718,6 @@ def select_longest_matching_parent(
     )
 
 
-_CHECKPOINT_COMPAT_COLUMN_DDL_TYPES = (
-    ("claim_token", "TEXT"),
-    ("claim_expires_at", "BIGINT"),
-    ("summary_token_count", "INTEGER"),
-)
-
-
 def _is_duplicate_schema_object_error(exc: Exception) -> bool:
     message = str(getattr(exc, "orig", None) or exc).lower()
     return "already exists" in message or "duplicate" in message
@@ -3740,29 +3732,10 @@ def _execute_checkpoint_ddl_tolerating_duplicates(sync_conn: Any, statement: Any
             raise
 
 
-def _quoted_checkpoint_table_sql() -> str:
-    if OPEN_WEBUI_DATABASE_SCHEMA:
-        return f'"{OPEN_WEBUI_DATABASE_SCHEMA}"."{CHECKPOINT_TABLE_NAME}"'
-    return f'"{CHECKPOINT_TABLE_NAME}"'
-
-
 def _initialize_checkpoint_schema(sync_conn: Any) -> None:
     _execute_checkpoint_ddl_tolerating_duplicates(sync_conn, CreateTable(CHECKPOINT_TABLE, if_not_exists=True))
     for index in CHECKPOINT_TABLE.indexes:
         _execute_checkpoint_ddl_tolerating_duplicates(sync_conn, CreateIndex(index, if_not_exists=True))
-    existing_columns = {
-        column["name"]
-        for column in sqlalchemy_inspect(sync_conn).get_columns(
-            CHECKPOINT_TABLE_NAME, schema=OPEN_WEBUI_DATABASE_SCHEMA
-        )
-    }
-    for column_name, column_ddl_type in _CHECKPOINT_COMPAT_COLUMN_DDL_TYPES:
-        if column_name in existing_columns:
-            continue
-        _execute_checkpoint_ddl_tolerating_duplicates(
-            sync_conn,
-            sql_text(f"ALTER TABLE {_quoted_checkpoint_table_sql()} ADD COLUMN {column_name} {column_ddl_type}"),
-        )
 
 
 def _schema_init_lock() -> asyncio.Lock:
@@ -7990,6 +7963,11 @@ async def emit_compaction_status(
         return
 
 
+def _sanitize_summary_text(value: str) -> str:
+    # Core skips surrogate cleanup when no NUL is present.
+    return sanitize_text_for_db(value).encode("utf-8", errors="ignore").decode("utf-8")
+
+
 async def extract_text_from_completion_response(response: Any, *, tools_enabled: bool = False) -> str:
     if isinstance(response, dict):
         if _responses_output_has_tool_call(response):
@@ -8003,11 +7981,15 @@ async def extract_text_from_completion_response(response: Any, *, tools_enabled:
             if _choice_has_tool_call(choice):
                 raise _summary_tool_call_error()
             value = _choice_message_text(choice)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+            if isinstance(value, str):
+                value = _sanitize_summary_text(value).strip()
+                if value:
+                    return value
         responses_text = _responses_output_text(response)
-        if responses_text and responses_text.strip():
-            return responses_text.strip()
+        if responses_text:
+            responses_text = _sanitize_summary_text(responses_text).strip()
+            if responses_text:
+                return responses_text
     if isinstance(response, StreamingResponse):
         parts: list[str] = []
         saw_tool_call = False
@@ -8024,7 +8006,7 @@ async def extract_text_from_completion_response(response: Any, *, tools_enabled:
                     saw_tool_call = saw_tool_call or _append_summary_sse_value(value, parts)
             for value in sse_parser.flush()[0]:
                 saw_tool_call = saw_tool_call or _append_summary_sse_value(value, parts)
-            text = "".join(parts).strip()
+            text = _sanitize_summary_text("".join(parts)).strip()
             if saw_tool_call:
                 raise _summary_tool_call_error()
             if text:
@@ -8603,8 +8585,8 @@ async def _claim_or_wait_for_checkpoint(
     source_message_count: int,
     summary_meta: dict[str, Any],
     claim_token: str,
-) -> str | dict[str, Any]:
-    """Return the claimed pending checkpoint id, or a ready row produced by another worker."""
+) -> dict[str, Any]:
+    """Return the claimed pending row, or a ready row produced by another worker."""
     deadline = time.monotonic() + CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS
     timeout_error = _checkpoint_wait_timeout_error(
         "another worker to finish generating this checkpoint summary"
@@ -8633,7 +8615,7 @@ async def _claim_or_wait_for_checkpoint(
                     deadline,
                 )
                 if claimed:
-                    return pending_row["id"]
+                    return pending_row
                 continue
             if row.get("state") == "ready":
                 try:
@@ -8659,7 +8641,7 @@ async def _claim_or_wait_for_checkpoint(
                     deadline,
                 )
                 if reclaimed:
-                    return row["id"]
+                    return row
                 continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -8757,9 +8739,10 @@ async def _get_or_create_checkpoint_summary(
                     summary_meta=summary_meta,
                     claim_token=claim_token,
                 )
-                if isinstance(claimed, dict):
+                if claimed.get("state") == "ready":
                     return CompactionSummaryResult(claimed["summary_text"], checkpoint=claimed)
-                checkpoint_id = claimed
+                checkpoint_id = str(claimed["id"])
+                checkpoint_summary_meta = normalize_summary_meta(claimed.get("summary_meta"))
 
                 heartbeat = asyncio.create_task(_heartbeat_checkpoint_claim(store, checkpoint_id, claim_token))
                 release_source_claim = False
@@ -8830,7 +8813,7 @@ async def _get_or_create_checkpoint_summary(
                     summary_token_count = await _estimate_rendered_summary_message_tokens(
                         request=request,
                         summary_text=summary_text,
-                        summary_meta=summary_meta,
+                        summary_meta=checkpoint_summary_meta,
                         transient_message_patterns=transient_message_patterns,
                     )
                     if lease_lost.is_set():

@@ -2736,43 +2736,6 @@ async def test_token_estimator_falls_back_to_legacy_tiktoken_encoding_when_confi
     assert not hasattr(pipe_request.state, mod.AUTO_COMPACT_TIKTOKEN_ENCODING_STATE_KEY)
 
 
-def test_checkpoint_schema_init_adds_summary_token_count_to_existing_tables(monkeypatch):
-    class NestedTransaction:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    class FakeSyncConn:
-        def __init__(self):
-            self.statements = []
-
-        def begin_nested(self):
-            return NestedTransaction()
-
-        def execute(self, statement):
-            self.statements.append(str(statement))
-
-    class FakeInspector:
-        def get_columns(self, table_name, schema=None):
-            return [
-                {"name": column.name}
-                for column in mod.CHECKPOINT_TABLE.columns
-                if column.name != "summary_token_count"
-            ]
-
-    sync_conn = FakeSyncConn()
-    monkeypatch.setattr(mod, "sqlalchemy_inspect", lambda conn: FakeInspector())
-
-    mod._initialize_checkpoint_schema(sync_conn)
-
-    assert any(
-        "ALTER TABLE" in statement and "summary_token_count" in statement
-        for statement in sync_conn.statements
-    )
-
-
 @pytest.mark.asyncio
 async def test_checkpoint_completion_stores_rendered_summary_token_count(monkeypatch, pipe_request, pipe_user):
     source_messages = [
@@ -9653,6 +9616,32 @@ async def test_extract_summary_text_from_streaming_response():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["\u0000", "\ud800", "\udc00"])
+async def test_extract_summary_text_rejects_all_invalid_db_characters_streaming_response(
+    content,
+):
+    async def chunks():
+        payload = {"choices": [{"delta": {"content": content}}]}
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    with pytest.raises(RuntimeError, match="did not return text content"):
+        await mod.extract_text_from_completion_response(response)
+
+
+@pytest.mark.asyncio
+async def test_extract_summary_text_sanitizes_invalid_db_characters_from_streaming_response():
+    async def chunks():
+        payload = {"choices": [{"delta": {"content": "hel\ud800😀\udc00lo"}}]}
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    response = StreamingResponse(chunks(), media_type="text/event-stream")
+
+    assert await mod.extract_text_from_completion_response(response) == "hel😀lo"
+
+
+@pytest.mark.asyncio
 async def test_extract_summary_text_accepts_mixed_case_sse_media_type():
     async def chunks():
         yield b'data: {"choices": [{"delta": {"content": "hello"}}]}\n\n'
@@ -9797,6 +9786,27 @@ async def test_extract_summary_text_from_responses_api_output():
     }
 
     assert await mod.extract_text_from_completion_response(response) == "hello world"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"choices": [{"message": {"content": "hel\ud800😀\udc00lo"}}]},
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "hel\ud800😀\udc00lo"}],
+                }
+            ]
+        },
+    ],
+)
+async def test_extract_summary_text_sanitizes_invalid_db_characters_from_dict_response(
+    response,
+):
+    assert await mod.extract_text_from_completion_response(response) == "hel😀lo"
 
 
 @pytest.mark.asyncio

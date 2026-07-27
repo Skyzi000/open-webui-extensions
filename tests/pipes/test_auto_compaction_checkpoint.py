@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import json
 import time
 from types import SimpleNamespace
 
@@ -1115,6 +1114,16 @@ async def test_pending_checkpoint_wait_times_out_with_explicit_error(monkeypatch
 async def test_stale_pending_claim_is_reclaimed_and_completed(monkeypatch):
     source_messages = [{"role": "user", "content": "old"}]
     stale = make_checkpoint_row(source_messages, claim_token="crashed-worker", claim_expires_at=1, now=1)
+    stale["summary_meta"] = mod.build_checkpoint_summary_meta(
+        source_messages,
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+    )
+    current_summary_meta = mod.build_checkpoint_summary_meta(
+        source_messages,
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=0,
+    )
     store = ClaimStore([stale])
     calls = []
 
@@ -1122,15 +1131,39 @@ async def test_stale_pending_claim_is_reclaimed_and_completed(monkeypatch):
         calls.append(parent)
         return "reclaimed summary"
 
+    async def estimate_rendered_summary_message_tokens(**kwargs):
+        return len(
+            mod.render_summary_message(
+                kwargs["summary_text"],
+                kwargs["summary_meta"],
+            )["content"]
+        )
+
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_rendered_summary_message_tokens",
+        estimate_rendered_summary_message_tokens,
+    )
 
-    result = await run_get_or_create(source_messages, summary_factory)
+    result = await run_get_or_create(
+        source_messages,
+        summary_factory,
+        summary_meta=current_summary_meta,
+    )
 
     assert result == "reclaimed summary"
     assert calls == [None]
     assert len(store.completed_rows) == 1
     assert store.completed_rows[0]["summary_text"] == "reclaimed summary"
+    assert store.completed_rows[0]["summary_meta"] == stale["summary_meta"]
+    assert store.completed_rows[0]["summary_token_count"] == len(
+        mod.render_summary_message_from_checkpoint(store.completed_rows[0])["content"]
+    )
+    assert store.completed_rows[0]["summary_token_count"] != len(
+        mod.render_summary_message(str(result), current_summary_meta)["content"]
+    )
     assert store.rows[0]["state"] == "ready"
     assert store.rows[0]["claim_token"] is None
 
@@ -3024,9 +3057,6 @@ def test_checkpoint_ddl_tolerates_only_duplicate_object_errors():
     duplicate_table = OperationalError("CREATE TABLE x", {}, Exception("table x already exists"))
     mod._execute_checkpoint_ddl_tolerating_duplicates(FakeConn(duplicate_table), "CREATE TABLE x")
 
-    duplicate_column = OperationalError("ALTER TABLE x", {}, Exception("duplicate column name: claim_token"))
-    mod._execute_checkpoint_ddl_tolerating_duplicates(FakeConn(duplicate_column), "ALTER TABLE x")
-
     broken = OperationalError("CREATE TABLE x", {}, Exception("disk I/O error"))
     with pytest.raises(OperationalError):
         mod._execute_checkpoint_ddl_tolerating_duplicates(FakeConn(broken), "CREATE TABLE x")
@@ -3313,73 +3343,6 @@ async def test_released_claim_lets_next_caller_claim_again(claim_engine):
     assert await store.release_claim(pending["id"], claim_token="other-token") is False
     assert await store.release_claim(pending["id"], claim_token="failed-owner") is True
     assert await store.claim_pending(dict(pending, claim_token="next-owner")) is True
-
-
-@pytest.mark.asyncio
-async def test_schema_init_migrates_existing_table_and_preserves_ready_rows(claim_engine):
-    from sqlalchemy import text
-
-    source_messages = [{"role": "user", "content": "old"}]
-    legacy = mod.build_checkpoint_row(
-        namespace=mod.CHECKPOINT_NAMESPACE,
-        user_id="user-1",
-        chat_id="chat-1",
-        pipe_function_id="auto_compact",
-        profile_hash=mod.compute_profile_hash(),
-        source_hash=mod.compute_source_hash(source_messages),
-        source_message_count=len(source_messages),
-        summary_text="legacy summary",
-        summary_meta={},
-        parent_checkpoint_id=None,
-        now=100,
-    )
-    legacy_create = (
-        f'CREATE TABLE "{mod.CHECKPOINT_TABLE_NAME}" ('
-        "id TEXT PRIMARY KEY, namespace TEXT NOT NULL, schema_version INTEGER NOT NULL, "
-        "user_id TEXT NOT NULL, chat_id TEXT NOT NULL, pipe_function_id TEXT NOT NULL, "
-        "profile_hash TEXT NOT NULL, source_message_count INTEGER NOT NULL, source_hash TEXT NOT NULL, "
-        "summary_text TEXT NOT NULL, summary_meta JSON NOT NULL, state TEXT NOT NULL, "
-        "parent_checkpoint_id TEXT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, "
-        "last_used_at BIGINT NOT NULL)"
-    )
-    legacy_params = {
-        key: value
-        for key, value in legacy.items()
-        if key not in ("claim_token", "claim_expires_at")
-    }
-    legacy_params["summary_meta"] = json.dumps(legacy_params["summary_meta"])
-    async with claim_engine.begin() as conn:
-        await conn.execute(text(legacy_create))
-        await conn.execute(
-            text(
-                f'INSERT INTO "{mod.CHECKPOINT_TABLE_NAME}" '
-                "(id, namespace, schema_version, user_id, chat_id, pipe_function_id, profile_hash, "
-                "source_message_count, source_hash, summary_text, summary_meta, state, "
-                "parent_checkpoint_id, created_at, updated_at, last_used_at) "
-                "VALUES (:id, :namespace, :schema_version, :user_id, :chat_id, :pipe_function_id, "
-                ":profile_hash, :source_message_count, :source_hash, :summary_text, :summary_meta, "
-                ":state, :parent_checkpoint_id, :created_at, :updated_at, :last_used_at)"
-            ),
-            legacy_params,
-        )
-
-    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
-
-    columns = await _checkpoint_table_columns(claim_engine)
-    assert {"claim_token", "claim_expires_at"} <= columns
-
-    store = _engine_store_factory(claim_engine)()
-    ready = await store.lookup_ready(
-        namespace=mod.CHECKPOINT_NAMESPACE,
-        user_id="user-1",
-        chat_id="chat-1",
-        pipe_function_id="auto_compact",
-        profile_hash=mod.compute_profile_hash(),
-        source_hash=mod.compute_source_hash(source_messages),
-    )
-    assert ready is not None
-    assert ready["summary_text"] == "legacy summary"
-    assert ready["claim_token"] is None
 
 
 @pytest.mark.asyncio
