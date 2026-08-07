@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.6
+version: 0.5.7
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -68,7 +68,7 @@ def _is_regular_chat_id(chat_id: Optional[str]) -> bool:
     """Return True for chat IDs backed by Open WebUI's Chats table."""
     if not chat_id:
         return False
-    return not str(chat_id).startswith(("local:", "channel:"))
+    return not str(chat_id).startswith(("local:", "channel:", "temporary:"))
 
 
 # ============================================================================
@@ -3575,6 +3575,14 @@ class Tools:
             default=True,
             description="Enable image generation tools (generate_image, edit_image).",
         )
+        ENABLE_FILE_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable Core tools for listing, searching, and reading files attached to the current chat "
+                "(list_chat_files, query_chat_files, grep_chat_files, view_file). Files exposed through "
+                "attached knowledge remain controlled by ENABLE_KNOWLEDGE_TOOLS."
+            ),
+        )
         ENABLE_KNOWLEDGE_TOOLS: bool = Field(
             default=True,
             description="Enable knowledge base tools (list/search/query knowledge bases and files).",
@@ -3628,6 +3636,13 @@ class Tools:
             default=True,
             description="Enable skills tools (view_skill). When enabled and the parent conversation has skills, review agents can view skill contents.",
         )
+        ENABLE_SUBAGENT_TOOLS: bool = Field(
+            default=False,
+            description=(
+                "Enable Core subagent tools (delegate_task, timer). Off by default to prevent review "
+                "agents from starting nested or scheduled work outside the review flow."
+            ),
+        )
         ENABLE_TASK_TOOLS: bool = Field(
             default=False,
             description="Enable task management tools (create_tasks, update_task).",
@@ -3639,6 +3654,14 @@ class Tools:
         ENABLE_CALENDAR_TOOLS: bool = Field(
             default=False,
             description="Enable calendar tools (search/create/update/delete calendar events).",
+        )
+        ENABLE_NOTIFICATION_TOOLS: bool = Field(
+            default=False,
+            description=(
+                "Enable Core notification tools (notify), which send messages to the user's configured "
+                "notification target. Off by default to prevent review agents from sending external "
+                "notifications."
+            ),
         )
         ITERATION_NOTE_ROLE: Literal["user", "system"] = Field(
             default="user",

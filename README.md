@@ -41,7 +41,6 @@ Execute multiple independent tool calls in parallel for faster execution.
 
 | Filter | Description |
 | ------ | ----------- |
-| [**Token Usage Display**](functions/filter/token_usage_display.py) | Display token usage as a percentage of the context window (requires LiteLLM Proxy) |
 | [**Current DateTime Injector**](functions/filter/current_datetime_injector.py) | Inject current datetime into system prompt (implemented as a filter to leverage OpenAI prompt caching) |
 | [**User Info Injector**](functions/filter/user_info_injector.py) | Inject user info into system prompt (same reason as above) |
 | [**Full Context Mode Toggle**](functions/filter/full_context_mode_toggle.py) | Batch toggle full context mode per chat (the built-in feature only supports per-file toggling) |

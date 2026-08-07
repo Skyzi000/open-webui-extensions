@@ -257,6 +257,7 @@ async def test_inlet_skips_invalid_requests_without_launch(dummy_request, user, 
     assert await f.inlet(body, __request__=dummy_request, __user__={**user, "valves": {"enabled": False}}, __metadata__=metadata) == body
     assert await f.inlet(body, __request__=dummy_request, __user__=user, __metadata__={"chat_id": "local:abc", "user_message_id": "u1"}) == body
     assert await f.inlet(body, __request__=dummy_request, __user__=user, __metadata__={"chat_id": "channel:abc", "user_message_id": "u1"}) == body
+    assert await f.inlet(body, __request__=dummy_request, __event_emitter__=AsyncMock(), __user__=user, __metadata__={"chat_id": "temporary:abc", "user_message_id": "u1"}) == body
     assert await f.inlet(body, __request__=dummy_request, __user__=user, __metadata__={"chat_id": "chat-1"}) == body
     assert await f.inlet(body, __request__=dummy_request, __user__=user, __metadata__=metadata, __task__="title_generation") == body
 

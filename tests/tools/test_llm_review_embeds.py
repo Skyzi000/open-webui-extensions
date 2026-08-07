@@ -365,13 +365,15 @@ async def test_init_rich_without_chat_id_skips_db_read(fake_chats) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("chat_id", ["local:abc123", "channel:abc123"])
+@pytest.mark.parametrize(
+    "chat_id", ["local:abc123", "channel:abc123", "temporary:abc123"]
+)
 async def test_init_rich_skips_non_regular_chat_db_read(fake_chats, chat_id) -> None:
     called = {"count": 0}
 
     def fail_get(chat_id, message_id):
         called["count"] += 1
-        raise AssertionError("should not read Chats for local/channel chat IDs")
+        raise AssertionError("should not read Chats for non-regular chat IDs")
 
     fake_chats.get_message_by_id_and_message_id = staticmethod(fail_get)
 

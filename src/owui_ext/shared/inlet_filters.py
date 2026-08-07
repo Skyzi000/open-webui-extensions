@@ -18,6 +18,7 @@ a shared dep module from mixing external imports (``fastapi.Request``)
 with imports from other ``owui_ext.shared.*`` modules.
 """
 
+import inspect
 import logging
 from typing import Any
 
@@ -66,12 +67,19 @@ async def apply_inlet_filters_if_enabled(
             function = await _inlet_filters_maybe_await(Functions.get_function_by_id(filter_id))
             if function:
                 filter_functions.append(function)
+        process_kwargs: dict[str, Any] = {
+            "request": request,
+            "filter_functions": filter_functions,
+            "filter_type": "inlet",
+            "form_data": form_data,
+            "extra_params": local_extra_params,
+        }
+        if "filter_context" in inspect.signature(
+            process_filter_functions
+        ).parameters:
+            process_kwargs["filter_context"] = None
         form_data, _ = await process_filter_functions(
-            request=request,
-            filter_functions=filter_functions,
-            filter_type="inlet",
-            form_data=form_data,
-            extra_params=local_extra_params,
+            **process_kwargs,
         )
     except Exception as exc:
         _inlet_filters_log.warning(f"Error applying inlet filters: {exc}")

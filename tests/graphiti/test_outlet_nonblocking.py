@@ -282,12 +282,13 @@ class TestOutletEarlyReturns:
         assert result is mock_body
         assert len(filter_instance._background_tasks) == 0
 
+    @pytest.mark.parametrize("chat_id", ["local:temp-123", "temporary:temp-123"])
     @pytest.mark.asyncio
     async def test_temporary_chat_skips_background(
-        self, filter_instance, mock_event_emitter, mock_user, mock_body
+        self, filter_instance, mock_event_emitter, mock_user, mock_body, chat_id
     ):
-        """When chat is temporary (local:*), outlet should return without background task."""
-        temp_metadata = {"chat_id": "local:temp-123", "message_id": "msg-1"}
+        """Temporary chats return without starting memory storage."""
+        temp_metadata = {"chat_id": chat_id, "message_id": "msg-1"}
 
         result = await filter_instance.outlet(
             body=mock_body,

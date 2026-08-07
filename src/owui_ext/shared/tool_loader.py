@@ -16,8 +16,8 @@ priority order:
    on.
 4. **Direct tools** from ``metadata.tool_servers`` (OpenAPI servers).
 5. **Builtin tools** from ``get_builtin_tools()``, filtered by the
-   plugin's per-category Valves (``ENABLE_*_TOOLS``) plus the
-   "keep ``view_note`` for knowledge" carve-out.
+   plugin's per-category Valves (``ENABLE_*_TOOLS``) plus overlap handling
+   for ``view_note`` and ``view_file``.
 
 Each merge step warns on duplicate names (debug-only) and surfaces
 load failures to the user via ``shared.notifications.emit_notification``.
@@ -42,6 +42,7 @@ from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
 from owui_ext.shared.mcp_tools import resolve_mcp_tools
 from owui_ext.shared.model_features import (
+    model_has_file_knowledge,
     model_has_note_knowledge,
     model_knowledge_tools_enabled,
 )
@@ -88,6 +89,13 @@ async def build_tools_dict(
     debug = bool(getattr(valves, "DEBUG", False))
 
     from open_webui.utils.tools import get_builtin_tools, get_tools
+
+    try:
+        from open_webui.utils.tools import (
+            get_attached_knowledge as core_get_attached_knowledge,
+        )
+    except ImportError:
+        core_get_attached_knowledge = None
 
     try:
         from open_webui.utils.tools import get_terminal_tools
@@ -306,19 +314,34 @@ async def build_tools_dict(
                 disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
 
         knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
+        file_tools_enabled = bool(getattr(valves, "ENABLE_FILE_TOOLS", True))
         notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
+        knowledge_metadata = (
+            metadata
+            if core_get_attached_knowledge is not None
+            else {"folder_knowledge": metadata.get("folder_knowledge")}
+        )
         keep_view_note_for_knowledge = (
             (not notes_tools_enabled)
             and knowledge_tools_enabled
             and model_knowledge_tools_enabled(model)
-            and model_has_note_knowledge(model)
+            and model_has_note_knowledge(model, knowledge_metadata)
+        )
+        keep_view_file = (
+            file_tools_enabled and "list_chat_files" in all_builtin_tools
+        ) or (
+            knowledge_tools_enabled
+            and model_knowledge_tools_enabled(model)
+            and "kb_exec" not in all_builtin_tools
+            and model_has_file_knowledge(model, knowledge_metadata)
         )
 
         # Regular tools take priority over builtin tools with the same name.
         builtin_count = 0
         for name, tool_dict in all_builtin_tools.items():
             if name in disabled_builtin_tools and not (
-                name == "view_note" and keep_view_note_for_knowledge
+                (name == "view_note" and keep_view_note_for_knowledge)
+                or (name == "view_file" and keep_view_file)
             ):
                 continue
             if name not in tools_dict:

@@ -50,6 +50,7 @@ CITATION_TOOLS: set[str] = {
     "search_web",
     "view_file",
     "view_knowledge_file",
+    "query_chat_files",
     "query_knowledge_files",
     "fetch_url",
 }

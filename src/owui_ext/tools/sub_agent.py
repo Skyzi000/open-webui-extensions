@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.5.7
+version: 0.5.8
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -688,6 +688,14 @@ class Tools:
             default=True,
             description="Enable image generation tools (generate_image, edit_image).",
         )
+        ENABLE_FILE_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable Core tools for listing, searching, and reading files attached to the current chat "
+                "(list_chat_files, query_chat_files, grep_chat_files, view_file). Files exposed through "
+                "attached knowledge remain controlled by ENABLE_KNOWLEDGE_TOOLS."
+            ),
+        )
         ENABLE_KNOWLEDGE_TOOLS: bool = Field(
             default=True,
             description="Enable knowledge base tools (list/search/query knowledge bases and files).",
@@ -723,6 +731,14 @@ class Tools:
             default=True,
             description="Enable skills tools (view_skill). When enabled and the parent conversation has skills, the sub-agent can view skill contents.",
         )
+        ENABLE_SUBAGENT_TOOLS: bool = Field(
+            default=False,
+            description=(
+                "Enable Core subagent tools (delegate_task, timer). Off by default because they use the "
+                "parent conversation's model and tools rather than this agent's restrictions, and timer "
+                "can schedule future work for the parent chat."
+            ),
+        )
         ENABLE_TASK_TOOLS: bool = Field(
             default=True,
             description="Enable task management tools (create_tasks, update_task).",
@@ -734,6 +750,13 @@ class Tools:
         ENABLE_CALENDAR_TOOLS: bool = Field(
             default=True,
             description="Enable calendar tools (search/create/update/delete calendar events).",
+        )
+        ENABLE_NOTIFICATION_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable Core notification tools (notify), which send messages to the user's configured "
+                "notification target."
+            ),
         )
         MAX_PARALLEL_AGENTS: int = Field(
             default=5,

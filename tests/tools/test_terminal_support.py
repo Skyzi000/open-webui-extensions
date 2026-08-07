@@ -76,6 +76,21 @@ BUILTIN_KNOWLEDGE_MODULES = [
     ("multi_model_council", multi_model_council),
 ]
 
+BUILTIN_CATALOG_MODULES = [
+    ("sub_agent", sub_agent),
+    ("magi_decision_support", magi_decision_support),
+    ("multi_model_council", multi_model_council),
+    ("llm_review", llm_review),
+    ("parallel_tools", parallel_tools),
+]
+
+CONFIGURABLE_BUILTIN_MODULES = [
+    ("sub_agent", sub_agent, (True, False, True)),
+    ("magi_decision_support", magi_decision_support, (True, False, True)),
+    ("multi_model_council", multi_model_council, (True, False, True)),
+    ("llm_review", llm_review, (True, False, False)),
+]
+
 
 def test_mcp_resolve_module_matrix_covers_generated_mcp_resolvers():
     """Verify the MCP compatibility matrix covers every generated resolver."""
@@ -2432,8 +2447,9 @@ def test_normalize_terminal_tools_result_supports_tuple_return(module_name, modu
 
 
 @pytest.mark.parametrize(("module_name", "module"), RESULT_HELPER_MODULES)
-def test_citation_tools_include_view_file(module_name, module):
-    assert "view_file" in module.CITATION_TOOLS, module_name
+@pytest.mark.parametrize("tool_name", ["view_file", "query_chat_files"])
+def test_citation_tools_include_source_tools(module_name, module, tool_name):
+    assert tool_name in module.CITATION_TOOLS, module_name
 
 
 @pytest.mark.parametrize(("module_name", "module"), BUILTIN_KNOWLEDGE_MODULES)
@@ -2451,3 +2467,293 @@ def test_builtin_knowledge_category_includes_v096_knowledge_tools(module_name, m
 @pytest.mark.parametrize("tool_name", ["list_memory_paths", "read_memory_path", "update_memory"])
 def test_builtin_memory_category_includes_v010_memory_tools(module_name, module, tool_name):
     assert tool_name in module.BUILTIN_TOOL_CATEGORIES["memory"], module_name
+
+
+@pytest.mark.parametrize(("module_name", "module"), BUILTIN_CATALOG_MODULES)
+@pytest.mark.parametrize(
+    ("valve_field", "category", "tool_names"),
+    [
+        (
+            "ENABLE_FILE_TOOLS",
+            "files",
+            {"list_chat_files", "query_chat_files", "grep_chat_files", "view_file"},
+        ),
+        ("ENABLE_SUBAGENT_TOOLS", "subagents", {"delegate_task", "timer"}),
+        ("ENABLE_NOTIFICATION_TOOLS", "notifications", {"notify"}),
+    ],
+)
+def test_builtin_catalog_includes_v011_tools(
+    module_name, module, valve_field, category, tool_names
+):
+    assert module.BUILTIN_TOOL_CATEGORIES[category] == tool_names, module_name
+    assert module.VALVE_TO_CATEGORY[valve_field] == category, module_name
+
+
+@pytest.mark.parametrize(
+    ("module_name", "module", "expected_defaults"),
+    CONFIGURABLE_BUILTIN_MODULES,
+)
+def test_v011_builtin_valves_have_safe_defaults(
+    module_name, module, expected_defaults
+):
+    valves = module.Tools().valves
+
+    assert (
+        valves.ENABLE_FILE_TOOLS,
+        valves.ENABLE_SUBAGENT_TOOLS,
+        valves.ENABLE_NOTIFICATION_TOOLS,
+    ) == expected_defaults, module_name
+
+
+def test_parallel_tools_core_subagents_follow_parent_tools_by_default():
+    assert parallel_tools.Tools().valves.ENABLE_SUBAGENT_TOOLS is True
+
+
+@pytest.mark.asyncio
+async def test_build_tools_dict_filters_disabled_v011_builtin_categories(
+    monkeypatch, dummy_request
+):
+    import open_webui.utils.tools as ow_tools
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {
+            name: {"type": "builtin"}
+            for name in {
+                "list_chat_files",
+                "query_chat_files",
+                "grep_chat_files",
+                "delegate_task",
+                "timer",
+                "notify",
+            }
+        }
+
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+
+    tools_dict, _ = await sub_agent.build_tools_dict(
+        request=dummy_request,
+        model={},
+        metadata={"features": {}},
+        user=SimpleNamespace(id="u1"),
+        valves=SimpleNamespace(
+            ENABLE_FILE_TOOLS=False,
+            ENABLE_SUBAGENT_TOOLS=False,
+            ENABLE_NOTIFICATION_TOOLS=False,
+        ),
+        extra_params={},
+        tool_id_list=[],
+        excluded_tool_ids=None,
+        resolved_terminal_id="",
+        resolved_direct_tool_servers=[],
+    )
+
+    assert tools_dict == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "files_enabled", "knowledge_enabled", "expected"),
+    [
+        ("files", True, False, True),
+        ("files", False, True, False),
+        ("knowledge", True, False, False),
+        ("knowledge", False, True, True),
+        ("both", True, False, True),
+        ("both", False, True, True),
+        ("both", False, False, False),
+    ],
+)
+async def test_build_tools_dict_filters_view_file_by_source_category(
+    monkeypatch,
+    dummy_request,
+    source,
+    files_enabled,
+    knowledge_enabled,
+    expected,
+):
+    import open_webui.utils.tools as ow_tools
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        names = {"view_file"}
+        if source in ("files", "both"):
+            names.add("list_chat_files")
+        return {name: {"type": "builtin"} for name in names}
+
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+    model = {}
+    if source in ("knowledge", "both"):
+        model = {
+            "info": {
+                "meta": {
+                    "knowledge": [{"type": "file", "id": "knowledge-file"}]
+                }
+            }
+        }
+
+    tools_dict, _ = await sub_agent.build_tools_dict(
+        request=dummy_request,
+        model=model,
+        metadata={"features": {}},
+        user=SimpleNamespace(id="u1"),
+        valves=SimpleNamespace(
+            ENABLE_FILE_TOOLS=files_enabled,
+            ENABLE_KNOWLEDGE_TOOLS=knowledge_enabled,
+        ),
+        extra_params={},
+        tool_id_list=[],
+        excluded_tool_ids=None,
+        resolved_terminal_id="",
+        resolved_direct_tool_servers=[],
+    )
+
+    assert ("view_file" in tools_dict) is expected
+
+
+@pytest.mark.asyncio
+async def test_build_tools_dict_does_not_keep_view_file_for_disabled_model_knowledge(
+    monkeypatch, dummy_request
+):
+    import open_webui.utils.tools as ow_tools
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {
+            name: {"type": "builtin"}
+            for name in {"list_chat_files", "view_file"}
+        }
+
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+    model = {
+        "info": {
+            "meta": {
+                "builtinTools": {"knowledge": False},
+                "capabilities": {"file_context": False},
+                "knowledge": [{"type": "file", "id": "knowledge-file"}],
+            }
+        }
+    }
+
+    tools_dict, _ = await sub_agent.build_tools_dict(
+        request=dummy_request,
+        model=model,
+        metadata={
+            "features": {},
+            "files": [{"type": "file", "id": "chat-file"}],
+        },
+        user=SimpleNamespace(id="u1"),
+        valves=SimpleNamespace(
+            ENABLE_FILE_TOOLS=False,
+            ENABLE_KNOWLEDGE_TOOLS=True,
+        ),
+        extra_params={},
+        tool_id_list=[],
+        excluded_tool_ids=None,
+        resolved_terminal_id="",
+        resolved_direct_tool_servers=[],
+    )
+
+    assert "view_file" not in tools_dict
+
+
+@pytest.mark.asyncio
+async def test_build_tools_dict_does_not_treat_invalid_knowledge_as_view_file_source(
+    monkeypatch, dummy_request
+):
+    import open_webui.utils.tools as ow_tools
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {
+            name: {"type": "builtin"}
+            for name in {"list_chat_files", "view_file"}
+        }
+
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+
+    tools_dict, _ = await sub_agent.build_tools_dict(
+        request=dummy_request,
+        model={
+            "info": {
+                "meta": {
+                    "capabilities": {"file_context": False},
+                    "knowledge": [{"type": "file"}],
+                }
+            }
+        },
+        metadata={
+            "features": {},
+            "files": [{"type": "file", "id": "chat-file"}],
+        },
+        user=SimpleNamespace(id="u1"),
+        valves=SimpleNamespace(
+            ENABLE_FILE_TOOLS=False,
+            ENABLE_KNOWLEDGE_TOOLS=True,
+        ),
+        extra_params={},
+        tool_id_list=[],
+        excluded_tool_ids=None,
+        resolved_terminal_id="",
+        resolved_direct_tool_servers=[],
+    )
+
+    assert "view_file" not in tools_dict
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "core_has_attached_knowledge", "expected"),
+    [
+        ("model", False, True),
+        ("folder", False, True),
+        ("chat", False, False),
+        ("chat", True, True),
+    ],
+)
+async def test_build_tools_dict_classifies_note_knowledge_by_core_capability(
+    monkeypatch,
+    dummy_request,
+    source,
+    core_has_attached_knowledge,
+    expected,
+):
+    import open_webui.utils.tools as ow_tools
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {"view_note": {"type": "builtin"}}
+
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+    if core_has_attached_knowledge:
+        monkeypatch.setattr(
+            ow_tools,
+            "get_attached_knowledge",
+            lambda model, metadata: [],
+            raising=False,
+        )
+    else:
+        monkeypatch.delattr(ow_tools, "get_attached_knowledge", raising=False)
+
+    note = {"type": "note", "id": "attached-note"}
+    model = {"info": {"meta": {"capabilities": {"file_context": False}}}}
+    metadata = {"features": {}}
+    if source == "model":
+        model["info"]["meta"]["knowledge"] = [note]
+    elif source == "folder":
+        metadata["folder_knowledge"] = [note]
+    else:
+        metadata["files"] = [note]
+
+    tools_dict, _ = await sub_agent.build_tools_dict(
+        request=dummy_request,
+        model=model,
+        metadata=metadata,
+        user=SimpleNamespace(id="u1"),
+        valves=SimpleNamespace(
+            ENABLE_NOTES_TOOLS=False,
+            ENABLE_KNOWLEDGE_TOOLS=True,
+        ),
+        extra_params={},
+        tool_id_list=[],
+        excluded_tool_ids=None,
+        resolved_terminal_id="",
+        resolved_direct_tool_servers=[],
+    )
+
+    assert ("view_note" in tools_dict) is expected

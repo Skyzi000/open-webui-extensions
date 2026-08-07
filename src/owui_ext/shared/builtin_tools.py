@@ -18,6 +18,12 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
     "time": {"get_current_timestamp", "calculate_timestamp"},
     "web": {"search_web", "fetch_url"},
     "image": {"generate_image", "edit_image"},
+    "files": {
+        "list_chat_files",
+        "query_chat_files",
+        "grep_chat_files",
+        "view_file",
+    },
     "knowledge": {
         "list_knowledge",
         "list_knowledge_bases",
@@ -55,6 +61,7 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
     },
     "code_interpreter": {"execute_code"},
     "skills": {"view_skill"},
+    "subagents": {"delegate_task", "timer"},
     "tasks": {"create_tasks", "update_task"},
     "automations": {
         "create_automation",
@@ -69,6 +76,7 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "update_calendar_event",
         "delete_calendar_event",
     },
+    "notifications": {"notify"},
 }
 
 
@@ -76,6 +84,7 @@ VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_TIME_TOOLS": "time",
     "ENABLE_WEB_TOOLS": "web",
     "ENABLE_IMAGE_TOOLS": "image",
+    "ENABLE_FILE_TOOLS": "files",
     "ENABLE_KNOWLEDGE_TOOLS": "knowledge",
     "ENABLE_CHAT_TOOLS": "chat",
     "ENABLE_MEMORY_TOOLS": "memory",
@@ -83,7 +92,9 @@ VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_CHANNELS_TOOLS": "channels",
     "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
     "ENABLE_SKILLS_TOOLS": "skills",
+    "ENABLE_SUBAGENT_TOOLS": "subagents",
     "ENABLE_TASK_TOOLS": "tasks",
     "ENABLE_AUTOMATION_TOOLS": "automations",
     "ENABLE_CALENDAR_TOOLS": "calendar",
+    "ENABLE_NOTIFICATION_TOOLS": "notifications",
 }

@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.2
+version: 0.2.3
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -216,6 +216,13 @@ class Tools:
             description=(
                 "Comma-separated list of regular or MCP tool IDs to exclude from parallel execution. "
                 "This is not a security boundary for tools the main AI can call directly."
+            ),
+        )
+        ENABLE_SUBAGENT_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable Core subagent tools (delegate_task, timer) when available in the current chat. "
+                "Disable this only to prevent Parallel Tools from executing delegation and timer calls."
             ),
         )
         ENABLE_TERMINAL_TOOLS: bool = Field(

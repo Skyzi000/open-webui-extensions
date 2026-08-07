@@ -3,6 +3,8 @@
 import sys
 import types
 
+import pytest
+
 from functions.filter.full_context_mode_toggle import Filter, folder_knowledge_file_ids
 
 
@@ -235,7 +237,10 @@ async def test_inlet_supports_legacy_parent_message_key():
     assert result["files"][0]["context"] == "full"
 
 
-async def test_folder_knowledge_skips_channel_chat_lookup(monkeypatch):
+@pytest.mark.parametrize(
+    "chat_id", ["local:abc123", "channel:abc123", "temporary:abc123"]
+)
+async def test_folder_knowledge_skips_non_regular_chat_lookup(monkeypatch, chat_id):
     calls = []
 
     class FakeChats:
@@ -249,7 +254,7 @@ async def test_folder_knowledge_skips_channel_chat_lookup(monkeypatch):
     monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
 
     result = await folder_knowledge_file_ids(
-        {"chat_id": "channel:abc123"},
+        {"chat_id": chat_id},
         {"id": "user-1"},
     )
 

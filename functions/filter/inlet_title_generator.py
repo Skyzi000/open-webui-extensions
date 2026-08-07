@@ -3,7 +3,7 @@ title: Inlet Title Generator
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Starts Open WebUI-compatible chat title generation from inlet using the current user-message history when the chat title is still New Chat.
-version: 0.1.0
+version: 0.1.1
 license: MIT
 """
 
@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 PLACEHOLDER_TITLE = "New Chat"
 TITLE_GENERATION_TASK = "title_generation"
-TEMP_CHAT_PREFIXES = ("local:", "channel:")
+TEMP_CHAT_PREFIXES = ("local:", "channel:", "temporary:")
 
 
 def is_regular_chat_id(chat_id: Any) -> bool:

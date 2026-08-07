@@ -39,7 +39,6 @@
 
 | フィルター | 説明 |
 | ---------- | ---- |
-| [**Token Usage Display**](functions/filter/token_usage_display.py) | トークン使用量をコンテキストウィンドウの割合で表示（LiteLLM Proxyが必要） |
 | [**Current DateTime Injector**](functions/filter/current_datetime_injector.py) | 現在日時をシステムプロンプトに注入（OpenAIプロンプトキャッシュ活用のためFilter化） |
 | [**User Info Injector**](functions/filter/user_info_injector.py) | ユーザー情報をシステムプロンプトに注入（同上） |
 | [**Full Context Mode Toggle**](functions/filter/full_context_mode_toggle.py) | チャット単位でフルコンテキストモードを一括切り替え |

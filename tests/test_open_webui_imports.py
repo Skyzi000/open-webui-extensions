@@ -608,6 +608,86 @@ class TestUserValvesInjection:
             pytest.fail(import_error_message("open_webui.utils.filter") + f"\n{e}")
 
 
+class TestInletFilterCompatibility:
+    """Test the shared inlet helper against old and current Core signatures."""
+
+    @pytest.mark.asyncio
+    async def test_current_core_process_filter_functions(self, monkeypatch):
+        from open_webui.utils import filter as filter_utils
+        from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
+
+        calls = []
+        original_process = filter_utils.process_filter_functions
+
+        async def no_filters(*args, **kwargs):
+            return []
+
+        async def current_process(
+            request,
+            filter_context,
+            filter_functions,
+            filter_type,
+            form_data,
+            extra_params,
+        ):
+            calls.append(filter_context)
+            return await original_process(
+                request,
+                filter_context,
+                filter_functions,
+                filter_type,
+                form_data,
+                extra_params,
+            )
+
+        monkeypatch.setattr(filter_utils, "get_sorted_filter_ids", no_filters)
+        monkeypatch.setattr(
+            filter_utils, "process_filter_functions", current_process
+        )
+        request = object()
+        form_data = {"metadata": {}}
+
+        result = await apply_inlet_filters_if_enabled(
+            True, request, {}, form_data, {}
+        )
+
+        assert result is form_data
+        assert calls == [None]
+
+    @pytest.mark.asyncio
+    async def test_legacy_process_filter_functions(self, monkeypatch):
+        from open_webui.utils import filter as filter_utils
+        from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
+
+        calls = []
+
+        async def no_filters(*args, **kwargs):
+            return []
+
+        async def legacy_process(
+            request,
+            filter_functions,
+            filter_type,
+            form_data,
+            extra_params,
+        ):
+            calls.append(filter_functions)
+            return form_data, {}
+
+        monkeypatch.setattr(filter_utils, "get_sorted_filter_ids", no_filters)
+        monkeypatch.setattr(
+            filter_utils, "process_filter_functions", legacy_process
+        )
+        form_data = {"metadata": {}}
+
+        result = await apply_inlet_filters_if_enabled(
+            True, object(), {}, form_data, {}
+        )
+
+        assert result is form_data
+        assert calls == [[]]
+
+
 # =============================================================================
 # Message Structure Tests
 # =============================================================================

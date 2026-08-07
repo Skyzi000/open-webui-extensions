@@ -54,6 +54,34 @@ class TestGraphitiMemoryFilterInstantiation:
         assert hasattr(f, "outlet")
         assert callable(f.outlet)
 
+    @pytest.mark.parametrize("chat_id", ["local:abc123", "temporary:abc123"])
+    def test_temporary_chat_is_not_regular(self, chat_id):
+        """Temporary chat IDs aren't backed by Open WebUI's Chats table."""
+        from graphiti_memory import _is_regular_chat_id
+
+        assert not _is_regular_chat_id(chat_id)
+
+    @pytest.mark.parametrize("chat_id", ["local:abc123", "temporary:abc123"])
+    @pytest.mark.asyncio
+    async def test_temporary_chat_skips_inlet_search(self, chat_id):
+        """Temporary chats don't retrieve persisted Graphiti memory."""
+        from graphiti_memory import Filter
+
+        f = Filter()
+        f._ensure_graphiti_initialized = AsyncMock(return_value=True)
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+        user = {"id": "u1", "email": "u1@example.com", "role": "user", "valves": {}}
+
+        result = await f.inlet(
+            body,
+            __event_emitter__=AsyncMock(),
+            __user__=user,
+            __metadata__={"chat_id": chat_id, "message_id": "m1"},
+        )
+
+        assert result is body
+        f._ensure_graphiti_initialized.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_channel_chat_runs_inlet_search(self):
         """Open WebUI 0.9.5 channel requests run through the full filter pipeline."""

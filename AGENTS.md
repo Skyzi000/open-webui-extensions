@@ -37,7 +37,7 @@
 - Fetch user valves with `self.UserValves.model_validate((__user__ or {}).get("valves", {}))`.
 - Treat `__user__["valves"]` as a Pydantic model; dict indexing returns defaults and silently ignores user-set values.
 - Use `Literal[...]` for dropdown choices and `bool` for switches; Open WebUI generates UI controls from the Pydantic schema.
-- Document each `Field` and end each nested Valve class with `pass`. For multi-select, use documented comma-separated strings since Open WebUI has no native multi-select widget.
+- Document each `Field` and end each nested Valve class with `pass`. For new multi-select fields in extensions that only support Open WebUI v0.11.0+, use `list[str]` with `json_schema_extra={"input": {"type": "multiselect", "options": [...]}}`; extensions that must remain compatible with older Core versions must use documented comma-separated strings. Keep released field types unchanged.
 
 ## Tool Implementation Rules
 
