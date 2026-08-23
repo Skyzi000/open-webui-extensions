@@ -48,6 +48,9 @@ jobs:
           echo "Updated to Open WebUI $BRANCH:"
           git log -1 --format='%H %s (%ci)'
 
+      - name: Fetch pinned Open WebUI v0.9.6 compatibility commit
+        run: git -C references/open-webui fetch --depth=1 origin 1a97751e376e00a1897bc3679215ae1c7bd8fd42
+
       - name: Install dependencies (including Open WebUI)
         run: uv sync --extra test --group dev
 

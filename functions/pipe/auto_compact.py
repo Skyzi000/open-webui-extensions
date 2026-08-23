@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.7.2
+version: 0.8.0
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -16,6 +16,7 @@ import asyncio
 import codecs
 import copy
 import hashlib
+import hmac
 import html
 import inspect
 import json
@@ -23,15 +24,23 @@ import logging
 import math
 import random
 import re
+import secrets
+import shlex
+import threading
 import time
 import uuid
+import weakref
+from array import array
+from bisect import bisect_left, bisect_right
+from collections import deque
 from contextlib import suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
+from enum import StrEnum
 from functools import lru_cache
 from html.parser import HTMLParser
-from types import SimpleNamespace
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Literal, TypeAlias, assert_never
 
 from fastapi import HTTPException
 from open_webui.constants import TASKS
@@ -54,7 +63,7 @@ from sqlalchemy import (
     select,
     update,
 )
-from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError, SQLAlchemyError
 from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
@@ -69,6 +78,11 @@ try:
 except Exception:
     _markdown_mod = None
 
+try:
+    import regex as _REGEX
+except ImportError:
+    _REGEX = None
+
 
 PIPE_FUNCTION_ID = "auto_compact"
 CHECKPOINT_NAMESPACE = "skyzi000.open_webui_extensions.auto_compaction_pipe"
@@ -81,6 +95,7 @@ CHECKPOINT_LOOKUP_UQ = "skyzi000_owui_ext_accp_v1_lookup_uq"
 CHECKPOINT_PREFIX_IDX = "skyzi000_owui_ext_accp_v1_prefix_idx"
 CHECKPOINT_RECENT_IDX = "skyzi000_owui_ext_accp_v1_recent_idx"
 REQUEST_STATE_SCHEMA_READY_KEY = "_auto_compact_checkpoint_schema_ready_v1"
+REQUEST_STATE_REF_STORE_KEY = "_skyzi000_auto_compact_ref_exec_v1"
 CHECKPOINT_CLAIM_LEASE_SECONDS = 90
 CHECKPOINT_CLAIM_HEARTBEAT_SECONDS = 30
 CHECKPOINT_PENDING_POLL_SECONDS = 0.25
@@ -103,6 +118,51 @@ MESSAGE_TOKEN_ESTIMATE_CACHE_MAX_ENTRIES = 8192
 MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES = 64 * 1024
 MESSAGE_TOKEN_SAMPLE_MAX_BYTES = 16 * 1024
 MESSAGE_TOKEN_IMAGE_OVERHEAD = 1000
+REF_TEXT_HASH_CHUNK_CHARS = 16 * 1024
+REF_EXEC_TOOL_NAME = "auto_compact_ref_exec"
+REF_EXEC_COMMAND_MAX_BYTES = 1_024
+REF_EXEC_RESPONSE_MAX_BYTES = 65_536
+REF_EXEC_TAIL_MAX_BYTES = 8 * 1024 * 1024
+REF_EXEC_USAGE_ERROR = (
+    "Error: usage: auto_compact_ref_exec(command). Expected REF: "
+    "tool:<64 hex> or history:accp_<64 hex>"
+)
+REF_EXEC_REGEX_BUDGET_SECONDS = 2.0
+REF_EXEC_COMMANDS = ("cat", "grep", "head", "ls", "sed", "stat", "tail", "wc")
+_REF_BINDING_LABEL_HMAC_KEY = secrets.token_bytes(32)
+_REF_SHARED_REGISTRY_WARNED_REQUESTS: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+_REF_SHARED_REGISTRY_WARNED_LOCK = threading.Lock()
+CANONICAL_HISTORY_IGNORED_MESSAGE_KEYS = frozenset(
+    {
+        "id",
+        "parentId",
+        "childrenIds",
+        "timestamp",
+        "created_at",
+        "updated_at",
+        "models",
+        "model",
+        "done",
+        "usage",
+        "info",
+        "sources",
+        "files",
+        "embeds",
+        "annotation",
+        "annotations",
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "status",
+        "statusHistory",
+        "status_history",
+        "contextSummary",
+        "context_summary",
+        "error",
+        "feedback",
+        "metadata",
+    }
+)
 BODY_TOKEN_EXTRA_KEYS = (
     "tools",
     "tool_choice",
@@ -122,6 +182,7 @@ CORE_CONTEXT_COMPACTION_CONFLICT_MESSAGE = (
     "Disable Open WebUI Core context compaction (ENABLE_CONTEXT_COMPACTION / "
     "chat.context_compaction.enable) before using this Pipe, or use the target model directly."
 )
+CHECKPOINT_STORE_UNAVAILABLE_MESSAGE = ("Auto-compaction could not access its checkpoint store. Please retry.")
 
 
 TEMP_CHAT_PREFIXES = ("temporary:", "local:", "channel:")
@@ -137,10 +198,13 @@ SUMMARY_META_FORMAT_VERSION_KEY = "summary_meta_format_version"
 SUMMARY_META_FORMAT_VERSION = 1
 SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY = "historical_user_messages"
 SUMMARY_META_HISTORICAL_USER_MESSAGES_FORMAT_VERSION = 1
+SUMMARY_META_HISTORY_REF_KEY = "history_ref"
+HISTORY_REF_FORMAT = "canonical-history-jsonl-v1"
 PROVIDER_MODEL_CACHE_WAIT_DEFAULT_TIMEOUT_SECONDS = 10.0
 PROVIDER_MODEL_CACHE_WAIT_POLL_SECONDS = 0.05
 OLLAMA_PROVIDER_MODEL_CACHE_REFRESH_REQUESTS = 2
 SummaryToolPolicy = Literal["always_strip", "fallback_on_tool_call", "error_on_tool_call"]
+RefKind = Literal["history", "tool"]
 CORE_FUNCTION_MODEL_LISTING_COROUTINE = ("get_function_models", "open_webui/functions.py")
 PROVIDER_MODEL_CACHE_REFRESH_COROUTINES = {
     "OPENAI_MODELS": (("fetch_openai_models", "open_webui/utils/models.py"),),
@@ -158,6 +222,7 @@ TIKTOKEN_ENCODING_CONFIG_KEY = "rag.tiktoken_encoding_name"
 CONFIG_VALUE_MISSING = object()
 MISSING_CORE_REQUEST = object()
 TARGET_MODEL_RECORD_UNKNOWN = object()
+REF_REGISTRY_ENTRY_MISSING = object()
 AUTO_COMPACTION_TARGET_HIDDEN_META_KEY = "auto_compaction_target_hidden_by"
 TARGET_MODEL_VISIBILITY_LOCKS: dict[str, asyncio.Lock] = {}
 # Context-local guard set while AutoCompact is mid target file-context
@@ -173,6 +238,40 @@ PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY = "_auto_compact_prefix_file_fingerpr
 PREFIX_FILE_FINGERPRINT_FAMILY = "prefix-file-fingerprint-v1"
 PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR = "_auto_compact_db_chain"
 LOG = logging.getLogger(__name__)
+REF_EXEC_TOOL_SPEC = MappingProxyType(
+    {
+        "type": "function",
+        "function": MappingProxyType(
+            {
+                "name": REF_EXEC_TOOL_NAME,
+                "description": (
+                    "Read externalized content in this chat. Oversized tool results and compacted history are replaced by ref tokens: tool:<64 hex> or history:accp_<64 hex>. "
+                    "When a tool message's content is such a token, the original text is retrievable only through this tool. Commands: ls [tool|history]; stat REF; "
+                    "wc -l|-w|-c REF; cat REF; head [-n N|-N|-c N] REF; tail [-n N|-N|-c N|-c +N] REF; sed -n 'M,Np' REF; grep [-E] [-i] [-n] [-c] [-o] [--] PATTERN REF "
+                    "(patterns match literally unless regex syntax is auto-detected; -E forces regex). REF is the complete token including its tool:/history: prefix, exactly as written. Pipelines are supported; "
+                    "only grep/head/tail/sed/wc consume piped input, e.g. grep -n PATTERN tool:<hash> | head -20. Start with stat, then prefer grep/sed/head over cat for large refs."
+                ),
+                "parameters": MappingProxyType(
+                    {
+                        "type": "object",
+                        "properties": MappingProxyType(
+                            {
+                                "command": MappingProxyType(
+                                    {
+                                        "type": "string",
+                                        "description": "One command line, max 1,024 UTF-8 bytes, e.g. sed -n '1,120p' tool:<64 hex>",
+                                    }
+                                )
+                            }
+                        ),
+                        "required": ("command",),
+                        "additionalProperties": False,
+                    }
+                ),
+            }
+        ),
+    }
+)
 COMPACTION_SUMMARY_EMBED_MARKER = "<!--auto-compaction-summary-embed:v1-->"
 SUMMARY_PROMPT = (
     "You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY for an Open WebUI chat. "
@@ -355,6 +454,358 @@ class UsageAnchorInput:
     stable_message_count: int
     input_fingerprint: str
     volatile_message_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedRef:
+    kind: RefKind
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class RefManifest:
+    ref: str
+    utf8_bytes: int | None
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class RefRenderManifest:
+    ref: str
+    utf8_bytes: int | None
+    kind: RefKind
+    line_count: int | None
+    tool: str
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ZeroCopySourceHandle:
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalHistorySourceHandle:
+    raw_messages: tuple[dict[str, Any], ...]
+    raw_record_limit: int
+    transient_message_patterns: TransientMessagePatterns | None
+    utf8_bytes: int
+    raw_source_hash: str
+    line_count: int
+
+    @property
+    def sha256(self) -> str:
+        return self.raw_source_hash
+
+    def iter_records(self) -> Iterable[str]:
+        return _iter_canonical_history_records(
+            self.raw_messages,
+            self.raw_record_limit,
+            self.transient_message_patterns,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryRefSourceHandle:
+    checkpoint_id: str
+    namespace: str
+    user_id: str
+    chat_id: str
+    pipe_function_id: str
+    profile_hash: str
+    source_hash: str
+    source_message_count: int
+    raw_source_hash: str
+    user_message_id: str
+    transient_message_patterns: TransientMessagePatterns | None
+
+
+RefSourceHandle = ZeroCopySourceHandle | CanonicalHistorySourceHandle | HistoryRefSourceHandle
+
+
+@dataclass(frozen=True, slots=True)
+class RefCatalogEntry:
+    manifest: RefManifest
+    source: RefSourceHandle
+
+
+@dataclass(frozen=True, slots=True)
+class InvalidRefTextClassificationError(ValueError):
+    def __str__(self) -> str:
+        return "Eligible ref text classification requires complete measurement"
+
+
+@dataclass(frozen=True, slots=True)
+class RefTextClassification:
+    eligible: bool
+    utf8_bytes: int | None
+    sha256: str | None
+    line_count: int | None
+    token_count: int | None
+    encoder_failed: bool
+
+    def __post_init__(self) -> None:
+        if self.eligible and (
+            self.utf8_bytes is None
+            or self.sha256 is None
+            or self.line_count is None
+        ):
+            raise InvalidRefTextClassificationError
+
+
+@dataclass(frozen=True, slots=True)
+class RefProjectionPlan:
+    catalog: tuple[RefCatalogEntry, ...]
+    manifests: tuple[RefManifest, ...]
+    reader_schema: MappingProxyType | None
+    render_manifests: tuple[RefRenderManifest, ...] = ()
+
+
+class _RenderedSummaryMessage(dict[str, Any]):
+    history_ref: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RefResolverResult:
+    ref: ParsedRef | None
+    content: str | None
+
+
+class CoreFunctionCallingGeneration(StrEnum):
+    NATIVE_DEFAULT = "native_default"
+    NATIVE_OPT_IN = "native_opt_in"
+    UNKNOWN = "unknown"
+
+
+class RefModeReason(StrEnum):
+    ACTIVE = "active"
+    VALVE_OFF = "valve_off"
+    NON_NATIVE_CONTEXT = "non_native_context"
+    NON_DURABLE_CONTEXT = "non_durable_context"
+    USER_UNAVAILABLE = "user_unavailable"
+    OWNER_UNAVAILABLE = "owner_unavailable"
+    MODEL_TOOLS_UNSUPPORTED = "model_tools_unsupported"
+    PROVIDER_SCHEMA_UNSUPPORTED = "provider_schema_unsupported"
+    SUMMARY_POLICY_UNSUPPORTED = "summary_policy_unsupported"
+    CORE_REGISTRY_UNAVAILABLE = "core_registry_unavailable"
+    READER_COLLISION = "reader_collision"
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveRefMode:
+    active: bool
+    reason: RefModeReason
+
+
+@dataclass(frozen=True, slots=True)
+class RefStateDelta:
+    added_refs: tuple[str, ...]
+    generation: int | None
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class RefBindingKey:
+    user_id: str
+    chat_id: str
+    user_message_id: str
+    assistant_message_id: str
+    incoming_model_id: str
+    base_pipe_id: str
+    profile_hash: str
+    branch_anchor: str
+
+    def __init__(
+        self,
+        *,
+        user_id: str,
+        chat_id: str,
+        assistant_message_id: str,
+        incoming_model_id: str,
+        profile_hash: str,
+        user_message_id: str = "",
+        base_pipe_id: str = "",
+        branch_anchor: str = "",
+        pipe_function_id: str = "",
+    ) -> None:
+        object.__setattr__(self, "user_id", user_id)
+        object.__setattr__(self, "chat_id", chat_id)
+        object.__setattr__(self, "user_message_id", user_message_id)
+        object.__setattr__(self, "assistant_message_id", assistant_message_id)
+        object.__setattr__(self, "incoming_model_id", incoming_model_id)
+        object.__setattr__(self, "base_pipe_id", base_pipe_id or pipe_function_id)
+        object.__setattr__(self, "profile_hash", profile_hash)
+        object.__setattr__(self, "branch_anchor", branch_anchor)
+
+    @property
+    def pipe_function_id(self) -> str:
+        return self.base_pipe_id
+
+
+@dataclass(frozen=True, slots=True)
+class RefBindingState:
+    generation: int
+    catalog: tuple[RefCatalogEntry, ...]
+    registry: dict[str, Any]
+    reader: Callable[[str], Awaitable[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class RefReservation:
+    key: RefBindingKey
+    generation: int
+    registry: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class RefAttempt:
+    key: RefBindingKey
+    generation: int
+    plan: RefProjectionPlan
+    registry: dict[str, Any]
+    reader: Callable[[str], Awaitable[str]]
+    previous_binding: RefBindingState | None
+    previous_reader_entry: Any
+
+    @property
+    def expected_generation(self) -> int:
+        return self.generation
+
+
+@dataclass(frozen=True, slots=True)
+class RefDeferredCleanup:
+    generation: int
+    successor_generation: int
+    registry: dict[str, Any]
+    reader: Callable[[str], Awaitable[str]]
+
+
+@dataclass(slots=True)
+class RefRequestStore:
+    lock: asyncio.Lock = dataclass_field(default_factory=asyncio.Lock)
+    next_generation: int = 0
+    bindings: dict[RefBindingKey, RefBindingState] = dataclass_field(default_factory=dict)
+    registry_owners: dict[int, RefBindingKey] = dataclass_field(default_factory=dict)
+    reservations: dict[RefBindingKey, RefReservation] = dataclass_field(default_factory=dict)
+    registry_reservations: dict[int, RefReservation] = dataclass_field(default_factory=dict)
+    deferred_cleanups: dict[RefBindingKey, RefDeferredCleanup] = dataclass_field(
+        default_factory=dict
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RefModePreflight:
+    valve_enabled: bool
+    native_function_calling: bool
+    durable_context: bool
+    user_available: bool
+    model_supports_tools: bool
+    provider_schema_supported: bool
+    summary_tool_policy: str
+    metadata_tools: Any
+    injected_tools: Any
+    registry_available: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class RefProjectionError(RuntimeError):
+    stage: str
+
+    def __str__(self) -> str:
+        return f"Externalized ref {self.stage} failed before provider forward"
+
+
+_REF_PROJECTION_DIAGNOSTIC_STAGES = MappingProxyType(
+    {
+        "reader schema rendering": "reader_schema",
+        "reader schema registration": "reader_schema",
+        "authorization": "authorization",
+        "registration": "registration",
+        "generation CAS": "generation_cas",
+    }
+)
+
+
+def _log_ref_projection_failure(exc: RefProjectionError) -> None:
+    LOG.warning(
+        "Auto Compact ref projection failed: stage=%s reason=operation_failed",
+        _REF_PROJECTION_DIAGNOSTIC_STAGES.get(exc.stage, "unknown"),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalHistoryError(RuntimeError):
+    reason: str
+
+    def __str__(self) -> str:
+        return f"Canonical history unavailable: {self.reason}"
+
+
+class HistoryRefStorageUnavailableError(Exception):
+    """Raised when history-reference storage access fails without exposing backend details."""
+
+
+@dataclass(frozen=True, slots=True)
+class RefExecStage:
+    command: str
+    ref: str | None = None
+    count: int | None = None
+    flags: frozenset[str] = frozenset()
+    pattern: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    list_kind: RefKind | None = None
+    byte_count: int | None = None
+    byte_start: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RefExecByteRange:
+    requested_start: int
+    requested_end: int | None
+    actual_start: int
+    actual_end: int | None
+    marked: bool = False
+    actual_empty: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RefExecComponent:
+    kind: Literal["display_prefix", "text", "synthetic_lf"]
+    text: str
+    start: int
+    end: int
+    utf8_bytes: int
+    source_byte_start: int | None = None
+    source_char_start: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RefExecComponentView:
+    components: tuple[RefExecComponent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RefExecLine:
+    text: str
+    number: int
+    byte_start: int
+    char_start: int
+    has_newline: bool
+    match_start: int | None = None
+    match_end: int | None = None
+    display_prefix: str = ""
+    byte_range: RefExecByteRange | None = None
+    metadata_only: bool = False
+    atomic_match: bool = False
+    component_view: RefExecComponentView | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RefExecError(RuntimeError):
+    message: str
+
+    def __str__(self) -> str:
+        return self.message
 
 
 @dataclass(frozen=True)
@@ -1118,6 +1569,769 @@ def _transient_message_mask(
     return tuple(_is_transient_message(message, transient_message_patterns) for message in messages)
 
 
+def _canonical_history_content(content: Any, *, required: bool) -> str | list[dict[str, str]]:
+    if content is None and not required:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise CanonicalHistoryError(reason="unknown content shape")
+    canonical: list[dict[str, str]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            raise CanonicalHistoryError(reason="unknown content shape")
+        part_type = part.get("type")
+        if part_type in {"text", "input_text", "output_text"}:
+            if set(part) != {"type", "text"} or not isinstance(part.get("text"), str):
+                raise CanonicalHistoryError(reason="unknown content shape")
+            canonical.append({"type": "text", "text": part["text"]})
+            continue
+        if part_type == "input_image":
+            if set(part) != {"type", "image_url"} or not isinstance(part.get("image_url"), str):
+                raise CanonicalHistoryError(reason="unknown content shape")
+            canonical.append({"type": "omitted_media", "media": "image"})
+            continue
+        if part_type == "image_url":
+            if set(part) != {"type", "image_url"}:
+                raise CanonicalHistoryError(reason="unknown content shape")
+            image_url = part.get("image_url")
+            if isinstance(image_url, dict):
+                if set(image_url) != {"url"} or not isinstance(image_url.get("url"), str):
+                    raise CanonicalHistoryError(reason="unknown content shape")
+            elif not isinstance(image_url, str):
+                raise CanonicalHistoryError(reason="unknown content shape")
+            canonical.append({"type": "omitted_media", "media": "image"})
+            continue
+        raise CanonicalHistoryError(reason="unknown content shape")
+    return canonical
+
+
+def _canonical_history_tool_calls(tool_calls: Any) -> list[dict[str, str]]:
+    if not isinstance(tool_calls, list):
+        raise CanonicalHistoryError(reason="unknown tool call shape")
+    canonical: list[dict[str, str]] = []
+    for call in tool_calls:
+        if not isinstance(call, dict) or set(call) != {"id", "type", "function"}:
+            raise CanonicalHistoryError(reason="unknown tool call shape")
+        function = call.get("function")
+        if (
+            call.get("type") != "function"
+            or not isinstance(call.get("id"), str)
+            or not isinstance(function, dict)
+            or set(function) != {"name", "arguments"}
+            or not isinstance(function.get("name"), str)
+            or not isinstance(function.get("arguments"), str)
+        ):
+            raise CanonicalHistoryError(reason="unknown tool call shape")
+        canonical.append(
+            {
+                "id": call["id"],
+                "name": function["name"],
+                "arguments": function["arguments"],
+            }
+        )
+    return canonical
+
+
+def _canonical_direct_history_message(message: dict[str, Any]) -> dict[str, Any]:
+    role = message.get("role")
+    semantic_keys = set(message) - CANONICAL_HISTORY_IGNORED_MESSAGE_KEYS
+    if role == "user":
+        if semantic_keys != {"role", "content"}:
+            raise CanonicalHistoryError(reason="unknown message shape")
+        return {
+            "role": "user",
+            "content": _canonical_history_content(message.get("content"), required=True),
+        }
+    if role == "assistant":
+        if not semantic_keys <= {"role", "content", "tool_calls"} or "role" not in semantic_keys:
+            raise CanonicalHistoryError(reason="unknown message shape")
+        canonical: dict[str, Any] = {
+            "role": "assistant",
+            "content": _canonical_history_content(message.get("content"), required=False),
+        }
+        if "tool_calls" in message:
+            calls = _canonical_history_tool_calls(message["tool_calls"])
+            if calls:
+                canonical["tool_calls"] = calls
+        return canonical
+    if role == "tool":
+        if semantic_keys != {"role", "content", "tool_call_id"}:
+            raise CanonicalHistoryError(reason="unknown message shape")
+        tool_call_id = message.get("tool_call_id")
+        if not isinstance(tool_call_id, str):
+            raise CanonicalHistoryError(reason="unknown message shape")
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": _canonical_history_content(message.get("content"), required=True),
+        }
+    raise CanonicalHistoryError(reason="unknown message shape")
+
+
+def _validated_output_call_ids(output: list[Any]) -> tuple[set[str], set[str]]:
+    requested: set[str] = set()
+    completed: set[str] = set()
+    for item in output:
+        if not isinstance(item, dict) or not isinstance(item.get("type"), str):
+            raise CanonicalHistoryError(reason="unknown output shape")
+        item_type = item["type"]
+        if item_type == "function_call":
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str):
+                raise CanonicalHistoryError(reason="unknown output shape")
+            requested.add(call_id)
+        elif item_type == "function_call_output":
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str):
+                raise CanonicalHistoryError(reason="unknown output shape")
+            completed.add(call_id)
+    return requested, completed
+
+
+def _iter_core_output_history_messages(output: list[Any]) -> Iterable[dict[str, Any]]:
+    requested, completed = _validated_output_call_ids(output)
+    pending_content: list[str] = []
+    pending_calls: list[dict[str, str]] = []
+
+    def flush_pending() -> dict[str, Any] | None:
+        if not pending_content and not pending_calls:
+            return None
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "\n".join(pending_content) if pending_content else "",
+        }
+        if pending_calls:
+            message["tool_calls"] = list(pending_calls)
+        pending_content.clear()
+        pending_calls.clear()
+        return message
+
+    for item in output:
+        item_type = item["type"]
+        if item_type == "message":
+            parts = item.get("content")
+            if not isinstance(parts, list):
+                raise CanonicalHistoryError(reason="unknown output shape")
+            text = ""
+            for part in parts:
+                if (
+                    not isinstance(part, dict)
+                    or set(part) != {"type", "text"}
+                    or part.get("type") != "output_text"
+                    or not isinstance(part.get("text"), str)
+                ):
+                    raise CanonicalHistoryError(reason="unknown content shape")
+                text += part["text"]
+            if text:
+                pending_content.append(text)
+            continue
+        if item_type == "function_call":
+            call_id = item.get("call_id")
+            name = item.get("name")
+            arguments = item.get("arguments")
+            if not isinstance(name, str) or not isinstance(arguments, str):
+                raise CanonicalHistoryError(reason="unknown output shape")
+            if call_id in completed:
+                pending_calls.append({"id": call_id, "name": name, "arguments": arguments})
+            continue
+        if item_type == "function_call_output":
+            pending = flush_pending()
+            if pending is not None:
+                yield pending
+            parts = item.get("output")
+            if not isinstance(parts, list):
+                raise CanonicalHistoryError(reason="unknown output shape")
+            text = ""
+            images: list[dict[str, str]] = []
+            for part in parts:
+                if not isinstance(part, dict):
+                    raise CanonicalHistoryError(reason="unknown content shape")
+                if part.get("type") == "input_text":
+                    if set(part) != {"type", "text"} or not isinstance(part.get("text"), str):
+                        raise CanonicalHistoryError(reason="unknown content shape")
+                    text += part["text"]
+                elif part.get("type") == "input_image":
+                    if set(part) != {"type", "image_url"} or not isinstance(part.get("image_url"), str):
+                        raise CanonicalHistoryError(reason="unknown content shape")
+                    images.append({"type": "omitted_media", "media": "image"})
+                else:
+                    raise CanonicalHistoryError(reason="unknown content shape")
+            call_id = item["call_id"]
+            if call_id in requested:
+                content: str | list[dict[str, str]] = text
+                if images:
+                    content = [{"type": "text", "text": text}, *images]
+                yield {"role": "tool", "tool_call_id": call_id, "content": content}
+            continue
+        if item_type == "open_webui:code_interpreter":
+            code = item.get("code", "")
+            code_output = item.get("output", "")
+            if not isinstance(code, str):
+                raise CanonicalHistoryError(reason="unknown output shape")
+            if code:
+                pending_content.append(
+                    f"<code_interpreter>\n{code}\n</code_interpreter>"
+                )
+            if isinstance(code_output, dict):
+                if not set(code_output) <= {"stdout", "result", "stderr"}:
+                    raise CanonicalHistoryError(reason="unknown output shape")
+                stdout = code_output.get("stdout", "")
+                result = code_output.get("result", "")
+                if not isinstance(stdout, str) or not isinstance(result, str):
+                    raise CanonicalHistoryError(reason="unknown output shape")
+                output_text = stdout or result
+            elif isinstance(code_output, str):
+                output_text = code_output
+            else:
+                raise CanonicalHistoryError(reason="unknown output shape")
+            if output_text:
+                pending_content.append(
+                    f"<code_interpreter_output>\n{output_text}\n</code_interpreter_output>"
+                )
+            continue
+        if item_type == "reasoning" or item_type.startswith("open_webui:"):
+            continue
+        raise CanonicalHistoryError(reason="unknown output shape")
+    pending = flush_pending()
+    if pending is not None:
+        yield pending
+
+
+def _convert_core_output_to_messages(output: list[Any]) -> list[dict[str, Any]]:
+    from open_webui.utils.misc import convert_output_to_messages
+
+    converter_kwargs: dict[str, Any] = {
+        "raw": True,
+        "reasoning_format": None,
+    }
+    if "flatten_tool_images" in inspect.signature(
+        convert_output_to_messages
+    ).parameters:
+        converter_kwargs["flatten_tool_images"] = True
+    return convert_output_to_messages(output, **converter_kwargs)
+
+
+def _iter_canonical_messages_for_raw(
+    message: dict[str, Any],
+    transient_message_patterns: TransientMessagePatterns | None,
+) -> Iterable[dict[str, Any]]:
+    if _is_system_message(message) or _is_transient_message(message, transient_message_patterns):
+        return
+    output = message.get("output")
+    if message.get("role") == "assistant" and output:
+        semantic_keys = set(message) - CANONICAL_HISTORY_IGNORED_MESSAGE_KEYS
+        if not semantic_keys <= {"role", "content", "tool_calls", "output"}:
+            raise CanonicalHistoryError(reason="unknown message shape")
+        if not isinstance(output, list):
+            raise CanonicalHistoryError(reason="unknown output shape")
+        emitted = False
+        for converted in _iter_core_output_history_messages(output):
+            emitted = True
+            yield converted
+        if emitted or _convert_core_output_to_messages(output):
+            return
+    if "output" in message:
+        message = {key: value for key, value in message.items() if key != "output"}
+    yield _canonical_direct_history_message(message)
+
+
+def _canonical_history_record(message: dict[str, Any]) -> str:
+    return json.dumps(
+        message,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _iter_canonical_history_records(
+    raw_messages: tuple[dict[str, Any], ...],
+    raw_record_limit: int,
+    transient_message_patterns: TransientMessagePatterns | None,
+) -> Iterable[str]:
+    for raw_message in raw_messages[:raw_record_limit]:
+        yield from (
+            _canonical_history_record(message)
+            for message in _iter_canonical_messages_for_raw(
+                raw_message,
+                transient_message_patterns,
+            )
+        )
+
+
+def _update_canonical_history_digest(
+    digest: Any,
+    record: str,
+    *,
+    separator: bool,
+    cancelled: threading.Event | None = None,
+) -> int:
+    utf8_bytes = 0
+    if separator:
+        digest.update(b"\n")
+        utf8_bytes = 1
+    for offset in range(0, len(record), REF_TEXT_HASH_CHUNK_CHARS):
+        if cancelled is not None:
+            _check_ref_exec_cancelled(cancelled)
+        try:
+            encoded = record[offset : offset + REF_TEXT_HASH_CHUNK_CHARS].encode(
+                "utf-8"
+            )
+        except UnicodeEncodeError as exc:
+            raise CanonicalHistoryError(
+                reason="history source is not valid UTF-8"
+            ) from exc
+        digest.update(encoded)
+        utf8_bytes += len(encoded)
+    return utf8_bytes
+
+
+def _build_canonical_history_source_sync(
+    raw_messages: tuple[dict[str, Any], ...],
+    source_message_count: int,
+    transient_message_patterns: TransientMessagePatterns | None,
+) -> CanonicalHistorySourceHandle:
+    if source_message_count < 0:
+        raise CanonicalHistoryError(reason="unsaved source count")
+    digest = hashlib.sha256()
+    utf8_bytes = 0
+    emitted = 0
+    source_identity_emitted = 0
+    if source_message_count == 0:
+        return CanonicalHistorySourceHandle(
+            raw_messages=raw_messages,
+            raw_record_limit=0,
+            transient_message_patterns=transient_message_patterns,
+            utf8_bytes=0,
+            raw_source_hash=digest.hexdigest(),
+            line_count=0,
+        )
+    for raw_index, raw_message in enumerate(raw_messages):
+        for canonical in _iter_canonical_messages_for_raw(
+            raw_message,
+            transient_message_patterns,
+        ):
+            record = _canonical_history_record(canonical)
+            utf8_bytes += _update_canonical_history_digest(
+                digest,
+                record,
+                separator=emitted > 0,
+            )
+            emitted += 1
+        if _is_source_identity_message(
+            raw_message,
+            transient_message_patterns=transient_message_patterns,
+        ):
+            source_identity_emitted += _source_identity_message_span(
+                raw_message,
+                transient_message_patterns=transient_message_patterns,
+            )
+        if source_identity_emitted == source_message_count:
+            return CanonicalHistorySourceHandle(
+                raw_messages=raw_messages,
+                raw_record_limit=raw_index + 1,
+                transient_message_patterns=transient_message_patterns,
+                utf8_bytes=utf8_bytes,
+                raw_source_hash=digest.hexdigest(),
+                line_count=emitted,
+            )
+        if source_identity_emitted > source_message_count:
+            raise CanonicalHistoryError(reason="checkpoint count is inside a raw record")
+    raise CanonicalHistoryError(reason="checkpoint count references an unsaved source")
+
+
+async def build_canonical_history_source(
+    raw_messages: list[dict[str, Any]],
+    *,
+    source_message_count: int,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> CanonicalHistorySourceHandle:
+    return await asyncio.to_thread(
+        _build_canonical_history_source_sync,
+        tuple(raw_messages),
+        source_message_count,
+        transient_message_patterns,
+    )
+
+
+async def load_authorized_raw_chat_branch(
+    *,
+    chat_id: str,
+    user_id: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    from open_webui.models.chats import Chats
+    from open_webui.utils.misc import get_message_list
+
+    current_user_message_id = metadata.get("user_message_id")
+    if not isinstance(current_user_message_id, str) or not current_user_message_id:
+        raise CanonicalHistoryError(reason="metadata user_message_id is required")
+    if not await Chats.is_chat_owner(chat_id, user_id):
+        raise CanonicalHistoryError(reason="owner authorization failed")
+    messages_map = await Chats.get_messages_map_by_chat_id(chat_id)
+    if not isinstance(messages_map, dict) or current_user_message_id not in messages_map:
+        raise CanonicalHistoryError(reason="authorized raw branch is unavailable")
+    branch = get_message_list(messages_map, current_user_message_id)
+    if not branch or not all(isinstance(message, dict) for message in branch):
+        raise CanonicalHistoryError(reason="authorized raw branch is unavailable")
+    return branch
+
+
+def _normalized_history_ref_metadata(summary_meta: Any) -> dict[str, str] | None:
+    if not isinstance(summary_meta, dict):
+        return None
+    value = summary_meta.get(SUMMARY_META_HISTORY_REF_KEY)
+    if not isinstance(value, dict) or set(value) != {"format", "raw_source_hash"}:
+        return None
+    if value.get("format") != HISTORY_REF_FORMAT:
+        return None
+    raw_source_hash = value.get("raw_source_hash")
+    if not isinstance(raw_source_hash, str) or re.fullmatch(r"[0-9a-f]{64}", raw_source_hash) is None:
+        return None
+    return {"format": HISTORY_REF_FORMAT, "raw_source_hash": raw_source_hash}
+
+
+def _history_ref_source_handle(
+    checkpoint: dict[str, Any],
+    *,
+    user_message_id: str,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> HistoryRefSourceHandle | None:
+    metadata = _normalized_history_ref_metadata(checkpoint.get("summary_meta"))
+    checkpoint_id = checkpoint.get("id")
+    if metadata is None or not isinstance(checkpoint_id, str):
+        return None
+    if re.fullmatch(r"accp_[0-9a-f]{64}", checkpoint_id) is None:
+        return None
+    try:
+        source_message_count = int(checkpoint.get("source_message_count") or 0)
+    except (TypeError, ValueError):
+        return None
+    if source_message_count <= 0 or not user_message_id:
+        return None
+    return HistoryRefSourceHandle(
+        checkpoint_id=checkpoint_id,
+        namespace=str(checkpoint.get("namespace") or ""),
+        user_id=str(checkpoint.get("user_id") or ""),
+        chat_id=str(checkpoint.get("chat_id") or ""),
+        pipe_function_id=str(checkpoint.get("pipe_function_id") or ""),
+        profile_hash=str(checkpoint.get("profile_hash") or ""),
+        source_hash=str(checkpoint.get("source_hash") or ""),
+        source_message_count=source_message_count,
+        raw_source_hash=metadata["raw_source_hash"],
+        user_message_id=user_message_id,
+        transient_message_patterns=transient_message_patterns,
+    )
+
+
+async def build_history_ref_catalog(
+    *,
+    store: Any,
+    selected_checkpoint: dict[str, Any] | None,
+    user_message_id: str,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> tuple[RefCatalogEntry, ...]:
+    if not isinstance(selected_checkpoint, dict) or selected_checkpoint.get("state") != "ready":
+        return ()
+    identity = {
+        "namespace": str(selected_checkpoint.get("namespace") or ""),
+        "user_id": str(selected_checkpoint.get("user_id") or ""),
+        "chat_id": str(selected_checkpoint.get("chat_id") or ""),
+        "pipe_function_id": str(selected_checkpoint.get("pipe_function_id") or ""),
+        "profile_hash": str(selected_checkpoint.get("profile_hash") or ""),
+    }
+    if not all(identity.values()) or not user_message_id:
+        return ()
+
+    entries: list[RefCatalogEntry] = []
+    visited: set[str] = set()
+    previous_count: int | None = None
+    current = selected_checkpoint
+    while True:
+        checkpoint_id = current.get("id")
+        if not isinstance(checkpoint_id, str) or checkpoint_id in visited:
+            return ()
+        if current.get("state") != "ready" or any(current.get(key) != value for key, value in identity.items()):
+            return ()
+        try:
+            count = int(current.get("source_message_count") or 0)
+        except (TypeError, ValueError):
+            return ()
+        if count <= 0 or (previous_count is not None and count >= previous_count):
+            return ()
+        visited.add(checkpoint_id)
+        previous_count = count
+
+        source = _history_ref_source_handle(
+            current,
+            user_message_id=user_message_id,
+            transient_message_patterns=transient_message_patterns,
+        )
+        if source is not None:
+            entries.append(
+                RefCatalogEntry(
+                    manifest=RefManifest(
+                        ref=f"history:{checkpoint_id}",
+                        utf8_bytes=None,
+                        sha256=source.raw_source_hash,
+                    ),
+                    source=source,
+                )
+            )
+
+        parent_id = current.get("parent_checkpoint_id")
+        if parent_id is None:
+            return tuple(entries)
+        if not isinstance(parent_id, str) or parent_id in visited:
+            return ()
+        lookup = getattr(store, "lookup_ready_descriptor_by_id", None)
+        if not callable(lookup):
+            return ()
+        parent = await lookup(parent_id, **identity)
+        if not isinstance(parent, dict):
+            return ()
+        current = parent
+
+
+async def resolve_history_ref_catalog_entry(
+    entry: RefCatalogEntry,
+    *,
+    request: Any,
+    metadata: dict[str, Any],
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> RefCatalogEntry:
+    source = entry.source
+    if not isinstance(source, HistoryRefSourceHandle):
+        return entry
+    if str(metadata.get("chat_id") or "") != source.chat_id:
+        raise CanonicalHistoryError(reason="current branch authorization failed")
+    current_user_message_id = str(metadata.get("user_message_id") or "")
+    if not current_user_message_id or current_user_message_id != source.user_message_id:
+        raise CanonicalHistoryError(reason="current branch authorization failed")
+    raw_messages = await load_authorized_raw_chat_branch(
+        chat_id=source.chat_id,
+        user_id=source.user_id,
+        metadata=metadata,
+    )
+    canonical_source = await build_canonical_history_source(
+        raw_messages,
+        source_message_count=source.source_message_count,
+        transient_message_patterns=transient_message_patterns,
+    )
+    if canonical_source.raw_source_hash != source.raw_source_hash:
+        raise CanonicalHistoryError(reason="raw source hash integrity verification failed")
+
+    from open_webui.utils.middleware import process_messages_with_output
+
+    expanded_messages = await asyncio.to_thread(process_messages_with_output, copy.deepcopy(raw_messages))
+    raw_limit = _raw_prefix_len_for_source_count(
+        expanded_messages,
+        source.source_message_count,
+        transient_message_patterns=transient_message_patterns,
+    )
+    if raw_limit is None:
+        raise CanonicalHistoryError(reason="checkpoint source boundary verification failed")
+    source_messages = expanded_messages[:raw_limit]
+    resolver = await _build_prefix_file_fingerprint_resolver(
+        request,
+        metadata,
+        source_messages,
+        transient_message_patterns=transient_message_patterns,
+    )
+    fingerprint = resolver(source.source_message_count) if resolver is not None else None
+    if (
+        compute_summary_source_hash(
+            source_messages,
+            fingerprint,
+            _prefix_file_fingerprint_resolver_db_chain(resolver),
+            transient_message_patterns=transient_message_patterns,
+        )
+        != source.source_hash
+    ):
+        raise CanonicalHistoryError(reason="checkpoint source integrity verification failed")
+    return RefCatalogEntry(
+        manifest=RefManifest(
+            ref=entry.manifest.ref,
+            utf8_bytes=canonical_source.utf8_bytes,
+            sha256=canonical_source.raw_source_hash,
+        ),
+        source=canonical_source,
+    )
+
+
+def _default_ref_render_manifest(entry: RefCatalogEntry) -> RefRenderManifest:
+    kind: RefKind = "history" if entry.manifest.ref.startswith("history:") else "tool"
+    source = entry.source
+    line_count = source.line_count if isinstance(source, CanonicalHistorySourceHandle) else None
+    return RefRenderManifest(
+        ref=entry.manifest.ref,
+        utf8_bytes=entry.manifest.utf8_bytes,
+        kind=kind,
+        line_count=line_count,
+        tool=kind,
+    )
+
+
+def build_history_ref_projection_plan(
+    catalog: tuple[RefCatalogEntry, ...],
+) -> RefProjectionPlan:
+    return RefProjectionPlan(
+        catalog=catalog,
+        manifests=tuple(entry.manifest for entry in catalog),
+        reader_schema=REF_EXEC_TOOL_SPEC if catalog else None,
+        render_manifests=tuple(_default_ref_render_manifest(entry) for entry in catalog),
+    )
+
+
+def merge_ref_projection_plans(
+    left: RefProjectionPlan | None,
+    right: RefProjectionPlan | None,
+) -> RefProjectionPlan | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    by_ref = {entry.manifest.ref: entry for entry in left.catalog}
+    for entry in right.catalog:
+        by_ref.setdefault(entry.manifest.ref, entry)
+    catalog = tuple(by_ref.values())
+    manifests = tuple(entry.manifest for entry in catalog)
+    render_by_ref = {manifest.ref: manifest for manifest in left.render_manifests}
+    for manifest in right.render_manifests:
+        render_by_ref.setdefault(manifest.ref, manifest)
+    for entry in catalog:
+        render_by_ref.setdefault(entry.manifest.ref, _default_ref_render_manifest(entry))
+    return RefProjectionPlan(
+        catalog=catalog,
+        manifests=manifests,
+        reader_schema=REF_EXEC_TOOL_SPEC if catalog else None,
+        render_manifests=tuple(render_by_ref.values()),
+    )
+
+
+async def extend_ref_projection_plan_with_checkpoint(
+    plan: RefProjectionPlan | None,
+    checkpoint: dict[str, Any] | None,
+    *,
+    request: Any,
+    metadata: dict[str, Any],
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> RefProjectionPlan | None:
+    user_message_id = str(metadata.get("user_message_id") or "")
+    if not isinstance(checkpoint, dict) or not user_message_id:
+        return plan
+    store = CheckpointStore()
+    try:
+        enriched = await enrich_checkpoint_history_ref(
+            store=store,
+            checkpoint=checkpoint,
+            request=request,
+            metadata=metadata,
+            transient_message_patterns=transient_message_patterns,
+        )
+        catalog = await build_history_ref_catalog(
+            store=store,
+            selected_checkpoint=enriched,
+            user_message_id=user_message_id,
+            transient_message_patterns=transient_message_patterns,
+        )
+    except SQLAlchemyError as exc:
+        LOG.exception(
+            "Auto-compaction history-ref enrichment hit a database error "
+            "(chat_id=%s)",
+            metadata.get("chat_id"),
+        )
+        raise HistoryRefStorageUnavailableError(CHECKPOINT_STORE_UNAVAILABLE_MESSAGE) from exc
+    return merge_ref_projection_plans(
+        plan,
+        build_history_ref_projection_plan(catalog),
+    )
+
+
+async def enrich_checkpoint_history_ref(
+    *,
+    store: Any,
+    checkpoint: dict[str, Any],
+    request: Any,
+    metadata: dict[str, Any],
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> dict[str, Any] | None:
+    user_message_id = str(metadata.get("user_message_id") or "")
+    if not user_message_id:
+        return None
+    source = HistoryRefSourceHandle(
+        checkpoint_id=str(checkpoint.get("id") or ""),
+        namespace=str(checkpoint.get("namespace") or ""),
+        user_id=str(checkpoint.get("user_id") or ""),
+        chat_id=str(checkpoint.get("chat_id") or ""),
+        pipe_function_id=str(checkpoint.get("pipe_function_id") or ""),
+        profile_hash=str(checkpoint.get("profile_hash") or ""),
+        source_hash=str(checkpoint.get("source_hash") or ""),
+        source_message_count=int(checkpoint.get("source_message_count") or 0),
+        raw_source_hash="0" * 64,
+        user_message_id=user_message_id,
+        transient_message_patterns=transient_message_patterns,
+    )
+    provisional = RefCatalogEntry(
+        manifest=RefManifest(
+            ref=f"history:{source.checkpoint_id}",
+            utf8_bytes=None,
+            sha256=source.raw_source_hash,
+        ),
+        source=source,
+    )
+    raw_messages = await load_authorized_raw_chat_branch(
+        chat_id=source.chat_id,
+        user_id=source.user_id,
+        metadata=metadata,
+    )
+    canonical_source = await build_canonical_history_source(
+        raw_messages,
+        source_message_count=source.source_message_count,
+        transient_message_patterns=transient_message_patterns,
+    )
+    desired = {"format": HISTORY_REF_FORMAT, "raw_source_hash": canonical_source.raw_source_hash}
+    source = replace(source, raw_source_hash=canonical_source.raw_source_hash)
+    await resolve_history_ref_catalog_entry(
+        replace(provisional, source=source, manifest=replace(provisional.manifest, sha256=source.raw_source_hash)),
+        request=request,
+        metadata=metadata,
+        transient_message_patterns=transient_message_patterns,
+    )
+
+    current_meta = normalize_summary_meta(checkpoint.get("summary_meta"))
+    existing = _normalized_history_ref_metadata(current_meta)
+    if existing is not None:
+        return copy.deepcopy(checkpoint) if existing == desired else None
+    compare_and_swap = getattr(store, "compare_and_swap_history_ref", None)
+    if not callable(compare_and_swap):
+        return None
+    updated = await compare_and_swap(
+        source.checkpoint_id,
+        expected_summary_meta=current_meta,
+        history_ref=desired,
+    )
+    if updated:
+        result = copy.deepcopy(checkpoint)
+        result["summary_meta"] = {**current_meta, SUMMARY_META_HISTORY_REF_KEY: desired}
+        return result
+    lookup = getattr(store, "lookup_ready_by_id", None)
+    if not callable(lookup):
+        return None
+    winner = await lookup(
+        source.checkpoint_id,
+        namespace=source.namespace,
+        user_id=source.user_id,
+        chat_id=source.chat_id,
+        pipe_function_id=source.pipe_function_id,
+        profile_hash=source.profile_hash,
+    )
+    if not isinstance(winner, dict):
+        return None
+    return winner if _normalized_history_ref_metadata(winner.get("summary_meta")) == desired else None
+
+
 def _is_source_identity_message(
     message: Any,
     *,
@@ -1132,13 +2346,37 @@ def _is_source_identity_message(
     return not _is_transient_message(message, transient_message_patterns)
 
 
+def _source_identity_message_span(
+    message: dict[str, Any],
+    *,
+    transient_message_patterns: TransientMessagePatterns | None,
+) -> int:
+    output = message.get("output")
+    if message.get("role") != "assistant" or not output:
+        return 1
+
+    converted = _convert_core_output_to_messages(output)
+    if not converted:
+        return 1
+    return sum(
+        _is_source_identity_message(
+            converted_message,
+            transient_message_patterns=transient_message_patterns,
+        )
+        for converted_message in converted
+    )
+
+
 def _source_identity_message_count(
     messages: list[dict[str, Any]],
     transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> int:
     mask = _transient_message_mask(messages, transient_message_patterns)
     return sum(
-        1
+        _source_identity_message_span(
+            message,
+            transient_message_patterns=transient_message_patterns,
+        )
         for index, message in enumerate(messages)
         if _is_source_identity_message(
             message,
@@ -1168,7 +2406,10 @@ def _raw_prefix_len_for_source_count(
             index=index,
         ):
             continue
-        seen += 1
+        seen += _source_identity_message_span(
+            message,
+            transient_message_patterns=transient_message_patterns,
+        )
         if seen == source_message_count:
             boundary = index + 1
             while boundary < len(messages) and not _is_source_identity_message(
@@ -1179,6 +2420,8 @@ def _raw_prefix_len_for_source_count(
             ):
                 boundary += 1
             return boundary
+        if seen > source_message_count:
+            return None
     return None
 
 
@@ -1952,6 +3195,3844 @@ def _encode_text_token_count(encoder: Any, text: str) -> int | None:
         return None
 
 
+RefTextMeasurement: TypeAlias = tuple[int, int, str]
+
+
+def _measure_ref_text(text: str) -> RefTextMeasurement | None:
+    digest = hashlib.sha256()
+    utf8_bytes = 0
+    line_count = 0
+    for offset in range(0, len(text), REF_TEXT_HASH_CHUNK_CHARS):
+        chunk = text[offset : offset + REF_TEXT_HASH_CHUNK_CHARS]
+        try:
+            encoded = chunk.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        utf8_bytes += len(encoded)
+        line_count += chunk.count("\n")
+        digest.update(encoded)
+    if text and not text.endswith("\n"):
+        line_count += 1
+    return utf8_bytes, line_count, digest.hexdigest()
+
+
+def _classify_ref_text_sync(
+    text: str,
+    *,
+    threshold_tokens: int,
+    encoder: Any = None,
+    request: Any = None,
+) -> RefTextClassification:
+    measurement = _measure_ref_text(text)
+    if measurement is None:
+        return RefTextClassification(
+            eligible=False,
+            utf8_bytes=None,
+            sha256=None,
+            line_count=None,
+            token_count=None,
+            encoder_failed=False,
+        )
+    utf8_bytes, line_count, text_hash = measurement
+    if utf8_bytes > MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES:
+        return RefTextClassification(
+            eligible=True,
+            utf8_bytes=utf8_bytes,
+            sha256=text_hash,
+            line_count=line_count,
+            token_count=None,
+            encoder_failed=False,
+        )
+    resolved_encoder = encoder
+    if resolved_encoder is None:
+        resolved_encoder, _ = _get_tiktoken_encoder(request)
+    if resolved_encoder is None:
+        return RefTextClassification(
+            eligible=False,
+            utf8_bytes=utf8_bytes,
+            sha256=text_hash,
+            line_count=line_count,
+            token_count=None,
+            encoder_failed=True,
+        )
+    token_count = _encode_text_token_count(resolved_encoder, text)
+    return RefTextClassification(
+        eligible=token_count is not None and token_count >= threshold_tokens,
+        utf8_bytes=utf8_bytes,
+        sha256=text_hash,
+        line_count=line_count,
+        token_count=token_count,
+        encoder_failed=token_count is None,
+    )
+
+
+async def classify_ref_text(
+    text: str,
+    *,
+    threshold_tokens: int,
+    encoder: Any = None,
+    request: Any = None,
+) -> RefTextClassification:
+    if encoder is None:
+        await _refresh_tiktoken_encoding_config(request)
+    return await asyncio.to_thread(
+        _classify_ref_text_sync,
+        text,
+        threshold_tokens=threshold_tokens,
+        encoder=encoder,
+        request=request,
+    )
+
+
+def _native_tool_names_by_call_id(messages: list[dict[str, Any]]) -> dict[str, str]:
+    candidate_names: dict[str, list[str | None]] = {}
+    for assistant_message in messages:
+        if assistant_message.get("role") != "assistant":
+            continue
+        tool_calls = assistant_message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            function = tool_call.get("function") if isinstance(tool_call, dict) else None
+            call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
+            name = function.get("name") if isinstance(function, dict) else None
+            if isinstance(call_id, str) and call_id:
+                candidate_names.setdefault(call_id, []).append(
+                    name if isinstance(name, str) and name else None
+                )
+    names_by_call_id: dict[str, str] = {}
+    for call_id, names in candidate_names.items():
+        if REF_EXEC_TOOL_NAME in names:
+            names_by_call_id[call_id] = REF_EXEC_TOOL_NAME
+        elif len(valid_names := {name for name in names if name is not None}) == 1:
+            names_by_call_id[call_id] = next(iter(valid_names))
+        else:
+            names_by_call_id[call_id] = "unknown"
+    return names_by_call_id
+
+
+async def project_native_tool_texts(
+    messages: list[dict[str, Any]],
+    *,
+    threshold_tokens: int,
+    encoder: Any = None,
+    request: Any = None,
+) -> RefProjectionPlan:
+    catalog_by_hash: dict[str, RefCatalogEntry] = {}
+    render_manifest_by_hash: dict[str, RefRenderManifest] = {}
+    names_by_call_id = _native_tool_names_by_call_id(messages)
+
+    eligible_results: list[tuple[int, str, RefTextMeasurement]] = []
+    for message_index, message in enumerate(messages):
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        tool_call_id = message.get("tool_call_id")
+        paired_name = (
+            names_by_call_id.get(tool_call_id, "unknown")
+            if isinstance(tool_call_id, str)
+            else "unknown"
+        )
+        if paired_name == REF_EXEC_TOOL_NAME:
+            continue
+        classification = await classify_ref_text(
+            content,
+            threshold_tokens=threshold_tokens,
+            encoder=encoder,
+            request=request,
+        )
+        if not classification.eligible:
+            continue
+        utf8_bytes = classification.utf8_bytes
+        line_count = classification.line_count
+        text_hash = classification.sha256
+        if utf8_bytes is None or line_count is None or text_hash is None:
+            raise InvalidRefTextClassificationError
+        measurement: RefTextMeasurement = (utf8_bytes, line_count, text_hash)
+        eligible_results.append((message_index, paired_name, measurement))
+
+    for message_index, paired_name, measurement in eligible_results:
+        content = messages[message_index]["content"]
+        utf8_bytes, line_count, text_hash = measurement
+        ref = f"tool:{text_hash}"
+        manifest = RefManifest(
+            ref=ref,
+            utf8_bytes=utf8_bytes,
+            sha256=text_hash,
+        )
+        source = ZeroCopySourceHandle(text=content)
+        catalog_by_hash.setdefault(
+            text_hash,
+            RefCatalogEntry(
+                manifest=manifest,
+                source=source,
+            ),
+        )
+        render_manifest_by_hash.setdefault(
+            text_hash,
+            RefRenderManifest(
+                ref=ref,
+                utf8_bytes=utf8_bytes,
+                kind="tool",
+                line_count=line_count,
+                tool=paired_name,
+            ),
+        )
+    catalog = tuple(catalog_by_hash.values())
+    return RefProjectionPlan(
+        catalog=catalog,
+        manifests=tuple(entry.manifest for entry in catalog),
+        reader_schema=REF_EXEC_TOOL_SPEC if catalog else None,
+        render_manifests=tuple(render_manifest_by_hash.values()),
+    )
+
+
+def _apply_ref_projection_plan_sync(
+    messages: list[dict[str, Any]],
+    plan: RefProjectionPlan,
+) -> list[dict[str, Any]]:
+    projected = copy.deepcopy(messages)
+    names_by_call_id = _native_tool_names_by_call_id(projected)
+    source_refs: dict[str, str] = {}
+    for entry in plan.catalog:
+        parsed = parse_ref(entry.manifest.ref)
+        if parsed is not None and parsed.kind == "tool":
+            source_refs.setdefault(parsed.value, entry.manifest.ref)
+    for message_index, message in enumerate(projected):
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        tool_call_id = message.get("tool_call_id")
+        paired_name = (
+            names_by_call_id.get(tool_call_id, "unknown")
+            if isinstance(tool_call_id, str)
+            else "unknown"
+        )
+        if paired_name == REF_EXEC_TOOL_NAME:
+            continue
+        measurement = _measure_ref_text(content)
+        if measurement is None:
+            continue
+        _, _, text_hash = measurement
+        ref = source_refs.get(text_hash)
+        if ref is None:
+            continue
+        message["content"] = ref
+    return projected
+
+
+async def apply_ref_projection_plan(
+    messages: list[dict[str, Any]],
+    plan: RefProjectionPlan,
+) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_apply_ref_projection_plan_sync, messages, plan)
+
+
+def _ref_manifest_payloads(plan: RefProjectionPlan) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for manifest in plan.manifests:
+        payload: dict[str, Any] = {
+            "ref": manifest.ref,
+            "sha256": manifest.sha256,
+        }
+        if manifest.utf8_bytes is not None:
+            payload["utf8_bytes"] = manifest.utf8_bytes
+        payloads.append(payload)
+    return payloads
+
+
+def ref_render_manifest_payloads(plan: RefProjectionPlan) -> list[dict[str, Any]]:
+    manifests = plan.render_manifests or tuple(
+        _default_ref_render_manifest(entry) for entry in plan.catalog
+    )
+    return [
+        {
+            "bytes": manifest.utf8_bytes,
+            "kind": manifest.kind,
+            "lines": manifest.line_count,
+            "ref": manifest.ref,
+            "tool": manifest.tool,
+            "version": manifest.version,
+        }
+        for manifest in manifests
+    ]
+
+
+def _apply_ref_manifests(body: dict[str, Any], plan: RefProjectionPlan) -> None:
+    if not plan.manifests:
+        return
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        body["metadata"] = metadata
+    metadata["auto_compact_ref_manifests"] = _ref_manifest_payloads(plan)
+    render_manifest_payloads = ref_render_manifest_payloads(plan)
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if isinstance(message, dict) and _is_rendered_summary_context_message(message):
+            context_prefix, context_close, trailing = message["content"].rpartition(
+                "</auto_compaction_context>"
+            )
+            if not context_close or trailing:
+                continue
+            context_prefix = re.sub(
+                r'<auto_compact_ref_manifests version="1">'
+                r'(?:<!\[CDATA\[(?:(?!\]\]>).)*\]\]>)+'
+                r'</auto_compact_ref_manifests>\n?\Z',
+                "",
+                context_prefix,
+                flags=re.DOTALL,
+            )
+            history_ref = getattr(message, "history_ref", None)
+            own_manifest = next(
+                (
+                    manifest
+                    for manifest in render_manifest_payloads
+                    if manifest["ref"] == history_ref and manifest["kind"] == "history"
+                ),
+                None,
+            )
+            if own_manifest is None:
+                message["content"] = f"{context_prefix}{context_close}"
+                continue
+            compact_json = json.dumps(
+                [own_manifest],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            manifest_block = (
+                '<auto_compact_ref_manifests version="1">'
+                f"{_xml_cdata(compact_json)}"
+                "</auto_compact_ref_manifests>"
+            )
+            message["content"] = f"{context_prefix}{manifest_block}\n{context_close}"
+
+
+def _mutable_ref_schema_value(value: Any) -> Any:
+    if isinstance(value, MappingProxyType):
+        return {key: _mutable_ref_schema_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_ref_schema_value(item) for item in value]
+    return value
+
+
+def apply_ref_projection_surfaces(
+    body: dict[str, Any],
+    plan: RefProjectionPlan,
+    *,
+    include_reader_schema: bool,
+) -> None:
+    _apply_ref_manifests(body, plan)
+    if not include_reader_schema or not plan.catalog or plan.reader_schema is None:
+        return
+    spec = _mutable_ref_schema_value(plan.reader_schema)
+    if not isinstance(spec, dict):
+        raise RefProjectionError(stage="reader schema rendering")
+    tools = body.get("tools")
+    if tools is None:
+        body["tools"] = [spec]
+    elif isinstance(tools, list):
+        if spec not in tools:
+            tools.append(spec)
+    else:
+        raise RefProjectionError(stage="reader schema registration")
+
+
+def _ref_request_store(request: Any, *, create: bool) -> RefRequestStore | None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    store = getattr(state, REQUEST_STATE_REF_STORE_KEY, None)
+    if isinstance(store, RefRequestStore):
+        return store
+    if not create:
+        return None
+    store = RefRequestStore()
+    setattr(state, REQUEST_STATE_REF_STORE_KEY, store)
+    return store
+
+
+def preflight_attached_ref_registry(
+    metadata: dict[str, Any] | None,
+    injected_tools: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(metadata, dict) or not isinstance(injected_tools, dict):
+        return None
+    attached = metadata.get("tools")
+    if not isinstance(attached, dict) or attached is not injected_tools:
+        return None
+    return attached
+
+
+def _binding_matches_reentry(candidate: RefBindingKey, owned: RefBindingKey) -> bool:
+    return (
+        candidate.user_id == owned.user_id
+        and candidate.chat_id == owned.chat_id
+        and candidate.user_message_id == owned.user_message_id
+        and candidate.incoming_model_id == owned.incoming_model_id
+        and candidate.base_pipe_id == owned.base_pipe_id
+        and candidate.profile_hash == owned.profile_hash
+        and candidate.branch_anchor == owned.branch_anchor
+    )
+
+
+def _warn_shared_registry_mapping(request: Any, key: RefBindingKey) -> None:
+    with _REF_SHARED_REGISTRY_WARNED_LOCK:
+        try:
+            if request in _REF_SHARED_REGISTRY_WARNED_REQUESTS:
+                return
+            _REF_SHARED_REGISTRY_WARNED_REQUESTS[request] = True
+        except TypeError:
+            return
+    values = (
+        key.user_id,
+        key.chat_id,
+        key.user_message_id,
+        key.assistant_message_id,
+        key.incoming_model_id,
+        key.base_pipe_id,
+        key.profile_hash,
+        key.branch_anchor,
+    )
+    payload = json.dumps(
+        [str(value) for value in values],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    label = hmac.new(_REF_BINDING_LABEL_HMAC_KEY, payload, hashlib.sha256).hexdigest()[:16]
+    LOG.warning("shared_registry_mapping binding=%s", label)
+
+
+async def reserve_ref_binding(
+    request: Any,
+    key: RefBindingKey,
+    registry: dict[str, Any],
+) -> RefReservation | None:
+    existing = registry.get(REF_EXEC_TOOL_NAME)
+    store = _ref_request_store(request, create=False)
+    if existing is not None and store is None:
+        return None
+    store = _ref_request_store(request, create=True)
+    if store is None:
+        return None
+    async with store.lock:
+        owner_key = store.registry_owners.get(id(registry))
+        owner_binding = store.bindings.get(owner_key) if owner_key is not None else None
+        if owner_key is not None:
+            if (
+                owner_binding is None
+                or owner_binding.registry is not registry
+                or not _binding_matches_reentry(key, owner_key)
+            ):
+                _warn_shared_registry_mapping(request, key)
+                return None
+            if (
+                not isinstance(existing, dict)
+                or existing.get("spec") != ref_exec_tool_spec_payload()["function"]
+                or existing.get("callable") is not owner_binding.reader
+            ):
+                return None
+            key = owner_key
+        elif existing is not None:
+            return None
+
+        binding = store.bindings.get(key)
+        if binding is not None and binding.registry is not registry:
+            _warn_shared_registry_mapping(request, key)
+            return None
+        pending = store.registry_reservations.get(id(registry))
+        if pending is not None and pending.registry is registry and pending.key != key:
+            _warn_shared_registry_mapping(request, key)
+            return None
+
+        replaced = store.reservations.get(key)
+        if replaced is not None and replaced.registry is not registry:
+            _warn_shared_registry_mapping(request, key)
+            return None
+        store.next_generation += 1
+        reservation = RefReservation(
+            key=key,
+            generation=store.next_generation,
+            registry=registry,
+        )
+        cleanup = store.deferred_cleanups.get(key)
+        if (
+            cleanup is not None
+            and replaced is not None
+            and pending is replaced
+            and replaced.key == key
+            and replaced.registry is registry
+            and cleanup.successor_generation == replaced.generation
+            and cleanup.registry is registry
+        ):
+            store.deferred_cleanups[key] = RefDeferredCleanup(
+                generation=cleanup.generation,
+                successor_generation=reservation.generation,
+                registry=cleanup.registry,
+                reader=cleanup.reader,
+            )
+        store.reservations[key] = reservation
+        store.registry_reservations[id(registry)] = reservation
+        return reservation
+
+
+async def release_ref_reservation(request: Any, reservation: RefReservation) -> None:
+    store = _ref_request_store(request, create=False)
+    if store is None:
+        return
+    async with store.lock:
+        _release_ref_reservation_locked(store, reservation)
+
+
+def _binding_matches_deferred_cleanup(
+    binding: RefBindingState,
+    cleanup: RefDeferredCleanup,
+) -> bool:
+    return (
+        binding.generation == cleanup.generation
+        and binding.registry is cleanup.registry
+        and binding.reader is cleanup.reader
+    )
+
+
+def _teardown_ref_binding_locked(
+    store: RefRequestStore,
+    key: RefBindingKey,
+    binding: RefBindingState,
+) -> bool:
+    if store.bindings.get(key) is not binding:
+        return False
+    store.bindings.pop(key, None)
+    if store.registry_owners.get(id(binding.registry)) == key:
+        store.registry_owners.pop(id(binding.registry), None)
+    existing = binding.registry.get(REF_EXEC_TOOL_NAME)
+    if isinstance(existing, dict) and existing.get("callable") is binding.reader:
+        binding.registry.pop(REF_EXEC_TOOL_NAME, None)
+    _invalidate_ref_reader(binding.reader)
+    return True
+
+
+def _deferred_cleanup_matches_attempt(
+    cleanup: RefDeferredCleanup,
+    attempt: RefAttempt,
+    binding: RefBindingState,
+) -> bool:
+    previous = attempt.previous_binding
+    return (
+        previous is not None
+        and cleanup.successor_generation == attempt.generation
+        and cleanup.registry is attempt.registry
+        and cleanup.reader is attempt.reader
+        and _binding_matches_deferred_cleanup(previous, cleanup)
+        and binding.generation == attempt.generation
+        and binding.registry is attempt.registry
+        and binding.reader is attempt.reader
+    )
+
+
+def _deferred_cleanup_targets_binding(
+    cleanup: RefDeferredCleanup,
+    binding: RefBindingState,
+) -> bool:
+    return (
+        cleanup.successor_generation == binding.generation
+        and cleanup.registry is binding.registry
+        and cleanup.reader is binding.reader
+    )
+
+
+def _complete_deferred_ref_cleanup_locked(
+    store: RefRequestStore,
+    reservation: RefReservation,
+) -> None:
+    cleanup = store.deferred_cleanups.get(reservation.key)
+    binding = store.bindings.get(reservation.key)
+    if (
+        cleanup is None
+        or binding is None
+        or cleanup.successor_generation != reservation.generation
+        or reservation.registry is not cleanup.registry
+        or not _binding_matches_deferred_cleanup(binding, cleanup)
+    ):
+        return
+    store.deferred_cleanups.pop(reservation.key, None)
+    _teardown_ref_binding_locked(store, reservation.key, binding)
+
+
+def _release_ref_reservation_locked(
+    store: RefRequestStore,
+    reservation: RefReservation,
+) -> bool:
+    if store.reservations.get(reservation.key) is not reservation:
+        return False
+    store.reservations.pop(reservation.key, None)
+    pending = store.registry_reservations.get(id(reservation.registry))
+    if pending is reservation:
+        store.registry_reservations.pop(id(reservation.registry), None)
+    _complete_deferred_ref_cleanup_locked(store, reservation)
+    return True
+
+
+def _ref_registry_available(
+    request: Any,
+    key: RefBindingKey,
+    registry: dict[str, Any],
+) -> bool:
+    existing = registry.get(REF_EXEC_TOOL_NAME)
+    store = _ref_request_store(request, create=False)
+    if store is None:
+        return existing is None
+    owner_key = store.registry_owners.get(id(registry))
+    if owner_key is not None:
+        binding = store.bindings.get(owner_key)
+        if (
+            binding is None
+            or binding.registry is not registry
+            or not _binding_matches_reentry(key, owner_key)
+        ):
+            _warn_shared_registry_mapping(request, key)
+            return False
+        return (
+            isinstance(existing, dict)
+            and existing.get("callable") is binding.reader
+            and existing.get("spec") == ref_exec_tool_spec_payload()["function"]
+        )
+    pending = store.registry_reservations.get(id(registry))
+    if pending is not None and pending.registry is registry and pending.key != key:
+        _warn_shared_registry_mapping(request, key)
+        return False
+    return existing is None
+
+
+def parse_ref(value: str) -> ParsedRef | None:
+    tool_match = re.fullmatch(r"tool:([0-9a-f]{64})", value)
+    if tool_match is not None:
+        return ParsedRef(kind="tool", value=tool_match.group(1))
+    history_match = re.fullmatch(r"history:(accp_[0-9a-f]{64})", value)
+    if history_match is not None:
+        return ParsedRef(kind="history", value=history_match.group(1))
+    return None
+
+
+def _split_ref_exec_pipeline(command: str) -> tuple[str, ...]:
+    stages: list[str] = []
+    buffer: list[str] = []
+    single_quoted = False
+    double_quoted = False
+    escaped = False
+    for character in command:
+        if escaped:
+            buffer.append(character)
+            escaped = False
+            continue
+        if character == "\\" and not single_quoted:
+            buffer.append(character)
+            escaped = True
+            continue
+        if character == "'" and not double_quoted:
+            single_quoted = not single_quoted
+            buffer.append(character)
+            continue
+        if character == '"' and not single_quoted:
+            double_quoted = not double_quoted
+            buffer.append(character)
+            continue
+        if character == "|" and not single_quoted and not double_quoted:
+            stage = "".join(buffer).strip()
+            if not stage:
+                raise RefExecError("Error: empty pipeline stage")
+            stages.append(stage)
+            buffer = []
+            continue
+        buffer.append(character)
+    if escaped or single_quoted or double_quoted:
+        raise RefExecError("Error: malformed quote or escape in command")
+    stage = "".join(buffer).strip()
+    if not stage:
+        raise RefExecError("Error: empty command or pipeline stage")
+    stages.append(stage)
+    return tuple(stages)
+
+
+def _parse_ref_exec_count(
+    tokens: list[str],
+    *,
+    command: str,
+) -> tuple[int | None, int | None, int | None, list[str]]:
+    remaining = list(tokens)
+    line_count: int | None = 10
+    byte_count: int | None = None
+    byte_start: int | None = None
+    if remaining and remaining[0] == "-n":
+        if len(remaining) < 2 or re.fullmatch(r"[0-9]+", remaining[1]) is None:
+            raise RefExecError(
+                f"Error: usage: {command} [-n N|-N|-c N{'|-c +N' if command == 'tail' else ''}] [REF]. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+            )
+        line_count = int(remaining[1])
+        remaining = remaining[2:]
+    elif remaining and remaining[0] == "-c":
+        valid_fixed = len(remaining) >= 2 and re.fullmatch(
+            r"[0-9]+", remaining[1]
+        ) is not None
+        valid_start = (
+            command == "tail"
+            and len(remaining) >= 2
+            and re.fullmatch(r"\+[1-9][0-9]*", remaining[1]) is not None
+        )
+        if not valid_fixed and not valid_start:
+            raise RefExecError(
+                f"Error: usage: {command} [-n N|-N|-c N{'|-c +N' if command == 'tail' else ''}] [REF]. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+            )
+        line_count = None
+        if valid_start:
+            byte_start = int(remaining[1][1:])
+        else:
+            byte_count = int(remaining[1])
+        remaining = remaining[2:]
+    elif remaining and re.fullmatch(r"-[0-9]+", remaining[0]) is not None:
+        line_count = int(remaining[0][1:])
+        remaining = remaining[1:]
+    return line_count, byte_count, byte_start, remaining
+
+
+def _parse_ref_exec_grep(tokens: list[str], *, source: bool) -> RefExecStage:
+    flags: set[str] = set()
+    remaining = list(tokens)
+    while remaining and remaining[0].startswith("-") and remaining[0] != "-":
+        token = remaining.pop(0)
+        if token == "--":
+            break
+        combined = token[1:]
+        if not combined or any(flag not in "Einco" for flag in combined):
+            raise RefExecError(
+                "Error: usage: grep [-E] [-i] [-n] [-c] [-o] [--] PATTERN [REF]. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+            )
+        flags.update(combined)
+    expected = 2 if source else 1
+    if len(remaining) != expected:
+        raise RefExecError(
+            "Error: usage: grep [-E] [-i] [-n] [-c] [-o] [--] PATTERN [REF]. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+        )
+    ref = remaining[1] if source else None
+    if ref is not None and parse_ref(ref) is None:
+        raise RefExecError(
+            "Error: invalid externalized ref. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+        )
+    return RefExecStage(
+        command="grep",
+        ref=ref,
+        flags=frozenset(flags),
+        pattern=remaining[0],
+    )
+
+
+def _parse_ref_exec_sed(tokens: list[str], *, source: bool) -> RefExecStage:
+    expected = 3 if source else 2
+    if len(tokens) != expected or tokens[0] != "-n":
+        raise RefExecError(
+            "Error: usage: sed -n Np|M,Np|M,$p [REF]. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+        )
+    selection = tokens[1]
+    match = re.fullmatch(r"([1-9][0-9]*)(?:,([1-9][0-9]*|\$))?p", selection)
+    if match is None:
+        raise RefExecError(
+            "Error: usage: sed -n Np|M,Np|M,$p [REF]. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+        )
+    start = int(match.group(1))
+    end_value = match.group(2)
+    end = start if end_value is None else (None if end_value == "$" else int(end_value))
+    if end is not None and start > end:
+        raise RefExecError("Error: sed range start exceeds end")
+    ref = tokens[2] if source else None
+    if ref is not None and parse_ref(ref) is None:
+        raise RefExecError(
+            "Error: invalid externalized ref. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+        )
+    return RefExecStage(command="sed", ref=ref, start_line=start, end_line=end)
+
+
+def _parse_ref_exec_stage(stage: str, *, source: bool) -> RefExecStage:
+    try:
+        tokens = shlex.split(stage, posix=True)
+    except ValueError as exc:
+        raise RefExecError("Error: malformed quote in command") from exc
+    if not tokens:
+        raise RefExecError("Error: empty pipeline stage")
+    command = tokens[0]
+    arguments = tokens[1:]
+    if command not in REF_EXEC_COMMANDS:
+        available = ", ".join(REF_EXEC_COMMANDS)
+        raise RefExecError(
+            f"Error: unknown command. Available: {available}. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+        )
+    if not source and command not in {"grep", "head", "sed", "tail", "wc"}:
+        raise RefExecError("Error: command is not a valid piped consumer")
+    if command == "ls":
+        if len(arguments) > 1 or (arguments and arguments[0] not in {"history", "tool"}):
+            raise RefExecError(
+                "Error: usage: ls [history|tool]. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+            )
+        kind: RefKind | None = arguments[0] if arguments else None
+        return RefExecStage(command=command, list_kind=kind)
+    if command == "grep":
+        return _parse_ref_exec_grep(arguments, source=source)
+    if command == "sed":
+        return _parse_ref_exec_sed(arguments, source=source)
+    if command in {"head", "tail"}:
+        count, byte_count, byte_start, remaining = _parse_ref_exec_count(
+            arguments, command=command
+        )
+        expected = 1 if source else 0
+        if len(remaining) != expected:
+            raise RefExecError(
+                f"Error: usage: {command} [-n N|-N|-c N{'|-c +N' if command == 'tail' else ''}] [REF]. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+            )
+        ref = remaining[0] if source else None
+        if ref is not None and parse_ref(ref) is None:
+            raise RefExecError(
+                "Error: invalid externalized ref. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+            )
+        return RefExecStage(
+            command=command,
+            ref=ref,
+            count=count,
+            byte_count=byte_count,
+            byte_start=byte_start,
+        )
+    if command == "wc":
+        if not arguments or arguments[0] not in {"-l", "-w", "-c"}:
+            raise RefExecError(
+                "Error: usage: wc [-l|-w|-c] [REF]. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+            )
+        expected = 2 if source else 1
+        if len(arguments) != expected:
+            raise RefExecError(
+                "Error: usage: wc [-l|-w|-c] [REF]. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+            )
+        ref = arguments[1] if source else None
+        if ref is not None and parse_ref(ref) is None:
+            raise RefExecError(
+                "Error: invalid externalized ref. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+            )
+        return RefExecStage(command=command, ref=ref, flags=frozenset({arguments[0][1:]}))
+    if len(arguments) != 1 or parse_ref(arguments[0]) is None:
+        raise RefExecError(
+            f"Error: usage: {command} REF. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+        )
+    return RefExecStage(command=command, ref=arguments[0])
+
+
+def _parse_ref_exec_command(command: str) -> tuple[RefExecStage, ...]:
+    if not command.strip():
+        raise RefExecError(REF_EXEC_USAGE_ERROR)
+    try:
+        encoded_command = command.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise RefExecError(REF_EXEC_USAGE_ERROR) from exc
+    if len(encoded_command) > REF_EXEC_COMMAND_MAX_BYTES:
+        raise RefExecError("Error: command exceeds the 1,024 UTF-8 byte parser limit")
+    return tuple(
+        _parse_ref_exec_stage(stage, source=index == 0)
+        for index, stage in enumerate(_split_ref_exec_pipeline(command))
+    )
+
+
+def _check_ref_exec_cancelled(cancelled: threading.Event) -> None:
+    if cancelled.is_set():
+        raise RefExecError("Error: reader command was cancelled")
+
+
+def _encode_ref_text_checked(text: str, cancelled: threading.Event) -> bytes:
+    _check_ref_exec_cancelled(cancelled)
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise RefExecError(
+            "Error: externalized ref source is not valid UTF-8"
+        ) from exc
+
+
+def _measure_ref_text_checked(text: str, cancelled: threading.Event) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    utf8_bytes = 0
+    for offset in range(0, len(text), REF_TEXT_HASH_CHUNK_CHARS):
+        encoded = _encode_ref_text_checked(
+            text[offset : offset + REF_TEXT_HASH_CHUNK_CHARS], cancelled
+        )
+        utf8_bytes += len(encoded)
+        digest.update(encoded)
+    return utf8_bytes, digest.hexdigest()
+
+
+def _measure_ref_text_parts_checked(
+    parts: tuple[str, ...],
+    cancelled: threading.Event,
+) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    utf8_bytes = 0
+    for part in parts:
+        for offset in range(0, len(part), REF_TEXT_HASH_CHUNK_CHARS):
+            encoded = _encode_ref_text_checked(
+                part[offset : offset + REF_TEXT_HASH_CHUNK_CHARS], cancelled
+            )
+            utf8_bytes += len(encoded)
+            digest.update(encoded)
+    return utf8_bytes, digest.hexdigest()
+
+
+def _ref_exec_utf8_range_bytes(
+    text: str,
+    start: int,
+    end: int,
+    cancelled: threading.Event,
+) -> int:
+    utf8_bytes = 0
+    for offset in range(start, end, REF_TEXT_HASH_CHUNK_CHARS):
+        chunk_end = min(end, offset + REF_TEXT_HASH_CHUNK_CHARS)
+        utf8_bytes += len(_encode_ref_text_checked(text[offset:chunk_end], cancelled))
+    return utf8_bytes
+
+
+def _ref_exec_utf8_prefix_index(
+    text: str,
+    max_bytes: int,
+    cancelled: threading.Event,
+) -> tuple[int, int]:
+    offset = 0
+    retained_bytes = 0
+    while offset < len(text) and retained_bytes < max_bytes:
+        chunk_end = min(len(text), offset + REF_TEXT_HASH_CHUNK_CHARS)
+        chunk = text[offset:chunk_end]
+        chunk_bytes = len(_encode_ref_text_checked(chunk, cancelled))
+        if retained_bytes + chunk_bytes <= max_bytes:
+            retained_bytes += chunk_bytes
+            offset = chunk_end
+            continue
+        low = offset
+        high = chunk_end
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            candidate_bytes = _ref_exec_utf8_range_bytes(text, offset, midpoint, cancelled)
+            if retained_bytes + candidate_bytes <= max_bytes:
+                low = midpoint
+            else:
+                high = midpoint - 1
+        retained_bytes += _ref_exec_utf8_range_bytes(text, offset, low, cancelled)
+        offset = low
+        break
+    return offset, retained_bytes
+
+
+def _ref_exec_utf8_prefix(
+    text: str,
+    max_bytes: int,
+    cancelled: threading.Event,
+) -> str:
+    offset, _ = _ref_exec_utf8_prefix_index(text, max_bytes, cancelled)
+    return text[:offset]
+
+
+def _iter_ref_text_lines(text: str, cancelled: threading.Event) -> Iterable[RefExecLine]:
+    offset = 0
+    line_number = 1
+    byte_start = 0
+    while offset < len(text):
+        _check_ref_exec_cancelled(cancelled)
+        newline = text.find("\n", offset)
+        end = len(text) if newline < 0 else newline
+        line = text[offset:end]
+        yield RefExecLine(
+            text=line,
+            number=line_number,
+            byte_start=byte_start,
+            char_start=offset,
+            has_newline=newline >= 0,
+        )
+        encoded_bytes, _ = _measure_ref_text_checked(line, cancelled)
+        byte_start += encoded_bytes + (1 if newline >= 0 else 0)
+        offset = end + (1 if newline >= 0 else 0)
+        line_number += 1
+
+
+def _measure_ref_source_checked(
+    source: RefSourceHandle,
+    cancelled: threading.Event,
+) -> tuple[int, str]:
+    if isinstance(source, ZeroCopySourceHandle):
+        return _measure_ref_text_checked(source.text, cancelled)
+    if isinstance(source, HistoryRefSourceHandle):
+        raise RefExecError("Error: externalized history ref requires current authorization")
+    digest = hashlib.sha256()
+    utf8_bytes = 0
+    emitted = 0
+    for record in source.iter_records():
+        _check_ref_exec_cancelled(cancelled)
+        if emitted > 0:
+            digest.update(b"\n")
+            utf8_bytes += 1
+        for offset in range(0, len(record), REF_TEXT_HASH_CHUNK_CHARS):
+            encoded = _encode_ref_text_checked(
+                record[offset : offset + REF_TEXT_HASH_CHUNK_CHARS], cancelled
+            )
+            digest.update(encoded)
+            utf8_bytes += len(encoded)
+        emitted += 1
+    if emitted != source.line_count:
+        raise RefExecError("Error: externalized ref integrity verification failed")
+    return utf8_bytes, digest.hexdigest()
+
+
+def _iter_ref_source_lines(
+    source: RefSourceHandle,
+    cancelled: threading.Event,
+) -> Iterable[RefExecLine]:
+    if isinstance(source, ZeroCopySourceHandle):
+        yield from _iter_ref_text_lines(source.text, cancelled)
+        return
+    if isinstance(source, HistoryRefSourceHandle):
+        raise RefExecError("Error: externalized history ref requires current authorization")
+    byte_start = 0
+    char_start = 0
+    for line_number, record in enumerate(source.iter_records(), 1):
+        _check_ref_exec_cancelled(cancelled)
+        has_newline = line_number < source.line_count
+        yield RefExecLine(
+            text=record,
+            number=line_number,
+            byte_start=byte_start,
+            char_start=char_start,
+            has_newline=has_newline,
+        )
+        record_bytes, _ = _measure_ref_text_checked(record, cancelled)
+        byte_start += record_bytes + int(has_newline)
+        char_start += len(record) + int(has_newline)
+
+
+def _iter_verified_ref_source_lines(
+    entry: RefCatalogEntry,
+    cancelled: threading.Event,
+) -> Iterable[RefExecLine]:
+    digest = hashlib.sha256()
+    utf8_bytes = 0
+    iterator = iter(_iter_ref_source_lines(entry.source, cancelled))
+
+    def update(line: RefExecLine) -> None:
+        nonlocal utf8_bytes
+        for offset in range(0, len(line.text), REF_TEXT_HASH_CHUNK_CHARS):
+            encoded = _encode_ref_text_checked(
+                line.text[offset : offset + REF_TEXT_HASH_CHUNK_CHARS], cancelled
+            )
+            digest.update(encoded)
+            utf8_bytes += len(encoded)
+        if line.has_newline:
+            digest.update(b"\n")
+            utf8_bytes += 1
+
+    try:
+        current = next(iterator)
+    except StopIteration:
+        current = None
+    if current is not None:
+        for following in iterator:
+            update(current)
+            yield current
+            current = following
+        update(current)
+    if utf8_bytes != entry.manifest.utf8_bytes or digest.hexdigest() != entry.manifest.sha256:
+        raise RefExecError("Error: externalized ref integrity verification failed")
+    if current is not None:
+        yield current
+
+
+def _ref_exec_head(lines: Iterable[RefExecLine], count: int, cancelled: threading.Event) -> Iterable[RefExecLine]:
+    selected = 0
+    iterator = iter(lines)
+    while selected < count:
+        try:
+            line = next(iterator)
+        except StopIteration:
+            return
+        _check_ref_exec_cancelled(cancelled)
+        if line.metadata_only:
+            yield line
+            continue
+        yield line
+        selected += 1
+
+
+def _ref_exec_tail(lines: Iterable[RefExecLine], count: int, cancelled: threading.Event) -> Iterable[RefExecLine]:
+    retained: deque[RefExecLine] = deque()
+    metadata: RefExecLine | None = None
+    for line in lines:
+        _check_ref_exec_cancelled(cancelled)
+        if line.metadata_only:
+            metadata = line
+            continue
+        retained.append(line)
+        while len(retained) > count:
+            retained.popleft()
+    for line in retained:
+        _check_ref_exec_cancelled(cancelled)
+        yield line
+    if metadata is not None and count > 0:
+        yield metadata
+
+
+def _ref_exec_component(
+    kind: Literal["display_prefix", "text", "synthetic_lf"],
+    text: str,
+    cancelled: threading.Event,
+    *,
+    source_start: tuple[int, int] | None = None,
+) -> RefExecComponent:
+    utf8_bytes, _ = _measure_ref_text_checked(text, cancelled)
+    return RefExecComponent(
+        kind=kind,
+        text=text,
+        start=0,
+        end=len(text),
+        utf8_bytes=utf8_bytes,
+        source_byte_start=source_start[0] if source_start is not None else None,
+        source_char_start=source_start[1] if source_start is not None else None,
+    )
+
+
+def _ref_exec_line_component_view(
+    line: RefExecLine,
+    cancelled: threading.Event,
+) -> RefExecComponentView:
+    if line.component_view is not None:
+        return line.component_view
+    components: list[RefExecComponent] = []
+    if line.display_prefix:
+        components.append(
+            _ref_exec_component("display_prefix", line.display_prefix, cancelled)
+        )
+    text_component = _ref_exec_component(
+        "text",
+        line.text,
+        cancelled,
+        source_start=(line.byte_start, line.char_start),
+    )
+    if line.text:
+        components.append(text_component)
+    if line.has_newline:
+        components.append(
+            _ref_exec_component(
+                "synthetic_lf",
+                "\n",
+                cancelled,
+                source_start=(
+                    line.byte_start + text_component.utf8_bytes,
+                    line.char_start + len(line.text),
+                ),
+            )
+        )
+    return RefExecComponentView(tuple(components))
+
+
+def _ref_exec_materialize_components(
+    components: Iterable[RefExecComponent],
+    *,
+    include_synthetic_lf: bool = True,
+) -> str:
+    return "".join(
+        component.text[component.start : component.end]
+        for component in components
+        if include_synthetic_lf or component.kind != "synthetic_lf"
+    )
+
+
+def _ref_exec_materialize_line(
+    line: RefExecLine,
+    cancelled: threading.Event,
+    *,
+    include_synthetic_lf: bool = True,
+) -> str:
+    if line.component_view is None:
+        return line.display_prefix + line.text + (
+            "\n" if include_synthetic_lf and line.has_newline else ""
+        )
+    _check_ref_exec_cancelled(cancelled)
+    return _ref_exec_materialize_components(
+        line.component_view.components,
+        include_synthetic_lf=include_synthetic_lf,
+    )
+
+
+def _ref_exec_component_prefix_index(
+    component: RefExecComponent,
+    max_bytes: int,
+    cancelled: threading.Event,
+) -> tuple[int, int]:
+    offset = component.start
+    retained_bytes = 0
+    while offset < component.end and retained_bytes < max_bytes:
+        chunk_end = min(component.end, offset + REF_TEXT_HASH_CHUNK_CHARS)
+        chunk_bytes = _ref_exec_utf8_range_bytes(
+            component.text, offset, chunk_end, cancelled
+        )
+        if retained_bytes + chunk_bytes <= max_bytes:
+            retained_bytes += chunk_bytes
+            offset = chunk_end
+            continue
+        low = offset
+        high = chunk_end
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            candidate_bytes = _ref_exec_utf8_range_bytes(
+                component.text, offset, midpoint, cancelled
+            )
+            if retained_bytes + candidate_bytes <= max_bytes:
+                low = midpoint
+            else:
+                high = midpoint - 1
+        retained_bytes += _ref_exec_utf8_range_bytes(
+            component.text, offset, low, cancelled
+        )
+        offset = low
+        break
+    return offset, retained_bytes
+
+
+def _ref_exec_presented_line_bytes(
+    line: RefExecLine,
+    cancelled: threading.Event,
+) -> int:
+    if line.component_view is not None:
+        return sum(component.utf8_bytes for component in line.component_view.components)
+    encoded_bytes, _ = _measure_ref_text_parts_checked(
+        (line.display_prefix, line.text), cancelled
+    )
+    return encoded_bytes + int(line.has_newline)
+
+
+def _ref_exec_source_byte_bounds(
+    line: RefExecLine,
+) -> tuple[int, int] | None:
+    if line.component_view is None:
+        return None
+    backed = tuple(
+        component
+        for component in line.component_view.components
+        if component.source_byte_start is not None
+    )
+    if not backed:
+        return None
+    return (
+        backed[0].source_byte_start + 1,
+        backed[-1].source_byte_start + backed[-1].utf8_bytes,
+    )
+
+
+def _ref_exec_slice_presented_line(
+    line: RefExecLine,
+    *,
+    stream_start: int,
+    selected_start: int,
+    selected_end: int,
+    cancelled: threading.Event,
+) -> tuple[RefExecLine | None, int, int, bool]:
+    actual_start: int | None = None
+    actual_end = stream_start
+    snapped = False
+    component_start = stream_start
+    selected_components: list[RefExecComponent] = []
+    for component in _ref_exec_line_component_view(line, cancelled).components:
+        component_end = component_start + component.utf8_bytes
+        overlap_start = max(selected_start, component_start)
+        overlap_end = min(selected_end, component_end)
+        if overlap_start < overlap_end:
+            local_start = overlap_start - component_start
+            local_end = overlap_end - component_start
+            start_index, start_floor = _ref_exec_component_prefix_index(
+                component, local_start, cancelled
+            )
+            if start_floor < local_start:
+                start_index += 1
+                snapped = True
+            actual_local_start = _ref_exec_utf8_range_bytes(
+                component.text, component.start, start_index, cancelled
+            )
+            end_index, actual_local_end = _ref_exec_component_prefix_index(
+                component, local_end, cancelled
+            )
+            if actual_local_end < local_end:
+                snapped = True
+            if start_index < end_index:
+                part_start = component_start + actual_local_start
+                if actual_start is None:
+                    actual_start = part_start
+                actual_end = component_start + actual_local_end
+                selected_components.append(
+                    replace(
+                        component,
+                        start=start_index,
+                        end=end_index,
+                        utf8_bytes=actual_local_end - actual_local_start,
+                        source_byte_start=(
+                            component.source_byte_start + actual_local_start
+                            if component.source_byte_start is not None
+                            else None
+                        ),
+                        source_char_start=(
+                            component.source_char_start
+                            + start_index
+                            - component.start
+                            if component.source_char_start is not None
+                            else None
+                        ),
+                    )
+                )
+        component_start = component_end
+    if actual_start is None:
+        if not snapped:
+            return None, selected_end, selected_end, False
+        return (
+            replace(
+                line,
+                text="",
+                byte_start=selected_end,
+                has_newline=False,
+                match_start=None,
+                match_end=None,
+                display_prefix="",
+                byte_range=None,
+                metadata_only=True,
+                component_view=RefExecComponentView(()),
+            ),
+            selected_end,
+            selected_end,
+            True,
+        )
+    return (
+        replace(
+            line,
+            text="",
+            byte_start=next(
+                (
+                    component.source_byte_start
+                    for component in selected_components
+                    if component.kind == "text"
+                    and component.source_byte_start is not None
+                ),
+                line.byte_start,
+            ),
+            char_start=next(
+                (
+                    component.source_char_start
+                    for component in selected_components
+                    if component.kind == "text"
+                    and component.source_char_start is not None
+                ),
+                line.char_start,
+            ),
+            has_newline=False,
+            match_start=None,
+            match_end=None,
+            display_prefix="",
+            byte_range=None,
+            component_view=RefExecComponentView(tuple(selected_components)),
+        ),
+        actual_start,
+        actual_end,
+        snapped,
+    )
+
+
+def _ref_exec_head_bytes(
+    lines: Iterable[RefExecLine],
+    count: int,
+    cancelled: threading.Event,
+) -> Iterable[RefExecLine]:
+    if count == 0:
+        return
+    stream_start = 0
+    pending: RefExecLine | None = None
+    for line in lines:
+        _check_ref_exec_cancelled(cancelled)
+        line_end = stream_start + _ref_exec_presented_line_bytes(line, cancelled)
+        selected, actual_start, actual_end, snapped = _ref_exec_slice_presented_line(
+            line,
+            stream_start=stream_start,
+            selected_start=0,
+            selected_end=min(count, line_end),
+            cancelled=cancelled,
+        )
+        if selected is not None:
+            source_bounds = (
+                _ref_exec_source_byte_bounds(selected)
+                if line.component_view is not None
+                else None
+            )
+            range_start = (
+                source_bounds[0] if source_bounds is not None else actual_start + 1
+            )
+            range_end = source_bounds[1] if source_bounds is not None else actual_end
+            ranged = replace(
+                selected,
+                atomic_match=False,
+                byte_range=RefExecByteRange(
+                    requested_start=1,
+                    requested_end=count,
+                    actual_start=range_start,
+                    actual_end=range_end,
+                    marked=snapped or source_bounds is not None,
+                    actual_empty=snapped and actual_start == actual_end,
+                ),
+            )
+            if (
+                ranged.metadata_only
+                and pending is not None
+                and pending.byte_range is not None
+            ):
+                pending = replace(
+                    pending,
+                    byte_range=replace(
+                        pending.byte_range,
+                        marked=pending.byte_range.marked or snapped,
+                    ),
+                )
+            else:
+                if pending is not None:
+                    yield pending
+                pending = ranged
+        if line_end >= count:
+            if pending is not None:
+                yield pending
+            return
+        stream_start = line_end
+    if pending is not None:
+        yield pending
+
+
+def _ref_exec_tail_from_bytes(
+    lines: Iterable[RefExecLine],
+    start: int,
+    cancelled: threading.Event,
+) -> Iterable[RefExecLine]:
+    selected_start = start - 1
+    stream_start = 0
+    actual_range_start: int | None = None
+    snapped_start = False
+    for line in lines:
+        _check_ref_exec_cancelled(cancelled)
+        if line.metadata_only:
+            continue
+        line_end = stream_start + _ref_exec_presented_line_bytes(line, cancelled)
+        if line_end <= selected_start:
+            stream_start = line_end
+            continue
+        selected, actual_start, actual_end, snapped = _ref_exec_slice_presented_line(
+            line,
+            stream_start=stream_start,
+            selected_start=selected_start,
+            selected_end=line_end,
+            cancelled=cancelled,
+        )
+        if selected is not None:
+            if actual_range_start is None:
+                actual_range_start = actual_start + 1
+                snapped_start = snapped
+            yield replace(
+                selected,
+                atomic_match=False,
+                byte_range=RefExecByteRange(
+                    requested_start=start,
+                    requested_end=None,
+                    actual_start=actual_range_start,
+                    actual_end=None,
+                    marked=snapped_start,
+                    actual_empty=snapped and actual_start == actual_end,
+                ),
+            )
+        stream_start = line_end
+
+
+@dataclass(frozen=True, slots=True)
+class RefExecTailSnapshot:
+    retained: bytearray
+    write_offset: int
+    component_lengths: array
+    component_flags: bytearray
+    component_source_delta_indexes: array
+    component_source_deltas: array
+    component_char_delta_indexes: array
+    component_char_deltas: array
+    record_component_ends: array
+    record_flags: bytearray
+    record_char_delta_indexes: array
+    record_char_deltas: array
+    record_number_delta_indexes: array
+    record_number_deltas: array
+    record_match_starts: array | None
+    record_match_ends: array | None
+    trailing_plain_default: bool
+    trailing_plain_change_indexes: array
+    trailing_number_delta_indexes: array
+    trailing_number_deltas: array
+    trailing_char_delta_indexes: array
+    trailing_char_deltas: array
+    trailing_match_indexes: array
+    trailing_match_starts: array
+    trailing_match_ends: array
+    compact_missing: int
+    retained_bytes: int
+    snapped_bytes: int
+    stream_start: int
+    stream_chars: int
+    line_count: int
+    trailing_empty_lines: int
+    snapped_empty: bool
+    snapped_number: int
+    snapped_char_start: int
+    partial_fallback_char_start: int | None
+    count: int
+
+
+def _iter_ref_exec_tail_snapshot(
+    snapshot: RefExecTailSnapshot,
+) -> Iterable[RefExecLine]:
+    effective_bytes = snapshot.retained_bytes - snapshot.snapped_bytes
+    oldest_offset = snapshot.write_offset if snapshot.retained_bytes == snapshot.count else 0
+    payload_start = (oldest_offset + snapshot.snapped_bytes) % snapshot.count
+    first_bytes = min(effective_bytes, snapshot.count - payload_start)
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    presented = decoder.decode(
+        memoryview(snapshot.retained)[payload_start : payload_start + first_bytes],
+        final=first_bytes == effective_bytes,
+    )
+    if first_bytes < effective_bytes:
+        presented += decoder.decode(
+            memoryview(snapshot.retained)[: effective_bytes - first_bytes],
+            final=True,
+        )
+    requested_start = max(1, snapshot.stream_start - snapshot.count + 1)
+    actual_start = (
+        snapshot.stream_start
+        - snapshot.retained_bytes
+        + snapshot.snapped_bytes
+        + 1
+    )
+    byte_range = RefExecByteRange(
+        requested_start=requested_start,
+        requested_end=snapshot.stream_start,
+        actual_start=actual_start,
+        actual_end=snapshot.stream_start,
+        marked=actual_start != requested_start,
+        actual_empty=actual_start > snapshot.stream_start,
+    )
+    if not presented and (snapshot.snapped_bytes or snapshot.snapped_empty):
+        yield RefExecLine(
+            text="",
+            number=snapshot.snapped_number,
+            byte_start=snapshot.stream_start,
+            char_start=snapshot.snapped_char_start,
+            has_newline=False,
+            byte_range=byte_range,
+            metadata_only=True,
+            component_view=RefExecComponentView(()),
+        )
+        if snapshot.trailing_empty_lines == 0:
+            return
+    output_line_count = (
+        len(snapshot.record_component_ends) + snapshot.trailing_empty_lines
+    )
+    output_number = snapshot.line_count - output_line_count + 1
+    presented_char_start = snapshot.stream_chars - len(presented)
+    line_byte_start = actual_start - 1
+    byte_offset = 0
+    char_offset = 0
+    component_offset = 0
+    source_delta_offset = 0
+    char_delta_offset = 0
+    number_delta_offset = 0
+    record_char_delta_offset = 0
+    for record_offset, component_end in enumerate(snapshot.record_component_ends):
+        record_flags = snapshot.record_flags[record_offset]
+        record_start = bool(record_flags & 0x01)
+        record_has_newline = bool(record_flags & 0x02)
+        record_plain = bool(record_flags & 0x04)
+        record_char_delta = 0
+        if (
+            record_char_delta_offset < len(snapshot.record_char_delta_indexes)
+            and snapshot.record_char_delta_indexes[record_char_delta_offset]
+            == record_offset
+        ):
+            record_char_delta = snapshot.record_char_deltas[
+                record_char_delta_offset
+            ]
+            record_char_delta_offset += 1
+        fallback_char_start = presented_char_start + char_offset + record_char_delta
+        components: list[RefExecComponent] = []
+        while component_offset < component_end:
+            component_length = snapshot.component_lengths[component_offset]
+            flags = snapshot.component_flags[component_offset]
+            kind = flags & 0x03
+            component_byte_end = byte_offset + component_length
+            component_ring_start = (payload_start + byte_offset) % snapshot.count
+            component_first_bytes = min(
+                component_length, snapshot.count - component_ring_start
+            )
+            component_decoder = codecs.getincrementaldecoder("utf-8")()
+            component_text = component_decoder.decode(
+                memoryview(snapshot.retained)[
+                    component_ring_start : component_ring_start
+                    + component_first_bytes
+                ],
+                final=component_first_bytes == component_length,
+            )
+            if component_first_bytes < component_length:
+                component_text += component_decoder.decode(
+                    memoryview(snapshot.retained)[
+                        : component_length - component_first_bytes
+                    ],
+                    final=True,
+                )
+            component_char_end = char_offset + len(component_text)
+            source_delta = 0
+            if flags & 0x08:
+                source_delta = record_char_delta
+            elif (
+                source_delta_offset < len(snapshot.component_source_delta_indexes)
+                and snapshot.component_source_delta_indexes[source_delta_offset]
+                == component_offset
+            ):
+                source_delta = snapshot.component_source_deltas[source_delta_offset]
+                source_delta_offset += 1
+            source_backed = bool(flags & 0x04)
+            source_char_delta = source_delta
+            if (
+                char_delta_offset < len(snapshot.component_char_delta_indexes)
+                and snapshot.component_char_delta_indexes[char_delta_offset]
+                == component_offset
+            ):
+                source_char_delta = snapshot.component_char_deltas[char_delta_offset]
+                char_delta_offset += 1
+            components.append(
+                RefExecComponent(
+                    kind=(
+                        "display_prefix"
+                        if kind == 0
+                        else "text" if kind == 1 else "synthetic_lf"
+                    ),
+                    text=presented,
+                    start=char_offset,
+                    end=component_char_end,
+                    utf8_bytes=component_length,
+                    source_byte_start=(
+                        actual_start - 1 + byte_offset + source_delta
+                        if source_backed
+                        else None
+                    ),
+                    source_char_start=(
+                        presented_char_start + char_offset + source_char_delta
+                        if source_backed
+                        else None
+                    ),
+                )
+            )
+            char_offset = component_char_end
+            byte_offset = component_byte_end
+            component_offset += 1
+        number_delta = 0
+        if (
+            number_delta_offset < len(snapshot.record_number_delta_indexes)
+            and snapshot.record_number_delta_indexes[number_delta_offset]
+            == record_offset
+        ):
+            number_delta = snapshot.record_number_deltas[number_delta_offset]
+            number_delta_offset += 1
+        history_fallback_char_start = fallback_char_start
+        if (
+            record_offset == 0
+            and not record_start
+            and snapshot.partial_fallback_char_start is not None
+        ):
+            history_fallback_char_start = snapshot.partial_fallback_char_start
+        reconstructed_char_start = (
+            history_fallback_char_start
+            if record_start
+            else next(
+                (
+                    component.source_char_start
+                    for component in components
+                    if component.kind == "text"
+                    and component.source_char_start is not None
+                ),
+                history_fallback_char_start,
+            )
+        )
+        match_start = (
+            snapshot.record_match_starts[record_offset]
+            if snapshot.record_match_starts is not None
+            else snapshot.compact_missing
+        )
+        match_end = (
+            snapshot.record_match_ends[record_offset]
+            if snapshot.record_match_ends is not None
+            else snapshot.compact_missing
+        )
+        plain_text = "".join(
+            component.text[component.start : component.end]
+            for component in components
+            if component.kind == "text"
+        )
+        plain_display_prefix = "".join(
+            component.text[component.start : component.end]
+            for component in components
+            if component.kind == "display_prefix"
+        )
+        yield RefExecLine(
+            text=plain_text if record_plain else "",
+            number=output_number + number_delta,
+            byte_start=line_byte_start,
+            char_start=reconstructed_char_start,
+            has_newline=record_start
+            and record_has_newline
+            and bool(components)
+            and components[-1].kind == "synthetic_lf",
+            match_start=(
+                match_start if match_start != snapshot.compact_missing else None
+            ),
+            match_end=match_end if match_end != snapshot.compact_missing else None,
+            display_prefix=plain_display_prefix if record_plain else "",
+            byte_range=byte_range,
+            component_view=(
+                None if record_plain else RefExecComponentView(tuple(components))
+            ),
+        )
+        output_number += 1
+        line_byte_start = actual_start - 1 + byte_offset
+    trailing_plain = snapshot.trailing_plain_default
+    trailing_plain_change_offset = 0
+    trailing_number_delta_offset = 0
+    trailing_char_delta_offset = 0
+    trailing_match_offset = 0
+    for trailing_offset in range(snapshot.trailing_empty_lines):
+        if (
+            trailing_plain_change_offset
+            < len(snapshot.trailing_plain_change_indexes)
+            and snapshot.trailing_plain_change_indexes[
+                trailing_plain_change_offset
+            ]
+            == trailing_offset
+        ):
+            trailing_plain = not trailing_plain
+            trailing_plain_change_offset += 1
+        number_delta = 0
+        if (
+            trailing_number_delta_offset
+            < len(snapshot.trailing_number_delta_indexes)
+            and snapshot.trailing_number_delta_indexes[
+                trailing_number_delta_offset
+            ]
+            == trailing_offset
+        ):
+            number_delta = snapshot.trailing_number_deltas[
+                trailing_number_delta_offset
+            ]
+            trailing_number_delta_offset += 1
+        char_delta = 0
+        if (
+            trailing_char_delta_offset < len(snapshot.trailing_char_delta_indexes)
+            and snapshot.trailing_char_delta_indexes[trailing_char_delta_offset]
+            == trailing_offset
+        ):
+            char_delta = snapshot.trailing_char_deltas[trailing_char_delta_offset]
+            trailing_char_delta_offset += 1
+        match_start = snapshot.compact_missing
+        match_end = snapshot.compact_missing
+        if (
+            trailing_match_offset < len(snapshot.trailing_match_indexes)
+            and snapshot.trailing_match_indexes[trailing_match_offset]
+            == trailing_offset
+        ):
+            match_start = snapshot.trailing_match_starts[trailing_match_offset]
+            match_end = snapshot.trailing_match_ends[trailing_match_offset]
+            trailing_match_offset += 1
+        yield RefExecLine(
+            text="",
+            number=output_number + number_delta,
+            byte_start=snapshot.stream_start,
+            char_start=snapshot.stream_chars + char_delta,
+            has_newline=False,
+            match_start=(
+                match_start if match_start != snapshot.compact_missing else None
+            ),
+            match_end=(
+                match_end if match_end != snapshot.compact_missing else None
+            ),
+            byte_range=byte_range,
+            component_view=(None if trailing_plain else RefExecComponentView(())),
+        )
+        output_number += 1
+
+
+# allow: SIZE_OK - one-pass circular-buffer state keeps overwrite ordering local.
+def _ref_exec_tail_bytes(
+    lines: Iterable[RefExecLine],
+    count: int,
+    cancelled: threading.Event,
+) -> Iterable[RefExecLine]:
+    if count > REF_EXEC_TAIL_MAX_BYTES:
+        raise RefExecError(
+            "Error: tail rolling window exceeds 8 MiB; reduce -c or filter first"
+    )
+    if count == 0:
+        return
+    retained = bytearray(count)
+    retained_bytes = 0
+    write_offset = 0
+    component_lengths = array("I")
+    component_flags = bytearray()
+    component_source_delta_indexes = array("I")
+    component_source_deltas = array("i")
+    component_char_delta_indexes = array("I")
+    component_char_deltas = array("i")
+    component_base = 0
+    record_component_ends = array("I")
+    record_flags = bytearray()
+    record_char_delta_indexes = array("I")
+    record_char_deltas = array("i")
+    record_number_delta_indexes = array("I")
+    record_number_deltas = array("i")
+    record_match_starts: array | None = None
+    record_match_ends: array | None = None
+    record_base = 0
+    trailing_plain_default = False
+    trailing_plain_last = False
+    trailing_plain_change_indexes = array("Q")
+    trailing_number_delta_indexes = array("Q")
+    trailing_number_deltas = array("i")
+    trailing_char_delta_indexes = array("Q")
+    trailing_char_deltas = array("i")
+    trailing_match_indexes = array("Q")
+    trailing_match_starts = array("i")
+    trailing_match_ends = array("i")
+    compact_missing = -1
+    stream_start = 0
+    stream_chars = 0
+    retained_char_start = 0
+    partial_fallback_char_start: int | None = None
+    line_count = 0
+    trailing_empty_lines = 0
+    snapped_empty = False
+    snapped_number = 0
+    snapped_char_start = 0
+
+    def append_compact(lane: array, value: int) -> array:
+        if lane.typecode == "i" and not -(1 << 31) <= value < 1 << 31:
+            lane = array("q", lane)
+        lane.append(value)
+        return lane
+
+    def drop_metadata(dropped_bytes: int, dropped_offset: int) -> None:
+        nonlocal component_base, record_base, partial_fallback_char_start
+        previous_component_base = component_base
+        remaining = dropped_bytes
+        clipped_component = False
+        while remaining and component_base < len(component_lengths):
+            component_length = component_lengths[component_base]
+            if remaining >= component_length:
+                remaining -= component_length
+                component_base += 1
+                continue
+            component_lengths[component_base] = component_length - remaining
+            remaining = 0
+            clipped_component = True
+        while (
+            record_base < len(record_component_ends)
+            and record_component_ends[record_base] <= component_base
+        ):
+            record_base += 1
+        if record_base >= len(record_component_ends):
+            return
+        record_component_start = (
+            record_component_ends[record_base - 1] if record_base else 0
+        )
+        if record_component_start < component_base or clipped_component:
+            if record_flags[record_base] & 0x01:
+                record_boundary_bytes = sum(
+                    component_lengths[index]
+                    for index in range(
+                        previous_component_base, record_component_start
+                    )
+                )
+                record_boundary_chars = sum(
+                    retained[(dropped_offset + offset) % count] & 0xC0 != 0x80
+                    for offset in range(
+                        min(record_boundary_bytes, dropped_bytes)
+                    )
+                )
+                char_delta_position = bisect_left(
+                    record_char_delta_indexes, record_base
+                )
+                record_char_delta = (
+                    record_char_deltas[char_delta_position]
+                    if char_delta_position < len(record_char_delta_indexes)
+                    and record_char_delta_indexes[char_delta_position] == record_base
+                    else 0
+                )
+                partial_fallback_char_start = (
+                    retained_char_start
+                    + record_boundary_chars
+                    + record_char_delta
+                )
+            record_flags[record_base] &= 0x02
+            if record_match_starts is not None and record_match_ends is not None:
+                record_match_starts[record_base] = compact_missing
+                record_match_ends[record_base] = compact_missing
+
+    for line in lines:
+        _check_ref_exec_cancelled(cancelled)
+        if line.metadata_only:
+            continue
+        line_count += 1
+        original_view = _ref_exec_line_component_view(line, cancelled)
+        line_bytes = sum(component.utf8_bytes for component in original_view.components)
+        line_end = stream_start + line_bytes
+        line_chars = sum(
+            component.end - component.start for component in original_view.components
+        )
+        selected = line
+        selected_start = stream_start
+        selected_char_start = stream_chars
+        selected_is_snapped_empty = False
+        if line_bytes > count:
+            selected, selected_start, _, _ = _ref_exec_slice_presented_line(
+                line,
+                stream_start=stream_start,
+                selected_start=line_end - count,
+                selected_end=line_end,
+                cancelled=cancelled,
+            )
+            if selected is None:
+                stream_start = line_end
+                stream_chars += line_chars
+                trailing_empty_lines += 1
+                continue
+            retained_bytes = 0
+            write_offset = 0
+            component_lengths = array("I")
+            component_flags = bytearray()
+            component_source_delta_indexes = array("I")
+            component_source_deltas = array("i")
+            component_char_delta_indexes = array("I")
+            component_char_deltas = array("i")
+            component_base = 0
+            record_component_ends = array("I")
+            record_flags = bytearray()
+            record_char_delta_indexes = array("I")
+            record_char_deltas = array("i")
+            record_number_delta_indexes = array("I")
+            record_number_deltas = array("i")
+            record_match_starts = None
+            record_match_ends = None
+            record_base = 0
+            trailing_empty_lines = 0
+            trailing_plain_default = False
+            trailing_plain_last = False
+            trailing_plain_change_indexes = array("Q")
+            trailing_number_delta_indexes = array("Q")
+            trailing_number_deltas = array("i")
+            trailing_char_delta_indexes = array("Q")
+            trailing_char_deltas = array("i")
+            trailing_match_indexes = array("Q")
+            trailing_match_starts = array("i")
+            trailing_match_ends = array("i")
+            partial_fallback_char_start = selected.char_start
+            snapped_empty = selected.metadata_only
+            selected_is_snapped_empty = snapped_empty
+            if snapped_empty:
+                snapped_number = selected.number
+                snapped_char_start = selected.char_start
+            selected_chars = sum(
+                component.end - component.start
+                for component in _ref_exec_line_component_view(
+                    selected, cancelled
+                ).components
+            )
+            selected_char_start = stream_chars + line_chars - selected_chars
+            retained_char_start = selected_char_start
+        selected_view = _ref_exec_line_component_view(selected, cancelled)
+        if line_bytes and trailing_empty_lines:
+            trailing_empty_lines = 0
+            trailing_plain_default = False
+            trailing_plain_last = False
+            trailing_plain_change_indexes = array("Q")
+            trailing_number_delta_indexes = array("Q")
+            trailing_number_deltas = array("i")
+            trailing_char_delta_indexes = array("Q")
+            trailing_char_deltas = array("i")
+            trailing_match_indexes = array("Q")
+            trailing_match_starts = array("i")
+            trailing_match_ends = array("i")
+        record_offset = len(record_component_ends)
+        record_start = selected_start == stream_start
+        record_char_delta = selected.char_start - selected_char_start
+        component_stream_start = selected_start
+        component_char_start = selected_char_start
+        for component in selected_view.components:
+            kind = {
+                "display_prefix": 0,
+                "text": 1,
+                "synthetic_lf": 2,
+            }[component.kind]
+            source_byte_delta = (
+                component.source_byte_start - component_stream_start
+                if component.source_byte_start is not None
+                else 0
+            )
+            source_char_delta = (
+                component.source_char_start - component_char_start
+                if component.source_char_start is not None
+                else 0
+            )
+            component_length = 0
+            for offset in range(
+                component.start, component.end, REF_TEXT_HASH_CHUNK_CHARS
+            ):
+                chunk_end = min(
+                    component.end, offset + REF_TEXT_HASH_CHUNK_CHARS
+                )
+                encoded = _encode_ref_text_checked(
+                    component.text[offset:chunk_end], cancelled
+                )
+                component_length += len(encoded)
+                encoded_offset = 0
+                while encoded_offset < len(encoded):
+                    available = min(
+                        len(encoded) - encoded_offset, count - write_offset
+                    )
+                    write_end = write_offset + available
+                    if retained_bytes == count:
+                        drop_metadata(available, write_offset)
+                        for retained_offset in range(write_offset, write_end):
+                            if retained[retained_offset] & 0xC0 != 0x80:
+                                retained_char_start += 1
+                    retained[write_offset:write_end] = encoded[
+                        encoded_offset : encoded_offset + available
+                    ]
+                    write_offset = write_end % count
+                    encoded_offset += available
+                    retained_bytes = min(count, retained_bytes + available)
+            if component_length:
+                component_lengths.append(component_length)
+                flags = kind
+                if component.source_byte_start is not None:
+                    flags |= 0x04
+                    if (
+                        source_byte_delta == record_char_delta
+                        and source_char_delta == record_char_delta
+                    ):
+                        flags |= 0x08
+                    elif source_byte_delta:
+                        component_source_delta_indexes.append(
+                            len(component_lengths) - 1
+                        )
+                        component_source_deltas = append_compact(
+                            component_source_deltas, source_byte_delta
+                        )
+                component_flags.append(flags)
+                if source_char_delta != source_byte_delta:
+                    component_char_delta_indexes.append(len(component_lengths) - 1)
+                    component_char_deltas = append_compact(
+                        component_char_deltas, source_char_delta
+                    )
+            component_stream_start += component.utf8_bytes
+            component_char_start += component.end - component.start
+        if line_bytes and not selected_is_snapped_empty:
+            record_component_ends.append(len(component_lengths))
+            flags = int(record_start)
+            if record_start and selected.has_newline:
+                flags |= 0x02
+            if record_start and selected.component_view is None:
+                flags |= 0x04
+            record_flags.append(flags)
+            if record_char_delta:
+                record_char_delta_indexes.append(record_offset)
+                record_char_deltas = append_compact(
+                    record_char_deltas, record_char_delta
+                )
+            number_delta = selected.number - line_count
+            if number_delta:
+                record_number_delta_indexes.append(record_offset)
+                record_number_deltas = append_compact(
+                    record_number_deltas, number_delta
+                )
+            if selected.match_start is not None or selected.match_end is not None:
+                if record_match_starts is None or record_match_ends is None:
+                    record_match_starts = array("i", (compact_missing,)) * record_offset
+                    record_match_ends = array("i", (compact_missing,)) * record_offset
+                record_match_starts = append_compact(
+                    record_match_starts,
+                    selected.match_start
+                    if selected.match_start is not None
+                    else compact_missing,
+                )
+                record_match_ends = append_compact(
+                    record_match_ends,
+                    selected.match_end
+                    if selected.match_end is not None
+                    else compact_missing,
+                )
+            elif record_match_starts is not None and record_match_ends is not None:
+                record_match_starts.append(compact_missing)
+                record_match_ends.append(compact_missing)
+        if retained_bytes:
+            physical_oldest_offset = write_offset if retained_bytes == count else 0
+            oldest_offset = physical_oldest_offset
+            for _ in range(min(4, retained_bytes)):
+                if retained[oldest_offset] & 0xC0 != 0x80:
+                    break
+                oldest_offset = (oldest_offset + 1) % count
+            skipped_bytes = (oldest_offset - physical_oldest_offset) % count
+            logical_component = component_base
+            logical_component_skip = skipped_bytes
+            while (
+                logical_component < len(component_lengths)
+                and logical_component_skip
+                >= component_lengths[logical_component]
+            ):
+                logical_component_skip -= component_lengths[logical_component]
+                logical_component += 1
+            logical_record = bisect_right(
+                record_component_ends,
+                logical_component,
+                lo=record_base,
+            )
+            logical_record_start = (
+                record_component_ends[logical_record - 1]
+                if logical_record
+                else 0
+            )
+            logical_record_intact = (
+                logical_record < len(record_flags)
+                and bool(record_flags[logical_record] & 0x01)
+                and logical_component == logical_record_start
+                and logical_component_skip == 0
+            )
+            if logical_record_intact:
+                partial_fallback_char_start = None
+            elif (
+                logical_record < len(record_component_ends)
+                and logical_component < len(component_flags)
+            ):
+                oldest_flags = component_flags[logical_component]
+                if oldest_flags & 0x03 == 1 and oldest_flags & 0x04:
+                    char_delta_position = bisect_left(
+                        record_char_delta_indexes, logical_record
+                    )
+                    source_char_delta = 0
+                    if (
+                        oldest_flags & 0x08
+                        and char_delta_position < len(record_char_delta_indexes)
+                        and record_char_delta_indexes[char_delta_position]
+                        == logical_record
+                    ):
+                        source_char_delta = record_char_deltas[
+                            char_delta_position
+                        ]
+                    source_delta_position = bisect_left(
+                        component_source_delta_indexes, logical_component
+                    )
+                    if (
+                        source_delta_position
+                        < len(component_source_delta_indexes)
+                        and component_source_delta_indexes[source_delta_position]
+                        == logical_component
+                    ):
+                        source_char_delta = component_source_deltas[
+                            source_delta_position
+                        ]
+                    char_delta_position = bisect_left(
+                        component_char_delta_indexes, logical_component
+                    )
+                    if (
+                        char_delta_position < len(component_char_delta_indexes)
+                        and component_char_delta_indexes[char_delta_position]
+                        == logical_component
+                    ):
+                        source_char_delta = component_char_deltas[
+                            char_delta_position
+                        ]
+                    partial_fallback_char_start = (
+                        retained_char_start + source_char_delta
+                    )
+        if line_bytes == 0:
+            trailing_plain = selected.component_view is None
+            if trailing_empty_lines == 0:
+                trailing_plain_default = trailing_plain
+            elif trailing_plain != trailing_plain_last:
+                trailing_plain_change_indexes.append(trailing_empty_lines)
+            trailing_plain_last = trailing_plain
+            trailing_number_delta = selected.number - line_count
+            if trailing_number_delta:
+                trailing_number_delta_indexes.append(trailing_empty_lines)
+                trailing_number_deltas = append_compact(
+                    trailing_number_deltas, trailing_number_delta
+                )
+            trailing_char_delta = selected.char_start - stream_chars
+            if trailing_char_delta:
+                trailing_char_delta_indexes.append(trailing_empty_lines)
+                trailing_char_deltas = append_compact(
+                    trailing_char_deltas, trailing_char_delta
+                )
+            if selected.match_start is not None or selected.match_end is not None:
+                trailing_match_indexes.append(trailing_empty_lines)
+                trailing_match_starts = append_compact(
+                    trailing_match_starts,
+                    selected.match_start
+                    if selected.match_start is not None
+                    else compact_missing,
+                )
+                trailing_match_ends = append_compact(
+                    trailing_match_ends,
+                    selected.match_end
+                    if selected.match_end is not None
+                    else compact_missing,
+                )
+            trailing_empty_lines += 1
+        stream_start = line_end
+        stream_chars += line_chars
+        if record_base >= 65_536:
+            del record_component_ends[:record_base]
+            del record_flags[:record_base]
+            char_record_prefix = bisect_left(
+                record_char_delta_indexes, record_base
+            )
+            del record_char_delta_indexes[:char_record_prefix]
+            del record_char_deltas[:char_record_prefix]
+            for index in range(len(record_char_delta_indexes)):
+                record_char_delta_indexes[index] -= record_base
+            if record_match_starts is not None and record_match_ends is not None:
+                del record_match_starts[:record_base]
+                del record_match_ends[:record_base]
+            number_prefix = 0
+            while (
+                number_prefix < len(record_number_delta_indexes)
+                and record_number_delta_indexes[number_prefix] < record_base
+            ):
+                number_prefix += 1
+            del record_number_delta_indexes[:number_prefix]
+            del record_number_deltas[:number_prefix]
+            for index in range(len(record_number_delta_indexes)):
+                record_number_delta_indexes[index] -= record_base
+            record_base = 0
+        if component_base >= 131_072:
+            if record_base:
+                del record_component_ends[:record_base]
+                del record_flags[:record_base]
+                char_record_prefix = bisect_left(
+                    record_char_delta_indexes, record_base
+                )
+                del record_char_delta_indexes[:char_record_prefix]
+                del record_char_deltas[:char_record_prefix]
+                for index in range(len(record_char_delta_indexes)):
+                    record_char_delta_indexes[index] -= record_base
+                if (
+                    record_match_starts is not None
+                    and record_match_ends is not None
+                ):
+                    del record_match_starts[:record_base]
+                    del record_match_ends[:record_base]
+                number_prefix = bisect_left(
+                    record_number_delta_indexes, record_base
+                )
+                del record_number_delta_indexes[:number_prefix]
+                del record_number_deltas[:number_prefix]
+                for index in range(len(record_number_delta_indexes)):
+                    record_number_delta_indexes[index] -= record_base
+                record_base = 0
+            del component_lengths[:component_base]
+            del component_flags[:component_base]
+            source_prefix = 0
+            while (
+                source_prefix < len(component_source_delta_indexes)
+                and component_source_delta_indexes[source_prefix] < component_base
+            ):
+                source_prefix += 1
+            del component_source_delta_indexes[:source_prefix]
+            del component_source_deltas[:source_prefix]
+            for index in range(len(component_source_delta_indexes)):
+                component_source_delta_indexes[index] -= component_base
+            char_prefix = 0
+            while (
+                char_prefix < len(component_char_delta_indexes)
+                and component_char_delta_indexes[char_prefix] < component_base
+            ):
+                char_prefix += 1
+            del component_char_delta_indexes[:char_prefix]
+            del component_char_deltas[:char_prefix]
+            for index in range(len(component_char_delta_indexes)):
+                component_char_delta_indexes[index] -= component_base
+            for index in range(len(record_component_ends)):
+                record_component_ends[index] -= component_base
+            component_base = 0
+    if retained_bytes == 0 and trailing_empty_lines == 0 and not snapped_empty:
+        return
+    snapped_bytes = 0
+    oldest_offset = write_offset if retained_bytes == count else 0
+    while (
+        snapped_bytes < retained_bytes
+        and retained[(oldest_offset + snapped_bytes) % count] & 0xC0 == 0x80
+    ):
+        snapped_bytes += 1
+    if snapped_bytes:
+        drop_metadata(snapped_bytes, oldest_offset)
+    if record_base:
+        del record_component_ends[:record_base]
+        del record_flags[:record_base]
+        char_record_prefix = bisect_left(record_char_delta_indexes, record_base)
+        del record_char_delta_indexes[:char_record_prefix]
+        del record_char_deltas[:char_record_prefix]
+        for index in range(len(record_char_delta_indexes)):
+            record_char_delta_indexes[index] -= record_base
+        if record_match_starts is not None and record_match_ends is not None:
+            del record_match_starts[:record_base]
+            del record_match_ends[:record_base]
+        number_prefix = 0
+        while (
+            number_prefix < len(record_number_delta_indexes)
+            and record_number_delta_indexes[number_prefix] < record_base
+        ):
+            number_prefix += 1
+        del record_number_delta_indexes[:number_prefix]
+        del record_number_deltas[:number_prefix]
+        for index in range(len(record_number_delta_indexes)):
+            record_number_delta_indexes[index] -= record_base
+        record_base = 0
+    if component_base:
+        del component_lengths[:component_base]
+        del component_flags[:component_base]
+        source_prefix = 0
+        while (
+            source_prefix < len(component_source_delta_indexes)
+            and component_source_delta_indexes[source_prefix] < component_base
+        ):
+            source_prefix += 1
+        del component_source_delta_indexes[:source_prefix]
+        del component_source_deltas[:source_prefix]
+        for index in range(len(component_source_delta_indexes)):
+            component_source_delta_indexes[index] -= component_base
+        char_prefix = 0
+        while (
+            char_prefix < len(component_char_delta_indexes)
+            and component_char_delta_indexes[char_prefix] < component_base
+        ):
+            char_prefix += 1
+        del component_char_delta_indexes[:char_prefix]
+        del component_char_deltas[:char_prefix]
+        for index in range(len(component_char_delta_indexes)):
+            component_char_delta_indexes[index] -= component_base
+        for index in range(len(record_component_ends)):
+            record_component_ends[index] -= component_base
+    yield from _iter_ref_exec_tail_snapshot(
+        RefExecTailSnapshot(
+            retained=retained,
+            write_offset=write_offset,
+            component_lengths=component_lengths,
+            component_flags=component_flags,
+            component_source_delta_indexes=component_source_delta_indexes,
+            component_source_deltas=component_source_deltas,
+            component_char_delta_indexes=component_char_delta_indexes,
+            component_char_deltas=component_char_deltas,
+            record_component_ends=record_component_ends,
+            record_flags=record_flags,
+            record_char_delta_indexes=record_char_delta_indexes,
+            record_char_deltas=record_char_deltas,
+            record_number_delta_indexes=record_number_delta_indexes,
+            record_number_deltas=record_number_deltas,
+            record_match_starts=record_match_starts,
+            record_match_ends=record_match_ends,
+            trailing_plain_default=trailing_plain_default,
+            trailing_plain_change_indexes=trailing_plain_change_indexes,
+            trailing_number_delta_indexes=trailing_number_delta_indexes,
+            trailing_number_deltas=trailing_number_deltas,
+            trailing_char_delta_indexes=trailing_char_delta_indexes,
+            trailing_char_deltas=trailing_char_deltas,
+            trailing_match_indexes=trailing_match_indexes,
+            trailing_match_starts=trailing_match_starts,
+            trailing_match_ends=trailing_match_ends,
+            compact_missing=compact_missing,
+            retained_bytes=retained_bytes,
+            snapped_bytes=snapped_bytes,
+            stream_start=stream_start,
+            stream_chars=stream_chars,
+            line_count=line_count,
+            trailing_empty_lines=trailing_empty_lines,
+            snapped_empty=snapped_empty,
+            snapped_number=snapped_number,
+            snapped_char_start=snapped_char_start,
+            partial_fallback_char_start=partial_fallback_char_start,
+            count=count,
+        )
+    )
+
+
+def _ref_exec_sed(lines: Iterable[RefExecLine], start: int, end: int | None, cancelled: threading.Event) -> Iterable[RefExecLine]:
+    input_number = 0
+    for line in lines:
+        _check_ref_exec_cancelled(cancelled)
+        if line.metadata_only:
+            yield line
+            continue
+        input_number += 1
+        if input_number < start:
+            continue
+        if end is not None and input_number > end:
+            return
+        yield line
+
+
+def _ref_exec_regex_requested(pattern: str, flags: frozenset[str]) -> bool:
+    return "E" in flags or any(marker in pattern for marker in (r"\|", ".*", ".+", ".?", r"\d", r"\w", r"\s")) or bool(re.search(r"\[.+\]", pattern))
+
+
+def _ref_exec_literal_component_spans(
+    line: RefExecLine,
+    stage: RefExecStage,
+    cancelled: threading.Event,
+) -> Iterable[tuple[int, int, RefExecComponent | None, int, int, str | None]]:
+    pattern = stage.pattern or ""
+    if not pattern:
+        component = next(
+            (
+                candidate
+                for candidate in _ref_exec_line_component_view(
+                    line, cancelled
+                ).components
+                if candidate.kind != "synthetic_lf"
+            ),
+            None,
+        )
+        if component is None and line.component_view is None:
+            component = _ref_exec_component(
+                "text",
+                line.text,
+                cancelled,
+                source_start=(line.byte_start, line.char_start),
+            )
+        position = component.start if component is not None else 0
+        yield (0, 0, component, position, position, None)
+        return
+    components = (
+        component
+        for component in _ref_exec_line_component_view(line, cancelled).components
+        if component.kind != "synthetic_lf"
+    )
+    compiled_literal = (
+        re.compile(re.escape(pattern), re.IGNORECASE)
+        if "i" in stage.flags
+        else None
+    )
+    logical_start = 0
+    overlap = len(pattern) - 1
+    suffix = ""
+    next_match_start = 0
+    for component in components:
+        _check_ref_exec_cancelled(cancelled)
+        component_length = component.end - component.start
+        if suffix and overlap > 0:
+            current_end = min(component.end, component.start + overlap)
+            boundary_text = suffix + component.text[component.start:current_end]
+            boundary_offset = logical_start - len(suffix)
+            boundary = len(suffix)
+            search_start = max(0, next_match_start - boundary_offset)
+            if compiled_literal is None:
+                position = search_start
+                while position <= len(boundary_text) - len(pattern):
+                    found = boundary_text.find(pattern, position, len(boundary_text))
+                    if found < 0:
+                        break
+                    end = found + len(pattern)
+                    if found < boundary < end:
+                        global_start = boundary_offset + found
+                        global_end = boundary_offset + end
+                        yield (
+                            global_start,
+                            global_end,
+                            None,
+                            0,
+                            0,
+                            boundary_text[found:end],
+                        )
+                        next_match_start = global_end
+                        position = max(end, next_match_start - boundary_offset)
+                    else:
+                        position = found + 1
+            else:
+                for match in compiled_literal.finditer(
+                    boundary_text, search_start, len(boundary_text)
+                ):
+                    start, end = match.span()
+                    if start < boundary < end:
+                        global_start = boundary_offset + start
+                        global_end = boundary_offset + end
+                        yield (
+                            global_start,
+                            global_end,
+                            None,
+                            0,
+                            0,
+                            boundary_text[start:end],
+                        )
+                        next_match_start = global_end
+        if compiled_literal is None:
+            position = max(
+                component.start,
+                component.start + next_match_start - logical_start,
+            )
+            while position <= component.end - len(pattern):
+                found = component.text.find(pattern, position, component.end)
+                if found < 0:
+                    break
+                global_start = logical_start + found - component.start
+                global_end = global_start + len(pattern)
+                yield (
+                    global_start,
+                    global_end,
+                    component,
+                    found,
+                    found + len(pattern),
+                    None,
+                )
+                next_match_start = global_end
+                position = found + len(pattern)
+        else:
+            position = max(
+                component.start,
+                component.start + next_match_start - logical_start,
+            )
+            for match in compiled_literal.finditer(
+                component.text, position, component.end
+            ):
+                start, end = match.span()
+                global_start = logical_start + start - component.start
+                global_end = logical_start + end - component.start
+                yield (
+                    global_start,
+                    global_end,
+                    component,
+                    start,
+                    end,
+                    None,
+                )
+                next_match_start = global_end
+        if overlap > 0:
+            suffix = (
+                component.text[component.end - overlap : component.end]
+                if component_length >= overlap
+                else (
+                    suffix + component.text[component.start : component.end]
+                )[-overlap:]
+            )
+        logical_start += component_length
+
+
+def _ref_exec_source_match(
+    line: RefExecLine,
+    component: RefExecComponent | None,
+    start: int,
+    end: int,
+) -> tuple[int, int] | None:
+    if (
+        component is None
+        or component.kind != "text"
+        or component.source_char_start is None
+    ):
+        return None
+    source_start = component.source_char_start + start - component.start
+    return source_start - line.char_start, source_start - line.char_start + end - start
+
+
+def _ref_exec_logical_source_match(
+    line: RefExecLine,
+    start: int,
+    end: int,
+    cancelled: threading.Event,
+) -> tuple[RefExecComponent, int, int, tuple[int, int]] | None:
+    logical_start = 0
+    for component in _ref_exec_line_component_view(line, cancelled).components:
+        if component.kind == "synthetic_lf":
+            continue
+        logical_end = logical_start + component.end - component.start
+        if start >= logical_start and end <= logical_end:
+            local_start = component.start + start - logical_start
+            local_end = component.start + end - logical_start
+            source_match = _ref_exec_source_match(
+                line, component, local_start, local_end
+            )
+            if source_match is None:
+                return None
+            return component, local_start, local_end, source_match
+        logical_start = logical_end
+    return None
+
+
+def _ref_exec_line_source_end(
+    line: RefExecLine,
+    cancelled: threading.Event,
+) -> int:
+    source_bounds = _ref_exec_source_byte_bounds(line)
+    if source_bounds is not None:
+        return source_bounds[1]
+    line_bytes, _ = _measure_ref_text_checked(line.text, cancelled)
+    return line.byte_start + line_bytes + int(line.has_newline)
+
+
+def _ref_exec_grep(lines: Iterable[RefExecLine], stage: RefExecStage, cancelled: threading.Event) -> Iterable[RefExecLine]:
+    pattern = stage.pattern or ""
+    use_regex = _ref_exec_regex_requested(pattern, stage.flags)
+    only_matching = "o" in stage.flags and "c" not in stage.flags
+    compiled = None
+    if use_regex:
+        if _REGEX is None:
+            raise RefExecError("Error: regex support is unavailable")
+        normalized = pattern.replace(r"\|", "|")
+        try:
+            compiled = _REGEX.compile(normalized, _REGEX.IGNORECASE if "i" in stage.flags else 0)
+        except (getattr(_REGEX, "error", RuntimeError), RuntimeError) as exc:
+            raise RefExecError(f"Error: invalid regex: {exc}") from exc
+
+    def selected() -> Iterable[RefExecLine]:
+        count = 0
+        budget_start: float | None = None
+        last_line = 0
+        last_byte = 0
+        input_number = 0
+        for line in lines:
+            _check_ref_exec_cancelled(cancelled)
+            if line.metadata_only:
+                continue
+            input_number += 1
+            selected_line = False
+            source_match: tuple[int, int] | None = None
+            presented_text = None
+            if only_matching:
+                if compiled is not None:
+                    presented_text = _ref_exec_materialize_line(
+                        line, cancelled, include_synthetic_lf=False
+                    )
+                    if budget_start is None:
+                        budget_start = time.monotonic()
+                    remaining = REF_EXEC_REGEX_BUDGET_SECONDS - (
+                        time.monotonic() - budget_start
+                    )
+                    if remaining <= 0:
+                        raise RefExecError(
+                            f"Error: regex timeout; last_completed_byte={last_byte} last_completed_line={last_line}; narrow with sed -n or literal grep"
+                        )
+                    regex_matches = iter(
+                        compiled.finditer(
+                            presented_text,
+                            timeout=min(REF_EXEC_REGEX_BUDGET_SECONDS, remaining),
+                        )
+                    )
+                    matches = (
+                        (match.span(), match.group(0), None, 0, 0)
+                        for match in regex_matches
+                    )
+                else:
+                    matches = (
+                        (
+                            (start, end),
+                            crossing_fragment or pattern,
+                            component,
+                            local_start,
+                            local_end,
+                        )
+                        for start, end, component, local_start, local_end, crossing_fragment in _ref_exec_literal_component_spans(
+                            line,
+                            stage,
+                            cancelled=cancelled,
+                        )
+                    )
+                measured_text: str | None = None
+                measured_origin = 0
+                measured_end = 0
+                measured_source_byte_start = 0
+                measured_bytes = 0
+                while True:
+                    _check_ref_exec_cancelled(cancelled)
+                    if compiled is not None:
+                        remaining = REF_EXEC_REGEX_BUDGET_SECONDS - (
+                            time.monotonic() - budget_start
+                        )
+                        if remaining <= 0:
+                            raise RefExecError(
+                                f"Error: regex timeout; last_completed_byte={last_byte} last_completed_line={last_line}; narrow with sed -n or literal grep"
+                            )
+                    try:
+                        match_data = next(matches)
+                    except StopIteration:
+                        break
+                    except TimeoutError as exc:
+                        raise RefExecError(
+                            f"Error: regex timeout; last_completed_byte={last_byte} last_completed_line={last_line}; narrow with sed -n or literal grep"
+                        ) from exc
+                    (match_start, match_end), fragment, component, local_start, local_end = match_data
+                    if match_end == match_start:
+                        continue
+                    source_match = _ref_exec_source_match(
+                        line, component, local_start, local_end
+                    )
+                    if compiled is not None:
+                        logical_source_match = _ref_exec_logical_source_match(
+                            line,
+                            match_start,
+                            match_end,
+                            cancelled,
+                        )
+                        if logical_source_match is not None:
+                            component, local_start, local_end, source_match = (
+                                logical_source_match
+                            )
+                    source_backed = source_match is not None
+                    source_match_start = source_match[0] if source_match is not None else 0
+                    source_prefix_bytes = 0
+                    if source_backed:
+                        measurement_text = (
+                            component.text if component is not None else line.text
+                        )
+                        measurement_origin = (
+                            component.start if component is not None else 0
+                        )
+                        measurement_start = (
+                            local_start
+                            if component is not None
+                            else source_match_start
+                        )
+                        measurement_end = (
+                            local_end
+                            if component is not None
+                            else source_match_start + match_end - match_start
+                        )
+                        measurement_source_byte_start = (
+                            component.source_byte_start
+                            if component is not None
+                            and component.source_byte_start is not None
+                            else line.byte_start
+                        )
+                        if (
+                            measured_text is measurement_text
+                            and measured_origin == measurement_origin
+                            and measured_source_byte_start
+                            == measurement_source_byte_start
+                            and measured_end <= measurement_start
+                        ):
+                            source_prefix_bytes = measured_bytes + (
+                                _ref_exec_utf8_range_bytes(
+                                    measurement_text,
+                                    measured_end,
+                                    measurement_start,
+                                    cancelled,
+                                )
+                            )
+                        else:
+                            source_prefix_bytes = _ref_exec_utf8_range_bytes(
+                                measurement_text,
+                                measurement_origin,
+                                measurement_start,
+                                cancelled,
+                            )
+                        measured_bytes = source_prefix_bytes + (
+                            _ref_exec_utf8_range_bytes(
+                                measurement_text,
+                                measurement_start,
+                                measurement_end,
+                                cancelled,
+                            )
+                        )
+                        measured_text = measurement_text
+                        measured_origin = measurement_origin
+                        measured_end = measurement_end
+                        measured_source_byte_start = measurement_source_byte_start
+                    else:
+                        measured_text = None
+                    yield replace(
+                        line,
+                        text=(
+                            fragment
+                            if compiled is not None
+                            else (
+                                component.text[local_start:local_end]
+                                if component is not None
+                                else fragment
+                            )
+                        ),
+                        byte_start=(
+                            component.source_byte_start + source_prefix_bytes
+                            if source_backed
+                            and component is not None
+                            and component.source_byte_start is not None
+                            else line.byte_start + source_prefix_bytes
+                        ),
+                        char_start=(
+                            line.char_start + source_match_start
+                            if source_backed
+                            else line.char_start
+                        ),
+                        match_start=None,
+                        match_end=None,
+                        display_prefix=(
+                            f"{input_number}:" if "n" in stage.flags else ""
+                        ),
+                        has_newline=True,
+                        byte_range=None,
+                        metadata_only=False,
+                        atomic_match=True,
+                        component_view=None,
+                    )
+                last_line = line.number
+                last_byte = _ref_exec_line_source_end(line, cancelled)
+                continue
+            if compiled is not None:
+                presented_text = _ref_exec_materialize_line(
+                    line, cancelled, include_synthetic_lf=False
+                )
+                if budget_start is None:
+                    budget_start = time.monotonic()
+                remaining = REF_EXEC_REGEX_BUDGET_SECONDS - (time.monotonic() - budget_start)
+                if remaining <= 0:
+                    raise RefExecError(
+                        f"Error: regex timeout; last_completed_byte={last_byte} last_completed_line={last_line}; narrow with sed -n or literal grep"
+                    )
+                try:
+                    # regex requires one contiguous string for cross-boundary matches.
+                    # Keep that unavoidable temporary to one current logical line and
+                    # only when a prior stage contributed presentation text.
+                    match = compiled.search(
+                        presented_text,
+                        timeout=min(REF_EXEC_REGEX_BUDGET_SECONDS, remaining),
+                    )
+                except TimeoutError as exc:
+                    raise RefExecError(
+                        f"Error: regex timeout; last_completed_byte={last_byte} last_completed_line={last_line}; narrow with sed -n or literal grep"
+                    ) from exc
+                if match is not None:
+                    selected_line = True
+                    match_start, match_end = match.span()
+                    logical_source_match = _ref_exec_logical_source_match(
+                        line,
+                        match_start,
+                        match_end,
+                        cancelled,
+                    )
+                    if logical_source_match is not None:
+                        _, _, _, source_match = logical_source_match
+            else:
+                literal_match = next(
+                    iter(
+                        _ref_exec_literal_component_spans(
+                            line,
+                            stage,
+                            cancelled=cancelled,
+                        )
+                    ),
+                    None,
+                )
+                selected_line = literal_match is not None
+                if literal_match is not None:
+                    _, _, component, local_start, local_end, _ = literal_match
+                    source_match = _ref_exec_source_match(
+                        line, component, local_start, local_end
+                    )
+            last_line = line.number
+            last_byte = _ref_exec_line_source_end(line, cancelled)
+            if not selected_line:
+                continue
+            count += 1
+            if "c" not in stage.flags:
+                display_prefix = (
+                    f"{input_number}:" if "n" in stage.flags else ""
+                )
+                component_view = line.component_view
+                if component_view is not None and display_prefix:
+                    component_view = RefExecComponentView(
+                        (
+                            _ref_exec_component(
+                                "display_prefix", display_prefix, cancelled
+                            ),
+                            *component_view.components,
+                        )
+                    )
+                    display_prefix = ""
+                elif component_view is None:
+                    display_prefix += line.display_prefix
+                yield replace(
+                    line,
+                    match_start=source_match[0] if source_match is not None else None,
+                    match_end=source_match[1] if source_match is not None else None,
+                    display_prefix=display_prefix,
+                    component_view=component_view,
+                )
+        if "c" in stage.flags:
+            yield RefExecLine(str(count), 1, 0, 0, False)
+
+    return selected()
+
+
+def _count_ref_words_checked(
+    text: str,
+    cancelled: threading.Event,
+    *,
+    prefix: str = "",
+) -> int:
+    count = 0
+    previous_ended_in_word = False
+    for part in (prefix, text):
+        for offset in range(0, len(part), REF_TEXT_HASH_CHUNK_CHARS):
+            _check_ref_exec_cancelled(cancelled)
+            chunk = part[offset : offset + REF_TEXT_HASH_CHUNK_CHARS]
+            chunk_count = sum(1 for _ in re.finditer(r"\S+", chunk))
+            if previous_ended_in_word and chunk and not chunk[0].isspace():
+                chunk_count -= 1
+            count += chunk_count
+            previous_ended_in_word = bool(chunk) and not chunk[-1].isspace()
+    return count
+
+
+def _ref_exec_wc(lines: Iterable[RefExecLine], flag: str, cancelled: threading.Event) -> Iterable[RefExecLine]:
+    line_count = 0
+    word_count = 0
+    byte_count = 0
+    for line in lines:
+        _check_ref_exec_cancelled(cancelled)
+        if line.metadata_only:
+            continue
+        line_count += 1
+        if line.component_view is None:
+            word_count += _count_ref_words_checked(
+                line.text, cancelled, prefix=line.display_prefix
+            )
+            encoded_bytes, _ = _measure_ref_text_parts_checked(
+                (line.display_prefix, line.text), cancelled
+            )
+            byte_count += encoded_bytes + int(line.has_newline)
+            continue
+        previous_ended_in_word = False
+        for component in line.component_view.components:
+            byte_count += component.utf8_bytes
+            for offset in range(
+                component.start, component.end, REF_TEXT_HASH_CHUNK_CHARS
+            ):
+                _check_ref_exec_cancelled(cancelled)
+                chunk_end = min(
+                    component.end, offset + REF_TEXT_HASH_CHUNK_CHARS
+                )
+                chunk = component.text[offset:chunk_end]
+                chunk_count = sum(1 for _ in re.finditer(r"\S+", chunk))
+                if previous_ended_in_word and chunk and not chunk[0].isspace():
+                    chunk_count -= 1
+                word_count += chunk_count
+                previous_ended_in_word = bool(chunk) and not chunk[-1].isspace()
+    value = {"l": line_count, "w": word_count, "c": byte_count}[flag]
+    yield RefExecLine(str(value), 1, 0, 0, False)
+
+
+def _ref_exec_stat(entry: RefCatalogEntry, cancelled: threading.Event) -> Iterable[RefExecLine]:
+    line_count = 0
+    word_count = 0
+    character_count = 0
+    for line in _iter_ref_source_lines(entry.source, cancelled):
+        line_count += 1
+        word_count += _count_ref_words_checked(line.text, cancelled)
+        character_count += len(line.text) + int(line.has_newline)
+    manifest = entry.manifest
+    text = (
+        f"ref={manifest.ref} kind={manifest.ref.split(':', 1)[0]} utf8_bytes={manifest.utf8_bytes} "
+        f"lines={line_count} words={word_count} chars={character_count} sha256={manifest.sha256}"
+    )
+    yield RefExecLine(text, 1, 0, 0, False)
+
+
+def _ref_exec_response_fits(
+    text: str,
+    *,
+    threshold_tokens: int,
+    encoder: Any,
+    cancelled: threading.Event,
+) -> bool:
+    encoded_bytes, _ = _measure_ref_text_checked(text, cancelled)
+    if encoded_bytes > REF_EXEC_RESPONSE_MAX_BYTES:
+        return False
+    if encoder is None:
+        return encoded_bytes < threshold_tokens
+    token_count = _encode_text_token_count(encoder, text)
+    if token_count is None:
+        return encoded_bytes < threshold_tokens
+    return token_count < threshold_tokens
+
+
+def _ref_exec_truncated_marker(next_command: str) -> str:
+    payload = json.dumps(
+        {"next": next_command},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        "\n<auto_compact_ref_truncated>"
+        f"{payload}"
+        "</auto_compact_ref_truncated>"
+    )
+
+
+def _ref_exec_truncated_prefix(
+    text: str,
+    *,
+    marker: str,
+    continuation_ref: str | None = None,
+    threshold_tokens: int,
+    encoder: Any,
+    cancelled: threading.Event,
+) -> str:
+    marker_bytes, _ = _measure_ref_text_checked(marker, cancelled)
+    bounded_text = _ref_exec_utf8_prefix(
+        text,
+        max(0, REF_EXEC_RESPONSE_MAX_BYTES - marker_bytes),
+        cancelled,
+    )
+    low = 0
+    high = len(bounded_text)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        prefix = bounded_text[:midpoint]
+        prefix_bytes, _ = _measure_ref_text_checked(prefix, cancelled)
+        candidate_marker = (
+            marker
+            if continuation_ref is None
+            else _ref_exec_truncated_marker(
+                f"tail -c +{prefix_bytes + 1} {continuation_ref}"
+            )
+        )
+        candidate = prefix + candidate_marker
+        if _ref_exec_response_fits(
+            candidate,
+            threshold_tokens=threshold_tokens,
+            encoder=encoder,
+            cancelled=cancelled,
+        ):
+            low = midpoint
+        else:
+            high = midpoint - 1
+    prefix = bounded_text[:low]
+    prefix_bytes, _ = _measure_ref_text_checked(prefix, cancelled)
+    return prefix + (
+        marker
+        if continuation_ref is None
+        else _ref_exec_truncated_marker(
+            f"tail -c +{prefix_bytes + 1} {continuation_ref}"
+        )
+    )
+
+
+def _ref_exec_component_view_prefix(
+    view: RefExecComponentView,
+    max_bytes: int,
+    cancelled: threading.Event,
+) -> str:
+    parts: list[str] = []
+    remaining = max_bytes
+    for component in view.components:
+        if remaining <= 0:
+            break
+        if component.utf8_bytes <= remaining:
+            parts.append(component.text[component.start : component.end])
+            remaining -= component.utf8_bytes
+            continue
+        end, retained = _ref_exec_component_prefix_index(
+            component, remaining, cancelled
+        )
+        parts.append(component.text[component.start:end])
+        remaining -= retained
+        break
+    return "".join(parts)
+
+
+def _ref_exec_grep_excerpt(
+    line: RefExecLine,
+    *,
+    threshold_tokens: int,
+    encoder: Any,
+    cancelled: threading.Event,
+) -> str:
+    match_start = line.match_start or 0
+    match_end = line.match_end if line.match_end is not None else match_start
+    if line.component_view is None:
+        source_text = line.text
+        source_start = 0
+        source_end = len(source_text)
+        display_prefix = line.display_prefix
+    else:
+        text_component = next(
+            (
+                component
+                for component in line.component_view.components
+                if component.kind == "text"
+            ),
+            None,
+        )
+        if text_component is None:
+            raise RefExecError("Error: grep excerpt has no source-backed text")
+        source_text = text_component.text
+        source_start = text_component.start
+        source_end = text_component.end
+        match_start += source_start
+        match_end += source_start
+        display_prefix = _ref_exec_materialize_components(
+            (
+                component
+                for component in line.component_view.components
+                if component.kind == "display_prefix"
+            )
+        )
+    line_bytes = _ref_exec_utf8_range_bytes(
+        source_text, source_start, source_end, cancelled
+    )
+    prefix_bytes = _ref_exec_utf8_range_bytes(
+        source_text, source_start, match_start, cancelled
+    )
+    match_bytes = _ref_exec_utf8_range_bytes(
+        source_text, match_start, match_end, cancelled
+    )
+    display_prefix_bytes, _ = _measure_ref_text_checked(display_prefix, cancelled)
+    absolute_byte_start = line.byte_start + prefix_bytes
+    absolute_char_start = line.char_start + match_start - source_start
+    left = max(source_start, match_start - 8_192)
+    right = min(source_end, max(match_end, match_start + 1) + 8_192)
+    while True:
+        omitted_prefix = _ref_exec_utf8_range_bytes(
+            source_text, source_start, left, cancelled
+        )
+        visible_end_bytes = _ref_exec_utf8_range_bytes(
+            source_text, source_start, right, cancelled
+        )
+        omitted_suffix = line_bytes - visible_end_bytes
+        marker_payload = json.dumps(
+            {
+                "line": line.number,
+                "match_byte_start": absolute_byte_start,
+                "match_byte_end": absolute_byte_start + match_bytes,
+                "match_char_start": absolute_char_start,
+                "match_char_end": line.char_start + match_end - source_start,
+                "omitted_prefix_bytes": omitted_prefix,
+                "omitted_suffix_bytes": omitted_suffix,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        marker = f"\n<auto_compact_ref_excerpt>{marker_payload}</auto_compact_ref_excerpt>"
+        visible_bytes = visible_end_bytes - omitted_prefix
+        marker_bytes, _ = _measure_ref_text_checked(marker, cancelled)
+        if display_prefix_bytes + visible_bytes + marker_bytes > REF_EXEC_RESPONSE_MAX_BYTES:
+            if left >= match_start and right <= match_end:
+                raise RefExecError("Error: response budget cannot contain the complete grep match")
+            left = min(match_start, left + max(1, (match_start - left) // 2))
+            right = max(match_end, right - max(1, (right - match_end) // 2))
+            continue
+        candidate = display_prefix + source_text[left:right] + marker
+        if _ref_exec_response_fits(
+            candidate,
+            threshold_tokens=threshold_tokens,
+            encoder=encoder,
+            cancelled=cancelled,
+        ):
+            return candidate
+        if left >= match_start and right <= match_end:
+            raise RefExecError("Error: response budget cannot contain the complete grep match")
+        left = min(match_start, left + max(1, (match_start - left) // 2))
+        right = max(match_end, right - max(1, (right - match_end) // 2))
+
+
+def _ref_exec_format_byte_range(start: int, end: int | None) -> str:
+    return f"{start}-{'*' if end is None else end}"
+
+
+def _ref_exec_byte_range_marker(
+    byte_range: RefExecByteRange,
+    *,
+    continuation: bool = False,
+    next_command: str | None = None,
+) -> str:
+    metadata = {
+        "actual": (
+            None
+            if byte_range.actual_empty
+            or byte_range.actual_end is not None
+            and byte_range.actual_end < byte_range.actual_start
+            else _ref_exec_format_byte_range(
+                byte_range.actual_start, byte_range.actual_end
+            )
+        ),
+        "requested": _ref_exec_format_byte_range(
+            byte_range.requested_start, byte_range.requested_end
+        ),
+    }
+    if continuation:
+        metadata["next"] = next_command or "wc|grep|head|tail|sed"
+    payload = json.dumps(
+        metadata,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"\n<auto_compact_ref_range>{payload}</auto_compact_ref_range>"
+
+
+def _ref_exec_truncated_byte_response(
+    text: str,
+    *,
+    byte_range: RefExecByteRange,
+    continuation_ref: str | None = None,
+    threshold_tokens: int,
+    encoder: Any,
+    cancelled: threading.Event,
+) -> str:
+    bounded_text = _ref_exec_utf8_prefix(text, REF_EXEC_RESPONSE_MAX_BYTES, cancelled)
+    low = 0
+    high = len(bounded_text)
+    result = ""
+    while low <= high:
+        midpoint = (low + high) // 2
+        prefix = bounded_text[:midpoint]
+        prefix_bytes, _ = _measure_ref_text_checked(prefix, cancelled)
+        actual_end = byte_range.actual_start + prefix_bytes - 1
+        marker_range = replace(
+            byte_range,
+            actual_end=actual_end,
+            marked=True,
+            actual_empty=prefix_bytes == 0,
+        )
+        candidate = prefix + _ref_exec_byte_range_marker(
+            marker_range,
+            continuation=True,
+            next_command=(
+                f"tail -c +{actual_end + 1} {continuation_ref}"
+                if continuation_ref is not None
+                else None
+            ),
+        )
+        if _ref_exec_response_fits(
+            candidate,
+            threshold_tokens=threshold_tokens,
+            encoder=encoder,
+            cancelled=cancelled,
+        ):
+            result = candidate
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    return result
+
+
+def _collect_ref_exec_response(
+    lines: Iterable[RefExecLine],
+    *,
+    continuation_ref: str | None,
+    final_grep: bool,
+    preserve_source_newlines: bool,
+    threshold_tokens: int,
+    encoder: Any,
+    cancelled: threading.Event,
+) -> str:
+    response = ""
+    response_bytes = 0
+    emitted_output = False
+    selected_byte_range: RefExecByteRange | None = None
+    atomic_boundaries = [0]
+    for line in lines:
+        _check_ref_exec_cancelled(cancelled)
+        if line.byte_range is not None:
+            current_range = line.byte_range
+            if selected_byte_range is None or (
+                selected_byte_range.requested_start,
+                selected_byte_range.requested_end,
+            ) != (current_range.requested_start, current_range.requested_end):
+                selected_byte_range = current_range
+            else:
+                existing_has_actual = not selected_byte_range.actual_empty
+                current_has_actual = not current_range.actual_empty
+                selected_byte_range = replace(
+                    current_range,
+                    actual_start=(
+                        selected_byte_range.actual_start
+                        if existing_has_actual
+                        else current_range.actual_start
+                    ),
+                    actual_end=(
+                        current_range.actual_end
+                        if current_has_actual
+                        else selected_byte_range.actual_end
+                    ),
+                    marked=selected_byte_range.marked or current_range.marked,
+                    actual_empty=not (existing_has_actual or current_has_actual),
+                )
+            if line.metadata_only:
+                continue
+        separator = "\n" if emitted_output and not preserve_source_newlines else ""
+        if line.component_view is None:
+            line_ending = "\n" if preserve_source_newlines and line.has_newline else ""
+            line_bytes, _ = _measure_ref_text_parts_checked(
+                (separator, line.display_prefix, line.text, line_ending), cancelled
+            )
+        else:
+            line_ending = ""
+            line_bytes = len(separator.encode("utf-8")) + sum(
+                component.utf8_bytes
+                for component in line.component_view.components
+                if preserve_source_newlines or component.kind != "synthetic_lf"
+            )
+        complete_bytes = response_bytes + line_bytes
+        candidate: str | None = None
+        if complete_bytes <= REF_EXEC_RESPONSE_MAX_BYTES:
+            if line.component_view is None:
+                presented_line = line.display_prefix + line.text
+            else:
+                presented_line = _ref_exec_materialize_line(
+                    line,
+                    cancelled,
+                    include_synthetic_lf=preserve_source_newlines,
+                )
+            candidate = response + separator + presented_line + line_ending
+            if selected_byte_range is not None and not final_grep:
+                response = candidate
+                response_bytes = complete_bytes
+                emitted_output = True
+                if line.atomic_match:
+                    atomic_boundaries.append(len(response))
+                continue
+            if _ref_exec_response_fits(
+                candidate,
+                threshold_tokens=threshold_tokens,
+                encoder=encoder,
+                cancelled=cancelled,
+            ):
+                response = candidate
+                response_bytes = complete_bytes
+                emitted_output = True
+                if line.atomic_match:
+                    atomic_boundaries.append(len(response))
+                continue
+        if line.atomic_match:
+            if not emitted_output:
+                return "Error: complete grep match exceeds the response budget; page source bytes with tail -c +N REF"
+            marker = _ref_exec_truncated_marker("wc|grep|head|tail|sed")
+            for boundary in reversed(atomic_boundaries):
+                atomic_response = response[:boundary] + marker
+                if _ref_exec_response_fits(
+                    atomic_response,
+                    threshold_tokens=threshold_tokens,
+                    encoder=encoder,
+                    cancelled=cancelled,
+                ):
+                    return atomic_response
+            return marker
+        if final_grep and line.match_start is not None and not emitted_output:
+            return _ref_exec_grep_excerpt(
+                line,
+                threshold_tokens=threshold_tokens,
+                encoder=encoder,
+                cancelled=cancelled,
+            )
+        marker = _ref_exec_truncated_marker("wc|grep|head|tail|sed")
+        if candidate is None:
+            remaining_bytes = max(
+                0,
+                REF_EXEC_RESPONSE_MAX_BYTES - response_bytes - len(separator),
+            )
+            if line.component_view is None:
+                display_prefix = _ref_exec_utf8_prefix(
+                    line.display_prefix, remaining_bytes, cancelled
+                )
+                display_prefix_bytes, _ = _measure_ref_text_checked(
+                    display_prefix, cancelled
+                )
+                source_prefix = (
+                    _ref_exec_utf8_prefix(
+                        line.text,
+                        remaining_bytes - display_prefix_bytes,
+                        cancelled,
+                    )
+                    if display_prefix == line.display_prefix
+                    else ""
+                )
+                line_prefix = display_prefix + source_prefix
+            else:
+                line_prefix = _ref_exec_component_view_prefix(
+                    line.component_view, remaining_bytes, cancelled
+                )
+            candidate = response + separator + line_prefix
+        if selected_byte_range is not None:
+            return _ref_exec_truncated_byte_response(
+                candidate,
+                byte_range=selected_byte_range,
+                continuation_ref=continuation_ref,
+                threshold_tokens=threshold_tokens,
+                encoder=encoder,
+                cancelled=cancelled,
+            )
+        return _ref_exec_truncated_prefix(
+            candidate,
+            marker=marker,
+            continuation_ref=continuation_ref,
+            threshold_tokens=threshold_tokens,
+            encoder=encoder,
+            cancelled=cancelled,
+        )
+    if selected_byte_range is not None and selected_byte_range.marked:
+        candidate = response + _ref_exec_byte_range_marker(selected_byte_range)
+        if _ref_exec_response_fits(
+            candidate,
+            threshold_tokens=threshold_tokens,
+            encoder=encoder,
+            cancelled=cancelled,
+        ):
+            return candidate
+        return _ref_exec_truncated_byte_response(
+            response,
+            byte_range=selected_byte_range,
+            continuation_ref=continuation_ref,
+            threshold_tokens=threshold_tokens,
+            encoder=encoder,
+            cancelled=cancelled,
+        )
+    if selected_byte_range is not None and not _ref_exec_response_fits(
+        response,
+        threshold_tokens=threshold_tokens,
+        encoder=encoder,
+        cancelled=cancelled,
+    ):
+        return _ref_exec_truncated_byte_response(
+            response,
+            byte_range=selected_byte_range,
+            continuation_ref=continuation_ref,
+            threshold_tokens=threshold_tokens,
+            encoder=encoder,
+            cancelled=cancelled,
+        )
+    return response
+
+
+def _execute_ref_reader_sync(
+    stages: tuple[RefExecStage, ...],
+    catalog: tuple[RefCatalogEntry, ...],
+    *,
+    threshold_tokens: int,
+    encoder: Any,
+    cancelled: threading.Event,
+) -> str:
+    first = stages[0]
+    verified_source: Iterable[RefExecLine] | None = None
+    if first.command == "ls":
+        lines: Iterable[RefExecLine] = (
+            RefExecLine(entry.manifest.ref, index, 0, 0, False)
+            for index, entry in enumerate(catalog, 1)
+            if first.list_kind is None
+            or entry.manifest.ref.startswith(f"{first.list_kind}:")
+        )
+    else:
+        entry = next(
+            (
+                candidate
+                for candidate in catalog
+                if candidate.manifest.ref == (first.ref or "")
+            ),
+            None,
+        )
+        if entry is None:
+            raise RefExecError(
+                "Error: externalized ref is not available in this binding. Expected REF: tool:<64 hex> or history:accp_<64 hex>"
+            )
+        first_is_byte_stage = first.byte_count is not None or first.byte_start is not None
+        if first.command in {"grep", "wc"} or first_is_byte_stage:
+            verified_source = _iter_verified_ref_source_lines(entry, cancelled)
+            lines = verified_source
+        else:
+            measured_bytes, measured_hash = _measure_ref_source_checked(entry.source, cancelled)
+            if measured_bytes != entry.manifest.utf8_bytes or measured_hash != entry.manifest.sha256:
+                raise RefExecError("Error: externalized ref integrity verification failed")
+            lines = _ref_exec_stat(entry, cancelled) if first.command == "stat" else _iter_ref_source_lines(entry.source, cancelled)
+        if first.command == "head":
+            lines = (
+                _ref_exec_head_bytes(lines, first.byte_count, cancelled)
+                if first.byte_count is not None
+                else _ref_exec_head(lines, first.count or 0, cancelled)
+            )
+        elif first.command == "tail":
+            if first.byte_start is not None:
+                lines = _ref_exec_tail_from_bytes(lines, first.byte_start, cancelled)
+            elif first.byte_count is not None:
+                lines = _ref_exec_tail_bytes(lines, first.byte_count, cancelled)
+            else:
+                lines = _ref_exec_tail(lines, first.count or 0, cancelled)
+        elif first.command == "sed":
+            lines = _ref_exec_sed(lines, first.start_line or 1, first.end_line, cancelled)
+        elif first.command == "grep":
+            lines = _ref_exec_grep(lines, first, cancelled)
+        elif first.command == "wc":
+            lines = _ref_exec_wc(lines, next(iter(first.flags)), cancelled)
+    for stage in stages[1:]:
+        if stage.command == "head":
+            lines = (
+                _ref_exec_head_bytes(lines, stage.byte_count, cancelled)
+                if stage.byte_count is not None
+                else _ref_exec_head(lines, stage.count or 0, cancelled)
+            )
+        elif stage.command == "tail":
+            if stage.byte_start is not None:
+                lines = _ref_exec_tail_from_bytes(lines, stage.byte_start, cancelled)
+            elif stage.byte_count is not None:
+                lines = _ref_exec_tail_bytes(lines, stage.byte_count, cancelled)
+            else:
+                lines = _ref_exec_tail(lines, stage.count or 0, cancelled)
+        elif stage.command == "sed":
+            lines = _ref_exec_sed(lines, stage.start_line or 1, stage.end_line, cancelled)
+        elif stage.command == "grep":
+            lines = _ref_exec_grep(lines, stage, cancelled)
+        elif stage.command == "wc":
+            lines = _ref_exec_wc(lines, next(iter(stage.flags)), cancelled)
+    final = stages[-1]
+    continuation_ref = (
+        first.ref
+        if len(stages) == 1
+        and (first.command == "cat" or first.command == "tail" and first.byte_start is not None)
+        else None
+    )
+    response = _collect_ref_exec_response(
+        lines,
+        continuation_ref=continuation_ref,
+        final_grep=final.command == "grep" and "c" not in final.flags,
+        preserve_source_newlines=(
+            len(stages) == 1 and first.command in {"cat", "head"}
+        )
+        or final.byte_count is not None
+        or final.byte_start is not None,
+        threshold_tokens=threshold_tokens,
+        encoder=encoder,
+        cancelled=cancelled,
+    )
+    if verified_source is not None:
+        for _ in verified_source:
+            _check_ref_exec_cancelled(cancelled)
+    return response
+
+
+def _new_ref_reader(
+    request: Any,
+    key: RefBindingKey,
+    *,
+    threshold_tokens: int,
+    encoder: Any = None,
+) -> Callable[[str], Awaitable[str]]:
+    request_state: dict[str, Any] = {"request": None}
+    try:
+        request_ref = weakref.ref(request)
+    except TypeError:
+        request_ref = None
+        request_state["request"] = request
+
+    async def reader(command: str = "") -> str:
+        """Inspect one binding-local externalized ref with bounded virtual reader commands.
+
+        :param command: Use ls, stat, wc, head, tail, sed -n, grep, or cat and optional bounded pipelines.
+        """
+        try:
+            if not isinstance(command, str):
+                return REF_EXEC_USAGE_ERROR
+            active_request = (
+                request_ref() if request_ref is not None else request_state["request"]
+            )
+            if active_request is None:
+                return "Error: externalized ref binding is unavailable"
+            if not await _chat_owner_authorized(key.chat_id, key.user_id):
+                return "Error: externalized ref authorization is no longer valid"
+            stages = _parse_ref_exec_command(command)
+            first_ref = stages[0].ref
+            store = _ref_request_store(active_request, create=False)
+            binding = store.bindings.get(key) if store is not None else None
+            if binding is None or binding.reader is not reader:
+                return "Error: externalized ref binding is unavailable"
+            catalog = binding.catalog
+            if first_ref is not None:
+                requested = next(
+                    (entry for entry in catalog if entry.manifest.ref == first_ref),
+                    None,
+                )
+                if requested is not None and isinstance(requested.source, HistoryRefSourceHandle):
+                    try:
+                        resolved = await resolve_history_ref_catalog_entry(
+                            requested,
+                            request=active_request,
+                            metadata={
+                                "chat_id": requested.source.chat_id,
+                                "user_message_id": requested.source.user_message_id,
+                            },
+                            transient_message_patterns=requested.source.transient_message_patterns,
+                        )
+                    except CanonicalHistoryError as exc:
+                        return f"Error: externalized history ref unavailable: {exc.reason}"
+                    catalog = tuple(
+                        resolved if entry.manifest.ref == first_ref else entry
+                        for entry in catalog
+                    )
+            cancelled = threading.Event()
+            resolved_encoder = encoder
+            if resolved_encoder is None and stages[-1].command != "wc":
+                resolved_encoder, _ = _get_tiktoken_encoder(active_request)
+            try:
+                worker = asyncio.create_task(
+                    asyncio.to_thread(
+                        _execute_ref_reader_sync,
+                        stages,
+                        catalog,
+                        threshold_tokens=threshold_tokens,
+                        encoder=resolved_encoder,
+                        cancelled=cancelled,
+                    )
+                )
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled.set()
+                try:
+                    await asyncio.shield(worker)
+                except Exception:
+                    pass
+                raise
+        except RefExecError as exc:
+            return str(exc)
+        except Exception:
+            LOG.exception(
+                "Unexpected externalized ref reader failure (chat_id=%s)",
+                key.chat_id,
+            )
+            return "Error: externalized ref reader is unavailable"
+
+    reader.__name__ = f"ref_reader_{hash(key)}"
+    reader._auto_compact_request_state = request_state
+    return reader
+
+
+def _invalidate_ref_reader(reader: Callable[[str], Awaitable[str]]) -> None:
+    request_state = getattr(reader, "_auto_compact_request_state", None)
+    if isinstance(request_state, dict):
+        request_state["request"] = None
+
+
+def stage_ref_attempt(
+    request: Any,
+    reservation: RefReservation,
+    plan: RefProjectionPlan,
+    *,
+    threshold_tokens: int = 10_000,
+) -> RefAttempt:
+    store = _ref_request_store(request, create=False)
+    binding = store.bindings.get(reservation.key) if store is not None else None
+    reader = (
+        binding.reader
+        if binding is not None and binding.registry is reservation.registry
+        else _new_ref_reader(
+            request,
+            reservation.key,
+            threshold_tokens=threshold_tokens,
+        )
+    )
+    return RefAttempt(
+        key=reservation.key,
+        generation=reservation.generation,
+        plan=plan,
+        registry=reservation.registry,
+        reader=reader,
+        previous_binding=binding,
+        previous_reader_entry=reservation.registry.get(
+            REF_EXEC_TOOL_NAME,
+            REF_REGISTRY_ENTRY_MISSING,
+        ),
+    )
+
+
+async def authorize_ref_attempt(attempt: RefAttempt) -> RefAttempt:
+    if not await _chat_owner_authorized(attempt.key.chat_id, attempt.key.user_id):
+        raise RefProjectionError(stage="authorization")
+    return attempt
+
+
+def register_ref_attempt(attempt: RefAttempt) -> RefStateDelta:
+    existing = attempt.registry.get(REF_EXEC_TOOL_NAME)
+    if existing is not None and (
+        not isinstance(existing, dict) or existing.get("callable") is not attempt.reader
+    ):
+        raise RefProjectionError(stage="registration")
+    return RefStateDelta(
+        added_refs=tuple(entry.manifest.ref for entry in attempt.plan.catalog),
+        generation=attempt.generation,
+    )
+
+
+async def compare_and_swap_ref_generation(
+    request: Any,
+    attempt: RefAttempt,
+) -> bool:
+    store = _ref_request_store(request, create=True)
+    if store is None:
+        return False
+    async with store.lock:
+        reservation = store.reservations.get(attempt.key)
+        if (
+            reservation is None
+            or reservation.generation != attempt.generation
+            or reservation.registry is not attempt.registry
+        ):
+            return False
+        current = store.bindings.get(attempt.key)
+        owner_key = store.registry_owners.get(id(attempt.registry))
+        if owner_key is not None and owner_key != attempt.key:
+            return False
+        existing = attempt.registry.get(REF_EXEC_TOOL_NAME)
+        if existing is not None and (
+            current is None
+            or current.registry is not attempt.registry
+            or not isinstance(existing, dict)
+            or existing.get("spec") != ref_exec_tool_spec_payload()["function"]
+            or existing.get("callable") is not current.reader
+        ):
+            return False
+        catalog_by_ref = {
+            entry.manifest.ref: entry
+            for entry in (current.catalog if current is not None else ())
+        }
+        for entry in attempt.plan.catalog:
+            catalog_by_ref.setdefault(entry.manifest.ref, entry)
+        attempt.registry[REF_EXEC_TOOL_NAME] = {
+            "spec": ref_exec_tool_spec_payload()["function"],
+            "callable": attempt.reader,
+        }
+        store.bindings[attempt.key] = RefBindingState(
+            generation=attempt.generation,
+            catalog=tuple(catalog_by_ref.values()),
+            registry=attempt.registry,
+            reader=attempt.reader,
+        )
+        store.registry_owners[id(attempt.registry)] = attempt.key
+        store.reservations.pop(attempt.key, None)
+        pending = store.registry_reservations.get(id(attempt.registry))
+        if pending is reservation:
+            store.registry_reservations.pop(id(attempt.registry), None)
+        return True
+
+
+async def commit_ref_attempt(request: Any, attempt: RefAttempt) -> RefAttempt:
+    if not await compare_and_swap_ref_generation(request, attempt):
+        raise RefProjectionError(stage="generation CAS")
+    return attempt
+
+
+async def rollback_ref_attempt(request: Any, attempt: RefAttempt) -> None:
+    store = _ref_request_store(request, create=False)
+    if store is None:
+        return
+    async with store.lock:
+        reservation = store.reservations.get(attempt.key)
+        if reservation is not None:
+            if (
+                reservation.generation == attempt.generation
+                and reservation.registry is attempt.registry
+            ):
+                _release_ref_reservation_locked(store, reservation)
+                return
+            if (
+                reservation.generation > attempt.generation
+                and reservation.registry is attempt.registry
+            ):
+                return
+        binding = store.bindings.get(attempt.key)
+        if (
+            binding is None
+            or binding.generation != attempt.generation
+            or binding.registry is not attempt.registry
+        ):
+            return
+        cleanup = store.deferred_cleanups.get(attempt.key)
+        if cleanup is not None and _deferred_cleanup_matches_attempt(
+            cleanup,
+            attempt,
+            binding,
+        ):
+            store.deferred_cleanups.pop(attempt.key, None)
+            _teardown_ref_binding_locked(store, attempt.key, binding)
+            return
+        existing = attempt.registry.get(REF_EXEC_TOOL_NAME)
+        owns_registry_entry = (
+            isinstance(existing, dict) and existing.get("callable") is attempt.reader
+        )
+        if not owns_registry_entry:
+            store.bindings.pop(attempt.key, None)
+            store.registry_owners.pop(id(attempt.registry), None)
+            if attempt.previous_binding is None:
+                _invalidate_ref_reader(attempt.reader)
+            return
+        if attempt.previous_binding is None:
+            store.bindings.pop(attempt.key, None)
+            store.registry_owners.pop(id(attempt.registry), None)
+            _invalidate_ref_reader(attempt.reader)
+        else:
+            store.bindings[attempt.key] = attempt.previous_binding
+            store.registry_owners[id(attempt.registry)] = attempt.key
+        if attempt.previous_reader_entry is REF_REGISTRY_ENTRY_MISSING:
+            attempt.registry.pop(REF_EXEC_TOOL_NAME, None)
+        else:
+            attempt.registry[REF_EXEC_TOOL_NAME] = attempt.previous_reader_entry
+
+
+async def cleanup_ref_attempt(request: Any, attempt: RefAttempt) -> None:
+    store = _ref_request_store(request, create=False)
+    if store is None:
+        return
+    async with store.lock:
+        binding = store.bindings.get(attempt.key)
+        if (
+            binding is None
+            or binding.generation != attempt.generation
+            or binding.registry is not attempt.registry
+            or binding.reader is not attempt.reader
+        ):
+            return
+        reservation = store.reservations.get(attempt.key)
+        if (
+            reservation is not None
+            and reservation.generation > attempt.generation
+            and reservation.registry is attempt.registry
+        ):
+            store.deferred_cleanups[attempt.key] = RefDeferredCleanup(
+                generation=binding.generation,
+                successor_generation=reservation.generation,
+                registry=binding.registry,
+                reader=binding.reader,
+            )
+            return
+        cleanup = store.deferred_cleanups.get(attempt.key)
+        if cleanup is not None and _deferred_cleanup_targets_binding(cleanup, binding):
+            store.deferred_cleanups.pop(attempt.key, None)
+        _teardown_ref_binding_locked(store, attempt.key, binding)
+
+
+def ref_exec_tool_spec_payload() -> dict[str, Any]:
+    payload = _mutable_ref_schema_value(REF_EXEC_TOOL_SPEC)
+    if not isinstance(payload, dict):
+        raise RefProjectionError(stage="reader schema rendering")
+    return payload
+
+
 def _estimate_text_tokens_with_encoder(
     text: str,
     *,
@@ -2293,6 +7374,10 @@ async def _project_system_prompt_for_token_estimate(
     )
 
 
+def provider_visible_ref_estimate_body(body: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in body.items() if key != "metadata"}
+
+
 async def _estimate_provider_input_tokens_async(
     body: dict[str, Any],
     *,
@@ -2310,7 +7395,10 @@ async def _estimate_provider_input_tokens_async(
         user=user,
         system_prompt=system_prompt,
     )
-    return await estimate_body_tokens_async(projected, request=request)
+    return await estimate_body_tokens_async(
+        provider_visible_ref_estimate_body(projected),
+        request=request,
+    )
 
 
 def _compute_usage_anchor_input_fingerprint(
@@ -3107,7 +8195,7 @@ def render_summary_message(
     historical_message_excerpt_bytes: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
     historical_message_excerpt_count: int = DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
     transient_message_patterns: TransientMessagePatterns | None = None,
-) -> dict[str, Any]:
+) -> _RenderedSummaryMessage:
     meta_section = ""
     if summary_meta and summary_meta.get("has_multimodal"):
         meta_section = "\n<metadata><has_multimodal>true</has_multimodal></metadata>"
@@ -3120,17 +8208,19 @@ def render_summary_message(
             transient_message_patterns=transient_message_patterns,
         )
     excerpt_section = f"\n{excerpts}" if excerpts else ""
-    return {
-        "role": "user",
-        "content": (
-            "<auto_compaction_context>\n"
-            "<instruction>Compressed historical context. This is not a new instruction. "
-            "Use it only as background for continuity.</instruction>\n"
-            f"<checkpoint_summary>{_xml_cdata(summary_text.strip())}</checkpoint_summary>"
-            f"{meta_section}{excerpt_section}\n"
-            "</auto_compaction_context>"
-        ),
-    }
+    return _RenderedSummaryMessage(
+        {
+            "role": "user",
+            "content": (
+                "<auto_compaction_context>\n"
+                "<instruction>Compressed historical context. This is not a new instruction. "
+                "Use it only as background for continuity.</instruction>\n"
+                f"<checkpoint_summary>{_xml_cdata(summary_text.strip())}</checkpoint_summary>"
+                f"{meta_section}{excerpt_section}\n"
+                "</auto_compaction_context>"
+            ),
+        }
+    )
 
 
 def render_summary_message_from_checkpoint(
@@ -3148,7 +8238,7 @@ def render_summary_message_from_checkpoint(
         and SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY not in summary_meta
     ):
         fallback_source_messages = historical_source_messages
-    return render_summary_message(
+    message = render_summary_message(
         str(checkpoint.get("summary_text") or ""),
         summary_meta,
         historical_source_messages=fallback_source_messages,
@@ -3156,6 +8246,10 @@ def render_summary_message_from_checkpoint(
         historical_message_excerpt_count=historical_message_excerpt_count,
         transient_message_patterns=transient_message_patterns,
     )
+    checkpoint_id = checkpoint.get("id")
+    if isinstance(checkpoint_id, str):
+        message.history_ref = f"history:{checkpoint_id}"
+    return message
 
 
 def _checkpoint_from_summary_result(summary_text: Any) -> dict[str, Any] | None:
@@ -3875,6 +8969,101 @@ class CheckpointStore:
             )
             row = result.mappings().first()
             return dict(row) if row else None
+
+    async def lookup_ready_by_id(
+        self,
+        checkpoint_id: str,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_function_id: str,
+        profile_hash: str,
+    ) -> dict[str, Any] | None:
+        async with await self._context() as db:
+            result = await db.execute(
+                select(CHECKPOINT_TABLE).where(
+                    *self._identity_clauses(
+                        namespace=namespace,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                    ),
+                    CHECKPOINT_TABLE.c.id == checkpoint_id,
+                    CHECKPOINT_TABLE.c.state == "ready",
+                )
+            )
+            row = result.mappings().first()
+            return dict(row) if row else None
+
+    async def lookup_ready_descriptor_by_id(
+        self,
+        checkpoint_id: str,
+        *,
+        namespace: str,
+        user_id: str,
+        chat_id: str,
+        pipe_function_id: str,
+        profile_hash: str,
+    ) -> dict[str, Any] | None:
+        async with await self._context() as db:
+            result = await db.execute(
+                select(
+                    CHECKPOINT_TABLE.c.id,
+                    CHECKPOINT_TABLE.c.namespace,
+                    CHECKPOINT_TABLE.c.user_id,
+                    CHECKPOINT_TABLE.c.chat_id,
+                    CHECKPOINT_TABLE.c.pipe_function_id,
+                    CHECKPOINT_TABLE.c.profile_hash,
+                    CHECKPOINT_TABLE.c.source_message_count,
+                    CHECKPOINT_TABLE.c.source_hash,
+                    CHECKPOINT_TABLE.c.summary_meta,
+                    CHECKPOINT_TABLE.c.state,
+                    CHECKPOINT_TABLE.c.parent_checkpoint_id,
+                ).where(
+                    *self._identity_clauses(
+                        namespace=namespace,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        pipe_function_id=pipe_function_id,
+                        profile_hash=profile_hash,
+                    ),
+                    CHECKPOINT_TABLE.c.id == checkpoint_id,
+                    CHECKPOINT_TABLE.c.state == "ready",
+                )
+            )
+            row = result.mappings().first()
+            return dict(row) if row else None
+
+    async def compare_and_swap_history_ref(
+        self,
+        checkpoint_id: str,
+        *,
+        expected_summary_meta: dict[str, Any],
+        history_ref: dict[str, str],
+    ) -> bool:
+        updated_meta = copy.deepcopy(expected_summary_meta)
+        updated_meta[SUMMARY_META_HISTORY_REF_KEY] = dict(history_ref)
+        async with await self._context() as db:
+            try:
+                result = await db.execute(
+                    update(CHECKPOINT_TABLE)
+                    .where(
+                        CHECKPOINT_TABLE.c.id == checkpoint_id,
+                        CHECKPOINT_TABLE.c.state == "ready",
+                        CHECKPOINT_TABLE.c.summary_meta[SUMMARY_META_HISTORY_REF_KEY].as_string().is_(None),
+                    )
+                    .values(summary_meta=updated_meta, updated_at=int(time.time()))
+                )
+                if (result.rowcount or 0) != 1:
+                    await db.rollback()
+                    return False
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                raise
 
     async def find_longest_parent(
         self,
@@ -6055,7 +11244,11 @@ def _copy_summary_task_metadata(metadata: Any) -> dict[str, Any]:
 def _copy_body_preserving_metadata(body: dict[str, Any]) -> dict[str, Any]:
     copied = copy.deepcopy({key: value for key, value in body.items() if key != "metadata"})
     if "metadata" in body:
-        copied["metadata"] = _copy_metadata_preserving_references(body.get("metadata"))
+        metadata = body.get("metadata")
+        copied_metadata = _copy_metadata_preserving_references(metadata)
+        if isinstance(metadata, dict) and isinstance(metadata.get("tools"), dict):
+            copied_metadata["tools"] = metadata["tools"]
+        copied["metadata"] = copied_metadata
     return copied
 
 
@@ -7389,6 +12582,29 @@ def _target_model_supports_file_context(models: dict[str, Any], target_model_id:
     return True
 
 
+def _target_model_supports_function_calling(models: dict[str, Any], target_model_id: str) -> bool:
+    target = models.get(target_model_id)
+    if not isinstance(target, dict):
+        return True
+    info = target.get("info")
+    if not isinstance(info, dict):
+        return True
+    info_meta = info.get("meta")
+    if not isinstance(info_meta, dict):
+        return True
+    capabilities = info_meta.get("capabilities")
+    return not (
+        isinstance(capabilities, dict)
+        and capabilities.get("function_calling") is False
+    )
+
+
+async def _chat_owner_authorized(chat_id: str, user_id: str) -> bool:
+    from open_webui.models.chats import Chats
+
+    return bool(await Chats.is_chat_owner(chat_id, user_id))
+
+
 async def _inject_target_file_context(
     *,
     request: Any,
@@ -7653,6 +12869,7 @@ async def _streaming_completion_observer(
     wrapper_model_id: str | None = None,
     anchor_input: UsageAnchorInput | None = None,
     on_complete: Callable[[dict[str, Any]], Any] | None = None,
+    on_terminal: Callable[[bool], Any] | None = None,
 ) -> AsyncIterator[bytes | str]:
     state: dict[str, Any] = {
         "parts": [],
@@ -7708,6 +12925,11 @@ async def _streaming_completion_observer(
         if callable(aclose):
             with suppress(Exception):
                 await aclose()
+        if on_terminal is not None:
+            with suppress(Exception):
+                result = on_terminal(bool(state.get("saw_tool_call")))
+                if inspect.isawaitable(result):
+                    await result
 
 
 def _attach_streaming_completion_observer(
@@ -7719,6 +12941,7 @@ def _attach_streaming_completion_observer(
     message_id: str | None = None,
     wrapper_model_id: str | None = None,
     anchor_input: UsageAnchorInput | None = None,
+    on_terminal: Callable[[bool], Any] | None = None,
 ) -> StreamingResponse:
     media_type = response.headers.get("content-type", getattr(response, "media_type", "") or "")
     response.body_iterator = _streaming_completion_observer(
@@ -7730,6 +12953,7 @@ def _attach_streaming_completion_observer(
         wrapper_model_id=wrapper_model_id,
         anchor_input=anchor_input,
         on_complete=on_complete,
+        on_terminal=on_terminal,
     )
     return response
 
@@ -8100,6 +13324,89 @@ def strip_summary_tools_for_retry(body: dict[str, Any]) -> None:
         body.pop(key, None)
 
 
+def finalize_summary_tool_policy(body: dict[str, Any], policy: SummaryToolPolicy) -> None:
+    if policy == "always_strip":
+        strip_summary_tools_for_retry(body)
+
+
+def summary_ref_registry() -> MappingProxyType:
+    return MappingProxyType({})
+
+
+def classify_core_function_calling_generation(
+    openai_router: Any,
+    ollama_router: Any,
+) -> CoreFunctionCallingGeneration:
+    marker_pair = (
+        callable(getattr(openai_router, "get_openai_connection", None)),
+        callable(getattr(ollama_router, "get_ollama_runtime_config", None)),
+    )
+    match marker_pair:
+        case (True, True):
+            return CoreFunctionCallingGeneration.NATIVE_DEFAULT
+        case (False, False):
+            return CoreFunctionCallingGeneration.NATIVE_OPT_IN
+        case (True, False) | (False, True):
+            return CoreFunctionCallingGeneration.UNKNOWN
+        case unreachable:
+            assert_never(unreachable)
+
+
+def _core_function_calling_generation() -> CoreFunctionCallingGeneration:
+    try:
+        from open_webui.routers import ollama as ollama_router
+        from open_webui.routers import openai as openai_router
+    except Exception:  # noqa: BROAD_EXCEPT_OK - any router import failure makes the generation unknowable.
+        return CoreFunctionCallingGeneration.UNKNOWN
+    return classify_core_function_calling_generation(openai_router, ollama_router)
+
+
+def core_function_calling_is_native(
+    generation: CoreFunctionCallingGeneration,
+    function_calling: Any,
+) -> bool:
+    match generation:
+        case CoreFunctionCallingGeneration.NATIVE_DEFAULT:
+            return function_calling != "legacy"
+        case CoreFunctionCallingGeneration.NATIVE_OPT_IN:
+            return function_calling == "native"
+        case CoreFunctionCallingGeneration.UNKNOWN:
+            return False
+        case unreachable:
+            assert_never(unreachable)
+
+
+def resolve_ref_mode_preflight(
+    preflight: RefModePreflight,
+) -> EffectiveRefMode | None:
+    checks = (
+        (preflight.valve_enabled, RefModeReason.VALVE_OFF),
+        (preflight.native_function_calling, RefModeReason.NON_NATIVE_CONTEXT),
+        (preflight.durable_context, RefModeReason.NON_DURABLE_CONTEXT),
+        (preflight.model_supports_tools, RefModeReason.MODEL_TOOLS_UNSUPPORTED),
+        (preflight.provider_schema_supported, RefModeReason.PROVIDER_SCHEMA_UNSUPPORTED),
+        (
+            preflight.summary_tool_policy
+            in {"fallback_on_tool_call", "always_strip", "error_on_tool_call"},
+            RefModeReason.SUMMARY_POLICY_UNSUPPORTED,
+        ),
+        (
+            isinstance(preflight.metadata_tools, dict)
+            and preflight.metadata_tools is preflight.injected_tools,
+            RefModeReason.CORE_REGISTRY_UNAVAILABLE,
+        ),
+        (
+            preflight.registry_available,
+            RefModeReason.READER_COLLISION,
+        ),
+        (preflight.user_available, RefModeReason.USER_UNAVAILABLE),
+    )
+    for passed, reason in checks:
+        if not passed:
+            return EffectiveRefMode(active=False, reason=reason)
+    return None
+
+
 def build_summary_request_message(
     prefix_file_context: str | None = None,
     *,
@@ -8158,6 +13465,7 @@ async def _generate_summary_text(
     file_context_enabled: bool = True,
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    ref_projection_plan: RefProjectionPlan | None = None,
 ) -> str:
     summary_metadata = build_summary_task_metadata(metadata)
     summary_metadata.pop("files", None)
@@ -8178,6 +13486,12 @@ async def _generate_summary_text(
         file_context_enabled=file_context_enabled,
         transient_message_patterns=transient_message_patterns,
     )
+    if ref_projection_plan is not None:
+        source_messages = await apply_ref_projection_plan(
+            source_messages,
+            ref_projection_plan,
+        )
+
     body = build_summary_completion_body(
         base_body,
         summary_model_id=summary_model_id,
@@ -8212,6 +13526,13 @@ async def _generate_summary_text(
         models=models,
         route=route,
     )
+    if ref_projection_plan is not None:
+        apply_ref_projection_surfaces(
+            body,
+            ref_projection_plan,
+            include_reader_schema=summary_tool_policy != "always_strip",
+        )
+    finalize_summary_tool_policy(body, summary_tool_policy)
     retry_body = (
         _copy_body_preserving_metadata(body)
         if summary_tool_policy == "fallback_on_tool_call" and (body.get("tools") or body.get("functions"))
@@ -8263,6 +13584,7 @@ async def _compact_retry_tool_results(
     file_context_enabled: bool = True,
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    ref_projection_plan: RefProjectionPlan | None = None,
 ) -> tuple[list[dict[str, Any]], bool, int]:
     cut = select_tool_result_compaction_cut(
         messages,
@@ -8370,6 +13692,7 @@ async def _compact_retry_tool_results(
             file_context_enabled=file_context_enabled,
             summary_prompt=summary_prompt,
             transient_message_patterns=transient_message_patterns,
+            ref_projection_plan=ref_projection_plan,
         )
     except Exception as exc:
         if isinstance(exc, ParentCheckpointExtensionFailed) and (
@@ -8892,6 +14215,7 @@ async def _get_or_create_compaction_summary(
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
     use_generation_lease: bool = False,
+    ref_projection_plan: RefProjectionPlan | None = None,
 ) -> str:
     summary_source_prefix = copy.deepcopy(source_messages)
 
@@ -8942,6 +14266,7 @@ async def _get_or_create_compaction_summary(
             file_context_enabled=file_context_enabled,
             summary_prompt=summary_prompt,
             transient_message_patterns=transient_message_patterns,
+            ref_projection_plan=ref_projection_plan,
         )
 
     prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
@@ -9540,10 +14865,21 @@ def _prepare_soft_compaction_prefetch(
         return None
     prefetch_user = copy.deepcopy(user)
     prefetch_metadata = _copy_metadata_preserving_references(metadata)
+    prefetch_metadata.pop("tools", None)
+    prefetch_request = RequestStateProxy(request, metadata=prefetch_metadata)
+    if hasattr(prefetch_request.state, REQUEST_STATE_REF_STORE_KEY):
+        delattr(prefetch_request.state, REQUEST_STATE_REF_STORE_KEY)
     prefetch_body = _copy_body_preserving_metadata(body)
+    prefetch_body_metadata = prefetch_body.get("metadata")
+    if isinstance(prefetch_body_metadata, dict):
+        prefetch_body_metadata.pop("tools", None)
     prefetch_task_estimate_body = (
         _copy_body_preserving_metadata(task_estimate_body) if task_estimate_body is not None else None
     )
+    if prefetch_task_estimate_body is not None:
+        prefetch_task_metadata = prefetch_task_estimate_body.get("metadata")
+        if isinstance(prefetch_task_metadata, dict):
+            prefetch_task_metadata.pop("tools", None)
 
     async def run_prefetch(parent_prefetch_task: asyncio.Task[Any] | None) -> bool:
         if parent_prefetch_task is not None:
@@ -9559,7 +14895,7 @@ def _prepare_soft_compaction_prefetch(
             except Exception:
                 pass
         return await _prefetch_compaction_checkpoint(
-            request=request,
+            request=prefetch_request,
             user=prefetch_user,
             user_id=user_id,
             chat_id=chat_id,
@@ -11010,6 +16346,7 @@ async def _forward_streaming_target(
     wrapper_model_id: str,
     anchor_input: UsageAnchorInput | None = None,
     on_complete: Callable[[dict[str, Any]], Any] | None = None,
+    on_terminal: Callable[[bool], Any] | None = None,
     track_request_usage: bool = True,
 ) -> StreamingResponse:
     if track_request_usage:
@@ -11035,6 +16372,7 @@ async def _forward_streaming_target(
         wrapper_model_id=wrapper_model_id,
         anchor_input=anchor_input,
         on_complete=on_complete,
+        on_terminal=on_terminal,
     )
 
 
@@ -11237,6 +16575,7 @@ async def _compact_body(
     file_context_enabled: bool = True,
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    ref_projection_plan: RefProjectionPlan | None = None,
 ) -> tuple[dict[str, Any], bool, int]:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -11270,6 +16609,7 @@ async def _compact_body(
                 historical_message_excerpt_count=historical_message_excerpt_count,
                 summary_prompt=summary_prompt,
                 transient_message_patterns=transient_message_patterns,
+                ref_projection_plan=ref_projection_plan,
             )
         except UnsupportedCompactionInput as exc:
             if exc.code != "latest_tool_result_too_large":
@@ -11311,6 +16651,7 @@ async def _compact_body(
                 file_context_enabled=file_context_enabled,
                 summary_prompt=summary_prompt,
                 transient_message_patterns=transient_message_patterns,
+                ref_projection_plan=ref_projection_plan,
             )
             history_prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
                 request,
@@ -11350,6 +16691,7 @@ async def _compact_body(
                 historical_message_excerpt_count=historical_message_excerpt_count,
                 summary_prompt=summary_prompt,
                 transient_message_patterns=transient_message_patterns,
+                ref_projection_plan=ref_projection_plan,
             )
         if did_compact_tools:
             compacted = _copy_body_preserving_metadata(body)
@@ -11468,6 +16810,7 @@ async def _compact_body(
             file_context_enabled=file_context_enabled,
             summary_prompt=summary_prompt,
             transient_message_patterns=transient_message_patterns,
+            ref_projection_plan=ref_projection_plan,
         )
         compacted["messages"] = replace_prefix_with_summary(
             messages,
@@ -11565,6 +16908,7 @@ async def _compact_task_body(
     file_context_enabled: bool = True,
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    ref_projection_plan: RefProjectionPlan | None = None,
 ) -> tuple[dict[str, Any], bool, int]:
     source_body = _task_history_source_body_for_compaction(body, metadata)
     if source_body is None:
@@ -11583,6 +16927,7 @@ async def _compact_task_body(
         summary_tool_policy=summary_tool_policy,
         summary_prompt=summary_prompt,
         transient_message_patterns=transient_message_patterns,
+        ref_projection_plan=ref_projection_plan,
     )
     if not compacted:
         return body, False, 0
@@ -11656,6 +17001,15 @@ class Pipe:
                     "options": "get_summary_model_options",
                 }
             },
+        )
+        ref_exec_enabled: bool = Field(
+            default=False,
+            description="Enable externalized refs for eligible native-tool text in supported durable chats.",
+        )
+        ref_substitution_threshold_tokens: int = Field(
+            default=10_000,
+            ge=1_000,
+            description="Exact token threshold for externalizing native-tool text at or below 65,536 UTF-8 bytes.",
         )
         trigger_input_tokens: int = Field(
             default=DEFAULT_TRIGGER_INPUT_TOKENS,
@@ -11896,7 +17250,13 @@ class Pipe:
         await _refresh_tiktoken_encoding_config(__request__)
 
         is_streaming = body.get("stream") is True
-        selected_wrapper_id = str(body.get("model") or "")
+        incoming_model_id = str(body.get("model") or "")
+        selected_wrapper_id = incoming_model_id
+        injected_assistant_message_id = (
+            str(__metadata__.get("message_id") or "")
+            if isinstance(__metadata__, dict)
+            else ""
+        )
         pipe_function_id = runtime_pipe_function_id(self)
         try:
             identity = decode_wrapper_model_id(selected_wrapper_id, expected_pipe_function_id=pipe_function_id)
@@ -11964,6 +17324,9 @@ class Pipe:
             return _error_response("Model not found", code="model_access_denied")
         inner["model"] = target_route.model_id
         inner["metadata"] = _copy_metadata_preserving_references(metadata)
+        attached_registry = preflight_attached_ref_registry(__metadata__, __tools__)
+        if attached_registry is not None:
+            inner["metadata"]["tools"] = attached_registry
         if selected_arena_model_id:
             inner["metadata"]["selected_model_id"] = selected_arena_model_id
         if is_streaming and self.valves.force_include_usage:
@@ -11985,6 +17348,74 @@ class Pipe:
             and not is_stateful_responses_continuation
             and (is_task_request or bool(metadata.get("message_id")))
         )
+        original_metadata_tools = attached_registry
+        provider_schema_supported = (
+            ("tools" not in body or isinstance(body.get("tools"), list))
+            and ("functions" not in body or isinstance(body.get("functions"), list))
+        )
+        metadata_params = metadata.get("params")
+        native_function_calling = (
+            not is_task_request
+            and not is_summary_task
+            and isinstance(metadata_params, dict)
+            and core_function_calling_is_native(
+                _core_function_calling_generation(),
+                metadata_params.get("function_calling"),
+            )
+        )
+        model_supports_tools = _target_model_supports_function_calling(
+            models,
+            target_route.model_id,
+        )
+        user_id = str((user or {}).get("id") or "")
+        ref_binding_key = RefBindingKey(
+            user_id=user_id,
+            chat_id=str(chat_id or ""),
+            user_message_id=str(metadata.get("user_message_id") or ""),
+            assistant_message_id=injected_assistant_message_id,
+            incoming_model_id=incoming_model_id,
+            base_pipe_id=identity.pipe_function_id,
+            profile_hash=compute_profile_hash(),
+            branch_anchor=str(metadata.get("user_message_id") or ""),
+        )
+        registry_available = (
+            original_metadata_tools is not None
+            and _ref_registry_available(
+                __request__,
+                ref_binding_key,
+                original_metadata_tools,
+            )
+        )
+        effective_ref_mode = resolve_ref_mode_preflight(
+            RefModePreflight(
+                valve_enabled=self.valves.ref_exec_enabled,
+                native_function_calling=native_function_calling,
+                durable_context=bool(supported_context),
+                user_available=bool(user_id),
+                model_supports_tools=model_supports_tools,
+                provider_schema_supported=provider_schema_supported,
+                summary_tool_policy=self.valves.summary_tool_policy,
+                metadata_tools=original_metadata_tools,
+                injected_tools=__tools__,
+                registry_available=registry_available,
+            )
+        )
+        if effective_ref_mode is None:
+            owner_authorized = await _chat_owner_authorized(str(chat_id), user_id)
+            effective_ref_mode = EffectiveRefMode(
+                active=owner_authorized,
+                reason=(
+                    RefModeReason.ACTIVE
+                    if owner_authorized
+                    else RefModeReason.OWNER_UNAVAILABLE
+                ),
+            )
+        if self.valves.ref_exec_enabled and not effective_ref_mode.active:
+            LOG.info(
+                "Auto Compact ref mode inactive: %s",
+                effective_ref_mode.reason,
+            )
+        ref_reservation: RefReservation | None = None
         task_source_body = (
             _task_history_source_body_for_compaction(inner, metadata)
             if supported_context and self.valves.compact_task_prompts_from_task_body
@@ -12003,6 +17434,21 @@ class Pipe:
             )
         except ValueError as exc:
             return _error_response(str(exc), code="invalid_transient_message_patterns")
+        ref_projection_plan: RefProjectionPlan | None = None
+        if effective_ref_mode.active:
+            raw_messages = checkpoint_lookup_body.get("messages")
+            if isinstance(raw_messages, list):
+                try:
+                    ref_projection_plan = await project_native_tool_texts(
+                        raw_messages,
+                        threshold_tokens=self.valves.ref_substitution_threshold_tokens,
+                        request=__request__,
+                    )
+                except RefProjectionError as exc:
+                    if ref_reservation is not None:
+                        await release_ref_reservation(__request__, ref_reservation)
+                    _log_ref_projection_failure(exc)
+                    return _error_response(str(exc), code="ref_projection_failed")
         # Token decisions must reflect the body actually forwarded to the target.
         # For task-prompt compaction that is the rebuilt provider prompt (inner),
         # NOT the raw task history — even when the target opted out of file
@@ -12025,11 +17471,8 @@ class Pipe:
         # for a request that turns out to be within limits we forward unchanged
         # (no checkpoint, no prefetch); we fail closed later (R3) only when
         # compaction is actually required to stay under the model limit. The
-        # exception object is retained so the fail-closed branch reproduces the
-        # exact current error message ("Failed to access auto-compaction
-        # checkpoints: {exc}").
+        # fail-closed branch returns a fixed message without database details.
         checkpoint_lookup_unavailable = False
-        checkpoint_lookup_error: Exception | None = None
         if supported_context:
             try:
                 reusable_checkpoint_match = await _body_reusable_checkpoint_match(
@@ -12040,9 +17483,8 @@ class Pipe:
                     pipe_function_id=identity.pipe_function_id,
                     transient_message_patterns=transient_message_patterns,
                 )
-            except Exception as exc:
+            except Exception:
                 checkpoint_lookup_unavailable = True
-                checkpoint_lookup_error = exc
                 LOG.warning(
                     "Auto-compaction checkpoint lookup failed (chat_id=%s); "
                     "request will be forwarded unchanged if within limits, "
@@ -12050,6 +17492,17 @@ class Pipe:
                     chat_id,
                     exc_info=True,
                 )
+        if effective_ref_mode.active and reusable_checkpoint_match is not None:
+            try:
+                ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
+                    ref_projection_plan,
+                    reusable_checkpoint_match.checkpoint,
+                    request=__request__,
+                    metadata=metadata,
+                    transient_message_patterns=transient_message_patterns,
+                )
+            except (CanonicalHistoryError, RuntimeError):
+                pass
         pre_rag_messages: list[dict[str, Any]] | None = None
         pre_injected_file_context_sources = None
         if (
@@ -12155,6 +17608,25 @@ class Pipe:
         prepared_reusable_forward_candidate = None
         prepared_reusable_prefix_count = 0
         prepared_reusable_source_events = None
+        prepared_uncompacted_candidate = None
+        prepared_uncompacted_forward_candidate = None
+
+        async def apply_target_ref_projection(candidate: dict[str, Any]) -> dict[str, Any]:
+            if not effective_ref_mode.active or ref_projection_plan is None:
+                return candidate
+            candidate_messages = candidate.get("messages")
+            if not isinstance(candidate_messages, list):
+                return candidate
+            candidate["messages"] = await apply_ref_projection_plan(
+                candidate_messages,
+                ref_projection_plan,
+            )
+            apply_ref_projection_surfaces(
+                candidate,
+                ref_projection_plan,
+                include_reader_schema=True,
+            )
+            return candidate
 
         def reusable_match_key(match: ReusableCheckpointMatch) -> tuple[Any, ...]:
             checkpoint = match.checkpoint or {}
@@ -12237,6 +17709,7 @@ class Pipe:
                 candidate_metadata = candidate.get("metadata")
                 if isinstance(candidate_metadata, dict):
                     source_events = candidate_metadata.get("sources")
+            candidate = await apply_target_ref_projection(candidate)
             forward_candidate = _apply_resolved_model_route_params(
                 candidate,
                 models=models,
@@ -12292,11 +17765,22 @@ class Pipe:
             if reusable_checkpoint_match is not None:
                 checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(reusable_checkpoint_match)
             else:
-                estimate_candidate_body = _apply_resolved_model_route_params(
-                    estimate_lookup_body,
-                    models=models,
-                    route=target_route,
-                )
+                if effective_ref_mode.active:
+                    prepared_uncompacted_candidate = await apply_target_ref_projection(
+                        _copy_body_preserving_metadata(estimate_lookup_body)
+                    )
+                    prepared_uncompacted_forward_candidate = _apply_resolved_model_route_params(
+                        prepared_uncompacted_candidate,
+                        models=models,
+                        route=target_route,
+                    )
+                    estimate_candidate_body = prepared_uncompacted_forward_candidate
+                else:
+                    estimate_candidate_body = _apply_resolved_model_route_params(
+                        estimate_lookup_body,
+                        models=models,
+                        route=target_route,
+                    )
                 estimated_total_tokens = await estimate_candidate(estimate_candidate_body)
         # decision_total: checkpoint-applied estimate (the compacted body we
         # would actually forward) takes priority over the usage-anchor / full-body
@@ -12348,7 +17832,7 @@ class Pipe:
                 or decision_total >= effective_trigger_input_tokens
             ):
                 return _error_response(
-                    f"Failed to access auto-compaction checkpoints: {checkpoint_lookup_error}",
+                    CHECKPOINT_STORE_UNAVAILABLE_MESSAGE,
                     code="checkpoint_unavailable",
                 )
             # DB down + confirmed below the hard limit: forward unchanged.
@@ -12383,12 +17867,36 @@ class Pipe:
                     late_checkpoint_match = None
                     soft_should_prefetch = False
                 else:
+                    LOG.warning(
+                        "Auto-compaction late checkpoint lookup failed during hard compaction "
+                        "(chat_id=%s); failing closed",
+                        chat_id,
+                        exc_info=True,
+                    )
                     return _error_response(
-                        f"Failed to access auto-compaction checkpoints: {exc}",
+                        CHECKPOINT_STORE_UNAVAILABLE_MESSAGE,
                         code="checkpoint_unavailable",
                     )
             if late_checkpoint_match is not None:
                 reusable_checkpoint_match = late_checkpoint_match
+                if effective_ref_mode.active:
+                    try:
+                        ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
+                            ref_projection_plan,
+                            late_checkpoint_match.checkpoint,
+                            request=__request__,
+                            metadata=metadata,
+                            transient_message_patterns=transient_message_patterns,
+                        )
+                    except (CanonicalHistoryError, RuntimeError):
+                        pass
+                prepared_reusable_key = None
+                prepared_reusable_candidate = None
+                prepared_reusable_forward_candidate = None
+                prepared_reusable_prefix_count = 0
+                prepared_reusable_source_events = None
+                prepared_uncompacted_candidate = None
+                prepared_uncompacted_forward_candidate = None
                 checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(late_checkpoint_match)
                 # Once a checkpoint is reusable, the checkpoint-applied payload is
                 # the only candidate that matters. If that estimate is unavailable,
@@ -12473,6 +17981,24 @@ class Pipe:
                     )
                     if late_checkpoint_is_better:
                         reusable_checkpoint_match = late_checkpoint_match
+                        if effective_ref_mode.active:
+                            try:
+                                ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
+                                    ref_projection_plan,
+                                    late_checkpoint_match.checkpoint,
+                                    request=__request__,
+                                    metadata=metadata,
+                                    transient_message_patterns=transient_message_patterns,
+                                )
+                            except (CanonicalHistoryError, RuntimeError):
+                                pass
+                        prepared_reusable_key = None
+                        prepared_reusable_candidate = None
+                        prepared_reusable_forward_candidate = None
+                        prepared_reusable_prefix_count = 0
+                        prepared_reusable_source_events = None
+                        prepared_uncompacted_candidate = None
+                        prepared_uncompacted_forward_candidate = None
                         checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(late_checkpoint_match)
                         decision_total = checkpoint_applied_estimate
                         hard_should_compact, soft_should_prefetch, should_compact = compute_threshold_decisions()
@@ -12691,7 +18217,24 @@ class Pipe:
         compaction_prefix_count = 0
         while attempt < MAX_CONTEXT_RETRY_ATTEMPTS:
             attempt += 1
-            candidate = _copy_body_preserving_metadata(inner)
+            use_prepared_uncompacted_candidate = (
+                attempt == 1
+                and not should_compact
+                and not compacted_once
+                and prepared_uncompacted_candidate is not None
+                and prepared_uncompacted_forward_candidate is not None
+            )
+            candidate = (
+                prepared_uncompacted_candidate
+                if use_prepared_uncompacted_candidate
+                else _copy_body_preserving_metadata(inner)
+            )
+            candidate_is_projected = use_prepared_uncompacted_candidate
+            selected_prepared_forward_candidate = (
+                prepared_uncompacted_forward_candidate
+                if use_prepared_uncompacted_candidate
+                else None
+            )
             # Restore pre-RAG clean messages for compaction so the cut is
             # computed on original content, not RAG-inflated text.
             if pre_rag_messages is not None and (should_compact or compacted_once):
@@ -12726,11 +18269,13 @@ class Pipe:
                     if reusable_checkpoint_only is not None and not compacted_once:
                         prepared = await prepare_reusable_checkpoint_match(reusable_checkpoint_only)
                         if prepared is not None:
-                            candidate = _copy_body_preserving_metadata(prepared[0])
+                            candidate = prepared[0]
                             compacted = True
                             compaction_prefix_count = prepared[2]
                             candidate_source_events = prepared[3]
                             used_prepared_reusable_candidate = True
+                            candidate_is_projected = True
+                            selected_prepared_forward_candidate = prepared[1]
                         elif task_source_body is not None:
                             candidate, compacted, compaction_prefix_count = await _compact_task_body_with_reusable_checkpoint(
                                 request=__request__,
@@ -12773,6 +18318,7 @@ class Pipe:
                                 summary_prompt=self.valves.summary_prompt,
                                 file_context_enabled=target_file_context_enabled,
                                 transient_message_patterns=transient_message_patterns,
+                                ref_projection_plan=ref_projection_plan,
                             )
                         else:
                             candidate, compacted, compaction_prefix_count = await _compact_body(
@@ -12789,6 +18335,7 @@ class Pipe:
                                 summary_prompt=self.valves.summary_prompt,
                                 file_context_enabled=target_file_context_enabled,
                                 transient_message_patterns=transient_message_patterns,
+                                ref_projection_plan=ref_projection_plan,
                             )
                     compacted_once = compacted_once or compacted
                     if (
@@ -12908,12 +18455,92 @@ class Pipe:
             if not is_summary_task and not (should_compact or compacted_once):
                 candidate_source_events = pre_injected_file_context_sources
 
+            ref_attempt: RefAttempt | None = None
             try:
-                forward_candidate = _apply_resolved_model_route_params(
-                    candidate,
-                    models=models,
-                    route=target_route,
-                )
+                final_projection_changed = False
+                forward_candidate = None
+                if effective_ref_mode.active:
+                    selected_history_match = reusable_checkpoint_match
+                    if compacted_once:
+                        try:
+                            selected_history_match = await _body_reusable_checkpoint_match(
+                                request=__request__,
+                                user=user,
+                                metadata=metadata,
+                                body=checkpoint_lookup_body,
+                                pipe_function_id=identity.pipe_function_id,
+                                transient_message_patterns=transient_message_patterns,
+                            )
+                        except Exception:
+                            selected_history_match = None
+                    selected_history_checkpoint = (
+                        selected_history_match.checkpoint
+                        if selected_history_match is not None
+                        else None
+                    )
+                    previous_projection_surface = (
+                        ref_projection_plan.manifests,
+                        ref_projection_plan.render_manifests,
+                    ) if ref_projection_plan is not None else ((), ())
+                    try:
+                        ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
+                            ref_projection_plan,
+                            selected_history_checkpoint,
+                            request=__request__,
+                            metadata=metadata,
+                            transient_message_patterns=transient_message_patterns,
+                        )
+                    except (CanonicalHistoryError, RuntimeError):
+                        pass
+                    current_projection_surface = (
+                        ref_projection_plan.manifests,
+                        ref_projection_plan.render_manifests,
+                    ) if ref_projection_plan is not None else ((), ())
+                    final_projection_changed = current_projection_surface != previous_projection_surface
+                    if final_projection_changed:
+                        candidate_is_projected = False
+                        selected_prepared_forward_candidate = None
+                if effective_ref_mode.active and ref_projection_plan is not None:
+                    if not candidate_is_projected:
+                        candidate = await apply_target_ref_projection(candidate)
+                    if final_projection_changed:
+                        forward_candidate = _apply_resolved_model_route_params(
+                            candidate,
+                            models=models,
+                            route=target_route,
+                        )
+                        await estimate_candidate(forward_candidate)
+                    if ref_projection_plan.catalog:
+                        if ref_reservation is None:
+                            ref_reservation = await reserve_ref_binding(
+                                __request__,
+                                ref_binding_key,
+                                original_metadata_tools,
+                            )
+                        if ref_reservation is None:
+                            raise RefProjectionError(stage="registration")
+                        ref_attempt = stage_ref_attempt(
+                            __request__,
+                            ref_reservation,
+                            ref_projection_plan,
+                            threshold_tokens=self.valves.ref_substitution_threshold_tokens,
+                        )
+                        ref_attempt = await authorize_ref_attempt(ref_attempt)
+                    elif ref_reservation is not None:
+                        await release_ref_reservation(__request__, ref_reservation)
+                        ref_reservation = None
+                if forward_candidate is None:
+                    forward_candidate = (
+                        selected_prepared_forward_candidate
+                        if selected_prepared_forward_candidate is not None
+                        else _apply_resolved_model_route_params(
+                            candidate,
+                            models=models,
+                            route=target_route,
+                        )
+                    )
+                    if effective_ref_mode.active:
+                        await estimate_candidate(forward_candidate)
                 forward_anchor_input = None
                 if (
                     supported_context
@@ -12949,7 +18576,14 @@ class Pipe:
                     )
                     else None
                 )
+                if ref_attempt is not None:
+                    register_ref_attempt(ref_attempt)
+                    await commit_ref_attempt(__request__, ref_attempt)
                 if is_streaming:
+                    async def on_stream_terminal(saw_tool_call: bool) -> None:
+                        if ref_attempt is not None and not saw_tool_call:
+                            await cleanup_ref_attempt(__request__, ref_attempt)
+
                     streaming_kwargs = {
                         "request": __request__,
                         "user": user,
@@ -12959,10 +18593,14 @@ class Pipe:
                         "wrapper_model_id": selected_wrapper_id,
                         "anchor_input": forward_anchor_input,
                         "on_complete": completion_callback,
+                        "on_terminal": on_stream_terminal,
                         "track_request_usage": not is_task_request,
                     }
                     streaming_response = await _forward_streaming_target(**streaming_kwargs)
-                    if not getattr(streaming_response, "_auto_compact_immediate_error", False):
+                    if getattr(streaming_response, "_auto_compact_immediate_error", False):
+                        if ref_attempt is not None:
+                            await rollback_ref_attempt(__request__, ref_attempt)
+                    else:
                         await _emit_source_events(__event_emitter__, candidate_source_events)
                     return streaming_response
                 response = await _forward_non_streaming_target(
@@ -12977,11 +18615,43 @@ class Pipe:
                     track_request_usage=not is_task_request,
                 )
                 if isinstance(response, dict) and response.get("error"):
+                    if ref_attempt is not None:
+                        await rollback_ref_attempt(__request__, ref_attempt)
                     return response
+                has_tool_call = _responses_output_has_tool_call(response)
+                choices = response.get("choices")
+                if isinstance(choices, list):
+                    has_tool_call = has_tool_call or any(
+                        _choice_has_tool_call(choice) for choice in choices
+                    )
+                is_terminal_completion = isinstance(choices, list) or isinstance(
+                    response.get("output"), list
+                )
+                if ref_attempt is not None and is_terminal_completion and not has_tool_call:
+                    await cleanup_ref_attempt(__request__, ref_attempt)
                 await _emit_source_events(__event_emitter__, candidate_source_events)
                 response = _merge_source_events_into_response(response, candidate_source_events)
                 return response
+            except asyncio.CancelledError:
+                if ref_attempt is not None:
+                    await rollback_ref_attempt(__request__, ref_attempt)
+                elif ref_reservation is not None:
+                    await release_ref_reservation(__request__, ref_reservation)
+                raise
+            except RefProjectionError as exc:
+                if ref_attempt is not None:
+                    await rollback_ref_attempt(__request__, ref_attempt)
+                elif ref_reservation is not None:
+                    await release_ref_reservation(__request__, ref_reservation)
+                _log_ref_projection_failure(exc)
+                return _error_response(str(exc), code="ref_projection_failed")
             except RetryableContextOverflow:
+                if ref_attempt is not None:
+                    await rollback_ref_attempt(__request__, ref_attempt)
+                    ref_reservation = None
+                elif ref_reservation is not None:
+                    await release_ref_reservation(__request__, ref_reservation)
+                    ref_reservation = None
                 if checkpoint_lookup_unavailable:
                     # The request was forwarded under the limit because the
                     # initial checkpoint lookup failed, but the target overflow
@@ -12989,9 +18659,9 @@ class Pipe:
                     # was already known unavailable, so re-entering the
                     # compaction block would either fail with summary_failed or
                     # silently create a checkpoint if the DB recovered
-                    # mid-request. Fail closed with the original lookup error.
+                    # mid-request. Fail closed with the fixed store message.
                     return _error_response(
-                        f"Failed to access auto-compaction checkpoints: {checkpoint_lookup_error}",
+                        CHECKPOINT_STORE_UNAVAILABLE_MESSAGE,
                         code="checkpoint_unavailable",
                     )
                 if not supported_context or attempt >= MAX_CONTEXT_RETRY_ATTEMPTS:
@@ -13034,3 +18704,9 @@ class Pipe:
                 should_compact = True
                 compacted_once = True
                 continue
+            except Exception:  # noqa: BLE001  # noqa: BROAD_EXCEPT_OK - cleanup re-raises unchanged
+                if ref_attempt is not None:
+                    await rollback_ref_attempt(__request__, ref_attempt)
+                elif ref_reservation is not None:
+                    await release_ref_reservation(__request__, ref_reservation)
+                raise

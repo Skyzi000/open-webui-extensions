@@ -3,9 +3,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 import asyncio
 import copy
+import dataclasses
+import hashlib
 import inspect
 import json
 import math
+import re
 import sys
 import threading
 import types
@@ -13,6 +16,7 @@ import types
 import pytest
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, ValidationError
+from sqlalchemy.exc import OperationalError
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
@@ -20,6 +24,20 @@ from functions.pipe import auto_compact as mod
 
 
 TRANSIENT_MARKER = r"(?s)<SYSTEM_CONTEXT>.*</SYSTEM_CONTEXT>\s*\Z"
+
+
+def test_auto_compact_release_header_is_080_with_096_floor():
+    header = {
+        key.strip(): value.strip()
+        for line in (mod.__doc__ or "").splitlines()
+        if ":" in line
+        for key, value in [line.split(":", 1)]
+    }
+    source_after_header = inspect.getsource(mod).split('"""', 2)[2]
+
+    assert header["version"] == "0.8.0"
+    assert header["required_open_webui_version"] == "0.9.6"
+    assert source_after_header.lstrip().startswith("# fmt: off")
 
 
 class ClaimCheckpointStore:
@@ -66,7 +84,9 @@ class ClaimCheckpointStore:
         self.claimed_rows.append(dict(stored))
         return True
 
-    async def reclaim_pending(self, checkpoint_id, *, claim_token, expires_at, now=None):
+    async def reclaim_pending(
+        self, checkpoint_id, *, claim_token, expires_at, now=None
+    ):
         return False
 
     async def extend_claim(self, checkpoint_id, *, claim_token, expires_at):
@@ -103,7 +123,8 @@ class ClaimCheckpointStore:
                     row
                     for row in self.rows
                     if row.get("id") == generation_lease_id
-                    and row.get("namespace") == mod.CHECKPOINT_GENERATION_LEASE_NAMESPACE
+                    and row.get("namespace")
+                    == mod.CHECKPOINT_GENERATION_LEASE_NAMESPACE
                     and row.get("state") == "pending"
                     and row.get("claim_token") == generation_lease_claim_token
                     and int(row.get("claim_expires_at") or 0) > timestamp
@@ -288,8 +309,17 @@ def test_target_filter_excludes_own_wrappers_and_arena_but_allows_other_pipes():
             "name": "wrapped",
             "pipe": {"type": "pipe"},
         },
-        "arena-model": {"id": "arena-model", "name": "Arena", "owned_by": "arena", "arena": True},
-        "other_pipe.child": {"id": "other_pipe.child", "name": "Other Pipe", "pipe": {"type": "pipe"}},
+        "arena-model": {
+            "id": "arena-model",
+            "name": "Arena",
+            "owned_by": "arena",
+            "arena": True,
+        },
+        "other_pipe.child": {
+            "id": "other_pipe.child",
+            "name": "Other Pipe",
+            "pipe": {"type": "pipe"},
+        },
     }
 
     targets = mod.filter_target_models(models.values(), mod.Pipe.Valves())
@@ -337,9 +367,21 @@ def test_target_filter_excludes_presets_based_on_own_wrappers():
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "gpt-4.1")
     models = [
         {"id": "gpt-4.1", "name": "GPT"},
-        {"id": "compact-preset", "name": "Compact Preset", "info": {"base_model_id": wrapper_id}},
-        {"id": "top-level-compact-preset", "name": "Compact Preset 2", "base_model_id": wrapper_id},
-        {"id": "normal-preset", "name": "Normal Preset", "info": {"base_model_id": "gpt-4.1"}},
+        {
+            "id": "compact-preset",
+            "name": "Compact Preset",
+            "info": {"base_model_id": wrapper_id},
+        },
+        {
+            "id": "top-level-compact-preset",
+            "name": "Compact Preset 2",
+            "base_model_id": wrapper_id,
+        },
+        {
+            "id": "normal-preset",
+            "name": "Normal Preset",
+            "info": {"base_model_id": "gpt-4.1"},
+        },
     ]
 
     targets = mod.filter_target_models(models, mod.Pipe.Valves())
@@ -370,7 +412,9 @@ def test_wrapper_model_form_does_not_copy_target_hidden():
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_preserves_existing_wrapper_hidden_when_updating(monkeypatch):
+async def test_sync_wrapper_model_records_preserves_existing_wrapper_hidden_when_updating(
+    monkeypatch,
+):
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     existing_wrapper = FakeModelForm(
         id=wrapper_id,
@@ -387,7 +431,9 @@ async def test_sync_wrapper_model_records_preserves_existing_wrapper_hidden_when
         access_grants=[],
         is_active=True,
     )
-    _, calls = install_fake_open_webui_model_modules(monkeypatch, {wrapper_id: existing_wrapper})
+    _, calls = install_fake_open_webui_model_modules(
+        monkeypatch, {wrapper_id: existing_wrapper}
+    )
 
     await mod.sync_wrapper_model_records(
         pipe_function_id="auto_compact",
@@ -409,7 +455,9 @@ async def test_sync_wrapper_model_records_preserves_existing_wrapper_hidden_when
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_reuses_bulk_snapshot_on_steady_state(monkeypatch):
+async def test_sync_wrapper_model_records_reuses_bulk_snapshot_on_steady_state(
+    monkeypatch,
+):
     records, calls = install_fake_open_webui_model_modules(monkeypatch)
     targets = [
         {"id": "target-a", "name": "Target A"},
@@ -444,7 +492,9 @@ async def test_sync_wrapper_model_records_reuses_bulk_snapshot_on_steady_state(m
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_keeps_fresh_target_reads_when_hiding(monkeypatch):
+async def test_sync_wrapper_model_records_keeps_fresh_target_reads_when_hiding(
+    monkeypatch,
+):
     _, calls = install_fake_open_webui_model_modules(monkeypatch)
     targets = [
         {"id": "target-a", "name": "Target A"},
@@ -522,7 +572,9 @@ async def test_sync_wrapper_model_records_does_not_hide_target_from_stale_snapsh
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_skips_stale_cleanup_when_bulk_read_fails(monkeypatch):
+async def test_sync_wrapper_model_records_skips_stale_cleanup_when_bulk_read_fails(
+    monkeypatch,
+):
     stale_wrapper_id = mod.build_wrapper_model_id("auto_compact", "stale-target")
     records = {
         stale_wrapper_id: FakeModelForm(
@@ -566,10 +618,14 @@ async def test_sync_wrapper_model_records_hides_target_models_when_enabled(monke
         name="Custom Target Name",
         params=FakeModelParams(),
         meta=FakeModelMeta(description="custom target description"),
-        access_grants=[{"principal_type": "group", "principal_id": "team", "permission": "read"}],
+        access_grants=[
+            {"principal_type": "group", "principal_id": "team", "permission": "read"}
+        ],
         is_active=True,
     )
-    _, calls = install_fake_open_webui_model_modules(monkeypatch, {"target": existing_target})
+    _, calls = install_fake_open_webui_model_modules(
+        monkeypatch, {"target": existing_target}
+    )
     valves = mod.Pipe.Valves()
     valves.hide_wrapped_target_models = True
 
@@ -610,7 +666,9 @@ async def test_sync_wrapper_model_records_hides_target_models_when_enabled(monke
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_restores_target_hidden_when_hide_valve_disabled(monkeypatch):
+async def test_sync_wrapper_model_records_restores_target_hidden_when_hide_valve_disabled(
+    monkeypatch,
+):
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     existing_target = FakeModelForm(
         id="target",
@@ -662,7 +720,9 @@ async def test_sync_wrapper_model_records_restores_target_hidden_when_hide_valve
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_keeps_current_wrapper_desired_when_target_hide_fails(monkeypatch):
+async def test_sync_wrapper_model_records_keeps_current_wrapper_desired_when_target_hide_fails(
+    monkeypatch,
+):
     active_wrapper_id = mod.build_wrapper_model_id("auto_compact", "active-target")
     records = {
         active_wrapper_id: FakeModelForm(
@@ -691,7 +751,13 @@ async def test_sync_wrapper_model_records_keeps_current_wrapper_desired_when_tar
 
     await mod.sync_wrapper_model_records(
         pipe_function_id="auto_compact",
-        target_models=[{"id": "active-target", "name": "Active Target", "params": {"temperature": 0.3}}],
+        target_models=[
+            {
+                "id": "active-target",
+                "name": "Active Target",
+                "params": {"temperature": 0.3},
+            }
+        ],
         valves=valves,
     )
 
@@ -715,7 +781,9 @@ async def test_sync_wrapper_model_records_does_not_hide_existing_target_when_wra
         access_grants=[],
         is_active=True,
     )
-    records, calls = install_fake_open_webui_model_modules(monkeypatch, {"target": existing_target})
+    records, calls = install_fake_open_webui_model_modules(
+        monkeypatch, {"target": existing_target}
+    )
     Models = sys.modules["open_webui.models.models"].Models
     original_insert_new_model = Models.insert_new_model
 
@@ -752,7 +820,9 @@ async def test_sync_wrapper_model_records_does_not_create_target_override_when_w
     original_insert_new_model = Models.insert_new_model
 
     async def fail_wrapper_insert(model_form, user_id):
-        if model_form.id == mod.build_wrapper_model_id("auto_compact", "provider-target"):
+        if model_form.id == mod.build_wrapper_model_id(
+            "auto_compact", "provider-target"
+        ):
             if insert_failure == "none":
                 return None
             raise RuntimeError("wrapper insert failed")
@@ -775,7 +845,9 @@ async def test_sync_wrapper_model_records_does_not_create_target_override_when_w
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("update_failure", ["exception", "none"])
-async def test_sync_wrapper_model_records_restores_target_when_wrapper_update_fails(monkeypatch, update_failure):
+async def test_sync_wrapper_model_records_restores_target_when_wrapper_update_fails(
+    monkeypatch, update_failure
+):
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     records = {
         "target": FakeModelForm(
@@ -797,7 +869,7 @@ async def test_sync_wrapper_model_records_restores_target_when_wrapper_update_fa
         wrapper_id: FakeModelForm(
             id=wrapper_id,
             base_model_id=None,
-        name="Target (AutoCompact)",
+            name="Target (AutoCompact)",
             params=FakeModelParams(),
             meta=FakeModelMeta(
                 auto_compaction={
@@ -838,7 +910,9 @@ async def test_sync_wrapper_model_records_restores_target_when_wrapper_update_fa
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_deactivates_stale_managed_wrappers(monkeypatch):
+async def test_sync_wrapper_model_records_deactivates_stale_managed_wrappers(
+    monkeypatch,
+):
     active_wrapper_id = mod.build_wrapper_model_id("auto_compact", "active-target")
     stale_wrapper_id = mod.build_wrapper_model_id("auto_compact", "stale-target")
     other_pipe_wrapper_id = mod.build_wrapper_model_id("other_pipe", "stale-target")
@@ -846,7 +920,7 @@ async def test_sync_wrapper_model_records_deactivates_stale_managed_wrappers(mon
         stale_wrapper_id: FakeModelForm(
             id=stale_wrapper_id,
             base_model_id=None,
-        name="Stale Target (AutoCompact)",
+            name="Stale Target (AutoCompact)",
             params=FakeModelParams(),
             meta=FakeModelMeta(
                 hidden=True,
@@ -890,7 +964,9 @@ async def test_sync_wrapper_model_records_deactivates_stale_managed_wrappers(mon
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_restores_hidden_target_before_deactivating_stale_wrapper(monkeypatch):
+async def test_sync_wrapper_model_records_restores_hidden_target_before_deactivating_stale_wrapper(
+    monkeypatch,
+):
     stale_wrapper_id = mod.build_wrapper_model_id("auto_compact", "stale-target")
     records = {
         "stale-target": FakeModelForm(
@@ -912,7 +988,7 @@ async def test_sync_wrapper_model_records_restores_hidden_target_before_deactiva
         stale_wrapper_id: FakeModelForm(
             id=stale_wrapper_id,
             base_model_id=None,
-        name="Stale Target (AutoCompact)",
+            name="Stale Target (AutoCompact)",
             params=FakeModelParams(),
             meta=FakeModelMeta(
                 auto_compaction={
@@ -932,7 +1008,10 @@ async def test_sync_wrapper_model_records_restores_hidden_target_before_deactiva
         valves=mod.Pipe.Valves(),
     )
 
-    assert [model_id for model_id, _ in calls["updated"]] == ["stale-target", stale_wrapper_id]
+    assert [model_id for model_id, _ in calls["updated"]] == [
+        "stale-target",
+        stale_wrapper_id,
+    ]
     target_meta = calls["updated"][0][1].meta.model_dump(exclude_unset=True)
     assert "hidden" not in target_meta
     assert "auto_compaction_target_hidden_by" not in target_meta
@@ -940,7 +1019,9 @@ async def test_sync_wrapper_model_records_restores_hidden_target_before_deactiva
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_retains_pipe_created_target_override_when_stale(monkeypatch):
+async def test_sync_wrapper_model_records_retains_pipe_created_target_override_when_stale(
+    monkeypatch,
+):
     records, calls = install_fake_open_webui_model_modules(monkeypatch)
     valves = mod.Pipe.Valves()
     valves.hide_wrapped_target_models = True
@@ -990,7 +1071,9 @@ async def test_sync_wrapper_model_records_retains_pipe_created_target_override_w
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_preserves_admin_edited_target_override(monkeypatch):
+async def test_sync_wrapper_model_records_preserves_admin_edited_target_override(
+    monkeypatch,
+):
     records, calls = install_fake_open_webui_model_modules(monkeypatch)
     valves = mod.Pipe.Valves()
     valves.hide_wrapped_target_models = True
@@ -1032,7 +1115,10 @@ async def test_sync_wrapper_model_records_preserves_admin_edited_target_override
         valves=valves,
     )
 
-    assert records["provider-target"].meta.auto_compaction_target_hidden_by == original_marker
+    assert (
+        records["provider-target"].meta.auto_compaction_target_hidden_by
+        == original_marker
+    )
     for key in ("inserted", "updated", "deleted", "get_by_id"):
         calls[key].clear()
     calls["get_all"] = 0
@@ -1056,11 +1142,16 @@ async def test_sync_wrapper_model_records_preserves_admin_edited_target_override
         for grant in restored.access_grants
     } == {("user", "admin-user", "write")}
     assert restored.is_active is False
-    assert records[mod.build_wrapper_model_id("auto_compact", "provider-target")].is_active is False
+    assert (
+        records[mod.build_wrapper_model_id("auto_compact", "provider-target")].is_active
+        is False
+    )
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_restores_previous_created_marker_without_deleting_override(monkeypatch):
+async def test_sync_wrapper_model_records_restores_previous_created_marker_without_deleting_override(
+    monkeypatch,
+):
     records, calls = install_fake_open_webui_model_modules(monkeypatch)
     valves = mod.Pipe.Valves()
     valves.hide_wrapped_target_models = True
@@ -1091,7 +1182,10 @@ async def test_sync_wrapper_model_records_restores_previous_created_marker_witho
     assert calls["deleted"] == []
     assert "hidden" not in restored_meta
     assert "auto_compaction_target_hidden_by" not in restored_meta
-    assert records[mod.build_wrapper_model_id("auto_compact", "provider-target")].is_active is False
+    assert (
+        records[mod.build_wrapper_model_id("auto_compact", "provider-target")].is_active
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -1127,7 +1221,9 @@ async def test_sync_wrapper_model_records_retains_pipe_created_target_override_w
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_keeps_preexisting_hidden_target_when_restoring(monkeypatch):
+async def test_sync_wrapper_model_records_keeps_preexisting_hidden_target_when_restoring(
+    monkeypatch,
+):
     stale_wrapper_id = mod.build_wrapper_model_id("auto_compact", "stale-target")
     records = {
         "stale-target": FakeModelForm(
@@ -1149,7 +1245,7 @@ async def test_sync_wrapper_model_records_keeps_preexisting_hidden_target_when_r
         stale_wrapper_id: FakeModelForm(
             id=stale_wrapper_id,
             base_model_id=None,
-        name="Stale Target (AutoCompact)",
+            name="Stale Target (AutoCompact)",
             params=FakeModelParams(),
             meta=FakeModelMeta(
                 auto_compaction={
@@ -1230,8 +1326,12 @@ async def test_sync_wrapper_model_records_keeps_stale_wrapper_active_when_target
             raise RuntimeError("restore failed")
         return await original_update_model_by_id(model_id, model_form)
 
-    monkeypatch.setattr(Models, "get_model_by_id", staticmethod(fail_target_restore_read))
-    monkeypatch.setattr(Models, "update_model_by_id", staticmethod(fail_target_restore_update))
+    monkeypatch.setattr(
+        Models, "get_model_by_id", staticmethod(fail_target_restore_read)
+    )
+    monkeypatch.setattr(
+        Models, "update_model_by_id", staticmethod(fail_target_restore_update)
+    )
 
     await mod.sync_wrapper_model_records(
         pipe_function_id="auto_compact",
@@ -1245,7 +1345,9 @@ async def test_sync_wrapper_model_records_keeps_stale_wrapper_active_when_target
 
 
 @pytest.mark.asyncio
-async def test_sync_wrapper_model_records_does_not_claim_target_hidden_by_other_pipe(monkeypatch):
+async def test_sync_wrapper_model_records_does_not_claim_target_hidden_by_other_pipe(
+    monkeypatch,
+):
     records = {
         "target": FakeModelForm(
             id="target",
@@ -1300,7 +1402,9 @@ async def test_sync_wrapper_model_records_does_not_claim_target_hidden_by_other_
 
 
 @pytest.mark.asyncio
-async def test_hide_target_model_record_preserves_foreign_marker_with_stale_snapshot(monkeypatch):
+async def test_hide_target_model_record_preserves_foreign_marker_with_stale_snapshot(
+    monkeypatch,
+):
     records = {
         "target": FakeModelForm(
             id="target",
@@ -1419,7 +1523,9 @@ async def test_pipes_returns_entries_when_wrapper_record_sync_fails(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_pipes_does_not_direct_fetch_provider_models_when_state_caches_remain_empty(monkeypatch):
+async def test_pipes_does_not_direct_fetch_provider_models_when_state_caches_remain_empty(
+    monkeypatch,
+):
     install_unavailable_open_webui_config(monkeypatch)
     captured = {}
 
@@ -1479,11 +1585,15 @@ async def test_pipes_waits_for_sibling_provider_cache_population(monkeypatch):
     monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
     monkeypatch.setattr(mod, "_provider_model_cache_wait_timeout_seconds", lambda: 0.1)
     monkeypatch.setattr(mod, "PROVIDER_MODEL_CACHE_WAIT_POLL_SECONDS", 0.001)
-    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+    monkeypatch.setattr(
+        mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs)
+    )
 
     async def populate_cache():
         await asyncio.sleep(0)
-        state.OPENAI_MODELS = {"sibling-target": {"id": "sibling-target", "name": "Sibling Target"}}
+        state.OPENAI_MODELS = {
+            "sibling-target": {"id": "sibling-target", "name": "Sibling Target"}
+        }
 
     task = asyncio.create_task(populate_cache())
     try:
@@ -1508,9 +1618,13 @@ async def test_pipes_waits_for_all_enabled_provider_cache_population(monkeypatch
         nonlocal sleep_calls
         sleep_calls += 1
         if sleep_calls == 1:
-            state.OPENAI_MODELS = {"openai-target": {"id": "openai-target", "name": "OpenAI Target"}}
+            state.OPENAI_MODELS = {
+                "openai-target": {"id": "openai-target", "name": "OpenAI Target"}
+            }
         elif sleep_calls == 2:
-            state.OLLAMA_MODELS = {"ollama-target": {"model": "ollama-target", "name": "Ollama Target"}}
+            state.OLLAMA_MODELS = {
+                "ollama-target": {"model": "ollama-target", "name": "Ollama Target"}
+            }
 
     state = SimpleNamespace(
         MODELS={},
@@ -1524,7 +1638,9 @@ async def test_pipes_waits_for_all_enabled_provider_cache_population(monkeypatch
     monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
     monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
     monkeypatch.setattr(mod.asyncio, "sleep", sleep)
-    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+    monkeypatch.setattr(
+        mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs)
+    )
 
     result = await mod.Pipe().pipes()
 
@@ -1537,7 +1653,9 @@ async def test_pipes_waits_for_all_enabled_provider_cache_population(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_pipes_waits_when_one_of_multiple_provider_caches_is_still_empty(monkeypatch):
+async def test_pipes_waits_when_one_of_multiple_provider_caches_is_still_empty(
+    monkeypatch,
+):
     install_unavailable_open_webui_config(monkeypatch)
     captured = {}
     sleep_calls = 0
@@ -1548,12 +1666,16 @@ async def test_pipes_waits_when_one_of_multiple_provider_caches_is_still_empty(m
     async def sleep(seconds):
         nonlocal sleep_calls
         sleep_calls += 1
-        state.OLLAMA_MODELS = {"ollama-target": {"model": "ollama-target", "name": "Ollama Target"}}
+        state.OLLAMA_MODELS = {
+            "ollama-target": {"model": "ollama-target", "name": "Ollama Target"}
+        }
 
     state = SimpleNamespace(
         MODELS={},
         BASE_MODELS=[],
-        OPENAI_MODELS={"openai-target": {"id": "openai-target", "name": "OpenAI Target"}},
+        OPENAI_MODELS={
+            "openai-target": {"id": "openai-target", "name": "OpenAI Target"}
+        },
         OLLAMA_MODELS={},
         config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=True),
     )
@@ -1562,7 +1684,9 @@ async def test_pipes_waits_when_one_of_multiple_provider_caches_is_still_empty(m
     monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
     monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
     monkeypatch.setattr(mod.asyncio, "sleep", sleep)
-    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+    monkeypatch.setattr(
+        mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs)
+    )
 
     result = await mod.Pipe().pipes()
 
@@ -1590,7 +1714,9 @@ async def test_pipes_does_not_wait_for_disabled_provider_cache(monkeypatch):
         state=SimpleNamespace(
             MODELS={},
             BASE_MODELS=[],
-            OPENAI_MODELS={"openai-target": {"id": "openai-target", "name": "OpenAI Target"}},
+            OPENAI_MODELS={
+                "openai-target": {"id": "openai-target", "name": "OpenAI Target"}
+            },
             OLLAMA_MODELS={},
             config=SimpleNamespace(ENABLE_OPENAI_API=True, ENABLE_OLLAMA_API=False),
         )
@@ -1614,7 +1740,12 @@ async def test_pipes_excludes_disabled_provider_stale_cache_models(monkeypatch):
 
     state = SimpleNamespace(
         MODELS={
-            "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}},
+            "stale-openai": {
+                "id": "stale-openai",
+                "name": "Stale OpenAI",
+                "owned_by": "openai",
+                "openai": {},
+            },
             "other-pipe.child": {
                 "id": "other-pipe.child",
                 "name": "Other Pipe",
@@ -1630,10 +1761,23 @@ async def test_pipes_excludes_disabled_provider_stale_cache_models(monkeypatch):
             },
         },
         BASE_MODELS=[
-            {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}},
+            {
+                "id": "stale-ollama",
+                "name": "Stale Ollama",
+                "owned_by": "ollama",
+                "ollama": {},
+            },
         ],
-        OPENAI_MODELS={"direct-openai": {"id": "direct-openai", "name": "Direct OpenAI", "openai": {}}},
-        OLLAMA_MODELS={"direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}},
+        OPENAI_MODELS={
+            "direct-openai": {
+                "id": "direct-openai",
+                "name": "Direct OpenAI",
+                "openai": {},
+            }
+        },
+        OLLAMA_MODELS={
+            "direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}
+        },
         config=SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False),
     )
     main_module = types.ModuleType("open_webui.main")
@@ -1651,7 +1795,9 @@ async def test_pipes_excludes_disabled_provider_stale_cache_models(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pipes_uses_config_provider_enable_flags_when_legacy_attrs_are_missing(monkeypatch):
+async def test_pipes_uses_config_provider_enable_flags_when_legacy_attrs_are_missing(
+    monkeypatch,
+):
     captured = {}
 
     async def sync_wrapper_model_records(**kwargs):
@@ -1667,12 +1813,30 @@ async def test_pipes_uses_config_provider_enable_flags_when_legacy_attrs_are_mis
     config_module.Config = FakeConfig
     state = SimpleNamespace(
         MODELS={
-            "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}},
-            "stale-ollama": {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}},
+            "stale-openai": {
+                "id": "stale-openai",
+                "name": "Stale OpenAI",
+                "owned_by": "openai",
+                "openai": {},
+            },
+            "stale-ollama": {
+                "id": "stale-ollama",
+                "name": "Stale Ollama",
+                "owned_by": "ollama",
+                "ollama": {},
+            },
         },
         BASE_MODELS=[],
-        OPENAI_MODELS={"direct-openai": {"id": "direct-openai", "name": "Direct OpenAI", "openai": {}}},
-        OLLAMA_MODELS={"direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}},
+        OPENAI_MODELS={
+            "direct-openai": {
+                "id": "direct-openai",
+                "name": "Direct OpenAI",
+                "openai": {},
+            }
+        },
+        OLLAMA_MODELS={
+            "direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}
+        },
         config=SimpleNamespace(),
     )
     main_module = types.ModuleType("open_webui.main")
@@ -1692,7 +1856,9 @@ async def test_pipes_uses_config_provider_enable_flags_when_legacy_attrs_are_mis
 
 
 @pytest.mark.asyncio
-async def test_pipes_falls_back_to_legacy_provider_enable_flags_when_config_errors(monkeypatch):
+async def test_pipes_falls_back_to_legacy_provider_enable_flags_when_config_errors(
+    monkeypatch,
+):
     captured = {}
 
     async def sync_wrapper_model_records(**kwargs):
@@ -1708,12 +1874,30 @@ async def test_pipes_falls_back_to_legacy_provider_enable_flags_when_config_erro
     config_module.Config = FakeConfig
     state = SimpleNamespace(
         MODELS={
-            "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}},
-            "stale-ollama": {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}},
+            "stale-openai": {
+                "id": "stale-openai",
+                "name": "Stale OpenAI",
+                "owned_by": "openai",
+                "openai": {},
+            },
+            "stale-ollama": {
+                "id": "stale-ollama",
+                "name": "Stale Ollama",
+                "owned_by": "ollama",
+                "ollama": {},
+            },
         },
         BASE_MODELS=[],
-        OPENAI_MODELS={"direct-openai": {"id": "direct-openai", "name": "Direct OpenAI", "openai": {}}},
-        OLLAMA_MODELS={"direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}},
+        OPENAI_MODELS={
+            "direct-openai": {
+                "id": "direct-openai",
+                "name": "Direct OpenAI",
+                "openai": {},
+            }
+        },
+        OLLAMA_MODELS={
+            "direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}
+        },
         config=SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=True),
     )
     main_module = types.ModuleType("open_webui.main")
@@ -1746,8 +1930,18 @@ async def test_model_dict_from_request_excludes_config_disabled_stale_provider_c
     monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
     pipe_request.app.state.config = SimpleNamespace()
     pipe_request.app.state.MODELS = {
-        "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}},
-        "stale-ollama": {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}},
+        "stale-openai": {
+            "id": "stale-openai",
+            "name": "Stale OpenAI",
+            "owned_by": "openai",
+            "openai": {},
+        },
+        "stale-ollama": {
+            "id": "stale-ollama",
+            "name": "Stale Ollama",
+            "owned_by": "ollama",
+            "ollama": {},
+        },
         "direct": {"id": "direct", "name": "Direct"},
     }
     pipe_request.app.state.BASE_MODELS = []
@@ -1790,7 +1984,9 @@ async def test_ensure_model_in_request_models_does_not_inject_config_disabled_pr
 
 
 @pytest.mark.asyncio
-async def test_pipes_does_not_wait_when_empty_provider_cache_already_refreshed(monkeypatch):
+async def test_pipes_does_not_wait_when_empty_provider_cache_already_refreshed(
+    monkeypatch,
+):
     captured = {}
 
     async def sync_wrapper_model_records(**kwargs):
@@ -1845,7 +2041,9 @@ async def test_provider_cache_pending_detection_requires_core_request_identity()
     task = asyncio.create_task(fetch_openai_models(other_request))
     await asyncio.sleep(0)
     try:
-        assert mod._provider_model_cache_refresh_pending_attrs(["OPENAI_MODELS"]) == set()
+        assert (
+            mod._provider_model_cache_refresh_pending_attrs(["OPENAI_MODELS"]) == set()
+        )
         function_task = asyncio.create_task(get_function_models(request))
         assert await function_task == set()
     finally:
@@ -1882,7 +2080,9 @@ async def test_pipes_does_not_wait_for_other_request_provider_refresh(monkeypatc
         captured["target_ids"] = [model["id"] for model in kwargs["target_models"]]
 
     async def sleep(seconds):
-        raise AssertionError("pipes() should not wait for another request's provider refresh")
+        raise AssertionError(
+            "pipes() should not wait for another request's provider refresh"
+        )
 
     state = SimpleNamespace(
         MODELS={},
@@ -1937,7 +2137,9 @@ async def test_pipes_waits_for_ollama_two_stage_provider_refresh(monkeypatch):
         nonlocal sleep_calls
         sleep_calls += 1
         if sleep_calls == 25:
-            state.OLLAMA_MODELS = {"ollama-target": {"model": "ollama-target", "name": "Ollama Target"}}
+            state.OLLAMA_MODELS = {
+                "ollama-target": {"model": "ollama-target", "name": "Ollama Target"}
+            }
 
     state = SimpleNamespace(
         MODELS={},
@@ -1952,7 +2154,9 @@ async def test_pipes_waits_for_ollama_two_stage_provider_refresh(monkeypatch):
     monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
     monkeypatch.setattr(mod, "_provider_model_cache_wait_timeout_seconds", lambda: 1.0)
     monkeypatch.setattr(mod.asyncio, "sleep", sleep)
-    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+    monkeypatch.setattr(
+        mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs)
+    )
 
     result = await mod.Pipe().pipes()
 
@@ -1975,7 +2179,13 @@ async def test_pipes_normalizes_ollama_provider_cache_models(monkeypatch):
             MODELS={},
             BASE_MODELS=[],
             OPENAI_MODELS={},
-            OLLAMA_MODELS={"llama3.2:latest": {"model": "llama3.2:latest", "name": "Llama 3.2", "tags": ["local"]}},
+            OLLAMA_MODELS={
+                "llama3.2:latest": {
+                    "model": "llama3.2:latest",
+                    "name": "Llama 3.2",
+                    "tags": ["local"],
+                }
+            },
             config=SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=True),
         )
     )
@@ -1991,7 +2201,11 @@ async def test_pipes_normalizes_ollama_provider_cache_models(monkeypatch):
             "object": "model",
             "created": 0,
             "owned_by": "ollama",
-            "ollama": {"model": "llama3.2:latest", "name": "Llama 3.2", "tags": ["local"]},
+            "ollama": {
+                "model": "llama3.2:latest",
+                "name": "Llama 3.2",
+                "tags": ["local"],
+            },
             "loaded": False,
             "connection_type": "local",
             "tags": ["local"],
@@ -2001,7 +2215,9 @@ async def test_pipes_normalizes_ollama_provider_cache_models(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pipes_waits_until_core_model_list_timeout_for_sibling_provider_cache(monkeypatch):
+async def test_pipes_waits_until_core_model_list_timeout_for_sibling_provider_cache(
+    monkeypatch,
+):
     install_unavailable_open_webui_config(monkeypatch)
     captured = {}
     sleep_calls = 0
@@ -2013,7 +2229,9 @@ async def test_pipes_waits_until_core_model_list_timeout_for_sibling_provider_ca
         nonlocal sleep_calls
         sleep_calls += 1
         if sleep_calls == 25:
-            state.OPENAI_MODELS = {"slow-target": {"id": "slow-target", "name": "Slow Target"}}
+            state.OPENAI_MODELS = {
+                "slow-target": {"id": "slow-target", "name": "Slow Target"}
+            }
 
     state = SimpleNamespace(
         MODELS={},
@@ -2028,7 +2246,9 @@ async def test_pipes_waits_until_core_model_list_timeout_for_sibling_provider_ca
     monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
     monkeypatch.setattr(mod, "_provider_model_cache_wait_timeout_seconds", lambda: 2.0)
     monkeypatch.setattr(mod.asyncio, "sleep", sleep)
-    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+    monkeypatch.setattr(
+        mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs)
+    )
 
     result = await mod.Pipe().pipes()
 
@@ -2059,8 +2279,12 @@ async def test_pipes_keeps_current_cache_when_provider_cache_wait_fails(monkeypa
     main_module.app = SimpleNamespace(state=state)
     monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
     monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
-    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
-    monkeypatch.setattr(mod, "_wait_for_provider_model_caches", wait_for_provider_model_caches)
+    monkeypatch.setattr(
+        mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs)
+    )
+    monkeypatch.setattr(
+        mod, "_wait_for_provider_model_caches", wait_for_provider_model_caches
+    )
 
     result = await mod.Pipe().pipes()
 
@@ -2069,7 +2293,9 @@ async def test_pipes_keeps_current_cache_when_provider_cache_wait_fails(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_pipes_stops_waiting_when_sibling_provider_cache_refresh_completes_empty(monkeypatch):
+async def test_pipes_stops_waiting_when_sibling_provider_cache_refresh_completes_empty(
+    monkeypatch,
+):
     install_unavailable_open_webui_config(monkeypatch)
     captured = {}
     sleep_calls = 0
@@ -2095,7 +2321,9 @@ async def test_pipes_stops_waiting_when_sibling_provider_cache_refresh_completes
     monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
     monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
     monkeypatch.setattr(mod.asyncio, "sleep", sleep)
-    monkeypatch.setattr(mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs))
+    monkeypatch.setattr(
+        mod, "_provider_model_cache_refresh_pending_attrs", lambda attrs: set(attrs)
+    )
 
     result = await mod.Pipe().pipes()
 
@@ -2139,7 +2367,10 @@ def test_compaction_summary_embed_html_renders_sanitized_markdown_summary():
     assert "<li>first item</li>" in embed_html
     assert "<strong>strong</strong>" in embed_html
     assert "<code>code &lt;value&gt;</code>" in embed_html
-    assert '<a href="https://example.com/path?q=1" target="_blank" rel="noopener noreferrer">safe</a>' in embed_html
+    assert (
+        '<a href="https://example.com/path?q=1" target="_blank" rel="noopener noreferrer">safe</a>'
+        in embed_html
+    )
     assert "&lt;b onclick=&quot;alert(1)&quot;&gt;bold&lt;/b&gt;" in embed_html
     assert "&lt;a href=&quot;javascript:alert(2)&quot;&gt;link&lt;/a&gt;" in embed_html
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in embed_html
@@ -2167,7 +2398,10 @@ def test_compaction_summary_embed_html_bounds_expanded_summary_height():
 
     # Regression guards for the two known bad sizing approaches.
     assert "inner.scrollHeight" not in embed_html
-    assert "Math.max(document.documentElement.scrollHeight,document.body.scrollHeight,1)" not in embed_html
+    assert (
+        "Math.max(document.documentElement.scrollHeight,document.body.scrollHeight,1)"
+        not in embed_html
+    )
 
 
 def test_extract_compaction_summary_text_decodes_cdata_boundaries():
@@ -2191,7 +2425,10 @@ def test_extract_compaction_summary_text_ignores_non_generated_tags():
         },
     ]
 
-    assert mod.extract_compaction_summary_text_from_messages(messages) == "generated summary"
+    assert (
+        mod.extract_compaction_summary_text_from_messages(messages)
+        == "generated summary"
+    )
 
 
 def test_message_token_estimates_are_cached_by_canonical_hash():
@@ -2211,8 +2448,12 @@ def test_message_token_estimates_are_cached_by_canonical_hash():
     message = {"role": "user", "content": "unchanged", "transient": "ignored"}
     messages = [message, copy.deepcopy(message)]
 
-    first = mod.estimate_messages_tokens(messages, encoder=encoder, encoding_name="unit-test")
-    second = mod.estimate_messages_tokens(messages, encoder=encoder, encoding_name="unit-test")
+    first = mod.estimate_messages_tokens(
+        messages, encoder=encoder, encoding_name="unit-test"
+    )
+    second = mod.estimate_messages_tokens(
+        messages, encoder=encoder, encoding_name="unit-test"
+    )
 
     assert first == second
     assert len(encoder.calls) == 1
@@ -2266,7 +2507,11 @@ def test_message_token_estimate_strips_image_file_attachment_data_url():
                 "id": "img-1",
                 "name": "photo.png",
                 "url": f"data:image/png;base64,{huge_base64}",
-                "file": {"id": "img-1", "hash": "abc", "data": {"content": huge_base64}},
+                "file": {
+                    "id": "img-1",
+                    "hash": "abc",
+                    "data": {"content": huge_base64},
+                },
             }
         ],
     }
@@ -2317,7 +2562,10 @@ def test_message_token_estimate_counts_input_image_content_part_as_image():
         "tool_call_id": "call-image",
         "content": [
             {"type": "input_text", "text": "generated image"},
-            {"type": "input_image", "image_url": f"data:image/png;base64,{huge_base64}"},
+            {
+                "type": "input_image",
+                "image_url": f"data:image/png;base64,{huge_base64}",
+            },
         ],
     }
 
@@ -2418,14 +2666,19 @@ def test_message_token_estimate_strips_non_image_file_attachment_raw_bodies():
                 "file": {
                     "id": "doc-1",
                     "hash": "hash-1",
-                    "data": {"content": huge_body, "metadata": {"sha256": metadata_sha}},
+                    "data": {
+                        "content": huge_body,
+                        "metadata": {"sha256": metadata_sha},
+                    },
                 },
             }
         ],
     }
 
     encoder = CaptureEncoder()
-    count = mod.estimate_message_tokens(message, encoder=encoder, encoding_name="unit-test")
+    count = mod.estimate_message_tokens(
+        message, encoder=encoder, encoding_name="unit-test"
+    )
 
     assert isinstance(count, int)
     assert count < len(huge_body) // 10
@@ -2467,9 +2720,9 @@ def test_message_token_cache_key_and_source_hash_reflect_raw_file_part_payload()
     different["content"][1]["content"] = "payload-b"
     different["content"][1]["file"]["data"]["content"] = "payload-b"
 
-    assert mod._message_token_cache_key(base, encoding_name="enc") != mod._message_token_cache_key(
-        different, encoding_name="enc"
-    )
+    assert mod._message_token_cache_key(
+        base, encoding_name="enc"
+    ) != mod._message_token_cache_key(different, encoding_name="enc")
     assert mod.compute_source_hash([base]) != mod.compute_source_hash([different])
 
 
@@ -2519,9 +2772,9 @@ def test_message_token_image_overhead_matches_core_context_compaction():
         }
     ]
 
-    core_image_overhead = _estimate_messages_tokens(with_image) - _estimate_messages_tokens(
-        text_only
-    )
+    core_image_overhead = _estimate_messages_tokens(
+        with_image
+    ) - _estimate_messages_tokens(text_only)
 
     assert mod.MESSAGE_TOKEN_IMAGE_OVERHEAD == core_image_overhead
 
@@ -2538,9 +2791,9 @@ def test_message_token_cache_key_reflects_full_image_payload():
     different = copy.deepcopy(base)
     different["content"][1]["image_url"]["url"] = "data:image/png;base64,bbb"
 
-    assert mod._message_token_cache_key(base, encoding_name="enc") != mod._message_token_cache_key(
-        different, encoding_name="enc"
-    )
+    assert mod._message_token_cache_key(
+        base, encoding_name="enc"
+    ) != mod._message_token_cache_key(different, encoding_name="enc")
 
 
 def test_large_message_token_estimate_uses_sampling_for_large_text():
@@ -2625,8 +2878,12 @@ def test_body_token_estimate_includes_provider_visible_tool_payload():
         ],
     }
 
-    message_only = mod.estimate_messages_tokens(body["messages"], encoder=LengthEncoder(), encoding_name="unit-test")
-    body_total = mod.estimate_body_tokens(body, encoder=LengthEncoder(), encoding_name="unit-test")
+    message_only = mod.estimate_messages_tokens(
+        body["messages"], encoder=LengthEncoder(), encoding_name="unit-test"
+    )
+    body_total = mod.estimate_body_tokens(
+        body, encoder=LengthEncoder(), encoding_name="unit-test"
+    )
 
     assert body_total > message_only
 
@@ -2648,7 +2905,9 @@ def test_body_token_estimate_ignores_provider_prompt_cache_hints_on_tools():
     with_cache_hint = copy.deepcopy(body)
     with_cache_hint["tools"][0]["cache_control"] = {"type": "ephemeral"}
 
-    assert mod.estimate_body_tokens(body, encoder=LengthEncoder(), encoding_name="unit-test") == mod.estimate_body_tokens(
+    assert mod.estimate_body_tokens(
+        body, encoder=LengthEncoder(), encoding_name="unit-test"
+    ) == mod.estimate_body_tokens(
         with_cache_hint,
         encoder=LengthEncoder(),
         encoding_name="unit-test",
@@ -2656,7 +2915,9 @@ def test_body_token_estimate_ignores_provider_prompt_cache_hints_on_tools():
 
 
 @pytest.mark.asyncio
-async def test_token_estimator_uses_db_config_tiktoken_encoding_before_legacy(monkeypatch, pipe_request):
+async def test_token_estimator_uses_db_config_tiktoken_encoding_before_legacy(
+    monkeypatch, pipe_request
+):
     captured = []
     config_gets = []
 
@@ -2685,16 +2946,25 @@ async def test_token_estimator_uses_db_config_tiktoken_encoding_before_legacy(mo
     setattr(tiktoken_module, "get_encoding", get_encoding)
     monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
     monkeypatch.setitem(sys.modules, "tiktoken", tiktoken_module)
-    pipe_request.app.state.config = SimpleNamespace(TIKTOKEN_ENCODING_NAME="legacy_encoding")
+    pipe_request.app.state.config = SimpleNamespace(
+        TIKTOKEN_ENCODING_NAME="legacy_encoding"
+    )
 
-    count = await mod.estimate_message_tokens_async({"role": "user", "content": "hello"}, request=pipe_request)
-    second_count = await mod.estimate_message_tokens_async({"role": "user", "content": "again"}, request=pipe_request)
+    count = await mod.estimate_message_tokens_async(
+        {"role": "user", "content": "hello"}, request=pipe_request
+    )
+    second_count = await mod.estimate_message_tokens_async(
+        {"role": "user", "content": "again"}, request=pipe_request
+    )
 
     assert count is not None
     assert second_count is not None
     assert captured[0] == "db_encoding"
     assert config_gets == [mod.TIKTOKEN_ENCODING_CONFIG_KEY]
-    assert getattr(pipe_request.state, mod.AUTO_COMPACT_TIKTOKEN_ENCODING_STATE_KEY) == "db_encoding"
+    assert (
+        getattr(pipe_request.state, mod.AUTO_COMPACT_TIKTOKEN_ENCODING_STATE_KEY)
+        == "db_encoding"
+    )
 
 
 @pytest.mark.asyncio
@@ -2727,9 +2997,13 @@ async def test_token_estimator_falls_back_to_legacy_tiktoken_encoding_when_confi
     setattr(tiktoken_module, "get_encoding", get_encoding)
     monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
     monkeypatch.setitem(sys.modules, "tiktoken", tiktoken_module)
-    pipe_request.app.state.config = SimpleNamespace(TIKTOKEN_ENCODING_NAME="legacy_encoding")
+    pipe_request.app.state.config = SimpleNamespace(
+        TIKTOKEN_ENCODING_NAME="legacy_encoding"
+    )
 
-    count = await mod.estimate_message_tokens_async({"role": "user", "content": "hello"}, request=pipe_request)
+    count = await mod.estimate_message_tokens_async(
+        {"role": "user", "content": "hello"}, request=pipe_request
+    )
 
     assert count is not None
     assert captured[0] == "legacy_encoding"
@@ -2737,7 +3011,9 @@ async def test_token_estimator_falls_back_to_legacy_tiktoken_encoding_when_confi
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_completion_stores_rendered_summary_token_count(monkeypatch, pipe_request, pipe_user):
+async def test_checkpoint_completion_stores_rendered_summary_token_count(
+    monkeypatch, pipe_request, pipe_user
+):
     source_messages = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
@@ -2756,7 +3032,12 @@ async def test_checkpoint_completion_stores_rendered_summary_token_count(monkeyp
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
-    monkeypatch.setattr(mod, "_estimate_rendered_summary_message_tokens", estimate_rendered_summary_message_tokens, raising=False)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_rendered_summary_message_tokens",
+        estimate_rendered_summary_message_tokens,
+        raising=False,
+    )
 
     summary = await mod._get_or_create_checkpoint_summary(
         request=pipe_request,
@@ -2773,7 +3054,9 @@ async def test_checkpoint_completion_stores_rendered_summary_token_count(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_summary_token_count_from_checkpoint_uses_checkpoint_rendering(monkeypatch, pipe_request):
+async def test_summary_token_count_from_checkpoint_uses_checkpoint_rendering(
+    monkeypatch, pipe_request
+):
     source_messages = [
         {"role": "user", "content": "old request"},
         {"role": "assistant", "content": "old answer"},
@@ -2787,7 +3070,9 @@ async def test_summary_token_count_from_checkpoint_uses_checkpoint_rendering(mon
         source_hash=mod.compute_source_hash(source_messages),
         source_message_count=len(source_messages),
         summary_text="Stored summary",
-        summary_meta={mod.SUMMARY_META_FORMAT_VERSION_KEY: mod.SUMMARY_META_FORMAT_VERSION},
+        summary_meta={
+            mod.SUMMARY_META_FORMAT_VERSION_KEY: mod.SUMMARY_META_FORMAT_VERSION
+        },
         summary_token_count=None,
         parent_checkpoint_id=None,
         now=123,
@@ -2821,7 +3106,9 @@ async def test_summary_token_count_from_checkpoint_uses_checkpoint_rendering(mon
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_applied_estimate_batches_delta_tail_token_estimation(monkeypatch, pipe_request, pipe_user):
+async def test_checkpoint_applied_estimate_batches_delta_tail_token_estimation(
+    monkeypatch, pipe_request, pipe_user
+):
     parent_source = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
@@ -2852,10 +3139,16 @@ async def test_checkpoint_applied_estimate_batches_delta_tail_token_estimation(m
         return 33
 
     async def estimate_message_tokens_async(message, **kwargs):
-        raise AssertionError("checkpoint-applied estimate must batch delta/tail token estimation")
+        raise AssertionError(
+            "checkpoint-applied estimate must batch delta/tail token estimation"
+        )
 
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "estimate_message_tokens_async", estimate_message_tokens_async)
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "estimate_message_tokens_async", estimate_message_tokens_async
+    )
 
     count = await mod._estimate_checkpoint_applied_body_tokens(
         request=pipe_request,
@@ -2887,7 +3180,9 @@ async def test_checkpoint_applied_estimate_batches_delta_tail_token_estimation(m
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_applied_estimate_includes_retained_file_context(monkeypatch, pipe_request, pipe_user):
+async def test_checkpoint_applied_estimate_includes_retained_file_context(
+    monkeypatch, pipe_request, pipe_user
+):
     parent_source = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
@@ -2922,13 +3217,22 @@ async def test_checkpoint_applied_estimate_includes_retained_file_context(monkey
         return 33
 
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
 
     count = await mod._estimate_checkpoint_applied_body_tokens(
         request=pipe_request,
         user=pipe_user,
-        metadata={"chat_id": "chat-1", "files": [_file("retained")], "user_message": {"files": [_file("retained")]}},
-        body={"metadata": {"files": [_file("retained")]}, "messages": [*parent_source, *delta_messages, *tail_messages]},
+        metadata={
+            "chat_id": "chat-1",
+            "files": [_file("retained")],
+            "user_message": {"files": [_file("retained")]},
+        },
+        body={
+            "metadata": {"files": [_file("retained")]},
+            "messages": [*parent_source, *delta_messages, *tail_messages],
+        },
         pipe_function_id="auto_compact",
         match=mod.ReusableCheckpointMatch(
             kind="parent",
@@ -2944,7 +3248,10 @@ async def test_checkpoint_applied_estimate_includes_retained_file_context(monkey
     assert count == 53
     assert captured["prefix_count"] == len(parent_source)
     assert captured["metadata_files"] == [_file("retained")]
-    assert captured["estimate_body"]["messages"] == [*delta_messages, {"role": "user", "content": "active\nFILE_CONTEXT"}]
+    assert captured["estimate_body"]["messages"] == [
+        *delta_messages,
+        {"role": "user", "content": "active\nFILE_CONTEXT"},
+    ]
 
 
 def test_include_exclude_patterns_match_id_and_name_and_deduplicate_targets():
@@ -2984,7 +3291,9 @@ def test_wrapper_model_name_template_supports_postfix_template():
         pipe_function_id="auto_compact",
         function_owner_user_id="owner-1",
         target_model={"id": "gpt-4.1", "name": "GPT"},
-        valves=mod.Pipe.Valves(wrapper_model_name_template="{target_name} (AutoCompact)"),
+        valves=mod.Pipe.Valves(
+            wrapper_model_name_template="{target_name} (AutoCompact)"
+        ),
     )
 
     assert form["name"] == "GPT (AutoCompact)"
@@ -3015,7 +3324,9 @@ def test_wrapper_model_name_template_rejects_format_width_specs():
 
 
 @pytest.mark.parametrize("target_name", ["Model {target_id}", "Model {v2}"])
-def test_wrapper_model_name_template_does_not_reinterpret_target_name_braces(target_name):
+def test_wrapper_model_name_template_does_not_reinterpret_target_name_braces(
+    target_name,
+):
     form = mod.build_wrapper_model_form(
         pipe_function_id="auto_compact",
         function_owner_user_id="owner-1",
@@ -3165,7 +3476,10 @@ def test_wrapper_model_form_inherits_target_meta_used_by_core_middleware():
     assert form["meta"]["filterIds"] == ["model-filter"]
     assert form["meta"]["actionIds"] == ["model-action"]
     assert form["meta"]["knowledge"] == [{"id": "knowledge-1", "name": "Knowledge"}]
-    assert form["meta"]["capabilities"] == {"file_context": False, "builtin_tools": False}
+    assert form["meta"]["capabilities"] == {
+        "file_context": False,
+        "builtin_tools": False,
+    }
     assert form["meta"]["skillIds"] == ["skill-1"]
     assert form["meta"]["toolIds"] == ["tool-1"]
     assert form["meta"]["defaultFeatureIds"] == ["web_search"]
@@ -3362,8 +3676,17 @@ def test_classify_target_with_tool_call_expansion_in_prefix():
         "role": "assistant",
         "content": "",
         "output": [
-            {"type": "function_call", "call_id": "c1", "name": "search", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "result"}]},
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "search",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [{"type": "input_text", "text": "result"}],
+            },
             {"type": "message", "content": [{"type": "output_text", "text": "done"}]},
         ],
     }
@@ -3385,7 +3708,11 @@ def test_classify_target_with_tool_call_expansion_in_prefix():
         db_chain=expanded,
         compaction_prefix_count=4,
         metadata_user_message={"files": [_file("current-file")]},
-        metadata_files=[_file("prefix-file"), _file("delta-file"), _file("current-file")],
+        metadata_files=[
+            _file("prefix-file"),
+            _file("delta-file"),
+            _file("current-file"),
+        ],
     )
 
     # delta-file AND current-file retained; prefix-file dropped
@@ -3402,15 +3729,36 @@ async def test_load_chat_message_chain_expands_assistant_with_output(monkeypatch
         "role": "assistant",
         "content": "",
         "output": [
-            {"type": "function_call", "call_id": "c1", "name": "search", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "result"}]},
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "search",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [{"type": "input_text", "text": "result"}],
+            },
             {"type": "message", "content": [{"type": "output_text", "text": "done"}]},
         ],
     }
     messages_map = {
-        "u1": {"id": "u1", "parentId": None, "role": "user", "content": "hi", "files": []},
+        "u1": {
+            "id": "u1",
+            "parentId": None,
+            "role": "user",
+            "content": "hi",
+            "files": [],
+        },
         "a1": {"id": "a1", "parentId": "u1", **assistant_with_output},
-        "u2": {"id": "u2", "parentId": "a1", "role": "user", "content": "bye", "files": []},
+        "u2": {
+            "id": "u2",
+            "parentId": "a1",
+            "role": "user",
+            "content": "bye",
+            "files": [],
+        },
     }
 
     class FakeChats:
@@ -3505,7 +3853,12 @@ def test_classify_target_skips_db_chain_system_rows():
 def test_classify_target_retains_leading_system_files():
     metadata_files = [_file("sys-doc"), _file("absorbed"), _file("kept")]
     db_chain = [
-        {"id": "m0", "role": "system", "content": "preserved system", "files": [_file("sys-doc")]},
+        {
+            "id": "m0",
+            "role": "system",
+            "content": "preserved system",
+            "files": [_file("sys-doc")],
+        },
         {"id": "m1", "role": "user", "files": [_file("absorbed")]},
         {"id": "m2", "role": "user", "files": [_file("kept")]},
     ]
@@ -3524,7 +3877,12 @@ def test_classify_target_retains_mid_chain_first_system_files():
     metadata_files = [_file("absorbed"), _file("sys-doc"), _file("kept")]
     db_chain = [
         {"id": "m0", "role": "user", "files": [_file("absorbed")]},
-        {"id": "m1", "role": "system", "content": "preserved system", "files": [_file("sys-doc")]},
+        {
+            "id": "m1",
+            "role": "system",
+            "content": "preserved system",
+            "files": [_file("sys-doc")],
+        },
         {"id": "m2", "role": "user", "files": [_file("kept")]},
     ]
 
@@ -3541,8 +3899,18 @@ def test_classify_target_retains_mid_chain_first_system_files():
 def test_classify_target_prunes_second_system_row_files():
     metadata_files = [_file("preserved"), _file("absorbed-sys"), _file("kept")]
     db_chain = [
-        {"id": "m0", "role": "system", "content": "preserved system", "files": [_file("preserved")]},
-        {"id": "m1", "role": "system", "content": "absorbed system", "files": [_file("absorbed-sys")]},
+        {
+            "id": "m0",
+            "role": "system",
+            "content": "preserved system",
+            "files": [_file("preserved")],
+        },
+        {
+            "id": "m1",
+            "role": "system",
+            "content": "absorbed system",
+            "files": [_file("absorbed-sys")],
+        },
         {"id": "m2", "role": "user", "content": "old"},
         {"id": "m3", "role": "user", "files": [_file("kept")]},
     ]
@@ -3560,7 +3928,12 @@ def test_classify_target_prunes_second_system_row_files():
 def test_classify_summary_skips_db_chain_system_rows():
     db_chain = [
         {"id": "m1", "role": "user", "files": [_file("first")]},
-        {"id": "m2", "role": "system", "content": "stored system", "files": [_file("system-owned")]},
+        {
+            "id": "m2",
+            "role": "system",
+            "content": "stored system",
+            "files": [_file("system-owned")],
+        },
         {"id": "m3", "role": "user", "files": [_file("second")]},
     ]
 
@@ -3673,11 +4046,16 @@ def test_open_webui_0101_default_native_tool_loop_redispatch_preserves_wrapper_i
     }
 
     assert new_form_data["model"] == wrapper_id
-    assert mod.decode_wrapper_model_id(new_form_data["model"]).target_model_id == "provider-target"
+    assert (
+        mod.decode_wrapper_model_id(new_form_data["model"]).target_model_id
+        == "provider-target"
+    )
 
 
 @pytest.mark.asyncio
-async def test_wrapper_sync_uses_function_owner_and_scoped_generated_wrapper_ids(monkeypatch):
+async def test_wrapper_sync_uses_function_owner_and_scoped_generated_wrapper_ids(
+    monkeypatch,
+):
     calls = {"insert": [], "update": []}
 
     class FakeFunction:
@@ -3738,19 +4116,29 @@ async def test_wrapper_sync_uses_function_owner_and_scoped_generated_wrapper_ids
     await mod.sync_wrapper_model_records(
         pipe_function_id="auto_compact",
         target_models=[
-            {"id": "existing-target", "name": "Existing", "info": {"access_grants": []}},
+            {
+                "id": "existing-target",
+                "name": "Existing",
+                "info": {"access_grants": []},
+            },
             {"id": "new-target", "name": "New", "info": {"access_grants": []}},
         ],
         valves=mod.Pipe.Valves(),
     )
 
-    assert [call[0] for call in calls["update"]] == [mod.build_wrapper_model_id("auto_compact", "existing-target")]
+    assert [call[0] for call in calls["update"]] == [
+        mod.build_wrapper_model_id("auto_compact", "existing-target")
+    ]
     assert calls["insert"][0][0] == "function-owner"
-    assert calls["insert"][0][1].id == mod.build_wrapper_model_id("auto_compact", "new-target")
+    assert calls["insert"][0][1].id == mod.build_wrapper_model_id(
+        "auto_compact", "new-target"
+    )
 
 
 @pytest.mark.asyncio
-async def test_wrapper_sync_uses_target_model_record_params_for_wrapper_record(monkeypatch):
+async def test_wrapper_sync_uses_target_model_record_params_for_wrapper_record(
+    monkeypatch,
+):
     calls = {"insert": [], "update": []}
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target-with-record")
 
@@ -3791,7 +4179,11 @@ async def test_wrapper_sync_uses_target_model_record_params_for_wrapper_record(m
                             "temperature": 0.2,
                         }
                     ),
-                    meta=SimpleNamespace(model_dump=lambda **kwargs: {"capabilities": {"builtin_tools": False}}),
+                    meta=SimpleNamespace(
+                        model_dump=lambda **kwargs: {
+                            "capabilities": {"builtin_tools": False}
+                        }
+                    ),
                     access_grants=[],
                     user_id="function-owner",
                 )
@@ -3819,18 +4211,32 @@ async def test_wrapper_sync_uses_target_model_record_params_for_wrapper_record(m
 
     await mod.sync_wrapper_model_records(
         pipe_function_id="auto_compact",
-        target_models=[{"id": "target-with-record", "name": "Target With Record", "info": {"meta": {}}}],
+        target_models=[
+            {
+                "id": "target-with-record",
+                "name": "Target With Record",
+                "info": {"meta": {}},
+            }
+        ],
         valves=mod.Pipe.Valves(),
     )
 
     inserted = calls["insert"][0][1]
     assert inserted.id == wrapper_id
-    assert inserted.params.payload == {"function_calling": "native", "stream_response": True}
-    assert inserted.meta.payload["capabilities"] == {"builtin_tools": False, "file_context": False}
+    assert inserted.params.payload == {
+        "function_calling": "native",
+        "stream_response": True,
+    }
+    assert inserted.meta.payload["capabilities"] == {
+        "builtin_tools": False,
+        "file_context": False,
+    }
 
 
 @pytest.mark.asyncio
-async def test_wrapper_sync_ignores_non_dict_top_level_provider_capabilities(monkeypatch):
+async def test_wrapper_sync_ignores_non_dict_top_level_provider_capabilities(
+    monkeypatch,
+):
     calls = {"insert": [], "update": []}
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "provider-target")
 
@@ -3906,7 +4312,9 @@ async def test_wrapper_sync_ignores_non_dict_top_level_provider_capabilities(mon
 
 
 @pytest.mark.asyncio
-async def test_wrapper_sync_does_not_make_base_target_public_without_model_info(monkeypatch):
+async def test_wrapper_sync_does_not_make_base_target_public_without_model_info(
+    monkeypatch,
+):
     calls = {"insert": [], "update": []}
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "base-target")
 
@@ -3969,7 +4377,9 @@ async def test_wrapper_sync_does_not_make_base_target_public_without_model_info(
 
     await mod.sync_wrapper_model_records(
         pipe_function_id="auto_compact",
-        target_models=[{"id": "base-target", "name": "Base Target", "owned_by": "openai"}],
+        target_models=[
+            {"id": "base-target", "name": "Base Target", "owned_by": "openai"}
+        ],
         valves=mod.Pipe.Valves(),
     )
 
@@ -4030,7 +4440,7 @@ async def test_wrapper_sync_skips_update_when_existing_record_matches(monkeypatc
             return {
                 "id": wrapper_id,
                 "base_model_id": None,
-            "name": "Same Target (AutoCompact)",
+                "name": "Same Target (AutoCompact)",
                 "params": {"stream_response": True},
                 "meta": {
                     "auto_compaction": {
@@ -4106,9 +4516,15 @@ async def test_target_access_uses_core_chat_model_dict_when_db_record_lookup_is_
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
 
-    await mod._validate_target_access(target_model_id="target", request=pipe_request, user=pipe_user)
+    await mod._validate_target_access(
+        target_model_id="target", request=pipe_request, user=pipe_user
+    )
 
-    assert captured == {"user_type": fake_user_model, "user_id": "user-1", "model": target_model}
+    assert captured == {
+        "user_type": fake_user_model,
+        "user_id": "user-1",
+        "model": target_model,
+    }
 
 
 def test_iter_cache_models_reads_redisdict_like_values():
@@ -4120,13 +4536,17 @@ def test_iter_cache_models_reads_redisdict_like_values():
             return list(self._values)
 
     state = SimpleNamespace(
-        MODELS=FakeRedisDict([{"id": "redis-target", "name": "Redis Target"}, "not-a-model"]),
+        MODELS=FakeRedisDict(
+            [{"id": "redis-target", "name": "Redis Target"}, "not-a-model"]
+        ),
         BASE_MODELS=[],
         OPENAI_MODELS={},
         OLLAMA_MODELS={},
     )
 
-    assert [model["id"] for model in mod._iter_cache_models_from_state(state)] == ["redis-target"]
+    assert [model["id"] for model in mod._iter_cache_models_from_state(state)] == [
+        "redis-target"
+    ]
 
 
 @pytest.mark.asyncio
@@ -4136,11 +4556,15 @@ async def test_target_access_bypasses_core_access_check_for_admin_when_admin_byp
     pipe_user,
 ):
     install_fake_open_webui_user_model(monkeypatch)
-    pipe_request.app.state.MODELS = {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+    pipe_request.app.state.MODELS = {
+        "target": {"id": "target", "name": "Target", "owned_by": "openai"}
+    }
     admin_user = {**pipe_user, "role": "admin"}
 
     async def check_model_access(user, model, db=None):
-        raise AssertionError("admin target validation should match core chat path and skip per-model grants")
+        raise AssertionError(
+            "admin target validation should match core chat path and skip per-model grants"
+        )
 
     utils_models_module = types.ModuleType("open_webui.utils.models")
     utils_models_module.check_model_access = check_model_access
@@ -4149,11 +4573,15 @@ async def test_target_access_bypasses_core_access_check_for_admin_when_admin_byp
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.config", config_module)
 
-    await mod._validate_target_access(target_model_id="target", request=pipe_request, user=admin_user)
+    await mod._validate_target_access(
+        target_model_id="target", request=pipe_request, user=admin_user
+    )
 
 
 @pytest.mark.asyncio
-async def test_target_access_checks_admin_when_admin_bypass_disabled(monkeypatch, pipe_request, pipe_user):
+async def test_target_access_checks_admin_when_admin_bypass_disabled(
+    monkeypatch, pipe_request, pipe_user
+):
     fake_user_model = install_fake_open_webui_user_model(monkeypatch)
     target_model = {"id": "target", "name": "Target", "owned_by": "openai"}
     pipe_request.app.state.MODELS = {"target": target_model}
@@ -4181,9 +4609,15 @@ async def test_target_access_checks_admin_when_admin_bypass_disabled(monkeypatch
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.config", config_module)
 
-    await mod._validate_target_access(target_model_id="target", request=pipe_request, user=admin_user)
+    await mod._validate_target_access(
+        target_model_id="target", request=pipe_request, user=admin_user
+    )
 
-    assert captured == {"user_type": fake_user_model, "user_role": "admin", "model": target_model}
+    assert captured == {
+        "user_type": fake_user_model,
+        "user_role": "admin",
+        "model": target_model,
+    }
 
 
 @pytest.mark.asyncio
@@ -4204,7 +4638,9 @@ async def test_target_access_allows_admin_raw_provider_target_without_model_reco
             return None
 
     async def check_model_access(user, model, db=None):
-        raise AssertionError("admin raw provider target should not require a DB Model access check")
+        raise AssertionError(
+            "admin raw provider target should not require a DB Model access check"
+        )
 
     models_module = types.ModuleType("open_webui.models.models")
     models_module.Models = FakeModels
@@ -4216,19 +4652,35 @@ async def test_target_access_allows_admin_raw_provider_target_without_model_reco
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.config", config_module)
 
-    await mod._validate_target_access(target_model_id="raw-target", request=pipe_request, user=admin_user)
+    await mod._validate_target_access(
+        target_model_id="raw-target", request=pipe_request, user=admin_user
+    )
 
 
 @pytest.mark.asyncio
-async def test_target_access_rejects_disabled_provider_stale_cache_target(monkeypatch, pipe_request, pipe_user):
+async def test_target_access_rejects_disabled_provider_stale_cache_target(
+    monkeypatch, pipe_request, pipe_user
+):
     install_fake_open_webui_user_model(monkeypatch)
     install_unavailable_open_webui_config(monkeypatch)
-    pipe_request.app.state.config = SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False)
+    pipe_request.app.state.config = SimpleNamespace(
+        ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False
+    )
     pipe_request.app.state.MODELS = {
-        "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}}
+        "stale-openai": {
+            "id": "stale-openai",
+            "name": "Stale OpenAI",
+            "owned_by": "openai",
+            "openai": {},
+        }
     }
     pipe_request.app.state.BASE_MODELS = [
-        {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}}
+        {
+            "id": "stale-ollama",
+            "name": "Stale Ollama",
+            "owned_by": "ollama",
+            "ollama": {},
+        }
     ]
     pipe_request.app.state.OPENAI_MODELS = {
         "direct-openai": {"id": "direct-openai", "name": "Direct OpenAI", "openai": {}}
@@ -4244,7 +4696,12 @@ async def test_target_access_rejects_disabled_provider_stale_cache_target(monkey
     utils_models_module.check_model_access = check_model_access
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
 
-    for target_model_id in ("stale-openai", "stale-ollama", "direct-openai", "direct-ollama"):
+    for target_model_id in (
+        "stale-openai",
+        "stale-ollama",
+        "direct-openai",
+        "direct-ollama",
+    ):
         with pytest.raises(HTTPException):
             await mod._validate_target_access(
                 target_model_id=target_model_id,
@@ -4254,7 +4711,9 @@ async def test_target_access_rejects_disabled_provider_stale_cache_target(monkey
 
 
 @pytest.mark.asyncio
-async def test_target_access_rejects_config_disabled_provider_stale_cache_target(monkeypatch, pipe_request, pipe_user):
+async def test_target_access_rejects_config_disabled_provider_stale_cache_target(
+    monkeypatch, pipe_request, pipe_user
+):
     install_fake_open_webui_user_model(monkeypatch)
     captured = {}
 
@@ -4284,8 +4743,18 @@ async def test_target_access_rejects_config_disabled_provider_stale_cache_target
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     pipe_request.app.state.config = SimpleNamespace()
     pipe_request.app.state.MODELS = {
-        "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "owned_by": "openai", "openai": {}},
-        "stale-ollama": {"id": "stale-ollama", "name": "Stale Ollama", "owned_by": "ollama", "ollama": {}},
+        "stale-openai": {
+            "id": "stale-openai",
+            "name": "Stale OpenAI",
+            "owned_by": "openai",
+            "openai": {},
+        },
+        "stale-ollama": {
+            "id": "stale-ollama",
+            "name": "Stale Ollama",
+            "owned_by": "ollama",
+            "ollama": {},
+        },
     }
     pipe_request.app.state.BASE_MODELS = []
     pipe_request.app.state.OPENAI_MODELS = {}
@@ -4370,7 +4839,9 @@ def test_arena_candidates_exclude_only_runtime_own_wrapper_and_presets(arena_met
     }
     normalized_meta = copy.deepcopy(arena_meta)
     if "model_ids" in normalized_meta:
-        normalized_meta["model_ids"] = [aliases.get(model_id, model_id) for model_id in normalized_meta["model_ids"]]
+        normalized_meta["model_ids"] = [
+            aliases.get(model_id, model_id) for model_id in normalized_meta["model_ids"]
+        ]
     arena_model = {
         "id": "arena",
         "owned_by": "arena",
@@ -4414,7 +4885,9 @@ async def test_target_access_rejects_custom_model_when_base_model_is_unavailable
 ):
     install_fake_open_webui_user_model(monkeypatch)
     install_unavailable_open_webui_config(monkeypatch)
-    pipe_request.app.state.config = SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False)
+    pipe_request.app.state.config = SimpleNamespace(
+        ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False
+    )
     pipe_request.app.state.MODELS = {
         "workspace-preset": {
             "id": "workspace-preset",
@@ -4434,7 +4907,9 @@ async def test_target_access_rejects_custom_model_when_base_model_is_unavailable
         @staticmethod
         async def get_model_by_id(model_id):
             if model_id == "workspace-preset":
-                return SimpleNamespace(id="workspace-preset", base_model_id="stale-openai")
+                return SimpleNamespace(
+                    id="workspace-preset", base_model_id="stale-openai"
+                )
             assert model_id == "fallback-legacy"
             return None
 
@@ -4463,6 +4938,7 @@ async def test_target_access_allows_custom_model_missing_base_when_core_fallback
     pipe_user,
 ):
     install_fake_open_webui_user_model(monkeypatch)
+
     class FakeConfig:
         @staticmethod
         async def get(key):
@@ -4480,9 +4956,19 @@ async def test_target_access_allows_custom_model_missing_base_when_core_fallback
         "preset": True,
         "info": {"base_model_id": "stale-openai"},
     }
-    fallback_model = {"id": "fallback-model", "name": "Fallback", "owned_by": "openai", "openai": {}}
-    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-model,other")
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-model": fallback_model}
+    fallback_model = {
+        "id": "fallback-model",
+        "name": "Fallback",
+        "owned_by": "openai",
+        "openai": {},
+    }
+    pipe_request.app.state.config = SimpleNamespace(
+        DEFAULT_MODELS="fallback-model,other"
+    )
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-model": fallback_model,
+    }
     captured = {}
 
     class FakeModels:
@@ -4520,13 +5006,19 @@ async def test_target_access_allows_custom_model_when_base_model_is_available(
     pipe_user,
 ):
     install_fake_open_webui_user_model(monkeypatch)
+
     class FakeConfig:
         @staticmethod
         async def get_many(*keys):
             raise RuntimeError("config unavailable")
 
     install_fake_open_webui_config(monkeypatch, FakeConfig)
-    base_model = {"id": "available-base", "name": "Available Base", "owned_by": "openai", "openai": {}}
+    base_model = {
+        "id": "available-base",
+        "name": "Available Base",
+        "owned_by": "openai",
+        "openai": {},
+    }
     target_model = {
         "id": "workspace-preset",
         "name": "Workspace Preset",
@@ -4534,14 +5026,19 @@ async def test_target_access_allows_custom_model_when_base_model_is_available(
         "preset": True,
         "info": {"base_model_id": "available-base"},
     }
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "available-base": base_model}
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "available-base": base_model,
+    }
     captured = {}
 
     class FakeModels:
         @staticmethod
         async def get_model_by_id(model_id):
             assert model_id == "workspace-preset"
-            return SimpleNamespace(id="workspace-preset", base_model_id="available-base")
+            return SimpleNamespace(
+                id="workspace-preset", base_model_id="available-base"
+            )
 
     async def check_model_access(user, model, db=None):
         captured["model"] = model
@@ -4563,12 +5060,18 @@ async def test_target_access_allows_custom_model_when_base_model_is_available(
 
 
 @pytest.mark.asyncio
-async def test_target_access_honors_global_model_access_bypass(monkeypatch, pipe_request, pipe_user):
+async def test_target_access_honors_global_model_access_bypass(
+    monkeypatch, pipe_request, pipe_user
+):
     install_fake_open_webui_user_model(monkeypatch)
-    pipe_request.app.state.MODELS = {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+    pipe_request.app.state.MODELS = {
+        "target": {"id": "target", "name": "Target", "owned_by": "openai"}
+    }
 
     async def check_model_access(user, model, db=None):
-        raise AssertionError("global BYPASS_MODEL_ACCESS_CONTROL should skip per-model grants")
+        raise AssertionError(
+            "global BYPASS_MODEL_ACCESS_CONTROL should skip per-model grants"
+        )
 
     env_module = types.ModuleType("open_webui.env")
     env_module.BYPASS_MODEL_ACCESS_CONTROL = True
@@ -4577,11 +5080,15 @@ async def test_target_access_honors_global_model_access_bypass(monkeypatch, pipe
     monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
 
-    await mod._validate_target_access(target_model_id="target", request=pipe_request, user=pipe_user)
+    await mod._validate_target_access(
+        target_model_id="target", request=pipe_request, user=pipe_user
+    )
 
 
 @pytest.mark.asyncio
-async def test_target_access_can_resolve_targets_from_base_model_cache(monkeypatch, pipe_request, pipe_user):
+async def test_target_access_can_resolve_targets_from_base_model_cache(
+    monkeypatch, pipe_request, pipe_user
+):
     install_fake_open_webui_user_model(monkeypatch)
     target_model = {"id": "LiteLLM.glm-5.1", "name": "GLM", "owned_by": "openai"}
     pipe_request.app.state.MODELS = {
@@ -4601,13 +5108,17 @@ async def test_target_access_can_resolve_targets_from_base_model_cache(monkeypat
     utils_models_module.check_model_access = check_model_access
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
 
-    await mod._validate_target_access(target_model_id="LiteLLM.glm-5.1", request=pipe_request, user=pipe_user)
+    await mod._validate_target_access(
+        target_model_id="LiteLLM.glm-5.1", request=pipe_request, user=pipe_user
+    )
 
     assert captured["model"] == target_model
 
 
 @pytest.mark.asyncio
-async def test_target_access_rejects_generated_wrapper_for_runtime_registered_id(pipe_request, pipe_user):
+async def test_target_access_rejects_generated_wrapper_for_runtime_registered_id(
+    pipe_request, pipe_user
+):
     wrapper_id = mod.build_wrapper_model_id("compact_alias", "target")
     pipe_request.app.state.MODELS = {
         wrapper_id: {"id": wrapper_id, "name": "Alias Wrapper", "owned_by": "openai"}
@@ -4623,13 +5134,17 @@ async def test_target_access_rejects_generated_wrapper_for_runtime_registered_id
 
 
 @pytest.mark.asyncio
-async def test_forward_target_injects_resolved_base_model_into_request_models(monkeypatch, pipe_request, pipe_user):
+async def test_forward_target_injects_resolved_base_model_into_request_models(
+    monkeypatch, pipe_request, pipe_user
+):
     target_model = {"id": "LiteLLM.glm-5.1", "name": "GLM", "owned_by": "openai"}
     pipe_request.app.state.MODELS = {}
     pipe_request.app.state.BASE_MODELS = [target_model]
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["has_target"] = form_data["model"] in request.app.state.MODELS
         captured["target_model"] = request.app.state.MODELS.get(form_data["model"])
         return StreamingResponse(
@@ -4644,7 +5159,11 @@ async def test_forward_target_injects_resolved_base_model_into_request_models(mo
     response = await mod._forward_streaming_target(
         request=pipe_request,
         user=pipe_user,
-        body={"model": "LiteLLM.glm-5.1", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        body={
+            "model": "LiteLLM.glm-5.1",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
         chat_id="chat-1",
         message_id="message-1",
         wrapper_model_id=mod.build_wrapper_model_id("auto_compact", "LiteLLM.glm-5.1"),
@@ -4656,17 +5175,25 @@ async def test_forward_target_injects_resolved_base_model_into_request_models(mo
 
 
 @pytest.mark.asyncio
-async def test_forward_target_reapplies_target_system_prompt_on_fresh_body(monkeypatch, pipe_request, pipe_user):
-    pipe_request.app.state.MODELS = {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+async def test_forward_target_reapplies_target_system_prompt_on_fresh_body(
+    monkeypatch, pipe_request, pipe_user
+):
+    pipe_request.app.state.MODELS = {
+        "target": {"id": "target", "name": "Target", "owned_by": "openai"}
+    }
     pipe_request.state.bypass_system_prompt = True
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         request.state.bypass_filter = bypass_filter
         request.state.bypass_system_prompt = bypass_system_prompt
         captured["bypass_filter"] = bypass_filter
         captured["bypass_system_prompt"] = bypass_system_prompt
-        captured["state_bypass_system_prompt"] = getattr(request.state, "bypass_system_prompt", None)
+        captured["state_bypass_system_prompt"] = getattr(
+            request.state, "bypass_system_prompt", None
+        )
         return StreamingResponse(
             iter([b'data: {"choices": [{"delta": {"content": "ok"}}]}\n\n']),
             media_type="text/event-stream",
@@ -4679,7 +5206,11 @@ async def test_forward_target_reapplies_target_system_prompt_on_fresh_body(monke
     response = await mod._forward_streaming_target(
         request=pipe_request,
         user=pipe_user,
-        body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
         chat_id="chat-1",
         message_id="message-1",
         wrapper_model_id=mod.build_wrapper_model_id("auto_compact", "target"),
@@ -4720,7 +5251,9 @@ def _install_real_core_provider_capture(
         assert model_id == "target"
         return FakeModelInfo()
 
-    monkeypatch.setattr(core_chat.Models, "get_model_by_id", staticmethod(get_model_by_id))
+    monkeypatch.setattr(
+        core_chat.Models, "get_model_by_id", staticmethod(get_model_by_id)
+    )
     request.app.state.MODELS = {
         "target": {"id": "target", "name": "Target", "owned_by": provider},
     }
@@ -4742,7 +5275,9 @@ def _install_real_core_provider_capture(
             async def json(self, **kwargs):
                 if queued_responses:
                     return queued_responses.pop(0)
-                return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+                return {
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                }
 
             async def text(self):
                 return ""
@@ -4768,9 +5303,15 @@ def _install_real_core_provider_capture(
         async def check_model_access(*args, **kwargs):
             return None
 
-        monkeypatch.setattr(provider_router, "Config", SimpleNamespace(get=config_get), raising=False)
-        monkeypatch.setattr(provider_router, "get_openai_connection", get_openai_connection)
-        monkeypatch.setattr(provider_router, "get_headers_and_cookies", get_headers_and_cookies)
+        monkeypatch.setattr(
+            provider_router, "Config", SimpleNamespace(get=config_get), raising=False
+        )
+        monkeypatch.setattr(
+            provider_router, "get_openai_connection", get_openai_connection
+        )
+        monkeypatch.setattr(
+            provider_router, "get_headers_and_cookies", get_headers_and_cookies
+        )
         monkeypatch.setattr(provider_router, "get_session", get_session)
         monkeypatch.setattr(provider_router, "cleanup_response", cleanup_response)
         monkeypatch.setattr(provider_router, "check_model_access", check_model_access)
@@ -4789,15 +5330,25 @@ def _install_real_core_provider_capture(
             captured.append(json.loads(kwargs["payload"]))
             if queued_responses:
                 return queued_responses.pop(0)
-            return {"model": "target", "message": {"role": "assistant", "content": "ok"}, "done": True}
+            return {
+                "model": "target",
+                "message": {"role": "assistant", "content": "ok"},
+                "done": True,
+            }
 
         async def check_model_access(*args, **kwargs):
             return None
 
-        monkeypatch.setattr(provider_router, "Config", SimpleNamespace(get=config_get), raising=False)
+        monkeypatch.setattr(
+            provider_router, "Config", SimpleNamespace(get=config_get), raising=False
+        )
         monkeypatch.setattr(provider_router, "get_ollama_url", get_ollama_url)
-        monkeypatch.setattr(provider_router, "resolve_api_config", lambda *args, **kwargs: {})
-        monkeypatch.setattr(provider_router, "get_api_key", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            provider_router, "resolve_api_config", lambda *args, **kwargs: {}
+        )
+        monkeypatch.setattr(
+            provider_router, "get_api_key", lambda *args, **kwargs: None
+        )
         monkeypatch.setattr(provider_router, "send_request", send_request)
         monkeypatch.setattr(provider_router, "check_model_access", check_model_access)
 
@@ -4837,7 +5388,10 @@ async def test_real_core_provider_system_prefix_is_stable_across_tool_rounds(
     ]
     metadata = {"variables": {"{{CURRENT_TIME}}": "12:34:56 PM"}}
 
-    for outer_bypass, messages in ((False, common_messages), (True, [*common_messages, *tool_suffix])):
+    for outer_bypass, messages in (
+        (False, common_messages),
+        (True, [*common_messages, *tool_suffix]),
+    ):
         pipe_request.state.bypass_system_prompt = outer_bypass
         await mod._call_target_completion(
             request=pipe_request,
@@ -4855,7 +5409,10 @@ async def test_real_core_provider_system_prefix_is_stable_across_tool_rounds(
         "role": "system",
         "content": "TARGET 12:34:56 PM\nCHAT SYSTEM",
     }
-    assert captured[1]["messages"][: len(captured[0]["messages"])] == captured[0]["messages"]
+    assert (
+        captured[1]["messages"][: len(captured[0]["messages"])]
+        == captured[0]["messages"]
+    )
     assert pipe_request.state.bypass_system_prompt is True
     assert not hasattr(pipe_request.state, "bypass_filter")
 
@@ -4893,7 +5450,12 @@ async def test_real_core_summary_retry_keeps_a_single_stable_system_prefix(
         ],
     )
     pipe_request.state.bypass_system_prompt = True
-    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}},
+        }
+    ]
 
     result = await mod._generate_summary_text(
         request=pipe_request,
@@ -4928,12 +5490,19 @@ async def test_real_core_summary_retry_keeps_a_single_stable_system_prefix(
 def test_summary_model_validation_allows_pipe_backed_and_rejects_arena():
     models = {
         "target": {"id": "target", "name": "Target"},
-        "pipe.summary": {"id": "pipe.summary", "pipe": {"type": "pipe"}, "name": "Summary Pipe"},
+        "pipe.summary": {
+            "id": "pipe.summary",
+            "pipe": {"type": "pipe"},
+            "name": "Summary Pipe",
+        },
         "arena": {"id": "arena", "owned_by": "arena", "arena": True},
     }
 
     assert mod.validate_summary_model_id("", "target", models) == "target"
-    assert mod.validate_summary_model_id("pipe.summary", "target", models) == "pipe.summary"
+    assert (
+        mod.validate_summary_model_id("pipe.summary", "target", models)
+        == "pipe.summary"
+    )
 
     with pytest.raises(ValueError, match="arena"):
         mod.validate_summary_model_id("arena", "target", models)
@@ -4980,8 +5549,14 @@ def test_valve_defaults_are_conservative_for_v1_continuation():
     assert valves.force_include_usage is True
     assert valves.compact_task_prompts_from_task_body is False
     assert valves.summary_tool_policy == "fallback_on_tool_call"
-    assert valves.historical_message_excerpt_bytes == mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES
-    assert valves.historical_message_excerpt_count == mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT
+    assert (
+        valves.historical_message_excerpt_bytes
+        == mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES
+    )
+    assert (
+        valves.historical_message_excerpt_count
+        == mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT
+    )
     assert not hasattr(valves, "keep_tail_messages")
     assert not hasattr(valves, "preserve_latest_tool_rounds")
 
@@ -5017,20 +5592,19 @@ def test_soft_trigger_ratio_default_resolves_against_hard_trigger():
     valves = mod.Pipe.Valves()
 
     assert valves.soft_trigger_ratio == mod.DEFAULT_SOFT_TRIGGER_RATIO
-    assert (
-        mod.resolve_soft_trigger_input_tokens(
-            valves,
-            {"id": "target", "name": "Target"},
-            valves.trigger_input_tokens,
-        )
-        == int(mod.DEFAULT_TRIGGER_INPUT_TOKENS * mod.DEFAULT_SOFT_TRIGGER_RATIO)
-    )
+    assert mod.resolve_soft_trigger_input_tokens(
+        valves,
+        {"id": "target", "name": "Target"},
+        valves.trigger_input_tokens,
+    ) == int(mod.DEFAULT_TRIGGER_INPUT_TOKENS * mod.DEFAULT_SOFT_TRIGGER_RATIO)
 
 
 def test_soft_trigger_ratio_missing_field_falls_back_to_default_constant():
     valves = SimpleNamespace(per_model_overrides_json="")
 
-    resolved = mod.resolve_soft_trigger_input_tokens(valves, {"id": "target", "name": "Target"}, 1000)
+    resolved = mod.resolve_soft_trigger_input_tokens(
+        valves, {"id": "target", "name": "Target"}, 1000
+    )
 
     assert resolved == int(1000 * mod.DEFAULT_SOFT_TRIGGER_RATIO)
 
@@ -5046,8 +5620,14 @@ def test_per_model_overrides_accepts_valid_ordered_json():
         {
             "schema_version": 1,
             "overrides": [
-                {"model_patterns": ["claude-fable-5[1m]"], "trigger_input_tokens": 950000},
-                {"model_patterns": ["claude-*", "Claude *"], "trigger_input_tokens": 160000},
+                {
+                    "model_patterns": ["claude-fable-5[1m]"],
+                    "trigger_input_tokens": 950000,
+                },
+                {
+                    "model_patterns": ["claude-*", "Claude *"],
+                    "trigger_input_tokens": 160000,
+                },
             ],
         }
     )
@@ -5063,21 +5643,27 @@ def test_per_model_overrides_rejects_non_json_string():
 
 
 def test_per_model_overrides_rejects_non_list_overrides():
-    payload = json.dumps({"overrides": {"model_patterns": ["claude-*"], "trigger_input_tokens": 1}})
+    payload = json.dumps(
+        {"overrides": {"model_patterns": ["claude-*"], "trigger_input_tokens": 1}}
+    )
 
     with pytest.raises(ValidationError):
         mod.Pipe.Valves(per_model_overrides_json=payload)
 
 
 def test_per_model_overrides_rejects_empty_model_patterns():
-    payload = json.dumps({"overrides": [{"model_patterns": [], "trigger_input_tokens": 160000}]})
+    payload = json.dumps(
+        {"overrides": [{"model_patterns": [], "trigger_input_tokens": 160000}]}
+    )
 
     with pytest.raises(ValidationError):
         mod.Pipe.Valves(per_model_overrides_json=payload)
 
 
 def test_per_model_overrides_rejects_zero_trigger_input_tokens():
-    payload = json.dumps({"overrides": [{"model_patterns": ["claude-*"], "trigger_input_tokens": 0}]})
+    payload = json.dumps(
+        {"overrides": [{"model_patterns": ["claude-*"], "trigger_input_tokens": 0}]}
+    )
 
     with pytest.raises(ValidationError):
         mod.Pipe.Valves(per_model_overrides_json=payload)
@@ -5086,7 +5672,9 @@ def test_per_model_overrides_rejects_zero_trigger_input_tokens():
 def test_per_model_overrides_rejects_unknown_root_key():
     payload = json.dumps(
         {
-            "overrides": [{"model_patterns": ["claude-*"], "trigger_input_tokens": 100}],
+            "overrides": [
+                {"model_patterns": ["claude-*"], "trigger_input_tokens": 100}
+            ],
             "soft_trigger_input_tokens": 50,
         }
     )
@@ -5097,11 +5685,7 @@ def test_per_model_overrides_rejects_unknown_root_key():
 
 def test_per_model_overrides_rejects_legacy_trigger_total_tokens():
     payload = json.dumps(
-        {
-            "overrides": [
-                {"model_patterns": ["*"], "trigger_total_tokens": 100}
-            ]
-        }
+        {"overrides": [{"model_patterns": ["*"], "trigger_total_tokens": 100}]}
     )
 
     with pytest.raises(ValidationError):
@@ -5109,12 +5693,16 @@ def test_per_model_overrides_rejects_legacy_trigger_total_tokens():
 
 
 def test_per_model_overrides_accepts_soft_trigger_ratio_without_hard_threshold():
-    payload = json.dumps({"overrides": [{"model_patterns": ["claude-*"], "soft_trigger_ratio": 0.5}]})
+    payload = json.dumps(
+        {"overrides": [{"model_patterns": ["claude-*"], "soft_trigger_ratio": 0.5}]}
+    )
 
     valves = mod.Pipe.Valves(per_model_overrides_json=payload)
 
     assert (
-        mod.resolve_trigger_input_tokens(valves, {"id": "claude-sonnet", "name": "Sonnet"})
+        mod.resolve_trigger_input_tokens(
+            valves, {"id": "claude-sonnet", "name": "Sonnet"}
+        )
         == valves.trigger_input_tokens
     )
     assert (
@@ -5131,12 +5719,20 @@ def test_resolve_trigger_input_tokens_matches_target_model_id_and_name():
     valves = mod.Pipe.Valves(
         trigger_input_tokens=100000,
         per_model_overrides_json=json.dumps(
-            {"overrides": [{"model_patterns": ["claude-*"], "trigger_input_tokens": 160000}]}
+            {
+                "overrides": [
+                    {"model_patterns": ["claude-*"], "trigger_input_tokens": 160000}
+                ]
+            }
         ),
     )
 
-    by_id = mod.resolve_trigger_input_tokens(valves, {"id": "claude-sonnet", "name": "Anthropic"})
-    by_name = mod.resolve_trigger_input_tokens(valves, {"id": "anthropic-1", "name": "claude-opus"})
+    by_id = mod.resolve_trigger_input_tokens(
+        valves, {"id": "claude-sonnet", "name": "Anthropic"}
+    )
+    by_name = mod.resolve_trigger_input_tokens(
+        valves, {"id": "anthropic-1", "name": "claude-opus"}
+    )
 
     assert by_id == 160000
     assert by_name == 160000
@@ -5155,7 +5751,9 @@ def test_resolve_trigger_input_tokens_first_match_wins():
         ),
     )
 
-    resolved = mod.resolve_trigger_input_tokens(valves, {"id": "claude-opus", "name": "Opus"})
+    resolved = mod.resolve_trigger_input_tokens(
+        valves, {"id": "claude-opus", "name": "Opus"}
+    )
 
     assert resolved == 950000
 
@@ -5166,12 +5764,29 @@ def test_resolve_trigger_input_tokens_matches_literal_bracket_id_without_escapin
     valves = mod.Pipe.Valves(
         trigger_input_tokens=100000,
         per_model_overrides_json=json.dumps(
-            {"overrides": [{"model_patterns": ["claude-opus-4-8[1m]"], "trigger_input_tokens": 950000}]}
+            {
+                "overrides": [
+                    {
+                        "model_patterns": ["claude-opus-4-8[1m]"],
+                        "trigger_input_tokens": 950000,
+                    }
+                ]
+            }
         ),
     )
 
-    assert mod.resolve_trigger_input_tokens(valves, {"id": "claude-opus-4-8[1m]", "name": "Opus 1M"}) == 950000
-    assert mod.resolve_trigger_input_tokens(valves, {"id": "claude-opus-4-81", "name": "Opus"}) == 100000
+    assert (
+        mod.resolve_trigger_input_tokens(
+            valves, {"id": "claude-opus-4-8[1m]", "name": "Opus 1M"}
+        )
+        == 950000
+    )
+    assert (
+        mod.resolve_trigger_input_tokens(
+            valves, {"id": "claude-opus-4-81", "name": "Opus"}
+        )
+        == 100000
+    )
 
 
 def test_resolve_trigger_input_tokens_bulk_matches_bracket_suffix_with_wildcard():
@@ -5179,20 +5794,49 @@ def test_resolve_trigger_input_tokens_bulk_matches_bracket_suffix_with_wildcard(
     valves = mod.Pipe.Valves(
         trigger_input_tokens=100000,
         per_model_overrides_json=json.dumps(
-            {"overrides": [{"model_patterns": ["*[1m]"], "trigger_input_tokens": 950000}]}
+            {
+                "overrides": [
+                    {"model_patterns": ["*[1m]"], "trigger_input_tokens": 950000}
+                ]
+            }
         ),
     )
 
-    assert mod.resolve_trigger_input_tokens(valves, {"id": "claude-opus-4-8[1m]", "name": "Opus"}) == 950000
-    assert mod.resolve_trigger_input_tokens(valves, {"id": "claude-fable-5[1m]", "name": "Fable"}) == 950000
-    assert mod.resolve_trigger_input_tokens(valves, {"id": "claude-opus-4-8", "name": "Opus"}) == 100000
+    assert (
+        mod.resolve_trigger_input_tokens(
+            valves, {"id": "claude-opus-4-8[1m]", "name": "Opus"}
+        )
+        == 950000
+    )
+    assert (
+        mod.resolve_trigger_input_tokens(
+            valves, {"id": "claude-fable-5[1m]", "name": "Fable"}
+        )
+        == 950000
+    )
+    assert (
+        mod.resolve_trigger_input_tokens(
+            valves, {"id": "claude-opus-4-8", "name": "Opus"}
+        )
+        == 100000
+    )
 
 
 def test_resolve_soft_trigger_input_tokens_uses_effective_hard_threshold():
     valves = mod.Pipe.Valves(soft_trigger_ratio=0.75)
 
-    assert mod.resolve_soft_trigger_input_tokens(valves, {"id": "target", "name": "Target"}, 1000) == 750
-    assert mod.resolve_soft_trigger_input_tokens(valves, {"id": "target", "name": "Target"}, 1001) == 750
+    assert (
+        mod.resolve_soft_trigger_input_tokens(
+            valves, {"id": "target", "name": "Target"}, 1000
+        )
+        == 750
+    )
+    assert (
+        mod.resolve_soft_trigger_input_tokens(
+            valves, {"id": "target", "name": "Target"}, 1001
+        )
+        == 750
+    )
 
 
 def test_resolve_soft_trigger_input_tokens_uses_model_ratio_override():
@@ -5203,8 +5847,18 @@ def test_resolve_soft_trigger_input_tokens_uses_model_ratio_override():
         ),
     )
 
-    assert mod.resolve_soft_trigger_input_tokens(valves, {"id": "claude-sonnet", "name": "Sonnet"}, 1000) == 500
-    assert mod.resolve_soft_trigger_input_tokens(valves, {"id": "other", "name": "Other"}, 1000) == 800
+    assert (
+        mod.resolve_soft_trigger_input_tokens(
+            valves, {"id": "claude-sonnet", "name": "Sonnet"}, 1000
+        )
+        == 500
+    )
+    assert (
+        mod.resolve_soft_trigger_input_tokens(
+            valves, {"id": "other", "name": "Other"}, 1000
+        )
+        == 800
+    )
 
 
 def test_resolve_soft_trigger_input_tokens_zero_ratio_disables_prefetch():
@@ -5216,7 +5870,12 @@ def test_resolve_soft_trigger_input_tokens_zero_ratio_disables_prefetch():
         ),
     )
 
-    assert mod.resolve_soft_trigger_input_tokens(global_disabled, {"id": "target", "name": "Target"}, 1000) is None
+    assert (
+        mod.resolve_soft_trigger_input_tokens(
+            global_disabled, {"id": "target", "name": "Target"}, 1000
+        )
+        is None
+    )
     assert (
         mod.resolve_soft_trigger_input_tokens(
             override_disabled,
@@ -5236,7 +5895,13 @@ def test_soft_trigger_ratio_rejects_one_or_greater():
 
 
 def test_per_model_overrides_rejects_non_finite_soft_trigger_ratio():
-    payload = json.dumps({"overrides": [{"model_patterns": ["claude-*"], "soft_trigger_ratio": math.nan}]})
+    payload = json.dumps(
+        {
+            "overrides": [
+                {"model_patterns": ["claude-*"], "soft_trigger_ratio": math.nan}
+            ]
+        }
+    )
 
     with pytest.raises(ValidationError):
         mod.Pipe.Valves(per_model_overrides_json=payload)
@@ -5252,25 +5917,35 @@ def test_transient_message_patterns_reject_invalid_regex():
 def test_matches_any_pattern_uses_star_question_wildcards_with_literal_brackets():
     model = {"id": "claude-opus-4-8[1m]", "name": "Opus 1M"}
 
-    assert mod._matches_any_pattern(model, ["claude-opus-4-8[1m]"])  # exact id, brackets literal
+    assert mod._matches_any_pattern(
+        model, ["claude-opus-4-8[1m]"]
+    )  # exact id, brackets literal
     assert mod._matches_any_pattern(model, ["Opus 1M"])  # exact name
     assert mod._matches_any_pattern(model, ["*[1m]"])  # bulk suffix, brackets literal
     assert mod._matches_any_pattern(model, ["claude-*"])  # "*" wildcard
     assert mod._matches_any_pattern(model, ["claude-?pus-4-8[1m]"])  # "?" single char
     assert not mod._matches_any_pattern(model, ["gpt-*"])  # non-match
     # character classes are not special: "[1m]" never expands to one-of "1"/"m"
-    assert not mod._matches_any_pattern({"id": "claude-opus-4-81", "name": "Opus"}, ["claude-opus-4-8[1m]"])
+    assert not mod._matches_any_pattern(
+        {"id": "claude-opus-4-81", "name": "Opus"}, ["claude-opus-4-8[1m]"]
+    )
 
 
 def test_resolve_trigger_input_tokens_falls_back_to_global_default_on_no_match():
     valves = mod.Pipe.Valves(
         trigger_input_tokens=100000,
         per_model_overrides_json=json.dumps(
-            {"overrides": [{"model_patterns": ["claude-*"], "trigger_input_tokens": 160000}]}
+            {
+                "overrides": [
+                    {"model_patterns": ["claude-*"], "trigger_input_tokens": 160000}
+                ]
+            }
         ),
     )
 
-    resolved = mod.resolve_trigger_input_tokens(valves, {"id": "gpt-4.1", "name": "GPT"})
+    resolved = mod.resolve_trigger_input_tokens(
+        valves, {"id": "gpt-4.1", "name": "GPT"}
+    )
 
     assert resolved == 100000
 
@@ -5278,7 +5953,9 @@ def test_resolve_trigger_input_tokens_falls_back_to_global_default_on_no_match()
 def test_resolve_trigger_input_tokens_falls_back_when_overrides_empty():
     valves = mod.Pipe.Valves(trigger_input_tokens=123456)
 
-    resolved = mod.resolve_trigger_input_tokens(valves, {"id": "claude-sonnet", "name": "Anthropic"})
+    resolved = mod.resolve_trigger_input_tokens(
+        valves, {"id": "claude-sonnet", "name": "Anthropic"}
+    )
 
     assert resolved == 123456
 
@@ -5342,11 +6019,21 @@ def test_strict_usage_input_tokens_rejects_ambiguous_or_empty_measurements(usage
 
 
 def test_usage_total_recomputes_split_fields_and_rejects_incomplete_llama_cache_usage():
-    assert mod._usage_total({"total_tokens": 100, "input_tokens": 100, "output_tokens": 20}) == 120
-    assert mod._usage_total({"total_tokens": 100, "prompt_n": 100, "output_tokens": 0}) is None
+    assert (
+        mod._usage_total(
+            {"total_tokens": 100, "input_tokens": 100, "output_tokens": 20}
+        )
+        == 120
+    )
+    assert (
+        mod._usage_total({"total_tokens": 100, "prompt_n": 100, "output_tokens": 0})
+        is None
+    )
 
 
-@pytest.mark.parametrize("chat_id", ["local:socket", "channel:thread", "temporary:session"])
+@pytest.mark.parametrize(
+    "chat_id", ["local:socket", "channel:thread", "temporary:session"]
+)
 def test_chat_id_supported_rejects_core_non_saved_prefixes(chat_id):
     assert not mod._chat_id_supported(chat_id)
 
@@ -5378,16 +6065,21 @@ async def test_usage_anchor_estimate_rebases_volatile_and_suffix_tokens(monkeypa
 
     monkeypatch.setattr(mod, "_estimate_message_token_sum_async", estimate_message_sum)
 
-    assert await mod._estimate_body_tokens_from_usage_anchor(
-        request=None,
-        body=body,
-        anchor=anchor,
-    ) == 123
+    assert (
+        await mod._estimate_body_tokens_from_usage_anchor(
+            request=None,
+            body=body,
+            anchor=anchor,
+        )
+        == 123
+    )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("edited_index", [0, 1])
-async def test_usage_anchor_estimate_rejects_edited_stable_prefix(monkeypatch, edited_index):
+async def test_usage_anchor_estimate_rejects_edited_stable_prefix(
+    monkeypatch, edited_index
+):
     stable = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
@@ -5397,22 +6089,29 @@ async def test_usage_anchor_estimate_rejects_edited_stable_prefix(monkeypatch, e
         assistant_message_id="assistant-1",
         input_tokens=100,
         stable_message_count=2,
-        input_fingerprint=mod._compute_usage_anchor_input_fingerprint(original_body, stable),
+        input_fingerprint=mod._compute_usage_anchor_input_fingerprint(
+            original_body, stable
+        ),
         volatile_message_tokens=0,
     )
     edited = copy.deepcopy(stable)
     edited[edited_index]["content"] += " edited"
 
     async def unexpected_estimate(*args, **kwargs):
-        raise AssertionError("fingerprint mismatch must be rejected before token estimation")
+        raise AssertionError(
+            "fingerprint mismatch must be rejected before token estimation"
+        )
 
     monkeypatch.setattr(mod, "_estimate_message_token_sum_async", unexpected_estimate)
 
-    assert await mod._estimate_body_tokens_from_usage_anchor(
-        request=None,
-        body={"model": "target", "messages": edited},
-        anchor=anchor,
-    ) is None
+    assert (
+        await mod._estimate_body_tokens_from_usage_anchor(
+            request=None,
+            body={"model": "target", "messages": edited},
+            anchor=anchor,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -5428,20 +6127,29 @@ async def test_usage_anchor_estimate_rejects_negative_measured_base(monkeypatch)
     )
 
     async def unexpected_estimate(*args, **kwargs):
-        raise AssertionError("negative measured base must be rejected before token estimation")
+        raise AssertionError(
+            "negative measured base must be rejected before token estimation"
+        )
 
     monkeypatch.setattr(mod, "_estimate_message_token_sum_async", unexpected_estimate)
 
-    assert await mod._estimate_body_tokens_from_usage_anchor(
-        request=None,
-        body=body,
-        anchor=anchor,
-    ) is None
+    assert (
+        await mod._estimate_body_tokens_from_usage_anchor(
+            request=None,
+            body=body,
+            anchor=anchor,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("identity_change", ["shaping", "encoding", "estimator_version"])
-async def test_usage_anchor_rejects_changed_provider_or_estimator_identity(monkeypatch, identity_change):
+@pytest.mark.parametrize(
+    "identity_change", ["shaping", "encoding", "estimator_version"]
+)
+async def test_usage_anchor_rejects_changed_provider_or_estimator_identity(
+    monkeypatch, identity_change
+):
     message = {"role": "user", "content": "old"}
     body = {"model": "target", "messages": [message]}
     anchor = mod.UsageAnchor(
@@ -5458,22 +6166,33 @@ async def test_usage_anchor_rejects_changed_provider_or_estimator_identity(monke
     )
 
     current_shaping_hash = "shape-b" if identity_change == "shaping" else "shape-a"
-    current_encoding_name = "encoding-b" if identity_change == "encoding" else "encoding-a"
-    monkeypatch.setattr(mod, "_get_tiktoken_encoder", lambda request=None: (object(), current_encoding_name))
+    current_encoding_name = (
+        "encoding-b" if identity_change == "encoding" else "encoding-a"
+    )
+    monkeypatch.setattr(
+        mod,
+        "_get_tiktoken_encoder",
+        lambda request=None: (object(), current_encoding_name),
+    )
     if identity_change == "estimator_version":
         monkeypatch.setattr(mod, "TOKEN_ESTIMATOR_VERSION", "future-estimator-version")
 
     async def unexpected_estimate(*args, **kwargs):
-        raise AssertionError("identity mismatch must be rejected before token estimation")
+        raise AssertionError(
+            "identity mismatch must be rejected before token estimation"
+        )
 
     monkeypatch.setattr(mod, "_estimate_message_token_sum_async", unexpected_estimate)
 
-    assert await mod._estimate_body_tokens_from_usage_anchor(
-        request=None,
-        body=body,
-        anchor=anchor,
-        usage_anchor_shaping_hash=current_shaping_hash,
-    ) is None
+    assert (
+        await mod._estimate_body_tokens_from_usage_anchor(
+            request=None,
+            body=body,
+            anchor=anchor,
+            usage_anchor_shaping_hash=current_shaping_hash,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -5517,7 +6236,9 @@ async def test_usage_anchor_resolves_encoder_off_the_event_loop(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_usage_anchor_reuses_same_checkpoint_and_rejects_a_different_one(monkeypatch):
+async def test_usage_anchor_reuses_same_checkpoint_and_rejects_a_different_one(
+    monkeypatch,
+):
     system = {"role": "system", "content": "system"}
     checkpoint_a = {"role": "assistant", "content": "checkpoint A"}
     active = {"role": "user", "content": "active"}
@@ -5526,7 +6247,9 @@ async def test_usage_anchor_reuses_same_checkpoint_and_rejects_a_different_one(m
         assistant_message_id="assistant-1",
         input_tokens=100,
         stable_message_count=2,
-        input_fingerprint=mod._compute_usage_anchor_input_fingerprint(original, [checkpoint_a, active]),
+        input_fingerprint=mod._compute_usage_anchor_input_fingerprint(
+            original, [checkpoint_a, active]
+        ),
         volatile_message_tokens=12,
     )
     suffix = [
@@ -5543,20 +6266,29 @@ async def test_usage_anchor_reuses_same_checkpoint_and_rejects_a_different_one(m
 
     monkeypatch.setattr(mod, "_estimate_message_token_sum_async", estimate_message_sum)
 
-    same_checkpoint = {"model": "target", "messages": [system, checkpoint_a, active, *suffix]}
-    assert await mod._estimate_body_tokens_from_usage_anchor(
-        request=None,
-        body=same_checkpoint,
-        anchor=anchor,
-    ) == 123
+    same_checkpoint = {
+        "model": "target",
+        "messages": [system, checkpoint_a, active, *suffix],
+    }
+    assert (
+        await mod._estimate_body_tokens_from_usage_anchor(
+            request=None,
+            body=same_checkpoint,
+            anchor=anchor,
+        )
+        == 123
+    )
 
     different_checkpoint = copy.deepcopy(same_checkpoint)
     different_checkpoint["messages"][1]["content"] = "checkpoint B"
-    assert await mod._estimate_body_tokens_from_usage_anchor(
-        request=None,
-        body=different_checkpoint,
-        anchor=anchor,
-    ) is None
+    assert (
+        await mod._estimate_body_tokens_from_usage_anchor(
+            request=None,
+            body=different_checkpoint,
+            anchor=anchor,
+        )
+        is None
+    )
 
 
 def test_usage_anchor_fingerprint_round_trips_core_expanded_assistant_output():
@@ -5568,13 +6300,21 @@ def test_usage_anchor_fingerprint_round_trips_core_expanded_assistant_output():
             "role": "assistant",
             "content": "",
             "output": [
-                {"type": "function_call", "call_id": "call-1", "name": "search", "arguments": "{}"},
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "search",
+                    "arguments": "{}",
+                },
                 {
                     "type": "function_call_output",
                     "call_id": "call-1",
                     "output": [{"type": "input_text", "text": "result"}],
                 },
-                {"type": "message", "content": [{"type": "output_text", "text": "answer"}]},
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
             ],
         },
     ]
@@ -5582,7 +6322,9 @@ def test_usage_anchor_fingerprint_round_trips_core_expanded_assistant_output():
     round_trip = process_messages_with_output(copy.deepcopy(raw_messages))
     body = {"model": "target", "messages": first}
 
-    assert mod._compute_usage_anchor_input_fingerprint(body, first) == mod._compute_usage_anchor_input_fingerprint(
+    assert mod._compute_usage_anchor_input_fingerprint(
+        body, first
+    ) == mod._compute_usage_anchor_input_fingerprint(
         {"model": "target", "messages": round_trip},
         round_trip,
     )
@@ -5614,7 +6356,9 @@ def test_usage_anchor_fingerprint_tracks_ollama_think_but_not_sampling_options()
     assert mod._body_token_extra_payload(enabled) == {"think": True}
     assert mod._body_token_extra_payload(disabled) == {"think": False}
     enabled_fingerprint = mod._compute_usage_anchor_input_fingerprint(enabled, messages)
-    assert enabled_fingerprint != mod._compute_usage_anchor_input_fingerprint(disabled, messages)
+    assert enabled_fingerprint != mod._compute_usage_anchor_input_fingerprint(
+        disabled, messages
+    )
     assert enabled_fingerprint == mod._compute_usage_anchor_input_fingerprint(
         different_temperature,
         messages,
@@ -5636,12 +6380,17 @@ def test_reasoning_content_is_semantic_but_provider_reasoning_fields_are_token_o
     assert mod.compute_source_hash([base]) != mod.compute_source_hash([with_reasoning])
     assert mod.compute_source_hash([base]) == mod.compute_source_hash([with_details])
     assert mod.compute_source_hash([base]) == mod.compute_source_hash([with_thinking])
-    assert convert_messages_openai_to_ollama([with_thinking])[0]["thinking"] == "ollama reasoning"
+    assert (
+        convert_messages_openai_to_ollama([with_thinking])[0]["thinking"]
+        == "ollama reasoning"
+    )
     assert mod.estimate_message_tokens(
         with_thinking,
         encoder=LengthEncoder(),
         encoding_name="unit-test",
-    ) > mod.estimate_message_tokens(base, encoder=LengthEncoder(), encoding_name="unit-test")
+    ) > mod.estimate_message_tokens(
+        base, encoder=LengthEncoder(), encoding_name="unit-test"
+    )
     base_fingerprint = mod._compute_usage_anchor_input_fingerprint(
         {"model": "target", "messages": [base]}, [base]
     )
@@ -5678,7 +6427,9 @@ def test_reasoning_token_projection_copies_only_changed_messages():
 
 
 @pytest.mark.asyncio
-async def test_system_prompt_token_projection_matches_core_without_mutating_body(pipe_user):
+async def test_system_prompt_token_projection_matches_core_without_mutating_body(
+    pipe_user,
+):
     chat_system = {"role": "system", "content": "chat system"}
     user_message = {"role": "user", "content": "hello"}
     body = {
@@ -5702,7 +6453,9 @@ async def test_system_prompt_token_projection_matches_core_without_mutating_body
 
 
 @pytest.mark.asyncio
-async def test_reasoning_token_projection_matches_core_transports(monkeypatch, pipe_request):
+async def test_reasoning_token_projection_matches_core_transports(
+    monkeypatch, pipe_request
+):
     import open_webui.routers.ollama as ollama_router
     import open_webui.routers.openai as openai_router
     from open_webui.utils.payload import convert_payload_openai_to_ollama
@@ -5722,7 +6475,10 @@ async def test_reasoning_token_projection_matches_core_transports(monkeypatch, p
 
     monkeypatch.setattr(openai_router, "get_openai_connection", responses_connection)
     pipe_request.app.state.OPENAI_MODELS = {"target": {"id": "target", "urlIdx": 0}}
-    responses_transport, responses_dropped_keys = await mod._usage_anchor_transport_profile(
+    (
+        responses_transport,
+        responses_dropped_keys,
+    ) = await mod._usage_anchor_transport_profile(
         pipe_request,
         {"target": {"id": "target", "owned_by": "openai", "urlIdx": 0}},
         "target",
@@ -5740,12 +6496,26 @@ async def test_reasoning_token_projection_matches_core_transports(monkeypatch, p
         "api_type": "responses",
         "api_config": {"api_type": "responses"},
     }
-    assert responses_dropped_keys == {"reasoning_content", "reasoning_details", "thinking"}
-    assert not ({"reasoning_content", "reasoning_details", "thinking"} & projected["messages"][0].keys())
-    assert all(key not in json.dumps(responses_payload) for key in responses_dropped_keys)
-    assert mod._compute_usage_anchor_input_fingerprint(projected, projected["messages"]) == (
+    assert responses_dropped_keys == {
+        "reasoning_content",
+        "reasoning_details",
+        "thinking",
+    }
+    assert not (
+        {"reasoning_content", "reasoning_details", "thinking"}
+        & projected["messages"][0].keys()
+    )
+    assert all(
+        key not in json.dumps(responses_payload) for key in responses_dropped_keys
+    )
+    assert mod._compute_usage_anchor_input_fingerprint(
+        projected, projected["messages"]
+    ) == (
         mod._compute_usage_anchor_input_fingerprint(
-            {"model": "target", "messages": [{"role": "assistant", "content": "answer"}]},
+            {
+                "model": "target",
+                "messages": [{"role": "assistant", "content": "answer"}],
+            },
             [{"role": "assistant", "content": "answer"}],
         )
     )
@@ -5760,7 +6530,9 @@ async def test_reasoning_token_projection_matches_core_transports(monkeypatch, p
             },
         )
 
-    monkeypatch.setattr(ollama_router, "get_ollama_runtime_config", ollama_runtime_config)
+    monkeypatch.setattr(
+        ollama_router, "get_ollama_runtime_config", ollama_runtime_config
+    )
     pipe_request.app.state.OLLAMA_MODELS = {
         "target": {"model": "target", "digest": "sha256:digest-a", "urls": [1]}
     }
@@ -5769,7 +6541,9 @@ async def test_reasoning_token_projection_matches_core_transports(monkeypatch, p
         {"target": {"id": "target", "owned_by": "ollama", "ollama": {"urls": [1]}}},
         "target",
     )
-    ollama_projected = mod._project_usage_anchor_token_body(body, dropped_message_keys=ollama_dropped_keys)
+    ollama_projected = mod._project_usage_anchor_token_body(
+        body, dropped_message_keys=ollama_dropped_keys
+    )
     ollama_payload = convert_payload_openai_to_ollama(copy.deepcopy(body))
     assert ollama_transport == {
         "owned_by": "ollama",
@@ -5785,7 +6559,10 @@ async def test_reasoning_token_projection_matches_core_transports(monkeypatch, p
     assert ollama_dropped_keys == {"reasoning_content", "reasoning_details"}
     assert "reasoning_details" not in ollama_payload["messages"][0]
     assert "reasoning_content" not in ollama_payload["messages"][0]
-    assert ollama_projected["messages"][0]["thinking"] == ollama_payload["messages"][0]["thinking"]
+    assert (
+        ollama_projected["messages"][0]["thinking"]
+        == ollama_payload["messages"][0]["thinking"]
+    )
 
     pipe_request.app.state.OLLAMA_MODELS = {
         "target": {"model": "target", "digest": "sha256:digest-a", "urls": [0, 1]}
@@ -5824,7 +6601,10 @@ async def test_reasoning_token_projection_matches_core_transports(monkeypatch, p
     assert changed_transport != multi_transport
 
     pipe_request.app.state.OLLAMA_MODELS = {"target": {"model": "target", "urls": [0]}}
-    missing_digest_transport, missing_digest_dropped_keys = await mod._usage_anchor_transport_profile(
+    (
+        missing_digest_transport,
+        missing_digest_dropped_keys,
+    ) = await mod._usage_anchor_transport_profile(
         pipe_request,
         {"target": {"id": "target", "owned_by": "ollama", "ollama": {"urls": [0]}}},
         "target",
@@ -5835,7 +6615,10 @@ async def test_reasoning_token_projection_matches_core_transports(monkeypatch, p
     pipe_request.app.state.OLLAMA_MODELS = {
         "target": {"model": "target", "digest": "sha256:digest-b", "urls": [2]}
     }
-    unresolved_transport, unresolved_dropped_keys = await mod._usage_anchor_transport_profile(
+    (
+        unresolved_transport,
+        unresolved_dropped_keys,
+    ) = await mod._usage_anchor_transport_profile(
         pipe_request,
         {"target": {"id": "target", "owned_by": "ollama", "ollama": {"urls": [2]}}},
         "target",
@@ -5846,7 +6629,9 @@ async def test_reasoning_token_projection_matches_core_transports(monkeypatch, p
     async def chat_completions_connection(index):
         return "http://provider", "key", {}
 
-    monkeypatch.setattr(openai_router, "get_openai_connection", chat_completions_connection)
+    monkeypatch.setattr(
+        openai_router, "get_openai_connection", chat_completions_connection
+    )
     chat_transport, chat_dropped_keys = await mod._usage_anchor_transport_profile(
         pipe_request,
         {"target": {"id": "target", "owned_by": "openai", "urlIdx": 0}},
@@ -5863,7 +6648,9 @@ async def test_reasoning_token_projection_matches_core_transports(monkeypatch, p
 
 
 @pytest.mark.asyncio
-async def test_usage_anchor_transport_profile_supports_v096_runtime_config(monkeypatch, pipe_request):
+async def test_usage_anchor_transport_profile_supports_v096_runtime_config(
+    monkeypatch, pipe_request
+):
     import open_webui.routers.ollama as ollama_router
     import open_webui.routers.openai as openai_router
 
@@ -5875,7 +6662,9 @@ async def test_usage_anchor_transport_profile_supports_v096_runtime_config(monke
         OLLAMA_BASE_URLS=["http://ollama-a"],
         OLLAMA_API_CONFIGS={"0": {"prefix_id": "local"}},
     )
-    pipe_request.app.state.OPENAI_MODELS = {"openai-target": {"id": "openai-target", "urlIdx": 1}}
+    pipe_request.app.state.OPENAI_MODELS = {
+        "openai-target": {"id": "openai-target", "urlIdx": 1}
+    }
     pipe_request.app.state.OLLAMA_MODELS = {
         "ollama-target": {
             "model": "ollama-target",
@@ -5918,7 +6707,10 @@ async def test_usage_anchor_transport_profile_supports_v096_runtime_config(monke
 
 
 def test_function_wrapper_core_round_trip_drops_target_reasoning_text():
-    from open_webui.utils.middleware import get_reasoning_format, process_messages_with_output
+    from open_webui.utils.middleware import (
+        get_reasoning_format,
+        process_messages_with_output,
+    )
 
     wrapper_model = {
         "id": "auto_compact.target",
@@ -5935,13 +6727,18 @@ def test_function_wrapper_core_round_trip_drops_target_reasoning_text():
                     "summary": [{"type": "output_text", "text": "private reasoning"}],
                     "reasoning_details": [{"type": "signature", "data": "abc"}],
                 },
-                {"type": "message", "content": [{"type": "output_text", "text": "answer"}]},
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
             ],
         }
     ]
 
     reasoning_format = get_reasoning_format(wrapper_model)
-    restored = process_messages_with_output(copy.deepcopy(persisted), reasoning_format=reasoning_format)
+    restored = process_messages_with_output(
+        copy.deepcopy(persisted), reasoning_format=reasoning_format
+    )
 
     assert reasoning_format is None
     assert restored[0].get("reasoning_content") is None
@@ -5951,7 +6748,9 @@ def test_function_wrapper_core_round_trip_drops_target_reasoning_text():
 
 
 @pytest.mark.asyncio
-async def test_persist_usage_anchor_saves_only_strict_final_input_measurement(monkeypatch):
+async def test_persist_usage_anchor_saves_only_strict_final_input_measurement(
+    monkeypatch,
+):
     rows = []
 
     class Store:
@@ -6081,12 +6880,15 @@ def test_request_scoped_usage_returns_current_tool_loop_measurement():
         wrapper_model_id="auto_compact.target",
         usage={"input_tokens": 901},
     )
-    assert mod.get_request_scoped_usage_anchor(
-        request=request,
-        chat_id="chat-1",
-        message_id="message-1",
-        wrapper_model_id="auto_compact.target",
-    ) is None
+    assert (
+        mod.get_request_scoped_usage_anchor(
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+        is None
+    )
 
 
 def test_usage_option_injection_preserves_existing_stream_options():
@@ -6112,7 +6914,9 @@ def test_context_window_classifier_handles_structured_responses_and_http_excepti
         PlainTextResponse("maximum context length exceeded", status_code=413)
     )
     assert mod.is_retryable_context_error(
-        HTTPException(status_code=400, detail={"error": {"type": "context_window_exceeded"}})
+        HTTPException(
+            status_code=400, detail={"error": {"type": "context_window_exceeded"}}
+        )
     )
     assert mod.is_retryable_context_error(Exception("maximum context length exceeded"))
 
@@ -6145,9 +6949,13 @@ def test_context_window_message_fallback_uses_only_error_message_fields():
         "metadata": {"raw": "maximum context length exceeded"},
         "error": {"message": "ordinary bad request"},
     }
-    body_with_error_message = {"error": {"message": "input is too long for the context window"}}
+    body_with_error_message = {
+        "error": {"message": "input is too long for the context window"}
+    }
 
-    assert not mod.is_retryable_context_error(body_with_unrelated_serialized_text, status_code=400)
+    assert not mod.is_retryable_context_error(
+        body_with_unrelated_serialized_text, status_code=400
+    )
     assert mod.is_retryable_context_error(body_with_error_message, status_code=400)
 
 
@@ -6162,7 +6970,11 @@ def test_context_window_classifier_handles_proxy_and_local_model_variants():
         status_code=400,
     )
     assert mod.is_retryable_context_error(
-        {"error": {"message": "This model supports at most 8192 tokens, but input tokens are 9000"}},
+        {
+            "error": {
+                "message": "This model supports at most 8192 tokens, but input tokens are 9000"
+            }
+        },
         status_code=400,
     )
     assert mod.is_retryable_context_error(
@@ -6189,7 +7001,11 @@ def test_context_window_classifier_rejects_input_length_validation_errors():
         status_code=400,
     )
     assert not mod.is_retryable_context_error(
-        {"error": {"message": "max_tokens must be less than the configured token limit"}},
+        {
+            "error": {
+                "message": "max_tokens must be less than the configured token limit"
+            }
+        },
         status_code=400,
     )
     assert not mod.is_retryable_context_error(
@@ -6202,7 +7018,11 @@ def test_context_window_classifier_rejects_input_length_validation_errors():
         status_code=400,
     )
     assert not mod.is_retryable_context_error(
-        {"error": {"message": "max_completion_tokens exceeds the maximum number of tokens"}},
+        {
+            "error": {
+                "message": "max_completion_tokens exceeds the maximum number of tokens"
+            }
+        },
         status_code=422,
     )
 
@@ -6280,7 +7100,9 @@ async def test_streaming_forwarder_retries_split_initial_sse_context_error():
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -6313,7 +7135,9 @@ async def test_streaming_forwarder_waits_for_split_sse_field_name_before_retryin
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -6347,7 +7171,9 @@ async def test_streaming_forwarder_waits_for_split_sse_payload_before_retrying_c
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -6380,7 +7206,9 @@ async def test_streaming_forwarder_ignores_empty_sse_data_before_retrying_contex
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -6413,7 +7241,9 @@ async def test_streaming_forwarder_ignores_bare_empty_sse_data_before_retrying_c
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -6430,7 +7260,9 @@ async def test_streaming_forwarder_ignores_bare_empty_sse_data_before_retrying_c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ignored_field", [b"ping: 1\n\n", b"x-trace: proxy\n\n"])
-async def test_streaming_forwarder_ignores_unknown_sse_fields_before_retrying_context_error(ignored_field):
+async def test_streaming_forwarder_ignores_unknown_sse_fields_before_retrying_context_error(
+    ignored_field,
+):
     closed = False
     background_count = 0
 
@@ -6447,7 +7279,9 @@ async def test_streaming_forwarder_ignores_unknown_sse_fields_before_retrying_co
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -6479,7 +7313,9 @@ async def test_streaming_forwarder_treats_sse_content_type_case_insensitively():
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="Text/Event-Stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="Text/Event-Stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -6520,7 +7356,9 @@ async def test_streaming_forwarder_retries_initial_responses_failed_context_erro
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -6563,7 +7401,9 @@ async def test_streaming_forwarder_retries_responses_failed_after_pre_output_eve
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -6596,7 +7436,9 @@ async def test_streaming_forwarder_retries_context_error_after_chat_role_delta()
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -6631,7 +7473,9 @@ async def test_streaming_forwarder_retries_context_error_after_same_chunk_chat_r
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(mod.RetryableContextOverflow):
         await mod.prepare_streaming_response(
@@ -6656,7 +7500,9 @@ async def test_streaming_forwarder_retries_context_error_after_same_chunk_chat_r
         "response.custom_tool_call_input.delta",
     ],
 )
-async def test_streaming_forwarder_treats_responses_output_deltas_as_visible_output(event_type):
+async def test_streaming_forwarder_treats_responses_output_deltas_as_visible_output(
+    event_type,
+):
     requested_second_chunk = False
     closed = False
     background_count = 0
@@ -6676,7 +7522,9 @@ async def test_streaming_forwarder_treats_responses_output_deltas_as_visible_out
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     prepared = await mod.prepare_streaming_response(
         response,
@@ -6702,7 +7550,9 @@ async def test_streaming_forwarder_treats_responses_output_deltas_as_visible_out
         (b'data: "plain text token"\n\n', "text/event-stream"),
     ],
 )
-async def test_streaming_forwarder_starts_unparsed_stream_after_first_chunk(first_chunk, media_type):
+async def test_streaming_forwarder_starts_unparsed_stream_after_first_chunk(
+    first_chunk, media_type
+):
     requested_second_chunk = False
     closed = False
     background_count = 0
@@ -6722,7 +7572,9 @@ async def test_streaming_forwarder_starts_unparsed_stream_after_first_chunk(firs
         background_count += 1
 
     request = SimpleNamespace(state=SimpleNamespace())
-    response = StreamingResponse(chunks(), media_type=media_type, background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type=media_type, background=BackgroundTask(background)
+    )
 
     prepared = await asyncio.wait_for(
         mod.prepare_streaming_response(
@@ -6860,7 +7712,9 @@ async def test_streaming_forwarder_retries_iterator_context_exception_before_vis
         try:
             raise HTTPException(
                 status_code=400,
-                detail={"error": {"code": "context_length_exceeded", "message": "too long"}},
+                detail={
+                    "error": {"code": "context_length_exceeded", "message": "too long"}
+                },
             )
             yield b""
         finally:
@@ -6908,7 +7762,9 @@ async def test_streaming_forwarder_retries_non_sse_context_exception_after_empty
             yield b""
             raise HTTPException(
                 status_code=400,
-                detail={"error": {"code": "context_length_exceeded", "message": "too long"}},
+                detail={
+                    "error": {"code": "context_length_exceeded", "message": "too long"}
+                },
             )
             yield b""
         finally:
@@ -6947,7 +7803,9 @@ async def test_streaming_forwarder_retries_non_sse_context_exception_after_empty
 @pytest.mark.asyncio
 async def test_non_context_json_response_is_returned_as_sse_event():
     request = SimpleNamespace(state=SimpleNamespace())
-    response = JSONResponse({"error": {"code": "provider_error", "message": "unavailable"}}, status_code=500)
+    response = JSONResponse(
+        {"error": {"code": "provider_error", "message": "unavailable"}}, status_code=500
+    )
 
     prepared = await mod.prepare_streaming_response(
         response,
@@ -6961,13 +7819,18 @@ async def test_non_context_json_response_is_returned_as_sse_event():
     async for chunk in prepared.body_iterator:
         emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
 
-    assert emitted == ['data: {"error":{"code":"provider_error","message":"unavailable"}}\n\n']
+    assert emitted == [
+        'data: {"error":{"code":"provider_error","message":"unavailable"}}\n\n'
+    ]
 
 
 def test_sse_data_chunk_preserves_single_event_multiline_payloads():
     assert mod._sse_data_chunk("line1") == "data: line1\n\n"
     assert mod._sse_data_chunk("line1\nline2") == "data: line1\ndata: line2\n\n"
-    assert mod._sse_data_chunk("line1\rline2\r\nline3") == "data: line1\ndata: line2\ndata: line3\n\n"
+    assert (
+        mod._sse_data_chunk("line1\rline2\r\nline3")
+        == "data: line1\ndata: line2\ndata: line3\n\n"
+    )
     assert mod._sse_data_chunk("line1\n") == "data: line1\n\n"
     assert mod._sse_data_chunk("line1\u2028line2\u2029line3\x85line4") == (
         "data: line1\u2028line2\u2029line3\x85line4\n\n"
@@ -6991,7 +7854,9 @@ async def test_non_context_json_detail_response_is_returned_as_sse_error_event()
     async for chunk in prepared.body_iterator:
         emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
 
-    assert emitted == ['data: {"error": {"code": "provider_error", "message": "provider unavailable"}}\n\n']
+    assert emitted == [
+        'data: {"error": {"code": "provider_error", "message": "provider unavailable"}}\n\n'
+    ]
 
 
 @pytest.mark.asyncio
@@ -7011,7 +7876,9 @@ async def test_non_context_json_message_response_is_returned_as_sse_error_event(
     async for chunk in prepared.body_iterator:
         emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
 
-    assert emitted == ['data: {"error": {"code": "provider_error", "message": "rate limited"}}\n\n']
+    assert emitted == [
+        'data: {"error": {"code": "provider_error", "message": "rate limited"}}\n\n'
+    ]
 
 
 @pytest.mark.asyncio
@@ -7031,7 +7898,9 @@ async def test_non_context_json_string_error_response_is_returned_as_sse_error_e
     async for chunk in prepared.body_iterator:
         emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
 
-    assert emitted == ['data: {"error": {"code": "provider_error", "message": "rate limited"}}\n\n']
+    assert emitted == [
+        'data: {"error": {"code": "provider_error", "message": "rate limited"}}\n\n'
+    ]
 
 
 @pytest.mark.asyncio
@@ -7051,7 +7920,9 @@ async def test_non_context_plain_text_response_is_returned_as_sse_error_event():
     async for chunk in prepared.body_iterator:
         emitted.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
 
-    assert emitted == ['data: {"error": {"code": "provider_error", "message": "provider unavailable"}}\n\n']
+    assert emitted == [
+        'data: {"error": {"code": "provider_error", "message": "provider unavailable"}}\n\n'
+    ]
 
 
 @pytest.mark.asyncio
@@ -7171,7 +8042,10 @@ def test_request_state_proxy_isolates_bypass_and_metadata():
 
     assert request.state.bypass_filter is False
     assert request.state.bypass_system_prompt is True
-    assert request.state.metadata == {"selected_model_id": "arena-a", "chat_id": "chat-1"}
+    assert request.state.metadata == {
+        "selected_model_id": "arena-a",
+        "chat_id": "chat-1",
+    }
     assert proxy.state.bypass_filter is True
     assert proxy.state.bypass_system_prompt is False
     assert proxy.state.metadata == {"task": mod.INTERNAL_SUMMARY_TASK, "new": "value"}
@@ -7180,7 +8054,9 @@ def test_request_state_proxy_isolates_bypass_and_metadata():
 def test_request_state_proxy_does_not_add_flags_to_original_request():
     request = SimpleNamespace(state=SimpleNamespace())
 
-    proxy = mod.RequestStateProxy(request, bypass_filter=True, bypass_system_prompt=True)
+    proxy = mod.RequestStateProxy(
+        request, bypass_filter=True, bypass_system_prompt=True
+    )
 
     assert not hasattr(request.state, "bypass_filter")
     assert not hasattr(request.state, "bypass_system_prompt")
@@ -7270,7 +8146,9 @@ async def test_prepare_summary_file_context_fails_closed_when_prefix_file_contex
         raise mod.SummaryFileContextUnavailable("summary file context unavailable")
 
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
-    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context)
+    monkeypatch.setattr(
+        mod, "_generate_summary_file_context", generate_summary_file_context
+    )
 
     with pytest.raises(mod.SummaryFileContextUnavailable):
         await mod._prepare_summary_file_context(
@@ -7297,10 +8175,14 @@ async def test_prepare_summary_file_context_fails_closed_when_db_chain_is_unavai
         return None
 
     async def generate_summary_file_context(*, request, user, prefix_files):
-        raise AssertionError("summary file context must not be generated without DB chain")
+        raise AssertionError(
+            "summary file context must not be generated without DB chain"
+        )
 
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
-    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context)
+    monkeypatch.setattr(
+        mod, "_generate_summary_file_context", generate_summary_file_context
+    )
 
     with pytest.raises(mod.SummaryFileContextUnavailable):
         await mod._prepare_summary_file_context(
@@ -7328,7 +8210,9 @@ async def test_prepare_summary_file_context_fails_closed_for_current_file_when_d
         raise AssertionError("current-only files must not be summarized")
 
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
-    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context)
+    monkeypatch.setattr(
+        mod, "_generate_summary_file_context", generate_summary_file_context
+    )
 
     with pytest.raises(mod.SummaryFileContextUnavailable):
         await mod._prepare_summary_file_context(
@@ -7354,10 +8238,14 @@ async def test_prepare_summary_file_context_fails_when_current_file_may_be_strip
         return None
 
     async def generate_summary_file_context(*, request, user, prefix_files):
-        raise AssertionError("summary file context must not be generated without DB chain")
+        raise AssertionError(
+            "summary file context must not be generated without DB chain"
+        )
 
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
-    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context)
+    monkeypatch.setattr(
+        mod, "_generate_summary_file_context", generate_summary_file_context
+    )
 
     with pytest.raises(mod.SummaryFileContextUnavailable):
         await mod._prepare_summary_file_context(
@@ -7383,10 +8271,22 @@ async def test_prepare_summary_file_context_includes_current_file_when_it_is_in_
         assert chat_id == "chat-1"
         assert current_message_id == "message-1"
         return [
-            {"role": "user", "content": "active with file", "files": [_file("current-file")]},
-            {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function"}]},
+            {
+                "role": "user",
+                "content": "active with file",
+                "files": [_file("current-file")],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
             {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
-            {"role": "assistant", "content": "", "tool_calls": [{"id": "call-2", "type": "function"}]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-2", "type": "function"}],
+            },
             {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
         ]
 
@@ -7395,7 +8295,9 @@ async def test_prepare_summary_file_context_includes_current_file_when_it_is_in_
         return "current file context"
 
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
-    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context)
+    monkeypatch.setattr(
+        mod, "_generate_summary_file_context", generate_summary_file_context
+    )
 
     context = await mod._prepare_summary_file_context(
         request=pipe_request,
@@ -7618,10 +8520,14 @@ async def test_summary_task_metadata_drops_unpickleable_core_values():
 
 
 @pytest.mark.asyncio
-async def test_target_completion_uses_forward_body_metadata_for_request_state(monkeypatch, pipe_request, pipe_user):
+async def test_target_completion_uses_forward_body_metadata_for_request_state(
+    monkeypatch, pipe_request, pipe_user
+):
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["state_metadata"] = copy.deepcopy(request.state.metadata)
         captured["form_metadata"] = copy.deepcopy(form_data["metadata"])
         captured["bypass_filter"] = bypass_filter
@@ -7639,7 +8545,9 @@ async def test_target_completion_uses_forward_body_metadata_for_request_state(mo
         "files": original_files,
         "sources": [{"source": {"id": "stale"}}],
     }
-    pipe_request.app.state.MODELS = {"target": {"id": "target", "name": "Target", "owned_by": "openai"}}
+    pipe_request.app.state.MODELS = {
+        "target": {"id": "target", "name": "Target", "owned_by": "openai"}
+    }
     body = {
         "model": "target",
         "metadata": {
@@ -7650,7 +8558,9 @@ async def test_target_completion_uses_forward_body_metadata_for_request_state(mo
         "messages": [{"role": "user", "content": "hello"}],
     }
 
-    response = await mod._call_target_completion(request=pipe_request, user=pipe_user, body=body)
+    response = await mod._call_target_completion(
+        request=pipe_request, user=pipe_user, body=body
+    )
 
     assert response == {"choices": [{"message": {"content": "ok"}}]}
     assert captured["state_metadata"] == captured["form_metadata"]
@@ -7669,7 +8579,9 @@ async def test_summary_generation_overrides_metadata_and_reapplies_system_prompt
 ):
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         request.state.bypass_filter = bypass_filter
         request.state.bypass_system_prompt = bypass_system_prompt
         captured["state_metadata"] = dict(request.state.metadata)
@@ -7681,16 +8593,29 @@ async def test_summary_generation_overrides_metadata_and_reapplies_system_prompt
     chat_module.generate_chat_completion = generate_chat_completion
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
 
-    pipe_request.state.metadata = {"selected_model_id": "arena-a", "tools": {"bad": {}}, "tool_ids": ["bad"]}
+    pipe_request.state.metadata = {
+        "selected_model_id": "arena-a",
+        "tools": {"bad": {}},
+        "tool_ids": ["bad"],
+    }
     pipe_request.state.bypass_system_prompt = True
 
     result = await mod._generate_summary_text(
         request=pipe_request,
         user=pipe_user,
-        metadata={"chat_id": "chat-1", "selected_model_id": "arena-a", "tools": {"bad": {}}, "tool_ids": ["bad"]},
+        metadata={
+            "chat_id": "chat-1",
+            "selected_model_id": "arena-a",
+            "tools": {"bad": {}},
+            "tool_ids": ["bad"],
+        },
         summary_model_id="target",
         source_messages=[{"role": "user", "content": "old"}],
-        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+        },
     )
 
     assert result == "summary"
@@ -7723,7 +8648,9 @@ async def test_summary_generation_does_not_emit_summary_start_before_route_resol
     async def on_summary_start():
         events.append("started")
 
-    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(
+        mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route
+    )
 
     with pytest.raises(RuntimeError, match="route failed"):
         await mod._generate_summary_text(
@@ -7732,7 +8659,11 @@ async def test_summary_generation_does_not_emit_summary_start_before_route_resol
             metadata={"chat_id": "chat-1"},
             summary_model_id="target",
             source_messages=[{"role": "user", "content": "old"}],
-            base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
+            base_body={
+                "model": "target",
+                "stream": True,
+                "messages": [{"role": "user", "content": "old"}],
+            },
             on_summary_start=on_summary_start,
         )
 
@@ -7746,7 +8677,10 @@ async def test_summary_generation_strips_request_response_format_without_overrid
     pipe_user,
 ):
     captured = {}
-    model_response_format = {"type": "json_schema", "json_schema": {"name": "Configured", "schema": {"type": "object"}}}
+    model_response_format = {
+        "type": "json_schema",
+        "json_schema": {"name": "Configured", "schema": {"type": "object"}},
+    }
     model_max_tokens = 64000
     pipe_request.app.state.MODELS = {
         "summary": {
@@ -7759,7 +8693,9 @@ async def test_summary_generation_strips_request_response_format_without_overrid
         }
     }
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["form_body"] = dict(form_data)
         captured["model_params"] = request.app.state.MODELS["summary"]["params"]
         return {"choices": [{"message": {"content": "summary"}}]}
@@ -7798,7 +8734,12 @@ async def test_summary_generation_applies_fallback_params_when_route_falls_back(
 ):
     captured = {}
     checked_model_ids = []
-    fallback_model = {"id": "fallback-openai", "name": "Fallback", "owned_by": "openai", "openai": {}}
+    fallback_model = {
+        "id": "fallback-openai",
+        "name": "Fallback",
+        "owned_by": "openai",
+        "openai": {},
+    }
     pipe_request.app.state.MODELS = {"fallback-openai": fallback_model}
 
     async def resolve_core_chat_model_route(request, model_id, **kwargs):
@@ -7827,7 +8768,9 @@ async def test_summary_generation_applies_fallback_params_when_route_falls_back(
         ):
             params.pop(key, None)
         params.update(custom_params)
-        form_data.update({key: value for key, value in params.items() if value is not None})
+        form_data.update(
+            {key: value for key, value in params.items() if value is not None}
+        )
         return form_data
 
     async def model_dict_from_request(request):
@@ -7836,7 +8779,9 @@ async def test_summary_generation_applies_fallback_params_when_route_falls_back(
     async def check_model_access(user, model, db=None):
         checked_model_ids.append(model["id"])
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["form_body"] = copy.deepcopy(form_data)
         return {"choices": [{"message": {"content": "summary"}}]}
 
@@ -7849,7 +8794,9 @@ async def test_summary_generation_applies_fallback_params_when_route_falls_back(
     monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(
+        mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route
+    )
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
 
     result = await mod._generate_summary_text(
@@ -7883,7 +8830,12 @@ async def test_summary_generation_checks_access_for_non_arena_fallback_model(
     pipe_request,
     pipe_user,
 ):
-    fallback_model = {"id": "fallback-openai", "name": "Fallback", "owned_by": "openai", "openai": {}}
+    fallback_model = {
+        "id": "fallback-openai",
+        "name": "Fallback",
+        "owned_by": "openai",
+        "openai": {},
+    }
     pipe_request.app.state.MODELS = {"fallback-openai": fallback_model}
     checked_model_ids = []
 
@@ -7903,8 +8855,12 @@ async def test_summary_generation_checks_access_for_non_arena_fallback_model(
         if model["id"] == "fallback-openai":
             raise HTTPException(status_code=403, detail="Model not found")
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
-        raise AssertionError("fallback model access denial must stop before summary generation")
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
+        raise AssertionError(
+            "fallback model access denial must stop before summary generation"
+        )
 
     utils_models_module = types.ModuleType("open_webui.utils.models")
     utils_models_module.check_model_access = check_model_access
@@ -7912,7 +8868,9 @@ async def test_summary_generation_checks_access_for_non_arena_fallback_model(
     chat_module.generate_chat_completion = generate_chat_completion
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(
+        mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route
+    )
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
 
     with pytest.raises(HTTPException):
@@ -7981,13 +8939,17 @@ async def test_summary_generation_resolves_arena_fallback_before_params(
         if model.get("owned_by") == "ollama":
             form_data["options"] = params
         else:
-            form_data.update({key: value for key, value in params.items() if value is not None})
+            form_data.update(
+                {key: value for key, value in params.items() if value is not None}
+            )
         return form_data
 
     async def check_model_access(user, model, db=None):
         captured.setdefault("checked_models", []).append(model["id"])
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["form_body"] = copy.deepcopy(form_data)
         return {"choices": [{"message": {"content": "summary"}}]}
 
@@ -8000,7 +8962,9 @@ async def test_summary_generation_resolves_arena_fallback_before_params(
     monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(
+        mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route
+    )
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
 
     result = await mod._generate_summary_text(
@@ -8020,7 +8984,10 @@ async def test_summary_generation_resolves_arena_fallback_before_params(
     assert result == "summary"
     assert captured["checked_models"] == ["arena-selected-ollama"]
     assert captured["form_body"]["model"] == "arena-selected-ollama"
-    assert captured["form_body"]["metadata"]["selected_model_id"] == "arena-selected-ollama"
+    assert (
+        captured["form_body"]["metadata"]["selected_model_id"]
+        == "arena-selected-ollama"
+    )
     assert captured["form_body"]["options"]["temperature"] == 0.4
     assert captured["form_body"]["options"]["num_predict"] == 128
     assert captured["form_body"]["options"]["provider_flag"] == "true"
@@ -8067,12 +9034,18 @@ async def test_summary_generation_checks_access_for_selected_arena_fallback_mode
     async def check_model_access(user, model, db=None):
         checked_model_ids.append(model["id"])
         if model["id"] == "fallback-arena":
-            raise AssertionError("arena wrapper access must not be checked after fallback selection")
+            raise AssertionError(
+                "arena wrapper access must not be checked after fallback selection"
+            )
         if model["id"] == "arena-selected":
             raise HTTPException(status_code=403, detail="Model not found")
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
-        raise AssertionError("selected arena model access denial must stop before summary generation")
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
+        raise AssertionError(
+            "selected arena model access denial must stop before summary generation"
+        )
 
     utils_models_module = types.ModuleType("open_webui.utils.models")
     utils_models_module.check_model_access = check_model_access
@@ -8080,7 +9053,9 @@ async def test_summary_generation_checks_access_for_selected_arena_fallback_mode
     chat_module.generate_chat_completion = generate_chat_completion
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(
+        mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route
+    )
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
 
     with pytest.raises(HTTPException):
@@ -8135,13 +9110,19 @@ async def test_summary_generation_rejects_stale_arena_fallback_candidate_before_
     async def model_dict_from_request(request):
         return dict(pipe_request.app.state.MODELS)
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
-        raise AssertionError("stale arena fallback candidate must stop before summary generation")
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
+        raise AssertionError(
+            "stale arena fallback candidate must stop before summary generation"
+        )
 
     chat_module = types.ModuleType("open_webui.utils.chat")
     chat_module.generate_chat_completion = generate_chat_completion
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(
+        mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route
+    )
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod.random, "choice", lambda items: "stale-id")
 
@@ -8225,7 +9206,9 @@ async def test_summary_generation_reshapes_sampling_params_without_inheriting_ol
     async def model_dict_from_request(request):
         return dict(pipe_request.app.state.MODELS)
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["form_body"] = copy.deepcopy(form_data)
         return {"choices": [{"message": {"content": "summary"}}]}
 
@@ -8281,10 +9264,14 @@ async def test_summary_generation_reshapes_sampling_params_without_inheriting_ol
 
 
 @pytest.mark.asyncio
-async def test_summary_generation_decodes_own_wrapper_summary_model(monkeypatch, pipe_request, pipe_user):
+async def test_summary_generation_decodes_own_wrapper_summary_model(
+    monkeypatch, pipe_request, pipe_user
+):
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["model"] = form_data["model"]
         captured["stream"] = form_data["stream"]
         captured["metadata"] = dict(form_data["metadata"])
@@ -8302,7 +9289,11 @@ async def test_summary_generation_decodes_own_wrapper_summary_model(monkeypatch,
         metadata={"chat_id": "chat-1"},
         summary_model_id=wrapper_summary_model,
         source_messages=[{"role": "user", "content": "old"}],
-        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+        },
     )
 
     assert result == "summary"
@@ -8312,10 +9303,14 @@ async def test_summary_generation_decodes_own_wrapper_summary_model(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_summary_generation_decodes_runtime_registered_wrapper_summary_model(monkeypatch, pipe_request, pipe_user):
+async def test_summary_generation_decodes_runtime_registered_wrapper_summary_model(
+    monkeypatch, pipe_request, pipe_user
+):
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["model"] = form_data["model"]
         captured["base_model_id"] = getattr(request, "base_model_id", None)
         return {"choices": [{"message": {"content": "summary"}}]}
@@ -8330,7 +9325,11 @@ async def test_summary_generation_decodes_runtime_registered_wrapper_summary_mod
         metadata={"chat_id": "chat-1"},
         summary_model_id=mod.build_wrapper_model_id("compact_alias", "target.summary"),
         source_messages=[{"role": "user", "content": "old"}],
-        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+        },
         pipe_function_id="compact_alias",
     )
 
@@ -8354,16 +9353,24 @@ async def test_summary_generation_uses_core_fallback_default_for_custom_model_mi
             "owned_by": "openai",
             "info": {"base_model_id": "stale-summary-base"},
         },
-        "fallback-summary": {"id": "fallback-summary", "name": "Fallback Summary", "owned_by": "openai"},
+        "fallback-summary": {
+            "id": "fallback-summary",
+            "name": "Fallback Summary",
+            "owned_by": "openai",
+        },
     }
 
     class FakeModels:
         @staticmethod
         async def get_model_by_id(model_id):
             assert model_id == "summary-preset"
-            return SimpleNamespace(id="summary-preset", base_model_id="stale-summary-base")
+            return SimpleNamespace(
+                id="summary-preset", base_model_id="stale-summary-base"
+            )
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["model"] = form_data["model"]
         captured["base_model_id"] = getattr(request, "base_model_id", None)
         return {"choices": [{"message": {"content": "summary"}}]}
@@ -8390,7 +9397,11 @@ async def test_summary_generation_uses_core_fallback_default_for_custom_model_mi
         metadata={"chat_id": "chat-1"},
         summary_model_id="summary-preset",
         source_messages=[{"role": "user", "content": "old"}],
-        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+        },
     )
 
     assert result == "summary"
@@ -8406,7 +9417,9 @@ async def test_summary_generation_preserves_tools_but_disables_forced_tool_choic
 ):
     captured = []
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured.append(form_data)
         return {"choices": [{"message": {"content": "summary"}}]}
 
@@ -8418,7 +9431,12 @@ async def test_summary_generation_preserves_tools_but_disables_forced_tool_choic
         {"role": "system", "content": "target system"},
         {"role": "user", "content": "old"},
     ]
-    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}},
+        }
+    ]
     metadata = {
         "chat_id": "chat-1",
         "selected_model_id": "arena-a",
@@ -8482,7 +9500,9 @@ async def test_summary_generation_retries_without_tools_after_tool_call_response
     captured = []
     bypass_values = []
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured.append(copy.deepcopy(form_data))
         bypass_values.append(bypass_system_prompt)
         if len(captured) == 1:
@@ -8513,7 +9533,12 @@ async def test_summary_generation_retries_without_tools_after_tool_call_response
         {"role": "system", "content": "target system"},
         {"role": "user", "content": "old"},
     ]
-    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}},
+        }
+    ]
     base_body = {
         "model": "target",
         "stream": True,
@@ -8556,7 +9581,9 @@ async def test_summary_generation_strips_tools_before_first_request_when_configu
 ):
     captured = []
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured.append(copy.deepcopy(form_data))
         return {"choices": [{"message": {"content": "summary without tools"}}]}
 
@@ -8568,7 +9595,12 @@ async def test_summary_generation_strips_tools_before_first_request_when_configu
     base_body = {
         "model": "target",
         "messages": [*source_messages, {"role": "user", "content": "active"}],
-        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ],
         "tool_choice": "auto",
         "functions": [{"name": "legacy_lookup", "parameters": {"type": "object"}}],
         "function_call": "auto",
@@ -8602,7 +9634,9 @@ async def test_summary_generation_errors_on_tool_call_when_fallback_disabled(
 ):
     captured = []
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured.append(copy.deepcopy(form_data))
         return {
             "choices": [
@@ -8629,7 +9663,12 @@ async def test_summary_generation_errors_on_tool_call_when_fallback_disabled(
     base_body = {
         "model": "target",
         "messages": [*source_messages, {"role": "user", "content": "active"}],
-        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ],
         "tool_choice": "auto",
     }
 
@@ -8650,10 +9689,14 @@ async def test_summary_generation_errors_on_tool_call_when_fallback_disabled(
 
 
 @pytest.mark.asyncio
-async def test_summary_generation_uses_handoff_checkpoint_prompt(monkeypatch, pipe_request, pipe_user):
+async def test_summary_generation_uses_handoff_checkpoint_prompt(
+    monkeypatch, pipe_request, pipe_user
+):
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["messages"] = form_data["messages"]
         return {"choices": [{"message": {"content": "summary"}}]}
 
@@ -8667,7 +9710,11 @@ async def test_summary_generation_uses_handoff_checkpoint_prompt(monkeypatch, pi
         metadata={"chat_id": "chat-1"},
         summary_model_id="target",
         source_messages=[{"role": "user", "content": "old"}],
-        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+        },
     )
 
     assert result == "summary"
@@ -8695,10 +9742,14 @@ def test_resolve_summary_prompt_returns_stripped_custom_prompt():
 
 
 @pytest.mark.asyncio
-async def test_summary_generation_uses_custom_summary_prompt(monkeypatch, pipe_request, pipe_user):
+async def test_summary_generation_uses_custom_summary_prompt(
+    monkeypatch, pipe_request, pipe_user
+):
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["messages"] = form_data["messages"]
         return {"choices": [{"message": {"content": "summary"}}]}
 
@@ -8706,7 +9757,9 @@ async def test_summary_generation_uses_custom_summary_prompt(monkeypatch, pipe_r
     chat_module.generate_chat_completion = generate_chat_completion
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
 
-    custom_prompt = "DISTINCTIVE CUSTOM MARKER 7c4f-9a21: rewrite the handoff in haiku form."
+    custom_prompt = (
+        "DISTINCTIVE CUSTOM MARKER 7c4f-9a21: rewrite the handoff in haiku form."
+    )
 
     result = await mod._generate_summary_text(
         request=pipe_request,
@@ -8714,7 +9767,11 @@ async def test_summary_generation_uses_custom_summary_prompt(monkeypatch, pipe_r
         metadata={"chat_id": "chat-1"},
         summary_model_id="target",
         source_messages=[{"role": "user", "content": "old"}],
-        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+        },
         summary_prompt=custom_prompt,
     )
 
@@ -8729,7 +9786,9 @@ async def test_summary_generation_falls_back_to_builtin_prompt_when_summary_prom
 ):
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["messages"] = form_data["messages"]
         return {"choices": [{"message": {"content": "summary"}}]}
 
@@ -8737,7 +9796,11 @@ async def test_summary_generation_falls_back_to_builtin_prompt_when_summary_prom
     chat_module.generate_chat_completion = generate_chat_completion
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
 
-    base_body = {"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]}
+    base_body = {
+        "model": "target",
+        "stream": True,
+        "messages": [{"role": "user", "content": "old"}],
+    }
 
     for blank in ("", "   \n\t "):
         captured.clear()
@@ -8765,7 +9828,11 @@ def test_build_summary_request_message_prepends_file_context_to_custom_summary_p
 def test_build_summary_completion_body_uses_custom_summary_prompt_in_final_message():
     custom = "DISTINCTIVE SUMMARY OVERRIDE 1a2b-3c4d."
     body = mod.build_summary_completion_body(
-        {"model": "target", "messages": [{"role": "user", "content": "old"}], "metadata": {}},
+        {
+            "model": "target",
+            "messages": [{"role": "user", "content": "old"}],
+            "metadata": {},
+        },
         summary_model_id="summary",
         source_messages=[{"role": "user", "content": "source"}],
         metadata={"chat_id": "chat-1"},
@@ -8784,7 +9851,11 @@ def test_build_summary_completion_body_prepends_preserved_system_message():
     ]
 
     body = mod.build_summary_completion_body(
-        {"model": "target", "messages": [{"role": "user", "content": "old"}], "metadata": {}},
+        {
+            "model": "target",
+            "messages": [{"role": "user", "content": "old"}],
+            "metadata": {},
+        },
         summary_model_id="summary",
         source_messages=source_messages,
         preserved_system_message=system,
@@ -8838,7 +9909,9 @@ async def test_compact_body_summary_request_preserves_system_but_checkpoint_iden
     async def noop_initialize(**kwargs):
         return None
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["messages"] = copy.deepcopy(form_data["messages"])
         return {"choices": [{"message": {"content": "summary"}}]}
 
@@ -8909,7 +9982,9 @@ async def test_compact_body_reuses_checkpoint_when_only_system_content_changes(
         return None
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("system-only changes must not invalidate a reusable checkpoint")
+        raise AssertionError(
+            "system-only changes must not invalidate a reusable checkpoint"
+        )
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
@@ -8937,7 +10012,10 @@ async def test_compact_body_reuses_checkpoint_when_only_system_content_changes(
     assert did_compact is True
     assert prefix_count == len(source_messages)
     assert store.touched == [checkpoint["id"]]
-    assert compacted["messages"][0] == {"role": "system", "content": "changed system prompt"}
+    assert compacted["messages"][0] == {
+        "role": "system",
+        "content": "changed system prompt",
+    }
     assert "reused summary" in compacted["messages"][1]["content"]
 
 
@@ -8959,7 +10037,9 @@ async def test_compact_body_reuses_checkpoint_when_transient_user_content_change
         chat_id="chat-1",
         pipe_function_id="auto_compact",
         profile_hash=mod.compute_profile_hash(),
-        source_hash=mod.compute_source_hash(stable_source_messages, transient_message_patterns=patterns),
+        source_hash=mod.compute_source_hash(
+            stable_source_messages, transient_message_patterns=patterns
+        ),
         source_message_count=mod._source_identity_message_count(
             stable_source_messages,
             transient_message_patterns=patterns,
@@ -8980,7 +10060,9 @@ async def test_compact_body_reuses_checkpoint_when_transient_user_content_change
         return None
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("transient user message changes must not invalidate a reusable checkpoint")
+        raise AssertionError(
+            "transient user message changes must not invalidate a reusable checkpoint"
+        )
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
@@ -8995,7 +10077,10 @@ async def test_compact_body_reuses_checkpoint_when_transient_user_content_change
             "messages": [
                 {"role": "system", "content": "first system prompt"},
                 {"role": "user", "content": "old"},
-                {"role": "user", "content": "  <SYSTEM_CONTEXT>now: 10:01</SYSTEM_CONTEXT>\n"},
+                {
+                    "role": "user",
+                    "content": "  <SYSTEM_CONTEXT>now: 10:01</SYSTEM_CONTEXT>\n",
+                },
                 {"role": "assistant", "content": "old answer"},
                 {"role": "user", "content": "active"},
             ],
@@ -9011,7 +10096,10 @@ async def test_compact_body_reuses_checkpoint_when_transient_user_content_change
     assert did_compact is True
     assert prefix_count == 2
     assert store.touched == [checkpoint["id"]]
-    assert compacted["messages"][0] == {"role": "system", "content": "first system prompt"}
+    assert compacted["messages"][0] == {
+        "role": "system",
+        "content": "first system prompt",
+    }
     assert "reused summary" in compacted["messages"][1]["content"]
     assert "now: 10:00" not in compacted["messages"][1]["content"]
     assert "now: 10:01" not in compacted["messages"][1]["content"]
@@ -9082,7 +10170,13 @@ async def test_compact_body_reuses_checkpoint_when_middle_system_presence_change
         pipe_function_id="auto_compact",
         profile_hash=mod.compute_profile_hash(),
         source_hash=mod.compute_source_hash(stable_source_messages),
-        source_message_count=len([message for message in stable_source_messages if message["role"] != "system"]),
+        source_message_count=len(
+            [
+                message
+                for message in stable_source_messages
+                if message["role"] != "system"
+            ]
+        ),
         summary_text="reused summary",
         summary_meta=mod.build_checkpoint_summary_meta(
             stable_source_messages,
@@ -9098,7 +10192,9 @@ async def test_compact_body_reuses_checkpoint_when_middle_system_presence_change
         return None
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("middle system presence changes must not invalidate a reusable checkpoint")
+        raise AssertionError(
+            "middle system presence changes must not invalidate a reusable checkpoint"
+        )
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
@@ -9127,7 +10223,10 @@ async def test_compact_body_reuses_checkpoint_when_middle_system_presence_change
     assert did_compact is True
     assert prefix_count == 2
     assert store.touched == [checkpoint["id"]]
-    assert compacted["messages"][0] == {"role": "system", "content": "first system prompt"}
+    assert compacted["messages"][0] == {
+        "role": "system",
+        "content": "first system prompt",
+    }
     assert "reused summary" in compacted["messages"][1]["content"]
     assert compacted["messages"][2:] == [{"role": "user", "content": "active"}]
 
@@ -9200,7 +10299,10 @@ async def test_compact_body_parent_extension_failure_returns_chain_parent_bounda
     assert summary_inputs[0][0]["role"] == "user"
     assert "parent summary" in summary_inputs[0][0]["content"]
     assert summary_inputs[0][1:] == [{"role": "assistant", "content": "old answer"}]
-    assert compacted["messages"][0] == {"role": "system", "content": "first system prompt"}
+    assert compacted["messages"][0] == {
+        "role": "system",
+        "content": "first system prompt",
+    }
     assert "parent summary" in compacted["messages"][1]["content"]
     assert compacted["messages"][2:] == [
         {"role": "assistant", "content": "old answer"},
@@ -9223,7 +10325,11 @@ async def test_tool_result_compaction_summary_request_preserves_system_but_ident
         {"role": "user", "content": "active"},
     ]
     latest_round = [
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function"}]},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
         {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
     ]
     messages = [system, *source_messages, *latest_round]
@@ -9231,7 +10337,9 @@ async def test_tool_result_compaction_summary_request_preserves_system_but_ident
     async def noop_initialize(**kwargs):
         return None
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["messages"] = copy.deepcopy(form_data["messages"])
         return {"choices": [{"message": {"content": "tool summary"}}]}
 
@@ -9271,7 +10379,9 @@ async def test_summary_generation_passes_open_webui_user_model_to_inner_completi
     fake_user_model = install_fake_open_webui_user_model(monkeypatch)
     captured = {}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["user_id"] = user.id
         captured["user_role"] = user.role
         captured["user_type"] = type(user)
@@ -9287,11 +10397,19 @@ async def test_summary_generation_passes_open_webui_user_model_to_inner_completi
         metadata={"chat_id": "chat-1"},
         summary_model_id="target",
         source_messages=[{"role": "user", "content": "old"}],
-        base_body={"model": "target", "stream": True, "messages": [{"role": "user", "content": "old"}]},
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [{"role": "user", "content": "old"}],
+        },
     )
 
     assert result == "summary"
-    assert captured == {"user_id": "user-1", "user_role": "user", "user_type": fake_user_model}
+    assert captured == {
+        "user_id": "user-1",
+        "user_role": "user",
+        "user_type": fake_user_model,
+    }
 
 
 @pytest.mark.asyncio
@@ -9306,7 +10424,9 @@ async def test_tool_history_compaction_summarizes_before_latest_tool_round_and_p
         captured["source_messages"] = kwargs["source_messages"]
         return "combined summary"
 
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     original_tool = {"role": "tool", "tool_call_id": "call-1", "content": {"value": 42}}
     compacted, did_compact, _tool_prefix_count = await mod._compact_retry_tool_results(
@@ -9330,7 +10450,10 @@ async def test_tool_history_compaction_summarizes_before_latest_tool_round_and_p
                         {
                             "id": "call-1",
                             "type": "function",
-                            "function": {"name": "search", "arguments": '{"q":"alpha"}'},
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"q":"alpha"}',
+                            },
                         }
                     ],
                 },
@@ -9358,7 +10481,11 @@ async def test_tool_history_compaction_summarizes_before_latest_tool_round_and_p
     )
 
     assert did_compact is True
-    assert original_tool == {"role": "tool", "tool_call_id": "call-1", "content": {"value": 42}}
+    assert original_tool == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": {"value": 42},
+    }
     assert [message["role"] for message in captured["source_messages"]] == [
         "user",
         "assistant",
@@ -9398,10 +10525,16 @@ async def test_tool_history_checkpoint_render_skips_transient_user_excerpts(
             }
         )
 
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     latest_round = [
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function"}]},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
         {"role": "tool", "tool_call_id": "call-1", "content": "latest result"},
     ]
     historical = [
@@ -9548,7 +10681,11 @@ async def test_tool_history_parent_handoff_uses_parent_checkpoint_saved_excerpts
         metadata={"chat_id": "chat-1"},
         pipe_function_id="auto_compact",
         summary_model_id="target",
-        base_body={"model": "target", "stream": True, "messages": [*history, active, *latest_round]},
+        base_body={
+            "model": "target",
+            "stream": True,
+            "messages": [*history, active, *latest_round],
+        },
         messages=[*history, active, *latest_round],
     )
 
@@ -9556,7 +10693,10 @@ async def test_tool_history_parent_handoff_uses_parent_checkpoint_saved_excerpts
     parent_context = summary_inputs[0][0]["content"]
     assert "existing history summary" in parent_context
     assert "<historical_user_messages" in parent_context
-    assert '<historical_user_message ordinal="1"><![CDATA[old request]]></historical_user_message>' in parent_context
+    assert (
+        '<historical_user_message ordinal="1"><![CDATA[old request]]></historical_user_message>'
+        in parent_context
+    )
     assert "tool summary" in compacted[0]["content"]
 
 
@@ -9572,7 +10712,9 @@ async def test_tool_history_compaction_summarizes_all_but_latest_sequential_tool
         captured["source_messages"] = kwargs["source_messages"]
         return "combined summary"
 
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     messages = [
         {"role": "user", "content": "active request"},
@@ -9580,7 +10722,11 @@ async def test_tool_history_compaction_summarizes_all_but_latest_sequential_tool
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"id": "call-1", "type": "function", "function": {"name": "search", "arguments": '{"q":"alpha"}'}}
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": '{"q":"alpha"}'},
+                }
             ],
         },
         {"role": "tool", "tool_call_id": "call-1", "content": {"value": 42}},
@@ -9588,7 +10734,14 @@ async def test_tool_history_compaction_summarizes_all_but_latest_sequential_tool
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"id": "call-2", "type": "function", "function": {"name": "fetch", "arguments": '{"url":"https://example.test"}'}}
+                {
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {
+                        "name": "fetch",
+                        "arguments": '{"url":"https://example.test"}',
+                    },
+                }
             ],
         },
         {"role": "tool", "tool_call_id": "call-2", "content": "fetched body"},
@@ -9622,7 +10775,9 @@ async def test_extract_summary_text_from_streaming_response():
         nonlocal background_ran
         background_ran = True
 
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     assert await mod.extract_text_from_completion_response(response) == "hello world"
     assert background_ran is True
@@ -9667,7 +10822,9 @@ async def test_extract_summary_text_accepts_mixed_case_sse_media_type():
 @pytest.mark.asyncio
 async def test_extract_summary_text_from_streamed_chat_completion_message():
     async def chunks():
-        payload = {"choices": [{"message": {"role": "assistant", "content": "pipe summary"}}]}
+        payload = {
+            "choices": [{"message": {"role": "assistant", "content": "pipe summary"}}]
+        }
         yield f"data: {json.dumps(payload)}\n\n".encode()
 
     response = StreamingResponse(chunks(), media_type="text/event-stream")
@@ -9727,7 +10884,9 @@ async def test_extract_summary_text_ignores_non_structured_sse_data():
         nonlocal background_ran
         background_ran = True
 
-    response = StreamingResponse(chunks(), media_type="text/event-stream", background=BackgroundTask(background))
+    response = StreamingResponse(
+        chunks(), media_type="text/event-stream", background=BackgroundTask(background)
+    )
 
     with pytest.raises(RuntimeError, match="did not return text content"):
         await mod.extract_text_from_completion_response(response)
@@ -9737,7 +10896,12 @@ async def test_extract_summary_text_ignores_non_structured_sse_data():
 @pytest.mark.asyncio
 async def test_extract_summary_text_propagates_streamed_context_error():
     async def chunks():
-        payload = {"error": {"code": "context_length_exceeded", "message": "maximum context length exceeded"}}
+        payload = {
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "maximum context length exceeded",
+            }
+        }
         yield f"data: {json.dumps(payload)}\n\n".encode()
 
     response = StreamingResponse(chunks(), media_type="text/event-stream")
@@ -9749,7 +10913,11 @@ async def test_extract_summary_text_propagates_streamed_context_error():
 @pytest.mark.asyncio
 async def test_extract_summary_text_propagates_responses_api_error_event():
     async def chunks():
-        payload = {"type": "error", "code": "context_length_exceeded", "message": "maximum context length exceeded"}
+        payload = {
+            "type": "error",
+            "code": "context_length_exceeded",
+            "message": "maximum context length exceeded",
+        }
         yield f"data: {json.dumps(payload)}\n\n".encode()
 
     response = StreamingResponse(chunks(), media_type="text/event-stream")
@@ -9763,7 +10931,12 @@ async def test_extract_summary_text_propagates_responses_api_failed_event():
     async def chunks():
         payload = {
             "type": "response.failed",
-            "response": {"error": {"code": "server_error", "message": "The model failed to generate a response."}},
+            "response": {
+                "error": {
+                    "code": "server_error",
+                    "message": "The model failed to generate a response.",
+                }
+            },
         }
         yield f"data: {json.dumps(payload)}\n\n".encode()
 
@@ -9844,16 +11017,25 @@ async def test_extract_summary_text_ignores_unused_incomplete_choices():
     response = {
         "choices": [
             {"message": {"content": "complete summary"}, "finish_reason": "stop"},
-            {"message": {"content": "unused partial summary"}, "finish_reason": "length"},
+            {
+                "message": {"content": "unused partial summary"},
+                "finish_reason": "length",
+            },
         ]
     }
 
-    assert await mod.extract_text_from_completion_response(response) == "complete summary"
+    assert (
+        await mod.extract_text_from_completion_response(response) == "complete summary"
+    )
 
 
 @pytest.mark.asyncio
 async def test_extract_summary_text_rejects_length_finished_chat_completion():
-    response = {"choices": [{"message": {"content": "partial summary"}, "finish_reason": "length"}]}
+    response = {
+        "choices": [
+            {"message": {"content": "partial summary"}, "finish_reason": "length"}
+        ]
+    }
 
     with pytest.raises(RuntimeError, match="stopped before completing"):
         await mod.extract_text_from_completion_response(response)
@@ -9861,7 +11043,14 @@ async def test_extract_summary_text_rejects_length_finished_chat_completion():
 
 @pytest.mark.asyncio
 async def test_extract_summary_text_rejects_max_output_finished_chat_completion():
-    response = {"choices": [{"message": {"content": "partial summary"}, "finish_reason": "max_output_tokens"}]}
+    response = {
+        "choices": [
+            {
+                "message": {"content": "partial summary"},
+                "finish_reason": "max_output_tokens",
+            }
+        ]
+    }
 
     with pytest.raises(RuntimeError, match="stopped before completing"):
         await mod.extract_text_from_completion_response(response)
@@ -9976,7 +11165,13 @@ async def test_extract_summary_text_rejects_streamed_message_content_with_tool_c
                     "message": {
                         "role": "assistant",
                         "content": "not a final summary",
-                        "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "lookup"}}],
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "lookup"},
+                            }
+                        ],
                     }
                 }
             ]
@@ -10015,7 +11210,9 @@ def test_build_summary_completion_body_strips_response_format():
 
 @pytest.fixture
 def pipe_request():
-    return SimpleNamespace(state=SimpleNamespace(), app=SimpleNamespace(state=SimpleNamespace(MODELS={})))
+    return SimpleNamespace(
+        state=SimpleNamespace(), app=SimpleNamespace(state=SimpleNamespace(MODELS={}))
+    )
 
 
 @pytest.fixture
@@ -10076,9 +11273,15 @@ def _install_durable_usage_anchor_estimate(monkeypatch, value, *, captured=None)
             captured.append(copy.deepcopy(kwargs["body"]))
         return value
 
-    monkeypatch.setattr(mod, "_usage_anchor_parent_assistant_message_id", parent_assistant_message_id)
+    monkeypatch.setattr(
+        mod, "_usage_anchor_parent_assistant_message_id", parent_assistant_message_id
+    )
     monkeypatch.setattr(mod, "lookup_usage_anchor", lookup_usage_anchor)
-    monkeypatch.setattr(mod, "_estimate_body_tokens_from_usage_anchor", estimate_body_tokens_from_usage_anchor)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_body_tokens_from_usage_anchor",
+        estimate_body_tokens_from_usage_anchor,
+    )
     _install_known_openai_usage_anchor_transport(monkeypatch)
 
 
@@ -10147,7 +11350,9 @@ async def test_pipe_persists_final_usage_for_the_actual_forward_candidate(
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "_get_target_db_model_record", get_target_db_model_record)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "lookup_usage_anchor", lookup_anchor)
     monkeypatch.setattr(mod, "_build_usage_anchor_input", build_anchor_input)
     monkeypatch.setattr(mod, "persist_usage_anchor", persist_anchor)
@@ -10197,7 +11402,9 @@ async def test_pipe_persists_final_usage_for_the_actual_forward_candidate(
 
 
 @pytest.mark.asyncio
-async def test_task_forward_preserves_outer_request_usage_anchor(monkeypatch, pipe_request):
+async def test_task_forward_preserves_outer_request_usage_anchor(
+    monkeypatch, pipe_request
+):
     chat_id = "chat-1"
     message_id = "message-1"
     wrapper_model_id = mod.build_wrapper_model_id("auto_compact", "target")
@@ -10260,7 +11467,9 @@ async def test_pipe_rejects_when_core_context_compaction_is_enabled(
             return default
 
     async def validate_target_access(**kwargs):
-        raise AssertionError("target access must not run when Core context compaction is enabled")
+        raise AssertionError(
+            "target access must not run when Core context compaction is enabled"
+        )
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     install_fake_open_webui_config(monkeypatch, FakeConfig)
@@ -10290,7 +11499,9 @@ def test_core_context_compaction_guard_matches_core_bool_semantics():
 
 
 @pytest.mark.asyncio
-async def test_pipe_forwards_below_threshold_to_decoded_target_with_metadata(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_forwards_below_threshold_to_decoded_target_with_metadata(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     captured = {}
 
     async def validate_target_access(**kwargs):
@@ -10395,7 +11606,9 @@ async def test_pipe_reshapes_request_params_for_normal_ollama_target(
 
 
 @pytest.mark.asyncio
-async def test_pipe_injects_file_context_for_persisted_chat(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_injects_file_context_for_persisted_chat(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     install_fake_open_webui_user_model(monkeypatch)
     captured = {"target_file_calls": [], "source_events": [], "forward_attempts": 0}
     rows = []
@@ -10422,7 +11635,9 @@ async def test_pipe_injects_file_context_for_persisted_chat(monkeypatch, pipe_re
         ids = ",".join(file["id"] for file in prefix_files)
         return f"<attached_file_contents>SUMMARY_CONTEXT:{ids}</attached_file_contents>"
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["summary_body"] = copy.deepcopy(form_data)
         return {"choices": [{"message": {"content": "summary"}}]}
 
@@ -10435,7 +11650,9 @@ async def test_pipe_injects_file_context_for_persisted_chat(monkeypatch, pipe_re
 
     async def chat_completion_files_handler(request, rag_body, extra_params, user):
         captured["target_files"] = copy.deepcopy(rag_body["metadata"]["files"])
-        captured["target_file_calls"].append(copy.deepcopy(rag_body["metadata"]["files"]))
+        captured["target_file_calls"].append(
+            copy.deepcopy(rag_body["metadata"]["files"])
+        )
         return rag_body, {
             "sources": [
                 {
@@ -10447,7 +11664,9 @@ async def test_pipe_injects_file_context_for_persisted_chat(monkeypatch, pipe_re
             ]
         }
 
-    async def apply_source_context_to_messages(request, messages, sources, last_user_msg):
+    async def apply_source_context_to_messages(
+        request, messages, sources, last_user_msg
+    ):
         captured["target_last_user"] = last_user_msg
         ids = ",".join(source["source"]["id"] for source in sources)
         updated = copy.deepcopy(messages)
@@ -10503,10 +11722,14 @@ async def test_pipe_injects_file_context_for_persisted_chat(monkeypatch, pipe_re
     chat_module.generate_chat_completion = generate_chat_completion
     middleware_module = types.ModuleType("open_webui.utils.middleware")
     middleware_module.chat_completion_files_handler = chat_completion_files_handler
-    middleware_module.apply_source_context_to_messages = apply_source_context_to_messages
+    middleware_module.apply_source_context_to_messages = (
+        apply_source_context_to_messages
+    )
     # _load_chat_message_chain calls process_messages_with_output to align DB chain
     # with expanded body.messages. Provide an identity passthrough for the test.
-    middleware_module.process_messages_with_output = lambda messages, reasoning_format=None: messages
+    middleware_module.process_messages_with_output = (
+        lambda messages, reasoning_format=None: messages
+    )
     misc_module = types.ModuleType("open_webui.utils.misc")
     misc_module.get_message_list = get_message_list
     misc_module.get_last_user_message = get_last_user_message
@@ -10522,11 +11745,22 @@ async def test_pipe_injects_file_context_for_persisted_chat(monkeypatch, pipe_re
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "_generate_summary_file_context", generate_summary_file_context, raising=False)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod,
+        "_generate_summary_file_context",
+        generate_summary_file_context,
+        raising=False,
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
-    metadata_files = [_file("absorbed-file"), _file("current-file"), _file("knowledge-file")]
+    metadata_files = [
+        _file("absorbed-file"),
+        _file("current-file"),
+        _file("knowledge-file"),
+    ]
     metadata = {
         **pipe_metadata,
         "files": metadata_files,
@@ -10560,9 +11794,15 @@ async def test_pipe_injects_file_context_for_persisted_chat(monkeypatch, pipe_re
     assert result == {"ok": True}
     assert captured["forward_attempts"] == 2
     assert captured["checkpoint_lookup_body"]["messages"][-1]["content"] == "same text"
-    assert "TARGET_CONTEXT:absorbed-file,current-file,knowledge-file" in captured["estimate_body"]["messages"][-1]["content"]
+    assert (
+        "TARGET_CONTEXT:absorbed-file,current-file,knowledge-file"
+        in captured["estimate_body"]["messages"][-1]["content"]
+    )
     assert captured["summary_prefix_files"] == [_file("absorbed-file")]
-    assert "SUMMARY_CONTEXT:absorbed-file" in captured["summary_body"]["messages"][-1]["content"]
+    assert (
+        "SUMMARY_CONTEXT:absorbed-file"
+        in captured["summary_body"]["messages"][-1]["content"]
+    )
     assert "files" not in captured["summary_body"]["metadata"]
     assert captured["target_file_calls"] == [
         [_file("absorbed-file"), _file("current-file"), _file("knowledge-file")],
@@ -10573,7 +11813,10 @@ async def test_pipe_injects_file_context_for_persisted_chat(monkeypatch, pipe_re
         "current-file",
         "knowledge-file",
     ]
-    assert "TARGET_CONTEXT:current-file,knowledge-file" in captured["target_body"]["messages"][-1]["content"]
+    assert (
+        "TARGET_CONTEXT:current-file,knowledge-file"
+        in captured["target_body"]["messages"][-1]["content"]
+    )
     assert "absorbed-file" not in captured["target_body"]["messages"][-1]["content"]
 
 
@@ -10582,7 +11825,12 @@ async def test_pipe_non_streaming_merges_manual_rag_sources_into_response(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
     install_fake_open_webui_user_model(monkeypatch)
-    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+    sources = [
+        {
+            "source": {"id": "file-1", "name": "manual.pdf"},
+            "document": ["manual context"],
+        }
+    ]
 
     async def validate_target_access(**kwargs):
         return None
@@ -10624,7 +11872,9 @@ async def test_pipe_non_streaming_merges_manual_rag_sources_into_response(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
@@ -10639,7 +11889,10 @@ async def test_pipe_non_streaming_merges_manual_rag_sources_into_response(
         },
         __request__=pipe_request,
         __user__=pipe_user,
-        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __metadata__={
+            **pipe_metadata,
+            "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}],
+        },
         __event_emitter__=None,
     )
 
@@ -10652,7 +11905,12 @@ async def test_pipe_non_streaming_source_event_failure_still_returns_response(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
     install_fake_open_webui_user_model(monkeypatch)
-    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+    sources = [
+        {
+            "source": {"id": "file-1", "name": "manual.pdf"},
+            "document": ["manual context"],
+        }
+    ]
 
     async def validate_target_access(**kwargs):
         return None
@@ -10697,7 +11955,9 @@ async def test_pipe_non_streaming_source_event_failure_still_returns_response(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
@@ -10712,7 +11972,10 @@ async def test_pipe_non_streaming_source_event_failure_still_returns_response(
         },
         __request__=pipe_request,
         __user__=pipe_user,
-        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __metadata__={
+            **pipe_metadata,
+            "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}],
+        },
         __event_emitter__=event_emitter,
     )
 
@@ -10725,7 +11988,12 @@ async def test_pipe_non_streaming_error_does_not_merge_or_emit_manual_rag_source
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
     install_fake_open_webui_user_model(monkeypatch)
-    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+    sources = [
+        {
+            "source": {"id": "file-1", "name": "manual.pdf"},
+            "document": ["manual context"],
+        }
+    ]
     emitted = []
 
     async def validate_target_access(**kwargs):
@@ -10760,7 +12028,9 @@ async def test_pipe_non_streaming_error_does_not_merge_or_emit_manual_rag_source
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
@@ -10775,7 +12045,10 @@ async def test_pipe_non_streaming_error_does_not_merge_or_emit_manual_rag_source
         },
         __request__=pipe_request,
         __user__=pipe_user,
-        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __metadata__={
+            **pipe_metadata,
+            "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}],
+        },
         __event_emitter__=event_emitter,
     )
 
@@ -10789,7 +12062,12 @@ async def test_pipe_streaming_immediate_error_does_not_emit_manual_file_sources(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
     install_fake_open_webui_user_model(monkeypatch)
-    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+    sources = [
+        {
+            "source": {"id": "file-1", "name": "manual.pdf"},
+            "document": ["manual context"],
+        }
+    ]
     emitted = []
 
     async def validate_target_access(**kwargs):
@@ -10824,7 +12102,9 @@ async def test_pipe_streaming_immediate_error_does_not_emit_manual_file_sources(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_call_target_completion", call_target_completion)
 
@@ -10839,7 +12119,10 @@ async def test_pipe_streaming_immediate_error_does_not_emit_manual_file_sources(
         },
         __request__=pipe_request,
         __user__=pipe_user,
-        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __metadata__={
+            **pipe_metadata,
+            "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}],
+        },
         __event_emitter__=event_emitter,
     )
 
@@ -10853,7 +12136,12 @@ async def test_pipe_streaming_plaintext_non_json_error_does_not_emit_manual_file
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
     install_fake_open_webui_user_model(monkeypatch)
-    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+    sources = [
+        {
+            "source": {"id": "file-1", "name": "manual.pdf"},
+            "document": ["manual context"],
+        }
+    ]
     emitted = []
 
     async def validate_target_access(**kwargs):
@@ -10888,7 +12176,9 @@ async def test_pipe_streaming_plaintext_non_json_error_does_not_emit_manual_file
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_call_target_completion", call_target_completion)
 
@@ -10903,7 +12193,10 @@ async def test_pipe_streaming_plaintext_non_json_error_does_not_emit_manual_file
         },
         __request__=pipe_request,
         __user__=pipe_user,
-        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __metadata__={
+            **pipe_metadata,
+            "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}],
+        },
         __event_emitter__=event_emitter,
     )
 
@@ -10917,7 +12210,12 @@ async def test_pipe_streaming_immediate_success_dict_emits_manual_file_sources(
     monkeypatch, pipe_request, pipe_user, pipe_metadata
 ):
     install_fake_open_webui_user_model(monkeypatch)
-    sources = [{"source": {"id": "file-1", "name": "manual.pdf"}, "document": ["manual context"]}]
+    sources = [
+        {
+            "source": {"id": "file-1", "name": "manual.pdf"},
+            "document": ["manual context"],
+        }
+    ]
     emitted = []
 
     async def validate_target_access(**kwargs):
@@ -10952,7 +12250,9 @@ async def test_pipe_streaming_immediate_success_dict_emits_manual_file_sources(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_call_target_completion", call_target_completion)
 
@@ -10967,7 +12267,10 @@ async def test_pipe_streaming_immediate_success_dict_emits_manual_file_sources(
         },
         __request__=pipe_request,
         __user__=pipe_user,
-        __metadata__={**pipe_metadata, "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}]},
+        __metadata__={
+            **pipe_metadata,
+            "files": [{"id": "file-1", "type": "file", "name": "manual.pdf"}],
+        },
         __event_emitter__=event_emitter,
     )
 
@@ -11013,7 +12316,9 @@ async def test_pipe_skips_file_context_injection_for_query_generation_task(
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     metadata = {
@@ -11055,7 +12360,9 @@ async def test_pipe_rejects_official_context_compaction_task_as_dict_error(
             return default
 
     async def validate_target_access(**kwargs):
-        raise AssertionError("target access must not run for Core context compaction tasks")
+        raise AssertionError(
+            "target access must not run for Core context compaction tasks"
+        )
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     install_fake_open_webui_config(monkeypatch, FakeConfig)
@@ -11120,7 +12427,12 @@ async def test_inject_target_file_context_skips_manual_rag_when_reentry_guard_ac
                     "content": "x",
                     "files": [_file("absorbed-file")],
                 },
-                "msg-2": {"id": "msg-2", "parentId": "msg-1", "role": "assistant", "content": "y"},
+                "msg-2": {
+                    "id": "msg-2",
+                    "parentId": "msg-1",
+                    "role": "assistant",
+                    "content": "y",
+                },
                 "message-1": {
                     "id": "message-1",
                     "parentId": "msg-2",
@@ -11142,7 +12454,9 @@ async def test_inject_target_file_context_skips_manual_rag_when_reentry_guard_ac
         return result
 
     misc_module.get_message_list = get_message_list
-    middleware_module.process_messages_with_output = lambda messages, reasoning_format=None: messages
+    middleware_module.process_messages_with_output = (
+        lambda messages, reasoning_format=None: messages
+    )
     monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.misc", misc_module)
     monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
@@ -11210,12 +12524,16 @@ async def test_inject_target_file_context_keeps_concurrent_sibling_tasks_indepen
             second_started.set()
         return rag_body, {"sources": []}
 
-    async def apply_source_context_to_messages(request, messages, sources, last_user_msg):
+    async def apply_source_context_to_messages(
+        request, messages, sources, last_user_msg
+    ):
         return messages
 
     middleware_module = types.ModuleType("open_webui.utils.middleware")
     middleware_module.chat_completion_files_handler = chat_completion_files_handler
-    middleware_module.apply_source_context_to_messages = apply_source_context_to_messages
+    middleware_module.apply_source_context_to_messages = (
+        apply_source_context_to_messages
+    )
     misc_module = types.ModuleType("open_webui.utils.misc")
     misc_module.get_last_user_message = lambda messages: ""
     monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
@@ -11284,11 +12602,15 @@ async def test_inject_target_file_context_uses_non_transient_user_for_manual_rag
             ]
         }
 
-    async def apply_source_context_to_messages(request, messages, sources, last_user_msg):
+    async def apply_source_context_to_messages(
+        request, messages, sources, last_user_msg
+    ):
         captured["apply_messages"] = copy.deepcopy(messages)
         captured["last_user_msg"] = last_user_msg
         updated = copy.deepcopy(messages)
-        updated[-1]["content"] = f"{updated[-1]['content']}\nTARGET_CONTEXT:current-file"
+        updated[-1]["content"] = (
+            f"{updated[-1]['content']}\nTARGET_CONTEXT:current-file"
+        )
         return updated
 
     def get_last_user_message(messages):
@@ -11299,7 +12621,9 @@ async def test_inject_target_file_context_uses_non_transient_user_for_manual_rag
 
     middleware_module = types.ModuleType("open_webui.utils.middleware")
     middleware_module.chat_completion_files_handler = chat_completion_files_handler
-    middleware_module.apply_source_context_to_messages = apply_source_context_to_messages
+    middleware_module.apply_source_context_to_messages = (
+        apply_source_context_to_messages
+    )
     misc_module = types.ModuleType("open_webui.utils.misc")
     misc_module.get_last_user_message = get_last_user_message
     monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
@@ -11354,7 +12678,9 @@ def test_merge_rag_messages_preserves_appended_user_context_from_core_default_ra
         {"role": "user", "content": "TARGET_CONTEXT:current-file"},
     ]
 
-    result = mod._merge_rag_messages_preserving_transient_users(original, applied, patterns)
+    result = mod._merge_rag_messages_preserving_transient_users(
+        original, applied, patterns
+    )
 
     assert result == [
         {"role": "user", "content": "real question"},
@@ -11420,6 +12746,7 @@ async def test_pipe_forwards_custom_model_missing_base_to_core_fallback_default(
     pipe_metadata,
 ):
     install_fake_open_webui_user_model(monkeypatch)
+
     class FakeConfig:
         @staticmethod
         async def get(key):
@@ -11437,9 +12764,19 @@ async def test_pipe_forwards_custom_model_missing_base_to_core_fallback_default(
         "preset": True,
         "info": {"base_model_id": "stale-openai"},
     }
-    fallback_model = {"id": "fallback-ollama", "name": "Fallback", "owned_by": "ollama", "ollama": {}}
-    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-ollama,other")
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-ollama": fallback_model}
+    fallback_model = {
+        "id": "fallback-ollama",
+        "name": "Fallback",
+        "owned_by": "ollama",
+        "ollama": {},
+    }
+    pipe_request.app.state.config = SimpleNamespace(
+        DEFAULT_MODELS="fallback-ollama,other"
+    )
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-ollama": fallback_model,
+    }
     captured = {}
     checked_model_ids = []
 
@@ -11455,7 +12792,9 @@ async def test_pipe_forwards_custom_model_missing_base_to_core_fallback_default(
     async def body_reusable_checkpoint_match(**kwargs):
         return None
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["forward_model"] = form_data["model"]
         captured["base_model_id"] = getattr(request, "base_model_id", None)
         return {
@@ -11483,7 +12822,9 @@ async def test_pipe_forwards_custom_model_missing_base_to_core_fallback_default(
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
 
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
@@ -11597,9 +12938,17 @@ async def test_pipe_applies_target_params_when_missing_base_uses_custom_model_fa
         "preset": True,
         "info": {"base_model_id": "stale-openai"},
     }
-    fallback_model = {"id": "fallback-ollama", "name": "Fallback", "owned_by": "ollama", "ollama": {}}
+    fallback_model = {
+        "id": "fallback-ollama",
+        "name": "Fallback",
+        "owned_by": "ollama",
+        "ollama": {},
+    }
     pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-ollama")
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-ollama": fallback_model}
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-ollama": fallback_model,
+    }
     captured = {}
 
     class FakeModels:
@@ -11640,10 +12989,14 @@ async def test_pipe_applies_target_params_when_missing_base_uses_custom_model_fa
         if model.get("owned_by") == "ollama":
             form_data["options"] = params
         else:
-            form_data.update({key: value for key, value in params.items() if value is not None})
+            form_data.update(
+                {key: value for key, value in params.items() if value is not None}
+            )
         return form_data
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["forward_body"] = copy.deepcopy(form_data)
         return {
             "id": "chatcmpl-fallback",
@@ -11673,7 +13026,9 @@ async def test_pipe_applies_target_params_when_missing_base_uses_custom_model_fa
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
 
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
@@ -11701,7 +13056,9 @@ async def test_pipe_applies_target_params_when_missing_base_uses_custom_model_fa
     }
     assert "params" not in captured["forward_body"]
     assert "system" not in captured["forward_body"]
-    assert captured["forward_body"]["messages"] == [{"role": "user", "content": "hello"}]
+    assert captured["forward_body"]["messages"] == [
+        {"role": "user", "content": "hello"}
+    ]
 
 
 @pytest.mark.asyncio
@@ -11720,9 +13077,17 @@ async def test_pipe_applies_request_params_when_missing_base_fallback_has_no_tar
         "preset": True,
         "info": {"base_model_id": "stale-openai"},
     }
-    fallback_model = {"id": "fallback-ollama", "name": "Fallback", "owned_by": "ollama", "ollama": {}}
+    fallback_model = {
+        "id": "fallback-ollama",
+        "name": "Fallback",
+        "owned_by": "ollama",
+        "ollama": {},
+    }
     pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-ollama")
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-ollama": fallback_model}
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-ollama": fallback_model,
+    }
     captured = {}
 
     class FakeModels:
@@ -11748,10 +13113,14 @@ async def test_pipe_applies_request_params_when_missing_base_fallback_has_no_tar
         if model.get("owned_by") == "ollama":
             form_data["options"] = params
         else:
-            form_data.update({key: value for key, value in params.items() if value is not None})
+            form_data.update(
+                {key: value for key, value in params.items() if value is not None}
+            )
         return form_data
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["forward_body"] = copy.deepcopy(form_data)
         return {
             "id": "chatcmpl-fallback",
@@ -11781,7 +13150,9 @@ async def test_pipe_applies_request_params_when_missing_base_fallback_has_no_tar
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
 
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
@@ -11830,9 +13201,17 @@ async def test_pipe_preserves_top_level_request_params_when_missing_base_uses_fa
         "preset": True,
         "info": {"base_model_id": "stale-openai"},
     }
-    fallback_model = {"id": "fallback-openai", "name": "Fallback", "owned_by": "openai", "openai": {}}
+    fallback_model = {
+        "id": "fallback-openai",
+        "name": "Fallback",
+        "owned_by": "openai",
+        "openai": {},
+    }
     pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-openai")
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-openai": fallback_model}
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-openai": fallback_model,
+    }
     captured = {}
 
     class FakeModels:
@@ -11855,10 +13234,14 @@ async def test_pipe_preserves_top_level_request_params_when_missing_base_uses_fa
         params = copy.deepcopy(form_data.pop("params", {}) or {})
         custom_params = params.pop("custom_params", {}) or {}
         params.update(custom_params)
-        form_data.update({key: value for key, value in params.items() if value is not None})
+        form_data.update(
+            {key: value for key, value in params.items() if value is not None}
+        )
         return form_data
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["forward_body"] = copy.deepcopy(form_data)
         return {
             "id": "chatcmpl-fallback",
@@ -11888,7 +13271,9 @@ async def test_pipe_preserves_top_level_request_params_when_missing_base_uses_fa
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
 
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
@@ -11939,9 +13324,17 @@ async def test_pipe_preserves_top_level_ollama_provider_params_when_missing_base
         "preset": True,
         "info": {"base_model_id": "stale-openai"},
     }
-    fallback_model = {"id": "fallback-ollama", "name": "Fallback", "owned_by": "ollama", "ollama": {}}
+    fallback_model = {
+        "id": "fallback-ollama",
+        "name": "Fallback",
+        "owned_by": "ollama",
+        "ollama": {},
+    }
     pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-ollama")
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-ollama": fallback_model}
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-ollama": fallback_model,
+    }
     captured = {}
 
     class FakeModels:
@@ -11967,10 +13360,14 @@ async def test_pipe_preserves_top_level_ollama_provider_params_when_missing_base
         if model.get("owned_by") == "ollama":
             form_data["options"] = params
         else:
-            form_data.update({key: value for key, value in params.items() if value is not None})
+            form_data.update(
+                {key: value for key, value in params.items() if value is not None}
+            )
         return form_data
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["forward_body"] = copy.deepcopy(form_data)
         return {
             "id": "chatcmpl-fallback",
@@ -12000,7 +13397,9 @@ async def test_pipe_preserves_top_level_ollama_provider_params_when_missing_base
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
 
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
@@ -12133,9 +13532,17 @@ async def test_pipe_preserves_top_level_ollama_provider_params_when_fallback_has
         "preset": True,
         "info": {"base_model_id": "stale-openai"},
     }
-    fallback_model = {"id": "fallback-ollama", "name": "Fallback", "owned_by": "ollama", "ollama": {}}
+    fallback_model = {
+        "id": "fallback-ollama",
+        "name": "Fallback",
+        "owned_by": "ollama",
+        "ollama": {},
+    }
     pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-ollama")
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-ollama": fallback_model}
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-ollama": fallback_model,
+    }
     captured = {}
 
     class FakeModels:
@@ -12159,10 +13566,14 @@ async def test_pipe_preserves_top_level_ollama_provider_params_when_fallback_has
         if model.get("owned_by") == "ollama":
             form_data["options"] = params
         else:
-            form_data.update({key: value for key, value in params.items() if value is not None})
+            form_data.update(
+                {key: value for key, value in params.items() if value is not None}
+            )
         return form_data
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["forward_body"] = copy.deepcopy(form_data)
         return {
             "id": "chatcmpl-fallback",
@@ -12192,7 +13603,9 @@ async def test_pipe_preserves_top_level_ollama_provider_params_when_fallback_has
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
 
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
@@ -12242,9 +13655,17 @@ async def test_pipe_preserves_existing_ollama_options_when_missing_base_uses_fal
         "preset": True,
         "info": {"base_model_id": "stale-openai"},
     }
-    fallback_model = {"id": "fallback-ollama", "name": "Fallback", "owned_by": "ollama", "ollama": {}}
+    fallback_model = {
+        "id": "fallback-ollama",
+        "name": "Fallback",
+        "owned_by": "ollama",
+        "ollama": {},
+    }
     pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-ollama")
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-ollama": fallback_model}
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-ollama": fallback_model,
+    }
     captured = {}
 
     class FakeModels:
@@ -12270,10 +13691,14 @@ async def test_pipe_preserves_existing_ollama_options_when_missing_base_uses_fal
         if model.get("owned_by") == "ollama":
             form_data["options"] = params
         else:
-            form_data.update({key: value for key, value in params.items() if value is not None})
+            form_data.update(
+                {key: value for key, value in params.items() if value is not None}
+            )
         return form_data
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["forward_body"] = copy.deepcopy(form_data)
         return {
             "id": "chatcmpl-fallback",
@@ -12303,7 +13728,9 @@ async def test_pipe_preserves_existing_ollama_options_when_missing_base_uses_fal
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.middleware", middleware_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
 
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
@@ -12321,7 +13748,10 @@ async def test_pipe_preserves_existing_ollama_options_when_missing_base_uses_fal
 
     assert result["choices"][0]["message"]["content"] == "ok"
     assert captured["forward_body"]["model"] == "fallback-ollama"
-    assert captured["forward_body"]["options"] == {"temperature": 0.9, "num_predict": 99}
+    assert captured["forward_body"]["options"] == {
+        "temperature": 0.9,
+        "num_predict": 99,
+    }
     assert "params" not in captured["forward_body"]
 
 
@@ -12363,7 +13793,10 @@ async def test_pipe_uses_fallback_model_file_context_capability_after_missing_ba
         "info": {"meta": {"capabilities": {"file_context": fallback_file_context}}},
     }
     pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-openai")
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-openai": fallback_model}
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-openai": fallback_model,
+    }
     captured = {"injections": 0}
 
     class FakeModels:
@@ -12411,7 +13844,9 @@ async def test_pipe_uses_fallback_model_file_context_capability_after_missing_ba
     monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
@@ -12534,7 +13969,9 @@ async def test_pipe_resolves_arena_fallback_before_file_context_capability_check
     monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
@@ -12618,10 +14055,14 @@ async def test_pipe_checks_access_for_selected_arena_fallback_model(
         return None
 
     async def inject_target_file_context(**kwargs):
-        raise AssertionError("selected arena model access denial must stop before file-context injection")
+        raise AssertionError(
+            "selected arena model access denial must stop before file-context injection"
+        )
 
     async def forward_target(**kwargs):
-        raise AssertionError("selected arena model access denial must stop before forwarding")
+        raise AssertionError(
+            "selected arena model access denial must stop before forwarding"
+        )
 
     env_module = types.ModuleType("open_webui.env")
     env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
@@ -12632,7 +14073,9 @@ async def test_pipe_checks_access_for_selected_arena_fallback_model(
     monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
@@ -12708,10 +14151,14 @@ async def test_pipe_rejects_stale_arena_fallback_candidate_before_forwarding(
         return None
 
     async def inject_target_file_context(**kwargs):
-        raise AssertionError("stale arena fallback candidate must stop before file-context injection")
+        raise AssertionError(
+            "stale arena fallback candidate must stop before file-context injection"
+        )
 
     async def forward_target(**kwargs):
-        raise AssertionError("stale arena fallback candidate must stop before forwarding")
+        raise AssertionError(
+            "stale arena fallback candidate must stop before forwarding"
+        )
 
     env_module = types.ModuleType("open_webui.env")
     env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
@@ -12722,7 +14169,9 @@ async def test_pipe_rejects_stale_arena_fallback_candidate_before_forwarding(
     monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
     monkeypatch.setattr(mod.random, "choice", lambda items: "stale-id")
@@ -12807,10 +14256,14 @@ async def test_pipe_rejects_nested_arena_fallback_candidate_before_forwarding(
         return None
 
     async def inject_target_file_context(**kwargs):
-        raise AssertionError("nested arena fallback candidate must stop before file-context injection")
+        raise AssertionError(
+            "nested arena fallback candidate must stop before file-context injection"
+        )
 
     async def forward_target(**kwargs):
-        raise AssertionError("nested arena fallback candidate must stop before forwarding")
+        raise AssertionError(
+            "nested arena fallback candidate must stop before forwarding"
+        )
 
     env_module = types.ModuleType("open_webui.env")
     env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
@@ -12821,7 +14274,9 @@ async def test_pipe_rejects_nested_arena_fallback_candidate_before_forwarding(
     monkeypatch.setitem(sys.modules, "open_webui.env", env_module)
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
@@ -12858,9 +14313,17 @@ async def test_pipe_forwards_custom_model_missing_base_to_config_default_model(
         "preset": True,
         "info": {"base_model_id": "stale-openai"},
     }
-    fallback_model = {"id": "fallback-config", "name": "Fallback", "owned_by": "openai", "openai": {}}
+    fallback_model = {
+        "id": "fallback-config",
+        "name": "Fallback",
+        "owned_by": "openai",
+        "openai": {},
+    }
     pipe_request.app.state.config = SimpleNamespace()
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-config": fallback_model}
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-config": fallback_model,
+    }
     captured = {"config_gets": []}
     checked_model_ids = []
 
@@ -12885,7 +14348,9 @@ async def test_pipe_forwards_custom_model_missing_base_to_config_default_model(
     async def body_reusable_checkpoint_match(**kwargs):
         return None
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["forward_model"] = form_data["model"]
         captured["base_model_id"] = getattr(request, "base_model_id", None)
         return {
@@ -12916,7 +14381,9 @@ async def test_pipe_forwards_custom_model_missing_base_to_config_default_model(
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
 
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
@@ -12944,7 +14411,9 @@ async def test_pipe_forwards_custom_model_missing_base_to_config_default_model(
 
 
 @pytest.mark.asyncio
-async def test_resolved_route_usage_anchor_hash_tracks_downstream_model_shaping(monkeypatch, pipe_request):
+async def test_resolved_route_usage_anchor_hash_tracks_downstream_model_shaping(
+    monkeypatch, pipe_request
+):
     import open_webui.routers.openai as openai_router
 
     pipe_request.app.state.MODELS = {
@@ -12976,7 +14445,9 @@ async def test_resolved_route_usage_anchor_hash_tracks_downstream_model_shaping(
     monkeypatch.setattr(mod, "_get_target_db_model_record", get_target_db_model_record)
     monkeypatch.setattr(openai_router, "get_openai_connection", get_openai_connection)
 
-    original = (await mod._resolve_core_chat_model_route(pipe_request, "target")).usage_anchor_shaping_hash
+    original = (
+        await mod._resolve_core_chat_model_route(pipe_request, "target")
+    ).usage_anchor_shaping_hash
     assert original is not None
 
     pipe_request.app.state.OPENAI_MODELS["base-a"]["urlIdx"] = 1
@@ -12988,14 +14459,19 @@ async def test_resolved_route_usage_anchor_hash_tracks_downstream_model_shaping(
     pipe_request.app.state.OPENAI_MODELS["base-a"]["urlIdx"] = 0
 
     api_type["value"] = "responses"
-    transport_changed = (await mod._resolve_core_chat_model_route(pipe_request, "target")).usage_anchor_shaping_hash
+    transport_changed = (
+        await mod._resolve_core_chat_model_route(pipe_request, "target")
+    ).usage_anchor_shaping_hash
     assert transport_changed is not None
     assert transport_changed != original
     api_type["value"] = "chat_completions"
 
     for replacement in (
         {"base_model_id": "base-b", "params": current["params"]},
-        {"base_model_id": "base-a", "params": {**current["params"], "system": "system-b"}},
+        {
+            "base_model_id": "base-a",
+            "params": {**current["params"], "system": "system-b"},
+        },
         {
             "base_model_id": "base-a",
             "params": {**current["params"], "response_format": {"type": "json_object"}},
@@ -13003,7 +14479,9 @@ async def test_resolved_route_usage_anchor_hash_tracks_downstream_model_shaping(
     ):
         current.clear()
         current.update(copy.deepcopy(replacement))
-        changed = (await mod._resolve_core_chat_model_route(pipe_request, "target")).usage_anchor_shaping_hash
+        changed = (
+            await mod._resolve_core_chat_model_route(pipe_request, "target")
+        ).usage_anchor_shaping_hash
         assert changed is not None
         assert changed != original
 
@@ -13011,12 +14489,18 @@ async def test_resolved_route_usage_anchor_hash_tracks_downstream_model_shaping(
         assert model_id == "target"
         return mod.TARGET_MODEL_RECORD_UNKNOWN
 
-    monkeypatch.setattr(mod, "_get_target_db_model_record", unknown_target_db_model_record)
-    assert (await mod._resolve_core_chat_model_route(pipe_request, "target")).usage_anchor_shaping_hash is None
+    monkeypatch.setattr(
+        mod, "_get_target_db_model_record", unknown_target_db_model_record
+    )
+    assert (
+        await mod._resolve_core_chat_model_route(pipe_request, "target")
+    ).usage_anchor_shaping_hash is None
 
 
 @pytest.mark.asyncio
-async def test_usage_anchor_system_identity_keeps_chat_variables_without_core_support(monkeypatch):
+async def test_usage_anchor_system_identity_keeps_chat_variables_without_core_support(
+    monkeypatch,
+):
     monkeypatch.setattr(mod, "_render_chat_variables", None)
 
     assert (
@@ -13064,13 +14548,17 @@ async def test_resolved_route_usage_anchor_hash_normalizes_clock_but_tracks_expa
 
     def render_chat_variables(system, variables, *, required=True):
         assert required is False
-        return system.replace("{{ chat.variables.project }}", variables.get("project", ""))
+        return system.replace(
+            "{{ chat.variables.project }}", variables.get("project", "")
+        )
 
     monkeypatch.setattr(mod, "_get_target_db_model_record", get_target_db_model_record)
     monkeypatch.setattr(mod, "_usage_anchor_transport_profile", transport_profile)
     if mod._render_chat_variables is None:
         monkeypatch.setattr(mod, "_render_chat_variables", render_chat_variables)
-    monkeypatch.setattr(groups_module.Groups, "get_groups_by_member_id", get_groups_by_member_id)
+    monkeypatch.setattr(
+        groups_module.Groups, "get_groups_by_member_id", get_groups_by_member_id
+    )
 
     user = {**pipe_user, "bio": "bio-a"}
     metadata = {
@@ -13078,7 +14566,7 @@ async def test_resolved_route_usage_anchor_hash_normalizes_clock_but_tracks_expa
         "variables": {
             "{{CURRENT_DATETIME}}": "clock-a",
             "{{CUSTOM}}": "custom-a",
-        }
+        },
     }
 
     async def shaping_hash(*, resolved_user=user, resolved_metadata=metadata):
@@ -13121,12 +14609,23 @@ async def test_resolved_route_usage_anchor_hash_normalizes_clock_but_tracks_expa
 
 
 @pytest.mark.asyncio
-async def test_raw_fallback_usage_anchor_hash_tracks_its_db_override(monkeypatch, pipe_request):
+async def test_raw_fallback_usage_anchor_hash_tracks_its_db_override(
+    monkeypatch, pipe_request
+):
     import open_webui.routers.openai as openai_router
 
     models = {
-        "missing-preset": {"id": "missing-preset", "owned_by": "openai", "preset": True},
-        "raw-fallback": {"id": "raw-fallback", "owned_by": "openai", "openai": {}, "urlIdx": 0},
+        "missing-preset": {
+            "id": "missing-preset",
+            "owned_by": "openai",
+            "preset": True,
+        },
+        "raw-fallback": {
+            "id": "raw-fallback",
+            "owned_by": "openai",
+            "openai": {},
+            "urlIdx": 0,
+        },
     }
     pipe_request.app.state.MODELS = models
     pipe_request.app.state.OPENAI_MODELS = {
@@ -13138,7 +14637,10 @@ async def test_raw_fallback_usage_anchor_hash_tracks_its_db_override(monkeypatch
     async def get_target_db_model_record(model_id):
         lookups.append(model_id)
         if model_id == "missing-preset":
-            return SimpleNamespace(base_model_id="missing-base", params=SimpleNamespace(model_dump=lambda: {}))
+            return SimpleNamespace(
+                base_model_id="missing-base",
+                params=SimpleNamespace(model_dump=lambda: {}),
+            )
         assert model_id == "raw-fallback"
         return SimpleNamespace(
             base_model_id=None,
@@ -13156,7 +14658,9 @@ async def test_raw_fallback_usage_anchor_hash_tracks_its_db_override(monkeypatch
         return "http://provider", "key", {}
 
     monkeypatch.setattr(mod, "_get_target_db_model_record", get_target_db_model_record)
-    monkeypatch.setattr(mod, "_custom_model_fallback_model_id_compatible", fallback_model_id)
+    monkeypatch.setattr(
+        mod, "_custom_model_fallback_model_id_compatible", fallback_model_id
+    )
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(openai_router, "get_openai_connection", get_openai_connection)
 
@@ -13165,8 +14669,13 @@ async def test_raw_fallback_usage_anchor_hash_tracks_its_db_override(monkeypatch
     async def validate_runtime_access(**kwargs):
         assert kwargs["model_id"] == "raw-fallback"
 
-    monkeypatch.setattr(mod, "_validate_chat_completion_runtime_model_access", validate_runtime_access)
-    forwarded, selected_arena_model_id = await mod._resolve_arena_chat_model_route_with_access(
+    monkeypatch.setattr(
+        mod, "_validate_chat_completion_runtime_model_access", validate_runtime_access
+    )
+    (
+        forwarded,
+        selected_arena_model_id,
+    ) = await mod._resolve_arena_chat_model_route_with_access(
         request=pipe_request,
         user=None,
         models=models,
@@ -13185,7 +14694,12 @@ async def test_raw_fallback_usage_anchor_hash_tracks_its_db_override(monkeypatch
     assert first.token_system_prompt == "fallback system a"
     assert second.token_system_prompt == "fallback system b"
     assert first.usage_anchor_shaping_hash != second.usage_anchor_shaping_hash
-    assert lookups == ["missing-preset", "raw-fallback", "missing-preset", "raw-fallback"]
+    assert lookups == [
+        "missing-preset",
+        "raw-fallback",
+        "missing-preset",
+        "raw-fallback",
+    ]
 
 
 @pytest.mark.asyncio
@@ -13193,7 +14707,9 @@ async def test_resolve_core_chat_model_route_falls_back_to_legacy_default_models
     monkeypatch,
     pipe_request,
 ):
-    pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-legacy,other")
+    pipe_request.app.state.config = SimpleNamespace(
+        DEFAULT_MODELS="fallback-legacy,other"
+    )
     pipe_request.app.state.MODELS = {
         "workspace-preset": {
             "id": "workspace-preset",
@@ -13202,7 +14718,12 @@ async def test_resolve_core_chat_model_route_falls_back_to_legacy_default_models
             "preset": True,
             "info": {"base_model_id": "stale-openai"},
         },
-        "fallback-legacy": {"id": "fallback-legacy", "name": "Fallback", "owned_by": "openai", "openai": {}},
+        "fallback-legacy": {
+            "id": "fallback-legacy",
+            "name": "Fallback",
+            "owned_by": "openai",
+            "openai": {},
+        },
     }
 
     class FakeConfig:
@@ -13240,6 +14761,7 @@ async def test_pipe_rejects_custom_model_fallback_default_without_user_access(
     pipe_metadata,
 ):
     install_fake_open_webui_user_model(monkeypatch)
+
     class FakeConfig:
         @staticmethod
         async def get(key):
@@ -13257,9 +14779,17 @@ async def test_pipe_rejects_custom_model_fallback_default_without_user_access(
         "preset": True,
         "info": {"base_model_id": "stale-openai"},
     }
-    fallback_model = {"id": "fallback-model", "name": "Fallback", "owned_by": "openai", "openai": {}}
+    fallback_model = {
+        "id": "fallback-model",
+        "name": "Fallback",
+        "owned_by": "openai",
+        "openai": {},
+    }
     pipe_request.app.state.config = SimpleNamespace(DEFAULT_MODELS="fallback-model")
-    pipe_request.app.state.MODELS = {"workspace-preset": target_model, "fallback-model": fallback_model}
+    pipe_request.app.state.MODELS = {
+        "workspace-preset": target_model,
+        "fallback-model": fallback_model,
+    }
     checked_model_ids = []
 
     class FakeModels:
@@ -13276,8 +14806,12 @@ async def test_pipe_rejects_custom_model_fallback_default_without_user_access(
     async def body_reusable_checkpoint_match(**kwargs):
         return None
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
-        raise AssertionError("fallback target must not be called when fallback model access is denied")
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
+        raise AssertionError(
+            "fallback target must not be called when fallback model access is denied"
+        )
 
     env_module = types.ModuleType("open_webui.env")
     env_module.ENABLE_CUSTOM_MODEL_FALLBACK = True
@@ -13291,7 +14825,9 @@ async def test_pipe_rejects_custom_model_fallback_default_without_user_access(
     monkeypatch.setitem(sys.modules, "open_webui.models.models", models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.models", utils_models_module)
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
 
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "workspace-preset")
@@ -13326,7 +14862,9 @@ async def test_pipe_uses_runtime_registered_id_for_decode_and_checkpoint_scope(
     async def model_dict_from_request(request):
         return {"target": {"id": "target", "name": "Target"}}
 
-    async def resolve_core_chat_model_route(request, model_id, *, pipe_function_id, **kwargs):
+    async def resolve_core_chat_model_route(
+        request, model_id, *, pipe_function_id, **kwargs
+    ):
         captured["route_pipe_function_id"] = pipe_function_id
         return mod.CoreChatModelRoute(model_id=model_id)
 
@@ -13344,13 +14882,17 @@ async def test_pipe_uses_runtime_registered_id_for_decode_and_checkpoint_scope(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
+    monkeypatch.setattr(
+        mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route
+    )
     monkeypatch.setattr(
         mod,
         "_resolve_arena_chat_model_route_with_access",
         resolve_arena_chat_model_route_with_access,
     )
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
     monkeypatch.setattr(mod.Pipe, "__module__", "function_compact_alias")
 
@@ -13409,7 +14951,9 @@ async def test_pipe_rejects_wrapper_prefix_that_does_not_match_runtime_registere
 
 
 @pytest.mark.asyncio
-async def test_pipe_forwards_metadata_with_unpickleable_core_values(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_forwards_metadata_with_unpickleable_core_values(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     future = asyncio.get_running_loop().create_future()
     metadata = {
         **pipe_metadata,
@@ -13468,7 +15012,9 @@ async def test_pipe_forwarding_passes_open_webui_user_model_to_inner_completion(
     async def model_dict_from_request(request):
         return {"target": {"id": "target", "name": "Target"}}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["model"] = form_data["model"]
         captured["user_id"] = user.id
         captured["user_role"] = user.role
@@ -13528,7 +15074,9 @@ async def test_pipe_non_streaming_forwards_to_decoded_target_completion(
     async def model_dict_from_request(request):
         return {"target": {"id": "target", "name": "Target"}}
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["request_state"] = request.state
         captured["form_data"] = form_data
         captured["user"] = user
@@ -13600,7 +15148,9 @@ async def test_pipe_non_streaming_retries_with_compaction_after_context_error(
     async def get_or_create_checkpoint_summary(**kwargs):
         return "retry summary"
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         calls.append(copy_body(form_data))
         if len(calls) == 1:
             return JSONResponse(
@@ -13626,18 +15176,18 @@ async def test_pipe_non_streaming_retries_with_compaction_after_context_error(
         }
 
     def copy_body(body):
-        return {
-            key: value
-            for key, value in body.items()
-            if key != "metadata"
-        } | {"metadata": body.get("metadata")}
+        return {key: value for key, value in body.items() if key != "metadata"} | {
+            "metadata": body.get("metadata")
+        }
 
     chat_module = types.ModuleType("open_webui.utils.chat")
     chat_module.generate_chat_completion = generate_chat_completion
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary
+    )
 
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
@@ -13651,7 +15201,9 @@ async def test_pipe_non_streaming_retries_with_compaction_after_context_error(
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result["choices"][0]["message"]["content"] == "ok"
     assert len(calls) == 2
@@ -13686,7 +15238,9 @@ async def test_pipe_non_streaming_does_not_retry_provider_validation_error(
     async def get_or_create_checkpoint_summary(**kwargs):
         raise AssertionError("validation errors must not trigger compaction retry")
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         calls.append(form_data)
         return JSONResponse(
             status_code=400,
@@ -13698,7 +15252,9 @@ async def test_pipe_non_streaming_does_not_retry_provider_validation_error(
     monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary
+    )
 
     pipe = mod.Pipe()
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
@@ -13708,7 +15264,9 @@ async def test_pipe_non_streaming_does_not_retry_provider_validation_error(
         "messages": [{"role": "user", "content": "active"}],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"error": {"code": "provider_error", "message": provider_message}}
     assert len(calls) == 1
@@ -13724,7 +15282,9 @@ def test_chat_completion_response_requires_core_template(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_marker", [False, {}])
-async def test_non_streaming_forward_preserves_success_with_falsey_error_marker(monkeypatch, error_marker):
+async def test_non_streaming_forward_preserves_success_with_falsey_error_marker(
+    monkeypatch, error_marker
+):
     response = {
         "error": error_marker,
         "choices": [
@@ -13762,7 +15322,9 @@ async def test_non_streaming_stream_response_error_stays_error_dict():
         media_type="text/event-stream",
     )
 
-    result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
+    result = await mod._coerce_non_streaming_completion_response(
+        response, model_id="target"
+    )
 
     assert result == {"error": {"code": "provider_error", "message": "rate limited"}}
 
@@ -13779,7 +15341,9 @@ async def test_non_streaming_stream_response_skips_done_chunk():
         media_type="text/event-stream",
     )
 
-    result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
+    result = await mod._coerce_non_streaming_completion_response(
+        response, model_id="target"
+    )
 
     assert result["choices"][0]["message"]["content"] == "ok"
 
@@ -13796,7 +15360,9 @@ async def test_non_streaming_stream_response_reassembles_split_sse_event():
         media_type="text/event-stream",
     )
 
-    result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
+    result = await mod._coerce_non_streaming_completion_response(
+        response, model_id="target"
+    )
 
     assert result["choices"][0]["message"]["content"] == "ok"
 
@@ -13829,7 +15395,10 @@ async def test_non_streaming_stream_response_preserves_tool_calls():
                                 "index": 0,
                                 "id": "call-1",
                                 "type": "function",
-                                "function": {"name": "search", "arguments": '{"query":'},
+                                "function": {
+                                    "name": "search",
+                                    "arguments": '{"query":',
+                                },
                             }
                         ]
                     }
@@ -13857,7 +15426,9 @@ async def test_non_streaming_stream_response_preserves_tool_calls():
         media_type="text/event-stream",
     )
 
-    result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
+    result = await mod._coerce_non_streaming_completion_response(
+        response, model_id="target"
+    )
 
     choice = result["choices"][0]
     assert choice["finish_reason"] == "tool_calls"
@@ -13879,14 +15450,18 @@ async def test_non_streaming_stream_response_preserves_tool_calls():
 async def test_non_streaming_http_error_response_stays_error_dict_without_error_shape():
     response = JSONResponse(status_code=429, content={"message": "rate limited"})
 
-    result = await mod._coerce_non_streaming_completion_response(response, model_id="target")
+    result = await mod._coerce_non_streaming_completion_response(
+        response, model_id="target"
+    )
 
     assert result == {"error": {"code": "provider_error", "message": "rate limited"}}
 
 
 @pytest.mark.asyncio
 async def test_non_streaming_unknown_response_type_stays_error_dict():
-    result = await mod._coerce_non_streaming_completion_response(object(), model_id="target")
+    result = await mod._coerce_non_streaming_completion_response(
+        object(), model_id="target"
+    )
 
     assert result == {
         "error": {
@@ -13897,7 +15472,9 @@ async def test_non_streaming_unknown_response_type_stays_error_dict():
 
 
 @pytest.mark.asyncio
-async def test_pipe_rejects_missing_configured_summary_model(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_rejects_missing_configured_summary_model(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     async def validate_target_access(**kwargs):
         return None
 
@@ -13966,7 +15543,9 @@ async def test_pipe_skips_auto_compaction_for_stateful_responses_continuation(
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_compact_body", compact_body)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
@@ -14018,7 +15597,9 @@ async def test_pipe_does_not_retry_stateful_responses_after_context_error(
         return {"target": {"id": "target", "name": "Target"}}
 
     async def compact_body(**kwargs):
-        raise AssertionError("stateful continuation must not be compacted after overflow")
+        raise AssertionError(
+            "stateful continuation must not be compacted after overflow"
+        )
 
     async def forward_target(**kwargs):
         forwarded.append(copy.deepcopy(kwargs["body"]))
@@ -14119,10 +15700,14 @@ async def test_pipe_reuses_existing_checkpoint_even_when_previous_compacted_usag
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingCheckpointStore([checkpoint]))
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ExistingCheckpointStore([checkpoint])
+    )
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = 100
@@ -14198,14 +15783,18 @@ async def test_pipe_newly_ready_checkpoint_does_not_reuse_previous_raw_candidate
 
     class ParentCheckpointStore(ClaimCheckpointStore):
         async def claim_pending(self, row):
-            raise AssertionError("safe checkpoint application must not create a foreground checkpoint")
+            raise AssertionError(
+                "safe checkpoint application must not create a foreground checkpoint"
+            )
 
         async def touch(self, checkpoint_id, *, now=None):
             captured["touched"] = checkpoint_id
             return True
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("safe checkpoint application must not call the summary model")
+        raise AssertionError(
+            "safe checkpoint application must not call the summary model"
+        )
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -14214,7 +15803,9 @@ async def test_pipe_newly_ready_checkpoint_does_not_reuse_previous_raw_candidate
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ParentCheckpointStore([checkpoint]))
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ParentCheckpointStore([checkpoint])
+    )
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
@@ -14287,7 +15878,9 @@ async def test_pipe_newly_ready_checkpoint_does_not_reuse_previous_raw_candidate
         tool_result,
     ]
     assert parent_source[0] not in forwarded["messages"]
-    assert [event["data"]["action"] for event in events if event["type"] == "status"] == []
+    assert [
+        event["data"]["action"] for event in events if event["type"] == "status"
+    ] == []
 
 
 @pytest.mark.asyncio
@@ -14353,11 +15946,15 @@ async def test_pipe_same_checkpoint_tool_loop_reuses_request_usage_anchor(
         raise AssertionError(f"unexpected request-anchor suffix: {messages!r}")
 
     async def estimate_body_tokens_async(*args, **kwargs):
-        raise AssertionError("same-checkpoint request anchor must avoid a full-body estimate")
+        raise AssertionError(
+            "same-checkpoint request anchor must avoid a full-body estimate"
+        )
 
     class ParentCheckpointStore(ClaimCheckpointStore):
         async def claim_pending(self, row):
-            raise AssertionError("safe checkpoint reuse must not create a foreground checkpoint")
+            raise AssertionError(
+                "safe checkpoint reuse must not create a foreground checkpoint"
+            )
 
         async def touch(self, checkpoint_id, *, now=None):
             captured["touched"] = checkpoint_id
@@ -14374,7 +15971,9 @@ async def test_pipe_same_checkpoint_tool_loop_reuses_request_usage_anchor(
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "_get_target_db_model_record", get_target_db_model_record)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ParentCheckpointStore([checkpoint]))
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ParentCheckpointStore([checkpoint])
+    )
     monkeypatch.setattr(mod, "_estimate_message_token_sum_async", estimate_message_sum)
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
@@ -14463,14 +16062,18 @@ async def test_pipe_applies_parent_checkpoint_when_hard_observed_total_but_check
 
     class ParentCheckpointStore(ClaimCheckpointStore):
         async def claim_pending(self, row):
-            raise AssertionError("safe checkpoint application must not create a foreground checkpoint")
+            raise AssertionError(
+                "safe checkpoint application must not create a foreground checkpoint"
+            )
 
         async def touch(self, checkpoint_id, *, now=None):
             captured["touched"] = checkpoint_id
             return True
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("safe checkpoint application must not call the summary model")
+        raise AssertionError(
+            "safe checkpoint application must not call the summary model"
+        )
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -14479,7 +16082,9 @@ async def test_pipe_applies_parent_checkpoint_when_hard_observed_total_but_check
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ParentCheckpointStore([checkpoint]))
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ParentCheckpointStore([checkpoint])
+    )
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
@@ -14513,7 +16118,10 @@ async def test_pipe_applies_parent_checkpoint_when_hard_observed_total_but_check
     assert captured["touched"] == "checkpoint-1"
     forwarded = captured["forward_body"]
     assert "existing parent summary" in forwarded["messages"][0]["content"]
-    assert forwarded["messages"][1:] == [*delta_messages, {"role": "user", "content": "active"}]
+    assert forwarded["messages"][1:] == [
+        *delta_messages,
+        {"role": "user", "content": "active"},
+    ]
     assert parent_source[0] not in forwarded["messages"]
     assert events == []
 
@@ -14561,14 +16169,18 @@ async def test_pipe_applies_parent_checkpoint_when_estimate_just_below_hard_no_f
 
     class ParentCheckpointStore(ClaimCheckpointStore):
         async def claim_pending(self, row):
-            raise AssertionError("safe checkpoint application must not create a foreground checkpoint")
+            raise AssertionError(
+                "safe checkpoint application must not create a foreground checkpoint"
+            )
 
         async def touch(self, checkpoint_id, *, now=None):
             captured["touched"] = checkpoint_id
             return True
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("safe checkpoint application must not call the summary model")
+        raise AssertionError(
+            "safe checkpoint application must not call the summary model"
+        )
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -14577,7 +16189,9 @@ async def test_pipe_applies_parent_checkpoint_when_estimate_just_below_hard_no_f
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ParentCheckpointStore([checkpoint]))
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ParentCheckpointStore([checkpoint])
+    )
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
@@ -14612,7 +16226,10 @@ async def test_pipe_applies_parent_checkpoint_when_estimate_just_below_hard_no_f
     assert captured["touched"] == "checkpoint-1"
     forwarded = captured["forward_body"]
     assert "existing parent summary" in forwarded["messages"][0]["content"]
-    assert forwarded["messages"][1:] == [*delta_messages, {"role": "user", "content": "active"}]
+    assert forwarded["messages"][1:] == [
+        *delta_messages,
+        {"role": "user", "content": "active"},
+    ]
     assert len(summary_inputs) == 0
     assert events == []
 
@@ -14667,7 +16284,9 @@ async def _run_parent_checkpoint_decision_case(
     class ParentCheckpointStore(ClaimCheckpointStore):
         async def claim_pending(self, row):
             if foreground_summary_text is None:
-                raise AssertionError("safe checkpoint application must not create a foreground checkpoint")
+                raise AssertionError(
+                    "safe checkpoint application must not create a foreground checkpoint"
+                )
             return await super().claim_pending(row)
 
         async def touch(self, checkpoint_id, *, now=None):
@@ -14678,7 +16297,9 @@ async def _run_parent_checkpoint_decision_case(
 
     async def generate_summary_text(**kwargs):
         if foreground_summary_text is None:
-            raise AssertionError("safe checkpoint application must not call the summary model")
+            raise AssertionError(
+                "safe checkpoint application must not call the summary model"
+            )
         summary_inputs.append(kwargs["source_messages"])
         return foreground_summary_text
 
@@ -14703,7 +16324,9 @@ async def _run_parent_checkpoint_decision_case(
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = trigger_input_tokens
@@ -14761,7 +16384,10 @@ async def test_pipe_skips_compaction_and_prefetch_when_checkpoint_estimate_below
     assert case["result"] == {"ok": True}
     forwarded = case["captured"]["forward_body"]
     assert "existing parent summary" in forwarded["messages"][0]["content"]
-    assert forwarded["messages"][1:] == [*case["delta_messages"], {"role": "user", "content": "active"}]
+    assert forwarded["messages"][1:] == [
+        *case["delta_messages"],
+        {"role": "user", "content": "active"},
+    ]
     assert case["parent_source"][0] not in forwarded["messages"]
     assert case["events"] == []
     assert case["prefetch_calls"] == []
@@ -14785,7 +16411,10 @@ async def test_pipe_skips_prefetch_when_checkpoint_estimate_below_soft_despite_h
     assert case["result"] == {"ok": True}
     forwarded = case["captured"]["forward_body"]
     assert "existing parent summary" in forwarded["messages"][0]["content"]
-    assert forwarded["messages"][1:] == [*case["delta_messages"], {"role": "user", "content": "active"}]
+    assert forwarded["messages"][1:] == [
+        *case["delta_messages"],
+        {"role": "user", "content": "active"},
+    ]
     assert case["prefetch_calls"] == []
     assert case["events"] == []
 
@@ -14822,8 +16451,10 @@ async def test_pipe_rechecks_ready_checkpoint_before_soft_prefetch(
     pipe_metadata,
 ):
     captured = {}
+    estimated_totals = []
     injected_messages = []
     injection_prefix_counts = []
+    ref_extension_calls = 0
     parent_source = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
@@ -14853,7 +16484,14 @@ async def test_pipe_rechecks_ready_checkpoint_before_soft_prefetch(
 
     async def estimate_body_tokens_async(body, **kwargs):
         text = json.dumps(body.get("messages", []))
-        return 40 if "just-finished parent summary" in text else 500
+        estimated_total = 40 if "just-finished parent summary" in text else 500
+        estimated_totals.append(estimated_total)
+        return estimated_total
+
+    async def extend_ref_projection_plan_with_checkpoint(plan, checkpoint, **kwargs):
+        nonlocal ref_extension_calls
+        ref_extension_calls += 1
+        return plan
 
     class LateReadyCheckpointStore(ClaimCheckpointStore):
         def __init__(self):
@@ -14868,12 +16506,16 @@ async def test_pipe_rechecks_ready_checkpoint_before_soft_prefetch(
             return await super().find_longest_parent(**kwargs)
 
         async def claim_pending(self, row):
-            raise AssertionError("late-ready parent checkpoint must make the new soft prefetch redundant")
+            raise AssertionError(
+                "late-ready parent checkpoint must make the new soft prefetch redundant"
+            )
 
     store = LateReadyCheckpointStore()
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("late-ready parent checkpoint must be applied instead of generating a fresh summary")
+        raise AssertionError(
+            "late-ready parent checkpoint must be applied instead of generating a fresh summary"
+        )
 
     async def inject_target_file_context(**kwargs):
         body = copy.deepcopy(kwargs["body"])
@@ -14891,17 +16533,26 @@ async def test_pipe_rechecks_ready_checkpoint_before_soft_prefetch(
         return {"ok": True}
 
     def start_soft_prefetch(**kwargs):
-        raise AssertionError("soft prefetch must be skipped after late checkpoint revalidation")
+        raise AssertionError(
+            "soft prefetch must be skipped after late checkpoint revalidation"
+        )
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
+    monkeypatch.setattr(
+        mod,
+        "extend_ref_projection_plan_with_checkpoint",
+        extend_ref_projection_plan_with_checkpoint,
+    )
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = 1000
@@ -14940,6 +16591,8 @@ async def test_pipe_rechecks_ready_checkpoint_before_soft_prefetch(
     assert json.dumps(forwarded["messages"]).count("FILE_CONTEXT") == 1
     assert store.claimed_rows == []
     assert events == []
+    assert estimated_totals == [500, 40]
+    assert ref_extension_calls == 0
 
 
 @pytest.mark.asyncio
@@ -14973,14 +16626,20 @@ async def test_pipe_keeps_forwarding_when_soft_only_late_checkpoint_recheck_fail
 
     def start_soft_prefetch(**kwargs):
         calls["prefetch"] += 1
-        raise AssertionError("soft prefetch must be skipped when its late recheck fails")
+        raise AssertionError(
+            "soft prefetch must be skipped when its late recheck fails"
+        )
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = 1000
@@ -14996,7 +16655,9 @@ async def test_pipe_keeps_forwarding_when_soft_only_late_checkpoint_recheck_fail
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert captured["forward_body"]["messages"] == body["messages"]
@@ -15038,10 +16699,14 @@ async def test_pipe_keeps_forwarding_when_prefetch_launch_recheck_fails(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = 1000
@@ -15057,7 +16722,9 @@ async def test_pipe_keeps_forwarding_when_prefetch_launch_recheck_fails(
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert captured["forward_body"]["messages"] == body["messages"]
@@ -15072,6 +16739,8 @@ async def test_pipe_rechecks_ready_checkpoint_after_token_status_before_soft_pre
     pipe_metadata,
 ):
     captured = {}
+    estimated_totals = []
+    ref_extension_calls = 0
     parent_source = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
@@ -15101,16 +16770,27 @@ async def test_pipe_rechecks_ready_checkpoint_after_token_status_before_soft_pre
 
     async def estimate_body_tokens_async(body, **kwargs):
         text = json.dumps(body.get("messages", []))
-        return 40 if "status-gap parent summary" in text else 500
+        estimated_total = 40 if "status-gap parent summary" in text else 500
+        estimated_totals.append(estimated_total)
+        return estimated_total
+
+    async def extend_ref_projection_plan_with_checkpoint(plan, checkpoint, **kwargs):
+        nonlocal ref_extension_calls
+        ref_extension_calls += 1
+        return plan
 
     class StatusReadyCheckpointStore(ClaimCheckpointStore):
         async def claim_pending(self, row):
-            raise AssertionError("status-gap ready checkpoint must make soft prefetch redundant")
+            raise AssertionError(
+                "status-gap ready checkpoint must make soft prefetch redundant"
+            )
 
     store = StatusReadyCheckpointStore([])
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("status-gap ready checkpoint must be applied instead of generating a fresh summary")
+        raise AssertionError(
+            "status-gap ready checkpoint must be applied instead of generating a fresh summary"
+        )
 
     async def inject_target_file_context(**kwargs):
         return kwargs["body"]
@@ -15120,17 +16800,26 @@ async def test_pipe_rechecks_ready_checkpoint_after_token_status_before_soft_pre
         return {"ok": True}
 
     def start_soft_prefetch(**kwargs):
-        raise AssertionError("soft prefetch must be skipped when checkpoint becomes ready during status emit")
+        raise AssertionError(
+            "soft prefetch must be skipped when checkpoint becomes ready during status emit"
+        )
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
+    monkeypatch.setattr(
+        mod,
+        "extend_ref_projection_plan_with_checkpoint",
+        extend_ref_projection_plan_with_checkpoint,
+    )
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = 1000
@@ -15163,9 +16852,14 @@ async def test_pipe_rechecks_ready_checkpoint_after_token_status_before_soft_pre
     assert result == {"ok": True}
     forwarded = captured["forward_body"]
     assert "status-gap parent summary" in forwarded["messages"][0]["content"]
-    assert forwarded["messages"][1:] == [*delta_messages, {"role": "user", "content": "active"}]
+    assert forwarded["messages"][1:] == [
+        *delta_messages,
+        {"role": "user", "content": "active"},
+    ]
     assert store.claimed_rows == []
     assert events
+    assert estimated_totals == [500, 40]
+    assert ref_extension_calls == 0
 
 
 @pytest.mark.asyncio
@@ -15186,45 +16880,114 @@ async def test_pipe_rechecks_better_checkpoint_after_token_status_when_parent_wa
     ]
     exact_source = [*parent_source, *delta_messages]
     parent_checkpoint = {
-        "id": "initial-parent-checkpoint",
+        "id": f"accp_{'b' * 64}",
+        "namespace": mod.CHECKPOINT_NAMESPACE,
+        "user_id": "user-1",
+        "chat_id": "chat-1",
+        "pipe_function_id": "auto_compact",
+        "profile_hash": mod.compute_profile_hash(),
         "state": "ready",
         "source_message_count": len(parent_source),
         "source_hash": mod.compute_source_hash(parent_source),
         "summary_text": "initial parent summary",
-        "summary_meta": {},
+        "summary_meta": {"fixture": "soft-parent"},
         "summary_token_count": 20,
+        "parent_checkpoint_id": None,
     }
     exact_checkpoint = {
-        "id": "status-gap-exact-checkpoint",
+        "id": f"accp_{'c' * 64}",
+        "namespace": mod.CHECKPOINT_NAMESPACE,
+        "user_id": "user-1",
+        "chat_id": "chat-1",
+        "pipe_function_id": "auto_compact",
+        "profile_hash": mod.compute_profile_hash(),
         "state": "ready",
         "source_message_count": len(exact_source),
         "source_hash": mod.compute_source_hash(exact_source),
         "summary_text": "status-gap exact summary",
-        "summary_meta": {},
+        "summary_meta": {"fixture": "soft-exact"},
         "summary_token_count": 20,
+        "parent_checkpoint_id": parent_checkpoint["id"],
     }
+    parent_history = await mod.build_canonical_history_source(
+        parent_source,
+        source_message_count=len(parent_source),
+    )
+    exact_history = await mod.build_canonical_history_source(
+        exact_source,
+        source_message_count=len(exact_source),
+    )
+    for checkpoint, source in (
+        (parent_checkpoint, parent_history),
+        (exact_checkpoint, exact_history),
+    ):
+        checkpoint["summary_meta"][mod.SUMMARY_META_HISTORY_REF_KEY] = {
+            "format": mod.HISTORY_REF_FORMAT,
+            "raw_source_hash": source.raw_source_hash,
+        }
+    parent_before = copy.deepcopy(parent_checkpoint)
+    exact_before = copy.deepcopy(exact_checkpoint)
+    selected_ref = f"history:{exact_checkpoint['id']}"
+    marker = '<auto_compact_ref_manifests version="1"><![CDATA['
+    estimate_observations = []
 
     async def validate_target_access(**kwargs):
         return None
 
     async def model_dict_from_request(request):
-        return {"target": {"id": "target", "name": "Target"}}
+        return {
+            "target": {
+                "id": "target",
+                "name": "Target",
+                "info": {"meta": {"capabilities": {"function_calling": True}}},
+            }
+        }
 
     async def noop_initialize(**kwargs):
         return None
 
     async def estimate_body_tokens_async(body, **kwargs):
+        manifest_refs = set()
+        for message in body.get("messages", []):
+            content = message.get("content", "")
+            if marker not in content:
+                continue
+            manifest_json = content.split(marker, maxsplit=1)[1].split(
+                "]]></auto_compact_ref_manifests>", maxsplit=1
+            )[0]
+            manifest_refs.update(item["ref"] for item in json.loads(manifest_json))
+        reader_schemas = [
+            tool
+            for tool in body.get("tools", [])
+            if tool.get("function", {}).get("name") == mod.REF_EXEC_TOOL_NAME
+        ]
         text = json.dumps(body.get("messages", []))
-        return 40 if "status-gap exact summary" in text else 500
+        total = 40 if "status-gap exact summary" in text else 500
+        estimate_observations.append((total, manifest_refs, reader_schemas))
+        return total
 
     class StatusBetterCheckpointStore(ClaimCheckpointStore):
+        async def lookup_ready_descriptor_by_id(self, checkpoint_id, **_kwargs):
+            return next(
+                (
+                    copy.deepcopy(row)
+                    for row in self.rows
+                    if row.get("id") == checkpoint_id and row.get("state") == "ready"
+                ),
+                None,
+            )
+
         async def claim_pending(self, row):
-            raise AssertionError("late exact checkpoint must make soft prefetch redundant")
+            raise AssertionError(
+                "late exact checkpoint must make soft prefetch redundant"
+            )
 
     store = StatusBetterCheckpointStore([dict(parent_checkpoint)])
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("late exact checkpoint must be applied instead of generating a fresh summary")
+        raise AssertionError(
+            "late exact checkpoint must be applied instead of generating a fresh summary"
+        )
 
     async def inject_target_file_context(**kwargs):
         return kwargs["body"]
@@ -15233,8 +16996,16 @@ async def test_pipe_rechecks_better_checkpoint_after_token_status_when_parent_wa
         captured["forward_body"] = copy.deepcopy(kwargs["body"])
         return {"ok": True}
 
+    async def owner_authorized(_chat_id, _user_id):
+        return True
+
+    async def load_raw_branch(**_kwargs):
+        return [*exact_source, {"role": "user", "content": "active"}]
+
     def start_soft_prefetch(**kwargs):
-        raise AssertionError("soft prefetch must be skipped when a better checkpoint becomes ready during status emit")
+        raise AssertionError(
+            "soft prefetch must be skipped when a better checkpoint becomes ready during status emit"
+        )
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
@@ -15244,14 +17015,26 @@ async def test_pipe_rechecks_better_checkpoint_after_token_status_when_parent_wa
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(mod, "_chat_owner_authorized", owner_authorized)
+    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", load_raw_branch)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
+    pipe.valves.ref_exec_enabled = True
     pipe.valves.trigger_input_tokens = 1000
     pipe.valves.soft_trigger_ratio = 0.1
     pipe.valves.token_status_visibility = "always"
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
     events = []
+    registry = {"existing": {"spec": {"name": "existing"}}}
+    metadata = {
+        **pipe_metadata,
+        "user_message_id": "current-user",
+        "params": {"function_calling": "native"},
+        "tools": registry,
+    }
 
     async def event_emitter(event):
         events.append(event)
@@ -15269,8 +17052,9 @@ async def test_pipe_rechecks_better_checkpoint_after_token_status_when_parent_wa
         },
         __request__=pipe_request,
         __user__=pipe_user,
-        __metadata__=pipe_metadata,
+        __metadata__=metadata,
         __event_emitter__=event_emitter,
+        __tools__=registry,
     )
 
     assert result == {"ok": True}
@@ -15279,6 +17063,50 @@ async def test_pipe_rechecks_better_checkpoint_after_token_status_when_parent_wa
     assert forwarded["messages"][1:] == [{"role": "user", "content": "active"}]
     assert store.claimed_rows == []
     assert events
+    rendered = forwarded["messages"][0]
+    manifest_json = (
+        rendered["content"]
+        .split(marker, maxsplit=1)[1]
+        .split("]]></auto_compact_ref_manifests>", maxsplit=1)[0]
+    )
+    manifest_refs = {item["ref"] for item in json.loads(manifest_json)}
+    request_store = getattr(pipe_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    binding = next(iter(request_store.bindings.values()))
+    reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
+    assert rendered["content"].count(marker) == 1
+    assert rendered["content"].endswith(
+        "]]></auto_compact_ref_manifests>\n</auto_compaction_context>"
+    )
+    assert [total for total, _, _ in estimate_observations] == [500, 40, 40]
+    _, late_manifest_refs, late_reader_schemas = estimate_observations[-2]
+    assert selected_ref in late_manifest_refs
+    assert len(late_reader_schemas) == 1
+    late_reader_schema = late_reader_schemas[0]
+    assert set(late_reader_schema) == {"type", "function"}
+    assert late_reader_schema["type"] == "function"
+    late_reader_function = late_reader_schema["function"]
+    assert set(late_reader_function) == {"name", "description", "parameters"}
+    assert late_reader_function["name"] == mod.REF_EXEC_TOOL_NAME
+    late_reader_parameters = late_reader_function["parameters"]
+    assert set(late_reader_parameters) == {
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+    }
+    assert late_reader_parameters["type"] == "object"
+    assert set(late_reader_parameters["properties"]) == {"command"}
+    assert late_reader_parameters["properties"]["command"]["type"] == "string"
+    assert late_reader_parameters["required"] == ["command"]
+    assert late_reader_parameters["additionalProperties"] is False
+    assert selected_ref in manifest_refs
+    assert _task6_ref_schema(forwarded)["function"]["name"] == mod.REF_EXEC_TOOL_NAME
+    assert selected_ref in {entry.manifest.ref for entry in binding.catalog}
+    assert await reader(f"cat {selected_ref}") == "\n".join(
+        exact_history.iter_records()
+    )
+    assert parent_checkpoint == parent_before
+    assert exact_checkpoint == exact_before
 
 
 @pytest.mark.asyncio
@@ -15303,10 +17131,157 @@ async def test_pipe_compacts_foreground_when_checkpoint_estimate_at_or_above_har
     assert "fresh checkpoint summary" in forwarded["messages"][0]["content"]
     completed = case["store"].completed_rows[0]
     assert completed["parent_checkpoint_id"] == "checkpoint-1"
-    assert [event["data"]["action"] for event in case["events"] if event["type"] == "status"] == [
+    assert [
+        event["data"]["action"] for event in case["events"] if event["type"] == "status"
+    ] == [
         "auto_compaction_compacting",
         "auto_compaction_compacted",
     ]
+
+
+@pytest.mark.asyncio
+async def test_pipe_first_compaction_forwards_exact_new_checkpoint_history_manifest(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
+    captured = {}
+    raw_branch = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "middle"},
+        {"role": "assistant", "content": "middle answer"},
+        {"role": "user", "content": "active"},
+    ]
+
+    class AuthorizedHistoryCheckpointStore(ClaimCheckpointStore):
+        async def compare_and_swap_history_ref(
+            self, checkpoint_id, *, expected_summary_meta, history_ref
+        ):
+            row = next(
+                (
+                    candidate
+                    for candidate in self.rows
+                    if candidate.get("id") == checkpoint_id
+                    and mod.normalize_summary_meta(candidate.get("summary_meta"))
+                    == expected_summary_meta
+                ),
+                None,
+            )
+            if row is None:
+                return False
+            row["summary_meta"] = {
+                **expected_summary_meta,
+                mod.SUMMARY_META_HISTORY_REF_KEY: history_ref,
+            }
+            return True
+
+    store = AuthorizedHistoryCheckpointStore()
+    get_or_create_checkpoint_summary = mod._get_or_create_checkpoint_summary
+
+    async def validate_target_access(**_kwargs):
+        return None
+
+    async def model_dict_from_request(_request):
+        return {
+            "target": {
+                "id": "target",
+                "name": "Target",
+                "info": {"meta": {"capabilities": {"function_calling": True}}},
+            }
+        }
+
+    async def noop_initialize(**_kwargs):
+        return None
+
+    async def estimate_body_tokens_async(_body, **_kwargs):
+        return 150
+
+    async def generate_summary_text(**_kwargs):
+        return "new checkpoint summary"
+
+    async def capture_checkpoint_summary(**kwargs):
+        result = await get_or_create_checkpoint_summary(**kwargs)
+        captured["summary_result"] = result
+        return result
+
+    async def owner_authorized(_chat_id, _user_id):
+        return True
+
+    async def load_raw_branch(**_kwargs):
+        captured["raw_branch_loads"] = captured.get("raw_branch_loads", 0) + 1
+        return copy.deepcopy(raw_branch)
+
+    async def forward_target(**kwargs):
+        captured["forward_body"] = copy.deepcopy(kwargs["body"])
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(
+        mod, "_get_or_create_checkpoint_summary", capture_checkpoint_summary
+    )
+    monkeypatch.setattr(mod, "_chat_owner_authorized", owner_authorized)
+    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", load_raw_branch)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.ref_exec_enabled = True
+    pipe.valves.trigger_input_tokens = 100
+    pipe.valves.soft_trigger_ratio = 0
+    registry = {"existing": {"spec": {"name": "existing"}}}
+    metadata = {
+        **pipe_metadata,
+        "user_message_id": "current-user",
+        "params": {"function_calling": "native"},
+        "tools": registry,
+    }
+
+    result = await pipe.pipe(
+        {
+            "model": mod.build_wrapper_model_id("auto_compact", "target"),
+            "stream": True,
+            "messages": raw_branch,
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=metadata,
+        __tools__=registry,
+    )
+
+    summary_result = captured["summary_result"]
+    checkpoint = summary_result.checkpoint
+    assert checkpoint is not None
+    new_checkpoint_id = checkpoint["id"]
+    rendered = next(
+        message
+        for message in captured["forward_body"]["messages"]
+        if "</auto_compaction_context>" in message.get("content", "")
+    )
+    payload = _task17_render_manifest_payload(rendered["content"])
+    expected_ref = f"history:{new_checkpoint_id}"
+
+    assert result == {"ok": True}
+    assert len(store.claimed_rows) == len(store.completed_rows) == 1
+    assert new_checkpoint_id == store.completed_rows[0]["id"]
+    assert captured["raw_branch_loads"] >= 2
+    assert rendered["content"].count(
+        '<auto_compact_ref_manifests version="1">'
+    ) == 1
+    assert payload == [
+        {
+            "bytes": None,
+            "kind": "history",
+            "lines": None,
+            "ref": expected_ref,
+            "tool": "history",
+            "version": 1,
+        }
+    ]
+    assert [entry["ref"] for entry in payload] == [expected_ref]
+    assert all(not entry["ref"].startswith("tool:") for entry in payload)
 
 
 @pytest.mark.asyncio
@@ -15329,7 +17304,9 @@ async def test_pipe_raw_usage_alone_does_not_trigger_compaction_without_candidat
         return 5
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("raw observed usage alone must not trigger foreground compaction")
+        raise AssertionError(
+            "raw observed usage alone must not trigger foreground compaction"
+        )
 
     async def forward_target(**kwargs):
         captured["forward_body"] = copy.deepcopy(kwargs["body"])
@@ -15341,11 +17318,17 @@ async def test_pipe_raw_usage_alone_does_not_trigger_compaction_without_candidat
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = 100
@@ -15401,9 +17384,15 @@ def _install_threshold_decision_stubs(monkeypatch, captured, *, total_tokens):
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
 
@@ -15421,7 +17410,9 @@ def _compactable_body():
 
 
 @pytest.mark.asyncio
-async def test_pipe_override_lowers_threshold_and_triggers_compaction(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_override_lowers_threshold_and_triggers_compaction(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     captured = {}
     _install_threshold_decision_stubs(monkeypatch, captured, total_tokens=500)
 
@@ -15445,7 +17436,9 @@ async def test_pipe_override_lowers_threshold_and_triggers_compaction(monkeypatc
         __event_emitter__=event_emitter,
     )
 
-    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
+    assert [
+        event["data"]["action"] for event in events if event["type"] == "status"
+    ] == [
         "auto_compaction_compacting",
         "auto_compaction_compacted",
     ]
@@ -15453,7 +17446,9 @@ async def test_pipe_override_lowers_threshold_and_triggers_compaction(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_pipe_override_raises_threshold_and_skips_compaction(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_override_raises_threshold_and_skips_compaction(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     captured = {}
     _install_threshold_decision_stubs(monkeypatch, captured, total_tokens=500)
 
@@ -15483,7 +17478,9 @@ async def test_pipe_override_raises_threshold_and_skips_compaction(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_pipe_override_non_match_uses_global_trigger_input_tokens(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_override_non_match_uses_global_trigger_input_tokens(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     captured = {}
     _install_threshold_decision_stubs(monkeypatch, captured, total_tokens=500)
 
@@ -15491,7 +17488,11 @@ async def test_pipe_override_non_match_uses_global_trigger_input_tokens(monkeypa
     pipe.valves.trigger_input_tokens = 100
     # Override targets a different model, so the global default (100) is used and 500 tokens compacts.
     pipe.valves.per_model_overrides_json = json.dumps(
-        {"overrides": [{"model_patterns": ["other-*"], "trigger_input_tokens": 1000000}]}
+        {
+            "overrides": [
+                {"model_patterns": ["other-*"], "trigger_input_tokens": 1000000}
+            ]
+        }
     )
 
     events = []
@@ -15507,14 +17508,18 @@ async def test_pipe_override_non_match_uses_global_trigger_input_tokens(monkeypa
         __event_emitter__=event_emitter,
     )
 
-    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
+    assert [
+        event["data"]["action"] for event in events if event["type"] == "status"
+    ] == [
         "auto_compaction_compacting",
         "auto_compaction_compacted",
     ]
 
 
 @pytest.mark.asyncio
-async def test_pipe_empty_overrides_json_preserves_global_threshold_behavior(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_empty_overrides_json_preserves_global_threshold_behavior(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     captured = {}
     _install_threshold_decision_stubs(monkeypatch, captured, total_tokens=500)
 
@@ -15535,14 +17540,18 @@ async def test_pipe_empty_overrides_json_preserves_global_threshold_behavior(mon
         __event_emitter__=event_emitter,
     )
 
-    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
+    assert [
+        event["data"]["action"] for event in events if event["type"] == "status"
+    ] == [
         "auto_compaction_compacting",
         "auto_compaction_compacted",
     ]
 
 
 @pytest.mark.asyncio
-async def test_pipe_returns_error_when_overrides_json_invalid_at_runtime(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_returns_error_when_overrides_json_invalid_at_runtime(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     captured = {}
 
     async def validate_target_access(**kwargs):
@@ -15576,7 +17585,9 @@ async def test_pipe_returns_error_when_overrides_json_invalid_at_runtime(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_task_template_selection_matches_core_whitespace_rules(monkeypatch, pipe_request):
+async def test_task_template_selection_matches_core_whitespace_rules(
+    monkeypatch, pipe_request
+):
     class FakeConfig:
         @staticmethod
         async def get(key):
@@ -15585,8 +17596,12 @@ async def test_task_template_selection_matches_core_whitespace_rules(monkeypatch
     config_module = types.ModuleType("open_webui.models.config")
     config_module.Config = FakeConfig
     core_config_module = types.ModuleType("open_webui.config")
-    core_config_module.DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE = "Default query {{MESSAGES}}"
-    core_config_module.DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE = "Default autocomplete {{PROMPT}}"
+    core_config_module.DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE = (
+        "Default query {{MESSAGES}}"
+    )
+    core_config_module.DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE = (
+        "Default autocomplete {{PROMPT}}"
+    )
     monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
     monkeypatch.setitem(sys.modules, "open_webui.config", core_config_module)
     import open_webui as core_package
@@ -15644,7 +17659,9 @@ async def test_render_task_prompt_uses_db_config_templates_for_all_supported_tas
     for task_name, spec in mod.TASK_PROMPT_SPECS.items():
         if task_name == mod.TASKS.AUTOCOMPLETE_GENERATION.value:
 
-            async def autocomplete_builder(template, prompt, messages, type, user, *, _task_name=task_name):
+            async def autocomplete_builder(
+                template, prompt, messages, type, user, *, _task_name=task_name
+            ):
                 captured_templates[_task_name] = template
                 return f"rendered::{_task_name}::{template}"
 
@@ -15665,7 +17682,10 @@ async def test_render_task_prompt_uses_db_config_templates_for_all_supported_tas
 
     monkeypatch.setattr(core_utils, "task", task_module, raising=False)
     pipe_request.app.state.config = SimpleNamespace(
-        **{spec.config_attr: f"legacy::{task_name}" for task_name, spec in mod.TASK_PROMPT_SPECS.items()}
+        **{
+            spec.config_attr: f"legacy::{task_name}"
+            for task_name, spec in mod.TASK_PROMPT_SPECS.items()
+        }
     )
 
     for task_name in mod.TASK_PROMPT_SPECS:
@@ -15684,7 +17704,9 @@ async def test_render_task_prompt_uses_db_config_templates_for_all_supported_tas
         assert rendered == f"rendered::{task_name}::{expected_template}"
         assert captured_templates[task_name] == expected_template
 
-    assert requested_keys == [expected_config_keys[task_name] for task_name in mod.TASK_PROMPT_SPECS]
+    assert requested_keys == [
+        expected_config_keys[task_name] for task_name in mod.TASK_PROMPT_SPECS
+    ]
 
 
 @pytest.mark.asyncio
@@ -15703,7 +17725,9 @@ async def test_render_task_prompt_falls_back_to_legacy_templates_for_all_support
     for task_name, spec in mod.TASK_PROMPT_SPECS.items():
         if task_name == mod.TASKS.AUTOCOMPLETE_GENERATION.value:
 
-            async def autocomplete_builder(template, prompt, messages, type, user, *, _task_name=task_name):
+            async def autocomplete_builder(
+                template, prompt, messages, type, user, *, _task_name=task_name
+            ):
                 captured_templates[_task_name] = template
                 return f"rendered::{_task_name}::{template}"
 
@@ -15724,7 +17748,10 @@ async def test_render_task_prompt_falls_back_to_legacy_templates_for_all_support
 
     monkeypatch.setattr(core_utils, "task", task_module, raising=False)
     pipe_request.app.state.config = SimpleNamespace(
-        **{spec.config_attr: f"legacy::{task_name}" for task_name, spec in mod.TASK_PROMPT_SPECS.items()}
+        **{
+            spec.config_attr: f"legacy::{task_name}"
+            for task_name, spec in mod.TASK_PROMPT_SPECS.items()
+        }
     )
 
     for task_name in mod.TASK_PROMPT_SPECS:
@@ -15764,7 +17791,9 @@ async def test_pipe_does_not_rebuild_task_prompt_from_task_body_by_default(
         "source_message_count": len(exact_source),
         "source_hash": mod.compute_source_hash(exact_source),
         "summary_text": "checkpointed task history",
-        "summary_meta": {mod.SUMMARY_META_FORMAT_VERSION_KEY: mod.SUMMARY_META_FORMAT_VERSION},
+        "summary_meta": {
+            mod.SUMMARY_META_FORMAT_VERSION_KEY: mod.SUMMARY_META_FORMAT_VERSION
+        },
     }
 
     async def validate_target_access(**kwargs):
@@ -15778,7 +17807,9 @@ async def test_pipe_does_not_rebuild_task_prompt_from_task_body_by_default(
 
     class ExistingCheckpointStore:
         async def lookup_ready(self, **kwargs):
-            captured.setdefault("lookup_source_hashes", []).append(kwargs["source_hash"])
+            captured.setdefault("lookup_source_hashes", []).append(
+                kwargs["source_hash"]
+            )
             if kwargs["source_hash"] == checkpoint["source_hash"]:
                 return checkpoint
             return None
@@ -15787,7 +17818,9 @@ async def test_pipe_does_not_rebuild_task_prompt_from_task_body_by_default(
             return None
 
         async def insert_ready(self, row):
-            raise AssertionError("default task handling must not create a checkpoint from task_body")
+            raise AssertionError(
+                "default task handling must not create a checkpoint from task_body"
+            )
 
         async def touch(self, checkpoint_id):
             captured["touched"] = checkpoint_id
@@ -15807,7 +17840,9 @@ async def test_pipe_does_not_rebuild_task_prompt_from_task_body_by_default(
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
-    pipe_request.app.state.config = SimpleNamespace(TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}")
+    pipe_request.app.state.config = SimpleNamespace(
+        TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}"
+    )
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = 100
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
@@ -15830,7 +17865,9 @@ async def test_pipe_does_not_rebuild_task_prompt_from_task_body_by_default(
         },
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata
+    )
 
     assert result == {"ok": True}
     assert "touched" not in captured
@@ -15853,7 +17890,13 @@ async def test_task_prompt_estimate_uses_provider_body_when_file_context_disable
         return None
 
     async def model_dict_from_request(request):
-        return {"target": {"id": "target", "name": "Target", "capabilities": {"file_context": False}}}
+        return {
+            "target": {
+                "id": "target",
+                "name": "Target",
+                "capabilities": {"file_context": False},
+            }
+        }
 
     async def body_reusable_checkpoint_match(**kwargs):
         captured["checkpoint_lookup_body"] = copy.deepcopy(kwargs["body"])
@@ -15872,7 +17915,9 @@ async def test_task_prompt_estimate_uses_provider_body_when_file_context_disable
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
@@ -15900,10 +17945,15 @@ async def test_task_prompt_estimate_uses_provider_body_when_file_context_disable
         },
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata
+    )
 
     assert result == {"ok": True}
-    assert captured["checkpoint_lookup_body"]["messages"] == metadata["task_body"]["messages"]
+    assert (
+        captured["checkpoint_lookup_body"]["messages"]
+        == metadata["task_body"]["messages"]
+    )
     assert captured["estimate_body"]["messages"] == body["messages"]
     assert captured["forward_body"]["messages"] == body["messages"]
 
@@ -15928,7 +17978,9 @@ async def test_pipe_rebuilds_open_webui_task_prompt_with_reusable_checkpoint(
         "source_message_count": len(exact_source),
         "source_hash": mod.compute_source_hash(exact_source),
         "summary_text": "checkpointed task history",
-        "summary_meta": {mod.SUMMARY_META_FORMAT_VERSION_KEY: mod.SUMMARY_META_FORMAT_VERSION},
+        "summary_meta": {
+            mod.SUMMARY_META_FORMAT_VERSION_KEY: mod.SUMMARY_META_FORMAT_VERSION
+        },
     }
 
     async def validate_target_access(**kwargs):
@@ -15950,7 +18002,9 @@ async def test_pipe_rebuilds_open_webui_task_prompt_with_reusable_checkpoint(
             return None
 
         async def insert_ready(self, row):
-            raise AssertionError("task checkpoint reuse must not create a new checkpoint")
+            raise AssertionError(
+                "task checkpoint reuse must not create a new checkpoint"
+            )
 
         async def touch(self, checkpoint_id):
             captured["touched"] = checkpoint_id
@@ -15970,7 +18024,9 @@ async def test_pipe_rebuilds_open_webui_task_prompt_with_reusable_checkpoint(
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
-    pipe_request.app.state.config = SimpleNamespace(TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}")
+    pipe_request.app.state.config = SimpleNamespace(
+        TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}"
+    )
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = 100000
     pipe.valves.compact_task_prompts_from_task_body = True
@@ -15981,7 +18037,10 @@ async def test_pipe_rebuilds_open_webui_task_prompt_with_reusable_checkpoint(
         "stream": False,
         "messages": [
             {"role": "system", "content": "pipeline system instruction"},
-            {"role": "user", "content": "Task:\nold raw request\nold raw answer\nactive task input"},
+            {
+                "role": "user",
+                "content": "Task:\nold raw request\nold raw answer\nactive task input",
+            },
         ],
     }
     metadata = {
@@ -15994,12 +18053,17 @@ async def test_pipe_rebuilds_open_webui_task_prompt_with_reusable_checkpoint(
         },
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata
+    )
 
     assert result == {"ok": True}
     assert captured["touched"] == "checkpoint-task"
     forwarded = captured["forward_body"]
-    assert forwarded["messages"][0] == {"role": "system", "content": "pipeline system instruction"}
+    assert forwarded["messages"][0] == {
+        "role": "system",
+        "content": "pipeline system instruction",
+    }
     forwarded_prompt = forwarded["messages"][1]["content"]
     assert "checkpointed task history" in forwarded_prompt
     assert "active task input" in forwarded_prompt
@@ -16011,7 +18075,9 @@ async def test_pipe_rebuilds_open_webui_task_prompt_with_reusable_checkpoint(
 
 
 @pytest.mark.asyncio
-async def test_task_checkpoint_applied_estimate_uses_rebuilt_provider_body(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_task_checkpoint_applied_estimate_uses_rebuilt_provider_body(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     captured = {}
     compacted_source = {
         "messages": [
@@ -16021,7 +18087,12 @@ async def test_task_checkpoint_applied_estimate_uses_rebuilt_provider_body(monke
     }
     rebuilt_body = {
         "model": "target",
-        "messages": [{"role": "user", "content": "Task:\ncheckpointed task history\nactive task input"}],
+        "messages": [
+            {
+                "role": "user",
+                "content": "Task:\ncheckpointed task history\nactive task input",
+            }
+        ],
     }
 
     async def compact_body_with_reusable_checkpoint(**kwargs):
@@ -16029,16 +18100,28 @@ async def test_task_checkpoint_applied_estimate_uses_rebuilt_provider_body(monke
         return copy.deepcopy(compacted_source), True, 1
 
     async def rebuild_task_body_from_compacted_history(**kwargs):
-        captured["rebuilt_history"] = copy.deepcopy(kwargs["compacted_history_messages"])
+        captured["rebuilt_history"] = copy.deepcopy(
+            kwargs["compacted_history_messages"]
+        )
         return copy.deepcopy(rebuilt_body)
 
     async def estimate_body_tokens_async(body, **kwargs):
         captured["estimated_body"] = copy.deepcopy(body)
         return 123
 
-    monkeypatch.setattr(mod, "_compact_body_with_reusable_checkpoint", compact_body_with_reusable_checkpoint)
-    monkeypatch.setattr(mod, "_rebuild_task_body_from_compacted_history", rebuild_task_body_from_compacted_history)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
+    monkeypatch.setattr(
+        mod,
+        "_compact_body_with_reusable_checkpoint",
+        compact_body_with_reusable_checkpoint,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_rebuild_task_body_from_compacted_history",
+        rebuild_task_body_from_compacted_history,
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
 
     count = await mod._estimate_task_checkpoint_applied_body_tokens(
         request=pipe_request,
@@ -16046,7 +18129,9 @@ async def test_task_checkpoint_applied_estimate_uses_rebuilt_provider_body(monke
         metadata=pipe_metadata,
         body={"messages": [{"role": "user", "content": "source task history"}]},
         pipe_function_id="auto_compact",
-        match=mod.ReusableCheckpointMatch(kind="exact", source_message_count=1, checkpoint={"id": "checkpoint-task"}),
+        match=mod.ReusableCheckpointMatch(
+            kind="exact", source_message_count=1, checkpoint={"id": "checkpoint-task"}
+        ),
         historical_message_excerpt_bytes=0,
         historical_message_excerpt_count=0,
     )
@@ -16066,7 +18151,11 @@ async def test_task_checkpoint_applied_estimate_returns_none_when_file_context_u
     async def compact_body_with_reusable_checkpoint(**kwargs):
         raise mod.SummaryFileContextUnavailable("attached file context unavailable")
 
-    monkeypatch.setattr(mod, "_compact_body_with_reusable_checkpoint", compact_body_with_reusable_checkpoint)
+    monkeypatch.setattr(
+        mod,
+        "_compact_body_with_reusable_checkpoint",
+        compact_body_with_reusable_checkpoint,
+    )
 
     count = await mod._estimate_task_checkpoint_applied_body_tokens(
         request=pipe_request,
@@ -16074,7 +18163,9 @@ async def test_task_checkpoint_applied_estimate_returns_none_when_file_context_u
         metadata=pipe_metadata,
         body={"messages": [{"role": "user", "content": "source task history"}]},
         pipe_function_id="auto_compact",
-        match=mod.ReusableCheckpointMatch(kind="exact", source_message_count=1, checkpoint={"id": "checkpoint-task"}),
+        match=mod.ReusableCheckpointMatch(
+            kind="exact", source_message_count=1, checkpoint={"id": "checkpoint-task"}
+        ),
         historical_message_excerpt_bytes=0,
         historical_message_excerpt_count=0,
     )
@@ -16093,15 +18184,31 @@ async def test_task_reusable_checkpoint_passes_file_context_disabled_to_history_
 
     async def compact_body_with_reusable_checkpoint(**kwargs):
         captured["file_context_enabled"] = kwargs.get("file_context_enabled")
-        return {"messages": [{"role": "user", "content": "checkpointed task history"}]}, True, 1
+        return (
+            {"messages": [{"role": "user", "content": "checkpointed task history"}]},
+            True,
+            1,
+        )
 
     async def rebuild_task_body_from_compacted_history(**kwargs):
         return {"messages": [{"role": "user", "content": "rebuilt task prompt"}]}
 
-    monkeypatch.setattr(mod, "_compact_body_with_reusable_checkpoint", compact_body_with_reusable_checkpoint)
-    monkeypatch.setattr(mod, "_rebuild_task_body_from_compacted_history", rebuild_task_body_from_compacted_history)
+    monkeypatch.setattr(
+        mod,
+        "_compact_body_with_reusable_checkpoint",
+        compact_body_with_reusable_checkpoint,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_rebuild_task_body_from_compacted_history",
+        rebuild_task_body_from_compacted_history,
+    )
 
-    rebuilt, compacted, prefix_count = await mod._compact_task_body_with_reusable_checkpoint(
+    (
+        rebuilt,
+        compacted,
+        prefix_count,
+    ) = await mod._compact_task_body_with_reusable_checkpoint(
         request=pipe_request,
         user=pipe_user,
         metadata={
@@ -16118,7 +18225,9 @@ async def test_task_reusable_checkpoint_passes_file_context_disabled_to_history_
         },
         body={"messages": [{"role": "user", "content": "provider task prompt"}]},
         pipe_function_id="auto_compact",
-        match=mod.ReusableCheckpointMatch(kind="exact", source_message_count=2, source_kind="message"),
+        match=mod.ReusableCheckpointMatch(
+            kind="exact", source_message_count=2, source_kind="message"
+        ),
         historical_message_excerpt_bytes=0,
         historical_message_excerpt_count=0,
         file_context_enabled=False,
@@ -16158,7 +18267,9 @@ async def test_pipe_uses_task_checkpoint_applied_estimate_for_reusable_checkpoin
         return 150
 
     async def estimate_checkpoint_applied_body_tokens(**kwargs):
-        raise AssertionError("task reusable checkpoint guard must estimate the rebuilt task body")
+        raise AssertionError(
+            "task reusable checkpoint guard must estimate the rebuilt task body"
+        )
 
     async def compact_task_body(**kwargs):
         captured["foreground_compaction"] = True
@@ -16172,13 +18283,26 @@ async def test_pipe_uses_task_checkpoint_applied_estimate_for_reusable_checkpoin
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "_estimate_task_checkpoint_applied_body_tokens", estimate_task_checkpoint_applied_body_tokens, raising=False)
-    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod,
+        "_estimate_task_checkpoint_applied_body_tokens",
+        estimate_task_checkpoint_applied_body_tokens,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_estimate_checkpoint_applied_body_tokens",
+        estimate_checkpoint_applied_body_tokens,
+    )
     monkeypatch.setattr(mod, "_compact_task_body", compact_task_body)
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
-    pipe_request.app.state.config = SimpleNamespace(TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}")
+    pipe_request.app.state.config = SimpleNamespace(
+        TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}"
+    )
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = 100
     pipe.valves.compact_task_prompts_from_task_body = True
@@ -16199,14 +18323,20 @@ async def test_pipe_uses_task_checkpoint_applied_estimate_for_reusable_checkpoin
     body = {
         "model": wrapper_id,
         "stream": False,
-        "messages": [{"role": "user", "content": "Task:\nold task input\nactive task input"}],
+        "messages": [
+            {"role": "user", "content": "Task:\nold task input\nactive task input"}
+        ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata
+    )
 
     assert result == {"ok": True}
     assert captured["foreground_compaction"] is True
-    assert captured["forward_body"]["messages"] == [{"role": "user", "content": "foreground task summary"}]
+    assert captured["forward_body"]["messages"] == [
+        {"role": "user", "content": "foreground task summary"}
+    ]
 
 
 @pytest.mark.asyncio
@@ -16246,12 +18376,18 @@ async def test_task_soft_prefetch_passes_rebuilt_prompt_for_checkpoint_estimates
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
-    pipe_request.app.state.config = SimpleNamespace(TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}")
+    pipe_request.app.state.config = SimpleNamespace(
+        TAGS_GENERATION_PROMPT_TEMPLATE="Task:\n{{MESSAGES}}"
+    )
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = 200
     pipe.valves.soft_trigger_ratio = 0.5
@@ -16265,7 +18401,9 @@ async def test_task_soft_prefetch_passes_rebuilt_prompt_for_checkpoint_estimates
     body = {
         "model": wrapper_id,
         "stream": False,
-        "messages": [{"role": "user", "content": "Task:\nold task input\nactive task input"}],
+        "messages": [
+            {"role": "user", "content": "Task:\nold task input\nactive task input"}
+        ],
     }
     metadata = {
         **pipe_metadata,
@@ -16277,13 +18415,18 @@ async def test_task_soft_prefetch_passes_rebuilt_prompt_for_checkpoint_estimates
         },
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata
+    )
 
     assert result == {"ok": True}
     assert captured["checkpoint_lookup_body"]["messages"] == task_history
     assert captured["estimate_body"]["messages"] == body["messages"]
     assert captured["prefetch_kwargs"]["body"]["messages"] == task_history
-    assert captured["prefetch_kwargs"]["task_estimate_body"]["messages"] == body["messages"]
+    assert (
+        captured["prefetch_kwargs"]["task_estimate_body"]["messages"]
+        == body["messages"]
+    )
     assert captured["forward_body"]["messages"] == body["messages"]
 
 
@@ -16311,7 +18454,9 @@ async def test_pipe_forwards_unchanged_when_checkpoint_lookup_fails_and_request_
         return 10
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("must not compact when DB is down and request is within limits")
+        raise AssertionError(
+            "must not compact when DB is down and request is within limits"
+        )
 
     def start_soft_prefetch(**kwargs):
         raise AssertionError("must not prefetch when checkpoint lookup is unavailable")
@@ -16326,7 +18471,9 @@ async def test_pipe_forwards_unchanged_when_checkpoint_lookup_fails_and_request_
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -16403,8 +18550,89 @@ async def test_pipe_fails_closed_when_checkpoint_lookup_fails_and_hard_compactio
         __metadata__=pipe_metadata,
     )
 
-    assert result["error"]["code"] == "checkpoint_unavailable"
-    assert "checkpoint db down" in result["error"]["message"]
+    assert result == {
+        "error": {
+            "code": "checkpoint_unavailable",
+            "message": "Auto-compaction could not access its checkpoint store. Please retry.",
+        }
+    }
+    assert "checkpoint db down" not in result["error"]["message"]
+    assert forward_calls == []
+
+
+@pytest.mark.asyncio
+async def test_pipe_fails_closed_when_hard_late_checkpoint_lookup_fails(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    pipe_metadata,
+):
+    lookup_calls = 0
+    forward_calls = []
+    private_sql = "SELECT hard_late_secret FROM private_checkpoint_table"
+    private_driver_detail = "psycopg hard-late driver secret"
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def reusable_checkpoint_match(**kwargs):
+        nonlocal lookup_calls
+        lookup_calls += 1
+        if lookup_calls == 1:
+            return None
+        raise OperationalError(
+            private_sql,
+            {"checkpoint_secret": "hard-late-parameter-secret"},
+            RuntimeError(private_driver_detail),
+        )
+
+    async def estimate_body_tokens_async(body, **kwargs):
+        return 250000
+
+    async def forward_target(**kwargs):
+        forward_calls.append(copy.deepcopy(kwargs["body"]))
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+
+    pipe = mod.Pipe()
+    pipe.valves.trigger_input_tokens = 200
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+
+    result = await pipe.pipe(
+        {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "active"},
+            ],
+        },
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+    )
+
+    assert result == {
+        "error": {
+            "code": "checkpoint_unavailable",
+            "message": "Auto-compaction could not access its checkpoint store. Please retry.",
+        }
+    }
+    assert private_sql not in result["error"]["message"]
+    assert private_driver_detail not in result["error"]["message"]
+    assert "hard-late-parameter-secret" not in result["error"]["message"]
+    assert lookup_calls == 2
     assert forward_calls == []
 
 
@@ -16444,7 +18672,9 @@ async def test_pipe_forwards_unchanged_when_checkpoint_lookup_fails_and_request_
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -16517,7 +18747,9 @@ async def test_pipe_db_down_lookup_creates_no_checkpoint_and_skips_completed_tur
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -16573,7 +18805,9 @@ async def test_pipe_fails_closed_when_checkpoint_lookup_fails_and_decision_total
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -16595,8 +18829,13 @@ async def test_pipe_fails_closed_when_checkpoint_lookup_fails_and_decision_total
         __metadata__=pipe_metadata,
     )
 
-    assert result["error"]["code"] == "checkpoint_unavailable"
-    assert "checkpoint db down" in result["error"]["message"]
+    assert result == {
+        "error": {
+            "code": "checkpoint_unavailable",
+            "message": "Auto-compaction could not access its checkpoint store. Please retry.",
+        }
+    }
+    assert "checkpoint db down" not in result["error"]["message"]
     assert forward_calls == []
 
 
@@ -16626,20 +18865,26 @@ async def test_pipe_fails_closed_on_overflow_retry_when_checkpoint_lookup_was_un
         raise RuntimeError("checkpoint db down")
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("must not attempt compaction when checkpoint lookup was unavailable")
+        raise AssertionError(
+            "must not attempt compaction when checkpoint lookup was unavailable"
+        )
 
     def start_soft_prefetch(**kwargs):
         raise AssertionError("must not prefetch when checkpoint lookup is unavailable")
 
     async def forward_target(**kwargs):
         forward_attempts.append(copy.deepcopy(kwargs["body"]))
-        raise mod.RetryableContextOverflow("target context window exceeded before output")
+        raise mod.RetryableContextOverflow(
+            "target context window exceeded before output"
+        )
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", initialize_fails)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -16662,8 +18907,13 @@ async def test_pipe_fails_closed_on_overflow_retry_when_checkpoint_lookup_was_un
     # The request was forwarded once (proving the under-limit path ran), but the
     # overflow retry must NOT re-enter compaction.
     assert len(forward_attempts) == 1
-    assert result["error"]["code"] == "checkpoint_unavailable"
-    assert "checkpoint db down" in result["error"]["message"]
+    assert result == {
+        "error": {
+            "code": "checkpoint_unavailable",
+            "message": "Auto-compaction could not access its checkpoint store. Please retry.",
+        }
+    }
+    assert "checkpoint db down" not in result["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -16726,7 +18976,9 @@ async def test_pipe_creates_tool_checkpoint_without_history_parent_when_summary_
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     tool_source = [*history, active]
@@ -16794,7 +19046,11 @@ async def test_direct_tool_compaction_and_reusable_checkpoint_render_same_saved_
         historical_message_excerpt_bytes=64,
         historical_message_excerpt_count=1,
     )
-    reusable_body, reusable_did_compact, reusable_prefix_count = await mod._compact_body_with_reusable_checkpoint(
+    (
+        reusable_body,
+        reusable_did_compact,
+        reusable_prefix_count,
+    ) = await mod._compact_body_with_reusable_checkpoint(
         request=pipe_request,
         user=pipe_user,
         metadata={"chat_id": "chat-1"},
@@ -16818,8 +19074,13 @@ async def test_direct_tool_compaction_and_reusable_checkpoint_render_same_saved_
     assert stored["max_count"] == 1
     assert stored["max_bytes_per_message"] == 64
     assert stored["messages"] == [{"ordinal": 1, "text": "active request"}]
-    assert direct_body["messages"][0]["content"] == reusable_body["messages"][0]["content"]
-    assert '<historical_user_message ordinal="1"><![CDATA[active request]]></historical_user_message>' in direct_body["messages"][0]["content"]
+    assert (
+        direct_body["messages"][0]["content"] == reusable_body["messages"][0]["content"]
+    )
+    assert (
+        '<historical_user_message ordinal="1"><![CDATA[active request]]></historical_user_message>'
+        in direct_body["messages"][0]["content"]
+    )
     assert direct_body["messages"][1:] == latest_round
     assert reusable_body["messages"][1:] == latest_round
 
@@ -16861,7 +19122,9 @@ async def test_reusable_checkpoint_fails_closed_when_db_chain_is_unavailable_for
 
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint]))
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint])
+    )
 
     with pytest.raises(mod.SummaryFileContextUnavailable):
         await mod._compact_body_with_reusable_checkpoint(
@@ -16892,9 +19155,17 @@ async def test_tool_reusable_checkpoint_fails_closed_when_current_file_is_in_pre
 ):
     messages = [
         {"role": "user", "content": "active with file"},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function"}]},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
         {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-2", "type": "function"}]},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function"}],
+        },
         {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
     ]
     tool_cut = mod.select_tool_result_compaction_cut(messages)
@@ -16922,7 +19193,9 @@ async def test_tool_reusable_checkpoint_fails_closed_when_current_file_is_in_pre
 
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint]))
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint])
+    )
 
     with pytest.raises(mod.SummaryFileContextUnavailable):
         await mod._compact_body_with_reusable_checkpoint(
@@ -16955,9 +19228,17 @@ async def test_tool_compaction_fails_closed_when_current_file_is_in_prefix_and_d
 ):
     messages = [
         {"role": "user", "content": "active with file"},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function"}]},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
         {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-2", "type": "function"}]},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function"}],
+        },
         {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
     ]
     tool_cut = mod.select_tool_result_compaction_cut(messages)
@@ -17003,7 +19284,9 @@ async def test_completed_turn_prefetch_fails_closed_when_current_file_is_in_pref
         {"role": "assistant", "content": "answer"},
         {"role": "user", "content": ""},
     ]
-    prefetch_source = mod._soft_prefetch_source_messages({"model": "target", "messages": messages})
+    prefetch_source = mod._soft_prefetch_source_messages(
+        {"model": "target", "messages": messages}
+    )
     assert prefetch_source == (messages[:-1], None)
     source_messages, preserved_system_message = prefetch_source
 
@@ -17011,7 +19294,9 @@ async def test_completed_turn_prefetch_fails_closed_when_current_file_is_in_pref
         return None
 
     async def generate_chat_completion(*args, **kwargs):
-        raise AssertionError("summary generation must not run without absorbed file context")
+        raise AssertionError(
+            "summary generation must not run without absorbed file context"
+        )
 
     async def noop_initialize(**kwargs):
         return None
@@ -17019,7 +19304,9 @@ async def test_completed_turn_prefetch_fails_closed_when_current_file_is_in_pref
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([]))
-    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setattr(
+        chat_module, "generate_chat_completion", generate_chat_completion
+    )
 
     with pytest.raises(mod.SummaryFileContextUnavailable):
         await mod._prefetch_compaction_checkpoint(
@@ -17031,7 +19318,10 @@ async def test_completed_turn_prefetch_fails_closed_when_current_file_is_in_pref
                 "chat_id": "chat-1",
                 "user_message_id": "message-1",
                 "files": [_file("current-file")],
-                "user_message": {"content": "active with file", "files": [_file("current-file")]},
+                "user_message": {
+                    "content": "active with file",
+                    "files": [_file("current-file")],
+                },
             },
             body={"model": "target", "messages": messages},
             pipe_function_id="auto_compact",
@@ -17079,7 +19369,9 @@ async def test_message_reusable_checkpoint_fails_closed_for_current_file_when_db
 
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint]))
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint])
+    )
 
     with pytest.raises(mod.SummaryFileContextUnavailable):
         await mod._compact_body_with_reusable_checkpoint(
@@ -17139,7 +19431,9 @@ async def test_message_reusable_checkpoint_fails_closed_when_current_file_id_is_
 
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint]))
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ClaimCheckpointStore([checkpoint])
+    )
 
     with pytest.raises(mod.SummaryFileContextUnavailable):
         await mod._compact_body_with_reusable_checkpoint(
@@ -17195,16 +19489,24 @@ async def test_hard_compaction_delegates_exact_pending_to_checkpoint_claim_wait(
         return None
 
     async def wait_for_pending_checkpoint_ready(row):
-        raise AssertionError("exact pending should use the existing checkpoint claim/wait path only")
+        raise AssertionError(
+            "exact pending should use the existing checkpoint claim/wait path only"
+        )
 
     async def get_or_create_compaction_summary(**kwargs):
         captured["source_messages"] = kwargs["source_messages"]
         return "exact pending summary"
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore([pending_row]))
-    monkeypatch.setattr(mod, "_wait_for_pending_checkpoint_ready", wait_for_pending_checkpoint_ready)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ClaimCheckpointStore([pending_row])
+    )
+    monkeypatch.setattr(
+        mod, "_wait_for_pending_checkpoint_ready", wait_for_pending_checkpoint_ready
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
         request=pipe_request,
@@ -17333,7 +19635,9 @@ async def test_tool_compaction_waits_for_pending_chain_prefix_before_foreground_
         return None
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("hard compaction should wait for and reuse the pending soft summary first")
+        raise AssertionError(
+            "hard compaction should wait for and reuse the pending soft summary first"
+        )
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
@@ -17421,8 +19725,13 @@ async def test_tool_loop_summary_extends_existing_history_parent_when_summary_fi
     assert "existing history summary" in summary_inputs[0][0]["content"]
     assert summary_inputs[0][1:] == [active]
     assert len(history_store.completed_rows) == 1
-    assert history_store.completed_rows[0]["source_hash"] == mod.compute_source_hash(tool_source)
-    assert history_store.completed_rows[0]["parent_checkpoint_id"] == history_checkpoint["id"]
+    assert history_store.completed_rows[0]["source_hash"] == mod.compute_source_hash(
+        tool_source
+    )
+    assert (
+        history_store.completed_rows[0]["parent_checkpoint_id"]
+        == history_checkpoint["id"]
+    )
     assert "direct tool summary" in compacted["messages"][0]["content"]
     assert compacted["messages"][1:] == body["messages"][3:]
 
@@ -17454,7 +19763,9 @@ async def test_parent_checkpoint_extension_summary_request_preserves_system(
     async def noop_initialize(**kwargs):
         return None
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["messages"] = copy.deepcopy(form_data["messages"])
         return {"choices": [{"message": {"content": "extended summary"}}]}
 
@@ -17542,7 +19853,9 @@ async def test_pipe_reuses_exact_tool_checkpoint_without_creating_history_checkp
             return True
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("exact tool checkpoint hit must not call the summary model")
+        raise AssertionError(
+            "exact tool checkpoint hit must not call the summary model"
+        )
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -17551,7 +19864,9 @@ async def test_pipe_reuses_exact_tool_checkpoint_without_creating_history_checkp
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingToolCheckpointStore([checkpoint]))
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ExistingToolCheckpointStore([checkpoint])
+    )
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -17635,7 +19950,9 @@ async def test_pipe_reuses_exact_tool_checkpoint_even_when_usage_is_below_thresh
 
     class ExistingToolCheckpointStore(ClaimCheckpointStore):
         async def find_longest_parent(self, **kwargs):
-            raise AssertionError("exact tool checkpoint reuse must not need a parent lookup")
+            raise AssertionError(
+                "exact tool checkpoint reuse must not need a parent lookup"
+            )
 
         async def claim_pending(self, row):
             raise AssertionError("exact tool checkpoint hit must not insert")
@@ -17645,7 +19962,9 @@ async def test_pipe_reuses_exact_tool_checkpoint_even_when_usage_is_below_thresh
             return True
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("exact tool checkpoint hit must not call the summary model")
+        raise AssertionError(
+            "exact tool checkpoint hit must not call the summary model"
+        )
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -17654,7 +19973,9 @@ async def test_pipe_reuses_exact_tool_checkpoint_even_when_usage_is_below_thresh
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
-    monkeypatch.setattr(mod, "CheckpointStore", lambda: ExistingToolCheckpointStore([checkpoint]))
+    monkeypatch.setattr(
+        mod, "CheckpointStore", lambda: ExistingToolCheckpointStore([checkpoint])
+    )
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
@@ -17730,14 +20051,18 @@ async def test_pipe_reuses_history_checkpoint_for_tool_loop_when_usage_is_below_
 
     class RecordingCheckpointStore(ClaimCheckpointStore):
         async def claim_pending(self, row):
-            raise AssertionError("below-threshold checkpoint reuse must not create a new checkpoint")
+            raise AssertionError(
+                "below-threshold checkpoint reuse must not create a new checkpoint"
+            )
 
         async def touch(self, checkpoint_id, *, now=None):
             captured["touched"] = checkpoint_id
             return True
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("below-threshold checkpoint reuse must not call the summary model")
+        raise AssertionError(
+            "below-threshold checkpoint reuse must not call the summary model"
+        )
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -17818,14 +20143,18 @@ async def test_pipe_reuses_longest_history_parent_for_tool_loop_when_usage_is_be
 
     class RecordingCheckpointStore(ClaimCheckpointStore):
         async def claim_pending(self, row):
-            raise AssertionError("below-threshold checkpoint reuse must not create a new checkpoint")
+            raise AssertionError(
+                "below-threshold checkpoint reuse must not create a new checkpoint"
+            )
 
         async def touch(self, checkpoint_id, *, now=None):
             captured["touched"] = checkpoint_id
             return True
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("below-threshold checkpoint reuse must not call the summary model")
+        raise AssertionError(
+            "below-threshold checkpoint reuse must not call the summary model"
+        )
 
     async def forward_target(**kwargs):
         captured["forward_body"] = kwargs["body"]
@@ -17932,7 +20261,9 @@ async def test_pipe_falls_back_to_history_parent_when_direct_tool_summary_overfl
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert summary_inputs[0] == tool_source
@@ -17982,11 +20313,23 @@ async def test_pipe_falls_back_to_history_checkpoint_when_existing_tool_parent_r
         summary_inputs.append(source)
         if source == tool_source:
             raise mod.RetryableContextOverflow("direct tool source overflow")
-        if source and "short parent summary" in source[0].get("content", "") and source[1:] == [history[1], active]:
+        if (
+            source
+            and "short parent summary" in source[0].get("content", "")
+            and source[1:] == [history[1], active]
+        ):
             raise mod.RetryableContextOverflow("short parent delta overflow")
-        if source and "short parent summary" in source[0].get("content", "") and source[1:] == [history[1]]:
+        if (
+            source
+            and "short parent summary" in source[0].get("content", "")
+            and source[1:] == [history[1]]
+        ):
             return "history summary"
-        if source and "history summary" in source[0].get("content", "") and source[1:] == [active]:
+        if (
+            source
+            and "history summary" in source[0].get("content", "")
+            and source[1:] == [active]
+        ):
             return "tool summary"
         raise AssertionError(f"unexpected summary input: {source!r}")
 
@@ -18083,11 +20426,19 @@ async def test_history_fallback_does_not_reselect_failed_longer_tool_parent(
         summary_inputs.append(source)
         if source == tool_source:
             raise mod.RetryableContextOverflow("direct tool source overflow")
-        if source and "failed parent summary" in source[0].get("content", "") and source[1:] == old_round:
+        if (
+            source
+            and "failed parent summary" in source[0].get("content", "")
+            and source[1:] == old_round
+        ):
             raise mod.RetryableContextOverflow("failed parent delta overflow")
         if source == history:
             return "history summary"
-        if source and "history summary" in source[0].get("content", "") and source[1:] == [active, *old_round]:
+        if (
+            source
+            and "history summary" in source[0].get("content", "")
+            and source[1:] == [active, *old_round]
+        ):
             return "tool summary"
         raise AssertionError(f"unexpected summary input: {source!r}")
 
@@ -18157,7 +20508,11 @@ async def test_tool_loop_parent_retry_does_not_swallow_non_context_error(
         summary_inputs.append(source)
         if source == tool_source:
             raise mod.RetryableContextOverflow("direct tool source overflow")
-        if source and "short parent summary" in source[0].get("content", "") and source[1:] == [history[1], active]:
+        if (
+            source
+            and "short parent summary" in source[0].get("content", "")
+            and source[1:] == [history[1], active]
+        ):
             raise RuntimeError("parent retry failed")
         raise AssertionError(f"unexpected summary input: {source!r}")
 
@@ -18271,7 +20626,11 @@ async def test_tool_loop_checkpoints_extend_previous_tool_checkpoint_without_his
             *round_3,
         ],
     }
-    second_compacted, second_did_compact, _second_prefix_count = await mod._compact_body(
+    (
+        second_compacted,
+        second_did_compact,
+        _second_prefix_count,
+    ) = await mod._compact_body(
         request=pipe_request,
         user=pipe_user,
         metadata=metadata,
@@ -18292,7 +20651,9 @@ async def test_tool_loop_checkpoints_extend_previous_tool_checkpoint_without_his
     assert len(rows) == 2
     assert rows[0]["source_hash"] == mod.compute_source_hash([active, *round_1])
     assert rows[0]["parent_checkpoint_id"] is None
-    assert rows[1]["source_hash"] == mod.compute_source_hash([active, *round_1, *round_2])
+    assert rows[1]["source_hash"] == mod.compute_source_hash(
+        [active, *round_1, *round_2]
+    )
     assert rows[1]["parent_checkpoint_id"] == rows[0]["id"]
     assert first_compacted["messages"][1:] == round_2
     assert second_compacted["messages"][1:] == round_3
@@ -18387,8 +20748,12 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_prior_checkpo
     assert summary_inputs[0][1:] == [{"role": "user", "content": "active"}]
     checkpoint_source = [*exact_source, {"role": "user", "content": "active"}]
     assert existing_store.completed_rows[0]["parent_checkpoint_id"] == checkpoint["id"]
-    assert existing_store.completed_rows[0]["source_message_count"] == len(checkpoint_source)
-    assert existing_store.completed_rows[0]["source_hash"] == mod.compute_source_hash(checkpoint_source)
+    assert existing_store.completed_rows[0]["source_message_count"] == len(
+        checkpoint_source
+    )
+    assert existing_store.completed_rows[0]["source_hash"] == mod.compute_source_hash(
+        checkpoint_source
+    )
     messages = captured["forward_body"]["messages"]
     assert "combined active summary" in messages[0]["content"]
     assert messages[1] == {
@@ -18494,10 +20859,17 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_checkpoint_pa
     assert len(summary_inputs) == 1
     assert "existing summary" in summary_inputs[0][0]["content"]
     assert summary_inputs[0][1:] == [{"role": "user", "content": "active"}]
-    checkpoint_source_with_active = [*checkpoint_source, {"role": "user", "content": "active"}]
+    checkpoint_source_with_active = [
+        *checkpoint_source,
+        {"role": "user", "content": "active"},
+    ]
     assert existing_store.completed_rows[0]["parent_checkpoint_id"] == checkpoint["id"]
-    assert existing_store.completed_rows[0]["source_message_count"] == len(checkpoint_source_with_active)
-    assert existing_store.completed_rows[0]["source_hash"] == mod.compute_source_hash(checkpoint_source_with_active)
+    assert existing_store.completed_rows[0]["source_message_count"] == len(
+        checkpoint_source_with_active
+    )
+    assert existing_store.completed_rows[0]["source_hash"] == mod.compute_source_hash(
+        checkpoint_source_with_active
+    )
     messages = captured["forward_body"]["messages"]
     assert "combined active summary" in messages[0]["content"]
     assert messages[1] == {
@@ -18510,7 +20882,9 @@ async def test_pipe_compacts_history_before_latest_tool_round_when_checkpoint_pa
 
 
 @pytest.mark.asyncio
-async def test_pipe_retries_with_compaction_after_pre_emission_context_error(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_retries_with_compaction_after_pre_emission_context_error(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     calls = []
 
     async def validate_target_access(**kwargs):
@@ -18530,7 +20904,9 @@ async def test_pipe_retries_with_compaction_after_pre_emission_context_error(mon
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -18545,7 +20921,9 @@ async def test_pipe_retries_with_compaction_after_pre_emission_context_error(mon
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert len(calls) == 2
@@ -18554,7 +20932,9 @@ async def test_pipe_retries_with_compaction_after_pre_emission_context_error(mon
 
 
 @pytest.mark.asyncio
-async def test_pipe_stops_context_retries_at_fixed_budget(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_stops_context_retries_at_fixed_budget(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     calls = []
 
     async def validate_target_access(**kwargs):
@@ -18572,7 +20952,9 @@ async def test_pipe_stops_context_retries_at_fixed_budget(monkeypatch, pipe_requ
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -18598,7 +20980,9 @@ async def test_pipe_stops_context_retries_at_fixed_budget(monkeypatch, pipe_requ
 
 
 @pytest.mark.asyncio
-async def test_pipe_does_not_retry_non_context_target_errors(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_does_not_retry_non_context_target_errors(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     calls = []
 
     async def validate_target_access(**kwargs):
@@ -18661,7 +21045,9 @@ async def test_pipe_retries_tool_loop_by_summarizing_history_before_latest_tool_
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -18700,7 +21086,9 @@ async def test_pipe_retries_tool_loop_by_summarizing_history_before_latest_tool_
     retry_messages = calls[1]["messages"]
     assert "combined retry summary" in retry_messages[0]["content"]
     assert retry_messages[1:] == body["messages"][1:]
-    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
+    assert [
+        event["data"]["action"] for event in events if event["type"] == "status"
+    ] == [
         "auto_compaction_retry",
         "auto_compaction_compacting",
         "auto_compaction_compacted",
@@ -18742,7 +21130,9 @@ async def test_pipe_reemits_latest_compaction_summary_embed_on_retry_after_initi
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
     _install_candidate_token_estimate(monkeypatch, 500)
 
@@ -18779,13 +21169,21 @@ async def test_pipe_reemits_latest_compaction_summary_embed_on_retry_after_initi
 
 
 @pytest.mark.asyncio
-async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_message(monkeypatch, pipe_request, pipe_user):
-    original_tool = {"role": "tool", "tool_call_id": "call-1", "content": "original tool result"}
+async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_message(
+    monkeypatch, pipe_request, pipe_user
+):
+    original_tool = {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "original tool result",
+    }
 
     async def get_or_create_compaction_summary(**kwargs):
         return "combined summary"
 
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     messages = [
         {"role": "user", "content": "active"},
@@ -18807,10 +21205,20 @@ async def test_tool_loop_compaction_replaces_tool_round_without_mutating_tool_me
     )
 
     assert did_compact is True
-    assert original_tool == {"role": "tool", "tool_call_id": "call-1", "content": "original tool result"}
+    assert original_tool == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "original tool result",
+    }
     assert compacted[0]["role"] == "user"
-    assert "<checkpoint_summary><![CDATA[combined summary]]></checkpoint_summary>" in compacted[0]["content"]
-    assert '<historical_user_message ordinal="1"><![CDATA[active]]></historical_user_message>' in compacted[0]["content"]
+    assert (
+        "<checkpoint_summary><![CDATA[combined summary]]></checkpoint_summary>"
+        in compacted[0]["content"]
+    )
+    assert (
+        '<historical_user_message ordinal="1"><![CDATA[active]]></historical_user_message>'
+        in compacted[0]["content"]
+    )
     assert compacted[1:] == [
         {
             "role": "assistant",
@@ -18894,14 +21302,20 @@ async def _run_token_status_pipe(
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "_get_target_db_model_record", get_target_db_model_record)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(
         mod,
         "_lookup_pending_checkpoint_for_source_prefix",
         lookup_pending_checkpoint_for_source_prefix,
     )
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
     _install_known_openai_usage_anchor_transport(monkeypatch)
 
@@ -18952,7 +21366,9 @@ async def _run_token_status_pipe(
 
 
 @pytest.mark.asyncio
-async def test_status_shows_before_tokens_by_default(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_shows_before_tokens_by_default(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     result, events, _captured, _estimate_calls = await _run_token_status_pipe(
         monkeypatch,
         pipe_request,
@@ -18977,7 +21393,9 @@ async def test_status_shows_before_tokens_by_default(monkeypatch, pipe_request, 
 
 
 @pytest.mark.asyncio
-async def test_status_before_after_mode(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_before_after_mode(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     pipe = mod.Pipe()
     pipe.valves.token_status_detail = "before_after"
 
@@ -19003,7 +21421,9 @@ async def test_status_before_after_mode(monkeypatch, pipe_request, pipe_user, pi
 
 
 @pytest.mark.asyncio
-async def test_status_show_usage_and_estimate_mode(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_show_usage_and_estimate_mode(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     pipe = mod.Pipe()
     pipe.valves.token_status_show_usage_and_estimate = True
 
@@ -19072,7 +21492,9 @@ def test_format_token_suffix_summary_mode_distinguishes_summary_from_after():
     )
 
     assert (
-        mod._format_token_suffix(ctx, after=None, show_usage_and_estimate=False, summary=50)
+        mod._format_token_suffix(
+            ctx, after=None, show_usage_and_estimate=False, summary=50
+        )
         == "(≈850 / 1,000 tokens · 85% · summary ≈50 tokens)"
     )
 
@@ -19089,13 +21511,17 @@ def test_format_token_suffix_summary_mode_with_usage_and_estimate():
     )
 
     assert (
-        mod._format_token_suffix(ctx, after=50, show_usage_and_estimate=True, summary=50)
+        mod._format_token_suffix(
+            ctx, after=50, show_usage_and_estimate=True, summary=50
+        )
         == "(observed usage 850 · candidate ≈860 / 1,000 · 85% · summary ≈50 tokens)"
     )
 
 
 @pytest.mark.asyncio
-async def test_status_always_mode_emits_pressure(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_always_mode_emits_pressure(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     pipe = mod.Pipe()
     pipe.valves.token_status_visibility = "always"
 
@@ -19113,14 +21539,18 @@ async def test_status_always_mode_emits_pressure(monkeypatch, pipe_request, pipe
     assert result == {"ok": True}
     assert captured["forward_bodies"][0]["messages"][0]["content"] == "old"
     status_events = _status_events(events)
-    assert [event["data"]["action"] for event in status_events] == ["auto_compaction_status"]
+    assert [event["data"]["action"] for event in status_events] == [
+        "auto_compaction_status"
+    ]
     assert status_events[0]["data"]["done"] is True
     assert "450" in status_events[0]["data"]["description"]
     assert status_events[0]["data"]["tokens"]["before"] == 450
 
 
 @pytest.mark.asyncio
-async def test_status_compaction_only_silent_below_threshold(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_compaction_only_silent_below_threshold(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     result, events, _captured, _estimate_calls = await _run_token_status_pipe(
         monkeypatch,
         pipe_request,
@@ -19136,7 +21566,9 @@ async def test_status_compaction_only_silent_below_threshold(monkeypatch, pipe_r
 
 
 @pytest.mark.asyncio
-async def test_status_unknown_tokens_render(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_unknown_tokens_render(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     result, events, captured, _estimate_calls = await _run_token_status_pipe(
         monkeypatch,
         pipe_request,
@@ -19161,7 +21593,9 @@ async def test_status_unknown_tokens_render(monkeypatch, pipe_request, pipe_user
 
 
 @pytest.mark.asyncio
-async def test_status_prefetch_shows_trigger_tokens(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_prefetch_shows_trigger_tokens(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     events = []
     source_messages = [
         {"role": "user", "content": "old"},
@@ -19179,7 +21613,9 @@ async def test_status_prefetch_shows_trigger_tokens(monkeypatch, pipe_request, p
             checkpoint={"summary_text": "prefetched summary", "summary_meta": {}},
         )
 
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     assert (
         await mod._prefetch_compaction_checkpoint(
@@ -19188,7 +21624,10 @@ async def test_status_prefetch_shows_trigger_tokens(monkeypatch, pipe_request, p
             user_id=pipe_user["id"],
             chat_id=pipe_metadata["chat_id"],
             metadata=pipe_metadata,
-            body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+            body={
+                "model": "target",
+                "messages": [*source_messages, {"role": "user", "content": "active"}],
+            },
             pipe_function_id="auto_compact",
             summary_model_id="target",
             source_messages=source_messages,
@@ -19249,9 +21688,13 @@ async def test_status_prefetched_shows_summary_in_before_after_mode(
         )
 
     async def estimate_rendered_summary_message_tokens(**kwargs):
-        raise AssertionError("persisted summary_token_count should avoid fallback estimation")
+        raise AssertionError(
+            "persisted summary_token_count should avoid fallback estimation"
+        )
 
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(
         mod,
         "_estimate_rendered_summary_message_tokens",
@@ -19265,7 +21708,10 @@ async def test_status_prefetched_shows_summary_in_before_after_mode(
             user_id=pipe_user["id"],
             chat_id=pipe_metadata["chat_id"],
             metadata=pipe_metadata,
-            body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+            body={
+                "model": "target",
+                "messages": [*source_messages, {"role": "user", "content": "active"}],
+            },
             pipe_function_id="auto_compact",
             summary_model_id="target",
             source_messages=source_messages,
@@ -19334,7 +21780,9 @@ async def test_status_prefetched_estimates_summary_when_checkpoint_count_is_miss
         estimate_calls.append(kwargs)
         return 37
 
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(
         mod,
         "_estimate_rendered_summary_message_tokens",
@@ -19348,7 +21796,10 @@ async def test_status_prefetched_estimates_summary_when_checkpoint_count_is_miss
             user_id=pipe_user["id"],
             chat_id=pipe_metadata["chat_id"],
             metadata=pipe_metadata,
-            body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+            body={
+                "model": "target",
+                "messages": [*source_messages, {"role": "user", "content": "active"}],
+            },
             pipe_function_id="auto_compact",
             summary_model_id="target",
             source_messages=source_messages,
@@ -19377,7 +21828,9 @@ async def test_status_prefetched_estimates_summary_when_checkpoint_count_is_miss
 
 
 @pytest.mark.asyncio
-async def test_status_skipped_action_carries_tokens(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_skipped_action_carries_tokens(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     pipe = mod.Pipe()
     pipe.valves.trigger_input_tokens = 1000
 
@@ -19408,7 +21861,9 @@ async def test_status_skipped_action_carries_tokens(monkeypatch, pipe_request, p
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(
         mod,
         "_lookup_pending_checkpoint_for_source_prefix",
@@ -19428,7 +21883,13 @@ async def test_status_skipped_action_carries_tokens(monkeypatch, pipe_request, p
             {"role": "user", "content": "active"},
         ],
     }
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata, __event_emitter__=event_emitter)
+    result = await pipe.pipe(
+        body,
+        __request__=pipe_request,
+        __user__=pipe_user,
+        __metadata__=pipe_metadata,
+        __event_emitter__=event_emitter,
+    )
 
     assert result == {"ok": True}
     status_events = _status_events(events)
@@ -19471,8 +21932,14 @@ async def test_summary_file_context_unavailable_stops_before_target_forward(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", lookup_pending_checkpoint_for_source_prefix)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        lookup_pending_checkpoint_for_source_prefix,
+    )
     monkeypatch.setattr(mod, "_compact_body", compact_body)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
     _install_candidate_token_estimate(monkeypatch, 1500)
@@ -19502,7 +21969,9 @@ async def test_summary_file_context_unavailable_stops_before_target_forward(
 
 
 @pytest.mark.asyncio
-async def test_status_before_after_renders_when_after_estimate_fails(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_before_after_renders_when_after_estimate_fails(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     pipe = mod.Pipe()
     pipe.valves.token_status_detail = "before_after"
 
@@ -19525,7 +21994,9 @@ async def test_status_before_after_renders_when_after_estimate_fails(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_status_always_mode_plus_compaction_emits_both(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_status_always_mode_plus_compaction_emits_both(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     pipe = mod.Pipe()
     pipe.valves.token_status_visibility = "always"
     pipe.valves.trigger_input_tokens = 1000
@@ -19602,7 +22073,9 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -19645,12 +22118,18 @@ async def test_pipe_compacts_older_tool_loop_results_from_request_scoped_usage(
     assert summary_inputs[0] == body["messages"][:3]
     messages = captured["forward_body"]["messages"]
     assert messages[1:] == body["messages"][3:]
-    summary_text = "\n".join(message.get("content", "") for message in messages if message.get("role") == "user")
+    summary_text = "\n".join(
+        message.get("content", "")
+        for message in messages
+        if message.get("role") == "user"
+    )
     assert "combined old tool summary" in summary_text
     assert "<auto_compaction_context>" in summary_text
     assert not any(message.get("tool_call_id") == "call-1" for message in messages)
     assert any(message.get("tool_call_id") == "call-2" for message in messages)
-    assert [event["data"]["action"] for event in events if event["type"] == "status"] == [
+    assert [
+        event["data"]["action"] for event in events if event["type"] == "status"
+    ] == [
         "auto_compaction_compacting",
         "auto_compaction_compacted",
     ]
@@ -19685,7 +22164,9 @@ async def test_pipe_closes_compaction_status_when_usage_threshold_has_no_safe_pr
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
     _install_candidate_token_estimate(monkeypatch, 500)
 
@@ -19720,7 +22201,9 @@ async def test_pipe_closes_compaction_status_when_usage_threshold_has_no_safe_pr
 
 
 @pytest.mark.asyncio
-async def test_pipe_returns_clear_error_when_latest_user_cannot_fit(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_returns_clear_error_when_latest_user_cannot_fit(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     async def validate_target_access(**kwargs):
         return None
 
@@ -19742,7 +22225,9 @@ async def test_pipe_returns_clear_error_when_latest_user_cannot_fit(monkeypatch,
         "messages": [{"role": "user", "content": "x" * 1000000}],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result["error"]["code"] == "active_input_too_large"
     assert "latest user message" in result["error"]["message"]
@@ -19788,7 +22273,9 @@ async def test_pipe_returns_clear_error_when_latest_tool_result_cannot_be_summar
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result["error"]["code"] == "latest_tool_result_too_large"
     assert "tool result" in result["error"]["message"]
@@ -19840,14 +22327,18 @@ async def test_pipe_does_not_create_transient_only_history_checkpoint_for_large_
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result["error"]["code"] == "latest_tool_result_too_large"
     assert summary_sources == [[body["messages"][0], body["messages"][1]]]
 
 
 @pytest.mark.asyncio
-async def test_pipe_does_not_compact_internal_summary_task(monkeypatch, pipe_request, pipe_user, pipe_metadata):
+async def test_pipe_does_not_compact_internal_summary_task(
+    monkeypatch, pipe_request, pipe_user, pipe_metadata
+):
     captured = {}
 
     async def validate_target_access(**kwargs):
@@ -19865,7 +22356,9 @@ async def test_pipe_does_not_compact_internal_summary_task(monkeypatch, pipe_req
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_checkpoint_summary", get_or_create_checkpoint_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -19882,7 +22375,9 @@ async def test_pipe_does_not_compact_internal_summary_task(monkeypatch, pipe_req
     }
     metadata = {**pipe_metadata, "task": mod.INTERNAL_SUMMARY_TASK}
 
-    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata
+    )
 
     assert captured["forward_body"]["messages"] == body["messages"]
 
@@ -19911,7 +22406,9 @@ async def test_soft_prefetch_emits_status_and_embed_when_checkpoint_is_created(
             checkpoint={"summary_text": "prefetched summary", "summary_meta": {}},
         )
 
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     assert (
         await mod._prefetch_compaction_checkpoint(
@@ -19920,7 +22417,10 @@ async def test_soft_prefetch_emits_status_and_embed_when_checkpoint_is_created(
             user_id=pipe_user["id"],
             chat_id=pipe_metadata["chat_id"],
             metadata=pipe_metadata,
-            body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+            body={
+                "model": "target",
+                "messages": [*source_messages, {"role": "user", "content": "active"}],
+            },
             pipe_function_id="auto_compact",
             summary_model_id="target",
             source_messages=source_messages,
@@ -19988,9 +22488,17 @@ async def test_soft_prefetch_waits_for_pending_parent_then_claims_child_at_soft_
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
     monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0)
-    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_checkpoint_applied_body_tokens",
+        estimate_checkpoint_applied_body_tokens,
+    )
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
-    monkeypatch.setattr(mod, "_estimate_rendered_summary_message_tokens", estimate_rendered_summary_message_tokens)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_rendered_summary_message_tokens",
+        estimate_rendered_summary_message_tokens,
+    )
 
     prefetched = await mod._prefetch_compaction_checkpoint(
         request=pipe_request,
@@ -19998,7 +22506,10 @@ async def test_soft_prefetch_waits_for_pending_parent_then_claims_child_at_soft_
         user_id=pipe_user["id"],
         chat_id=pipe_metadata["chat_id"],
         metadata=pipe_metadata,
-        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        body={
+            "model": "target",
+            "messages": [*source_messages, {"role": "user", "content": "active"}],
+        },
         pipe_function_id="auto_compact",
         summary_model_id="target",
         source_messages=source_messages,
@@ -20010,9 +22521,16 @@ async def test_soft_prefetch_waits_for_pending_parent_then_claims_child_at_soft_
 
     assert prefetched is True
     assert store.lookup_any_count >= 2
-    assert len(
-        [row for row in store.claimed_rows if row["namespace"] == mod.CHECKPOINT_NAMESPACE]
-    ) == 1
+    assert (
+        len(
+            [
+                row
+                for row in store.claimed_rows
+                if row["namespace"] == mod.CHECKPOINT_NAMESPACE
+            ]
+        )
+        == 1
+    )
     assert store.completed_rows[0]["parent_checkpoint_id"] == pending["id"]
     assert store.completed_rows[0]["summary_text"] == "child summary"
 
@@ -20058,7 +22576,11 @@ async def test_soft_prefetch_waits_for_pending_parent_then_skips_below_soft(
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
     monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0)
-    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_checkpoint_applied_body_tokens",
+        estimate_checkpoint_applied_body_tokens,
+    )
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
 
     prefetched = await mod._prefetch_compaction_checkpoint(
@@ -20067,7 +22589,10 @@ async def test_soft_prefetch_waits_for_pending_parent_then_skips_below_soft(
         user_id=pipe_user["id"],
         chat_id=pipe_metadata["chat_id"],
         metadata=pipe_metadata,
-        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        body={
+            "model": "target",
+            "messages": [*source_messages, {"role": "user", "content": "active"}],
+        },
         pipe_function_id="auto_compact",
         summary_model_id="target",
         source_messages=source_messages,
@@ -20114,7 +22639,9 @@ async def test_soft_prefetch_waits_for_pending_exact_checkpoint_then_skips(
         return None
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("an exact checkpoint that became ready must skip generation")
+        raise AssertionError(
+            "an exact checkpoint that became ready must skip generation"
+        )
 
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
@@ -20127,7 +22654,10 @@ async def test_soft_prefetch_waits_for_pending_exact_checkpoint_then_skips(
         user_id=pipe_user["id"],
         chat_id=pipe_metadata["chat_id"],
         metadata=pipe_metadata,
-        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        body={
+            "model": "target",
+            "messages": [*source_messages, {"role": "user", "content": "active"}],
+        },
         pipe_function_id="auto_compact",
         summary_model_id="target",
         source_messages=source_messages,
@@ -20188,7 +22718,10 @@ async def test_soft_prefetch_pending_parent_timeout_is_bounded_and_starts_no_chi
         user_id=pipe_user["id"],
         chat_id=pipe_metadata["chat_id"],
         metadata=pipe_metadata,
-        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        body={
+            "model": "target",
+            "messages": [*source_messages, {"role": "user", "content": "active"}],
+        },
         pipe_function_id="auto_compact",
         summary_model_id="target",
         source_messages=source_messages,
@@ -20224,7 +22757,9 @@ async def test_soft_prefetch_emits_done_status_when_checkpoint_creation_is_cance
         await on_summary_start()
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     with pytest.raises(asyncio.CancelledError):
         await mod._prefetch_compaction_checkpoint(
@@ -20233,7 +22768,10 @@ async def test_soft_prefetch_emits_done_status_when_checkpoint_creation_is_cance
             user_id=pipe_user["id"],
             chat_id=pipe_metadata["chat_id"],
             metadata=pipe_metadata,
-            body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+            body={
+                "model": "target",
+                "messages": [*source_messages, {"role": "user", "content": "active"}],
+            },
             pipe_function_id="auto_compact",
             summary_model_id="target",
             source_messages=source_messages,
@@ -20284,15 +22822,23 @@ async def test_pipe_does_not_launch_completed_turn_soft_prefetch_for_internal_su
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
     pipe.valves.trigger_input_tokens = 1000
     wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
-    metadata = {"chat_id": "chat-1", "message_id": "msg-1", "task": mod.INTERNAL_SUMMARY_TASK}
+    metadata = {
+        "chat_id": "chat-1",
+        "message_id": "msg-1",
+        "task": mod.INTERNAL_SUMMARY_TASK,
+    }
     body = {
         "model": wrapper_id,
         "stream": False,
@@ -20303,7 +22849,9 @@ async def test_pipe_does_not_launch_completed_turn_soft_prefetch_for_internal_su
         ],
     }
 
-    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata
+    )
 
     assert calls == []
 
@@ -20336,17 +22884,23 @@ async def test_pipe_launches_soft_prefetch_below_hard_without_foreground_compact
 
     def start_soft_prefetch(**kwargs):
         assert "target_model_id" not in kwargs
-        captured["prefetch"] = copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"})
+        captured["prefetch"] = copy.deepcopy(
+            {key: value for key, value in kwargs.items() if key != "event_emitter"}
+        )
         captured["prefetch_event_emitter"] = kwargs.get("event_emitter")
         return True
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
@@ -20415,11 +22969,19 @@ async def test_pipe_logs_late_parent_checkpoint_lookup_failure_for_soft_prefetch
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
-    monkeypatch.setattr(mod, "_compact_body_with_reusable_checkpoint", compact_body_with_reusable_checkpoint)
+    monkeypatch.setattr(
+        mod,
+        "_compact_body_with_reusable_checkpoint",
+        compact_body_with_reusable_checkpoint,
+    )
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
@@ -20436,7 +22998,12 @@ async def test_pipe_logs_late_parent_checkpoint_lookup_failure_for_soft_prefetch
     }
 
     with caplog.at_level("WARNING", logger=mod.LOG.name):
-        result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        result = await pipe.pipe(
+            body,
+            __request__=pipe_request,
+            __user__=pipe_user,
+            __metadata__=pipe_metadata,
+        )
 
     assert result == {"ok": True}
     assert calls == {"lookup": 2, "prefetch": 0}
@@ -20468,16 +23035,24 @@ async def test_pipe_uses_full_body_estimate_for_request_usage_without_tool_suffi
         return None
 
     async def parent_assistant_message_id(**kwargs):
-        raise AssertionError("route without a shaping hash must not query durable usage anchors")
+        raise AssertionError(
+            "route without a shaping hash must not query durable usage anchors"
+        )
 
     async def estimate_messages_tokens_async(messages, **kwargs):
         if not messages:
             return mod.REQUEST_TOKEN_OVERHEAD
-        raise AssertionError("request-scoped usage must only anchor a safe tool-result suffix")
+        raise AssertionError(
+            "request-scoped usage must only anchor a safe tool-result suffix"
+        )
 
     async def estimate_body_tokens_async(body, **kwargs):
         body_estimates.append(copy.deepcopy(body))
-        return 120 if body["messages"][0] == {"role": "system", "content": "target system"} else 10
+        return (
+            120
+            if body["messages"][0] == {"role": "system", "content": "target system"}
+            else 10
+        )
 
     async def get_or_create_compaction_summary(**kwargs):
         return "full estimate from request usage without tool suffix"
@@ -20489,11 +23064,21 @@ async def test_pipe_uses_full_body_estimate_for_request_usage_without_tool_suffi
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "_get_target_db_model_record", get_target_db_model_record)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "_usage_anchor_parent_assistant_message_id", parent_assistant_message_id)
-    monkeypatch.setattr(mod, "estimate_messages_tokens_async", estimate_messages_tokens_async)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "_usage_anchor_parent_assistant_message_id", parent_assistant_message_id
+    )
+    monkeypatch.setattr(
+        mod, "estimate_messages_tokens_async", estimate_messages_tokens_async
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -20516,13 +23101,24 @@ async def test_pipe_uses_full_body_estimate_for_request_usage_without_tool_suffi
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert len(body_estimates) == 1
-    assert body_estimates[0]["messages"][0] == {"role": "system", "content": "target system"}
-    assert all(message.get("content") != "target system" for message in captured["forward_body"]["messages"])
-    assert "full estimate from request usage without tool suffix" in captured["forward_body"]["messages"][0]["content"]
+    assert body_estimates[0]["messages"][0] == {
+        "role": "system",
+        "content": "target system",
+    }
+    assert all(
+        message.get("content") != "target system"
+        for message in captured["forward_body"]["messages"]
+    )
+    assert (
+        "full estimate from request usage without tool suffix"
+        in captured["forward_body"]["messages"][0]["content"]
+    )
 
 
 @pytest.mark.asyncio
@@ -20544,7 +23140,9 @@ async def test_pipe_ignores_body_message_usage_without_request_or_persisted_usag
     async def estimate_messages_tokens_async(messages, **kwargs):
         if not messages:
             return mod.REQUEST_TOKEN_OVERHEAD
-        raise AssertionError("body.messages usage should not be treated as a normal Open WebUI usage anchor")
+        raise AssertionError(
+            "body.messages usage should not be treated as a normal Open WebUI usage anchor"
+        )
 
     async def estimate_body_tokens_async(body, **kwargs):
         body_estimates.append(copy.deepcopy(body))
@@ -20559,10 +23157,18 @@ async def test_pipe_ignores_body_message_usage_without_request_or_persisted_usag
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "estimate_messages_tokens_async", estimate_messages_tokens_async)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "estimate_messages_tokens_async", estimate_messages_tokens_async
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -20573,16 +23179,25 @@ async def test_pipe_ignores_body_message_usage_without_request_or_persisted_usag
         "stream": True,
         "messages": [
             {"role": "user", "content": "old"},
-            {"role": "assistant", "content": "old answer", "usage": {"total_tokens": 90, "input_tokens": 70, "output_tokens": 20}},
+            {
+                "role": "assistant",
+                "content": "old answer",
+                "usage": {"total_tokens": 90, "input_tokens": 70, "output_tokens": 20},
+            },
             {"role": "user", "content": "active"},
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert len(body_estimates) == 1
-    assert "body estimate because message usage is ignored" in captured["forward_body"]["messages"][0]["content"]
+    assert (
+        "body estimate because message usage is ignored"
+        in captured["forward_body"]["messages"][0]["content"]
+    )
 
 
 @pytest.mark.asyncio
@@ -20606,13 +23221,19 @@ async def test_pipe_does_not_prefetch_from_stable_body_extras_already_counted_by
         return 50
 
     async def estimate_body_extra_tokens_async(*args, **kwargs):
-        raise AssertionError("stable body extras are already counted by the observed usage anchor")
+        raise AssertionError(
+            "stable body extras are already counted by the observed usage anchor"
+        )
 
     async def estimate_body_tokens_async(*args, **kwargs):
-        raise AssertionError("safe usage anchor should avoid full-body token estimation on stable raw shape")
+        raise AssertionError(
+            "safe usage anchor should avoid full-body token estimation on stable raw shape"
+        )
 
     async def get_or_create_compaction_summary(**kwargs):
-        raise AssertionError("stable tool schemas must not force foreground compaction from usage anchoring")
+        raise AssertionError(
+            "stable tool schemas must not force foreground compaction from usage anchoring"
+        )
 
     async def forward_target(**kwargs):
         captured["forward_body"] = copy.deepcopy(kwargs["body"])
@@ -20624,13 +23245,28 @@ async def test_pipe_does_not_prefetch_from_stable_body_extras_already_counted_by
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "estimate_messages_tokens_async", estimate_messages_tokens_async)
-    monkeypatch.setattr(mod, "estimate_body_extra_tokens_async", estimate_body_extra_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "estimate_messages_tokens_async", estimate_messages_tokens_async
+    )
+    monkeypatch.setattr(
+        mod,
+        "estimate_body_extra_tokens_async",
+        estimate_body_extra_tokens_async,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
     _install_durable_usage_anchor_estimate(monkeypatch, 750)
 
     pipe = mod.Pipe()
@@ -20650,13 +23286,17 @@ async def test_pipe_does_not_prefetch_from_stable_body_extras_already_counted_by
                 "type": "function",
                 "function": {
                     "name": "large_tool",
-                    "parameters": {"description": "stable huge tool schema payload" * 1000},
+                    "parameters": {
+                        "description": "stable huge tool schema payload" * 1000
+                    },
                 },
             }
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert captured["forward_body"]["messages"] == body["messages"]
@@ -20684,7 +23324,9 @@ async def test_pipe_compacts_from_usage_anchor_plus_latest_user_delta_without_fu
         return 15
 
     async def estimate_body_tokens_async(*args, **kwargs):
-        raise AssertionError("usage anchor should avoid full-body token estimation on stable raw shape")
+        raise AssertionError(
+            "usage anchor should avoid full-body token estimation on stable raw shape"
+        )
 
     async def get_or_create_compaction_summary(**kwargs):
         return "anchored hard summary"
@@ -20695,10 +23337,18 @@ async def test_pipe_compacts_from_usage_anchor_plus_latest_user_delta_without_fu
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "estimate_messages_tokens_async", estimate_messages_tokens_async)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "estimate_messages_tokens_async", estimate_messages_tokens_async
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
     _install_durable_usage_anchor_estimate(monkeypatch, 105)
 
@@ -20715,7 +23365,9 @@ async def test_pipe_compacts_from_usage_anchor_plus_latest_user_delta_without_fu
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert "anchored hard summary" in captured["forward_body"]["messages"][0]["content"]
@@ -20747,7 +23399,9 @@ async def test_pipe_usage_anchor_ignores_trailing_transient_user_delta(
         raise AssertionError(f"unexpected usage-anchor delta: {messages!r}")
 
     async def estimate_body_tokens_async(*args, **kwargs):
-        raise AssertionError("transient-aware usage anchor should avoid full-body token estimation")
+        raise AssertionError(
+            "transient-aware usage anchor should avoid full-body token estimation"
+        )
 
     async def get_or_create_compaction_summary(**kwargs):
         return "anchored hard summary"
@@ -20758,10 +23412,18 @@ async def test_pipe_usage_anchor_ignores_trailing_transient_user_delta(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "estimate_messages_tokens_async", estimate_messages_tokens_async)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "estimate_messages_tokens_async", estimate_messages_tokens_async
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
     _install_durable_usage_anchor_estimate(monkeypatch, 105)
 
@@ -20780,7 +23442,9 @@ async def test_pipe_usage_anchor_ignores_trailing_transient_user_delta(
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert "anchored hard summary" in captured["forward_body"]["messages"][0]["content"]
@@ -20805,23 +23469,35 @@ async def test_pipe_launches_soft_prefetch_from_usage_anchor_plus_latest_user_de
         return 40
 
     async def estimate_body_tokens_async(*args, **kwargs):
-        raise AssertionError("usage anchor should avoid full-body token estimation on stable raw shape")
+        raise AssertionError(
+            "usage anchor should avoid full-body token estimation on stable raw shape"
+        )
 
     async def forward_target(**kwargs):
         captured["forward_body"] = copy.deepcopy(kwargs["body"])
         return {"ok": True}
 
     def start_soft_prefetch(**kwargs):
-        captured["prefetch"] = copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"})
+        captured["prefetch"] = copy.deepcopy(
+            {key: value for key, value in kwargs.items() if key != "event_emitter"}
+        )
         return True
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "estimate_messages_tokens_async", estimate_messages_tokens_async)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "estimate_messages_tokens_async", estimate_messages_tokens_async
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
     _install_durable_usage_anchor_estimate(monkeypatch, 110)
 
     pipe = mod.Pipe()
@@ -20838,7 +23514,9 @@ async def test_pipe_launches_soft_prefetch_from_usage_anchor_plus_latest_user_de
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert captured["forward_body"]["messages"] == body["messages"]
@@ -20870,7 +23548,9 @@ async def test_pipe_compacts_from_request_anchor_plus_tool_loop_suffix_without_f
         return mod.REQUEST_TOKEN_OVERHEAD if not messages else 50
 
     async def estimate_body_tokens_async(*args, **kwargs):
-        raise AssertionError("tool-loop request usage anchor should avoid full-body token estimation for safe trailing tool results")
+        raise AssertionError(
+            "tool-loop request usage anchor should avoid full-body token estimation for safe trailing tool results"
+        )
 
     async def get_or_create_compaction_summary(**kwargs):
         return "tool loop hard summary"
@@ -20882,10 +23562,18 @@ async def test_pipe_compacts_from_request_anchor_plus_tool_loop_suffix_without_f
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
     monkeypatch.setattr(mod, "_get_target_db_model_record", get_target_db_model_record)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "estimate_messages_tokens_async", estimate_messages_tokens_async)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "estimate_messages_tokens_async", estimate_messages_tokens_async
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
     _install_known_openai_usage_anchor_transport(monkeypatch)
 
@@ -20901,15 +23589,19 @@ async def test_pipe_compacts_from_request_anchor_plus_tool_loop_suffix_without_f
         usage={"total_tokens": 70, "input_tokens": 60, "output_tokens": 10},
         anchor_input=mod.UsageAnchorInput(
             stable_message_count=len(previous_messages),
-                input_fingerprint=mod._compute_usage_anchor_input_fingerprint(
-                    {"model": "target", "messages": previous_messages},
-                    previous_messages,
-                    usage_anchor_shaping_hash=_known_empty_model_shaping_hash(),
-                ),
+            input_fingerprint=mod._compute_usage_anchor_input_fingerprint(
+                {"model": "target", "messages": previous_messages},
+                previous_messages,
+                usage_anchor_shaping_hash=_known_empty_model_shaping_hash(),
+            ),
             volatile_message_tokens=0,
         ),
     )
-    tool_message = {"role": "tool", "tool_call_id": "call-1", "content": "huge tool result"}
+    tool_message = {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "huge tool result",
+    }
     body = {
         "model": wrapper_id,
         "stream": True,
@@ -20918,13 +23610,21 @@ async def test_pipe_compacts_from_request_anchor_plus_tool_loop_suffix_without_f
             {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "big", "arguments": "{}"}}],
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "big", "arguments": "{}"},
+                    }
+                ],
             },
             tool_message,
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert [
@@ -20932,12 +23632,18 @@ async def test_pipe_compacts_from_request_anchor_plus_tool_loop_suffix_without_f
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"id": "call-1", "type": "function", "function": {"name": "big", "arguments": "{}"}}
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "big", "arguments": "{}"},
+                }
             ],
         },
         tool_message,
     ] in estimated_batches
-    assert "tool loop hard summary" in captured["forward_body"]["messages"][0]["content"]
+    assert (
+        "tool loop hard summary" in captured["forward_body"]["messages"][0]["content"]
+    )
 
 
 @pytest.mark.asyncio
@@ -20959,7 +23665,9 @@ async def test_pipe_uses_full_body_estimate_when_visible_usage_suffix_is_not_anc
     async def estimate_messages_tokens_async(messages, **kwargs):
         if not messages:
             return mod.REQUEST_TOKEN_OVERHEAD
-        raise AssertionError("unsafe visible usage suffix must not use usage anchor fallback")
+        raise AssertionError(
+            "unsafe visible usage suffix must not use usage anchor fallback"
+        )
 
     async def estimate_body_tokens_async(body, **kwargs):
         body_estimates.append(copy.deepcopy(body))
@@ -20974,10 +23682,18 @@ async def test_pipe_uses_full_body_estimate_when_visible_usage_suffix_is_not_anc
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "estimate_messages_tokens_async", estimate_messages_tokens_async)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "estimate_messages_tokens_async", estimate_messages_tokens_async
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -20988,18 +23704,27 @@ async def test_pipe_uses_full_body_estimate_when_visible_usage_suffix_is_not_anc
         "stream": True,
         "messages": [
             {"role": "user", "content": "old"},
-            {"role": "assistant", "content": "old answer", "usage": {"total_tokens": 80, "input_tokens": 60, "output_tokens": 20}},
+            {
+                "role": "assistant",
+                "content": "old answer",
+                "usage": {"total_tokens": 80, "input_tokens": 60, "output_tokens": 20},
+            },
             {"role": "user", "content": "middle"},
             {"role": "assistant", "content": "large unmeasured assistant output"},
             {"role": "user", "content": "active"},
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert len(body_estimates) == 1
-    assert "full estimate hard summary" in captured["forward_body"]["messages"][0]["content"]
+    assert (
+        "full estimate hard summary"
+        in captured["forward_body"]["messages"][0]["content"]
+    )
 
 
 @pytest.mark.asyncio
@@ -21025,15 +23750,23 @@ async def test_pipe_launches_soft_prefetch_from_estimate_when_usage_is_missing(
         return {"ok": True}
 
     def start_soft_prefetch(**kwargs):
-        captured["prefetch"] = copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"})
+        captured["prefetch"] = copy.deepcopy(
+            {key: value for key, value in kwargs.items() if key != "event_emitter"}
+        )
         return True
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
@@ -21049,7 +23782,9 @@ async def test_pipe_launches_soft_prefetch_from_estimate_when_usage_is_missing(
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert captured["forward_body"]["messages"] == body["messages"]
@@ -21089,12 +23824,20 @@ async def test_pipe_does_not_launch_soft_prefetch_when_hard_compaction_will_run(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "estimate_messages_tokens", estimate_messages_tokens)
-    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "estimate_body_tokens_async", estimate_body_tokens_async, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.2
@@ -21110,7 +23853,9 @@ async def test_pipe_does_not_launch_soft_prefetch_when_hard_compaction_will_run(
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert result == {"ok": True}
     assert "hard summary" in captured["forward_body"]["messages"][0]["content"]
@@ -21146,7 +23891,13 @@ async def test_pipe_does_not_launch_seed_prefetch_below_soft_when_no_reusable_ch
         assert "target_model_id" not in kwargs
         calls.append(
             {
-                **copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"}),
+                **copy.deepcopy(
+                    {
+                        key: value
+                        for key, value in kwargs.items()
+                        if key != "event_emitter"
+                    }
+                ),
                 "event_emitter": kwargs.get("event_emitter"),
             }
         )
@@ -21154,11 +23905,15 @@ async def test_pipe_does_not_launch_seed_prefetch_below_soft_when_no_reusable_ch
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "estimate_messages_tokens", estimate_messages_tokens)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.5
@@ -21213,7 +23968,9 @@ async def test_pipe_does_not_launch_seed_prefetch_when_soft_prefetch_disabled(
         return 50
 
     async def generate_summary_text(**kwargs):
-        raise AssertionError("disabled soft prefetch must not synchronously generate summaries")
+        raise AssertionError(
+            "disabled soft prefetch must not synchronously generate summaries"
+        )
 
     async def forward_target(**kwargs):
         captured["forward_body"] = copy.deepcopy(kwargs["body"])
@@ -21225,11 +23982,15 @@ async def test_pipe_does_not_launch_seed_prefetch_when_soft_prefetch_disabled(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "estimate_messages_tokens", estimate_messages_tokens)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0
@@ -21331,7 +24092,9 @@ def test_soft_prefetch_task_release_logs_returned_task_exception(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_start_soft_prefetch_passes_selected_source_messages_to_task(monkeypatch, pipe_user):
+async def test_start_soft_prefetch_passes_selected_source_messages_to_task(
+    monkeypatch, pipe_user
+):
     selected_source = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "old answer"},
@@ -21358,8 +24121,12 @@ async def test_start_soft_prefetch_passes_selected_source_messages_to_task(monke
         launched["coro"] = coro
         return True
 
-    monkeypatch.setattr(mod, "_soft_prefetch_source_messages", soft_prefetch_source_messages)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_soft_prefetch_source_messages", soft_prefetch_source_messages
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod, "_launch_soft_prefetch_task", launch_soft_prefetch_task)
 
     assert (
@@ -21405,7 +24172,9 @@ async def test_soft_prefetch_uses_tool_aware_source_prefix(
         captured["source_messages"] = copy.deepcopy(source_messages)
         return "summary"
 
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     messages = [
         {"role": "user", "content": "active request"},
@@ -21422,7 +24191,9 @@ async def test_soft_prefetch_uses_tool_aware_source_prefix(
         },
         {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
     ]
-    prefetch_source = mod._soft_prefetch_source_messages({"model": "target", "messages": messages})
+    prefetch_source = mod._soft_prefetch_source_messages(
+        {"model": "target", "messages": messages}
+    )
     assert prefetch_source == (messages[:3], None)
     source_messages, preserved_system_message = prefetch_source
 
@@ -21465,7 +24236,9 @@ async def test_soft_prefetch_summary_request_preserves_system_but_identity_exclu
     async def noop_initialize(**kwargs):
         return None
 
-    async def generate_chat_completion(request, form_data, user, bypass_filter=False, bypass_system_prompt=False):
+    async def generate_chat_completion(
+        request, form_data, user, bypass_filter=False, bypass_system_prompt=False
+    ):
         captured["messages"] = copy.deepcopy(form_data["messages"])
         return {"choices": [{"message": {"content": "prefetch summary"}}]}
 
@@ -21475,7 +24248,9 @@ async def test_soft_prefetch_summary_request_preserves_system_but_identity_exclu
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: ClaimCheckpointStore(rows))
 
-    prefetch_source = mod._soft_prefetch_source_messages({"model": "target", "messages": messages})
+    prefetch_source = mod._soft_prefetch_source_messages(
+        {"model": "target", "messages": messages}
+    )
     assert prefetch_source == (source_messages, system)
     selected_source_messages, preserved_system_message = prefetch_source
 
@@ -21523,9 +24298,13 @@ async def test_soft_prefetch_skips_checkpoint_when_prefix_has_only_transient_use
     source_messages, preserved_system_message = prefetch_source
 
     async def get_or_create_compaction_summary(**kwargs):
-        raise AssertionError("transient-only prefetch prefixes must not create checkpoints")
+        raise AssertionError(
+            "transient-only prefetch prefixes must not create checkpoints"
+        )
 
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     prefetched = await mod._prefetch_compaction_checkpoint(
         request=pipe_request,
@@ -21547,7 +24326,9 @@ async def test_soft_prefetch_skips_checkpoint_when_prefix_has_only_transient_use
     assert prefetched is False
 
 
-def test_start_soft_prefetch_preserves_uncopyable_metadata_references(monkeypatch, pipe_user):
+def test_start_soft_prefetch_preserves_uncopyable_metadata_references(
+    monkeypatch, pipe_user
+):
     class Uncopyable:
         def __deepcopy__(self, memo):
             raise RuntimeError("cannot copy")
@@ -21606,13 +24387,17 @@ async def test_pipe_launches_completed_turn_soft_prefetch_when_no_parent_prefetc
 
     async def forward_target(**kwargs):
         response = {
-            "usage": {"total_tokens": 150, "prompt_tokens": 100, "completion_tokens": 50},
+            "usage": {
+                "total_tokens": 150,
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+            },
             "choices": [
                 {
                     "message": {"role": "assistant", "content": "answer"},
                     "finish_reason": "stop",
                 }
-            ]
+            ],
         }
         return response
 
@@ -21621,7 +24406,13 @@ async def test_pipe_launches_completed_turn_soft_prefetch_when_no_parent_prefetc
         assert mod._soft_prefetch_source_messages(kwargs["body"])
         calls.append(
             {
-                **copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"}),
+                **copy.deepcopy(
+                    {
+                        key: value
+                        for key, value in kwargs.items()
+                        if key != "event_emitter"
+                    }
+                ),
                 "event_emitter": kwargs.get("event_emitter"),
             }
         )
@@ -21629,9 +24420,13 @@ async def test_pipe_launches_completed_turn_soft_prefetch_when_no_parent_prefetc
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_call_target_completion", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
     _install_candidate_token_estimate(monkeypatch, 150)
 
     pipe = mod.Pipe()
@@ -21702,7 +24497,11 @@ async def test_pipe_completed_turn_prefetch_waits_for_in_flight_parent_prefetch(
 
     async def forward_target(**kwargs):
         response = {
-            "usage": {"total_tokens": 150, "prompt_tokens": 100, "completion_tokens": 50},
+            "usage": {
+                "total_tokens": 150,
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+            },
             "choices": [
                 {
                     "message": {"role": "assistant", "content": "answer"},
@@ -21730,10 +24529,16 @@ async def test_pipe_completed_turn_prefetch_waits_for_in_flight_parent_prefetch(
     monkeypatch.setattr(mod, "_SOFT_PREFETCH_TASKS", set())
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_call_target_completion", forward_target)
-    monkeypatch.setattr(mod, "_soft_prefetch_inflight_task_for_body", in_flight_parent_prefetch)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_soft_prefetch_inflight_task_for_body", in_flight_parent_prefetch
+    )
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
     _install_candidate_token_estimate(monkeypatch, 150)
 
     pipe = mod.Pipe()
@@ -21751,7 +24556,12 @@ async def test_pipe_completed_turn_prefetch_waits_for_in_flight_parent_prefetch(
     }
 
     try:
-        result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        result = await pipe.pipe(
+            body,
+            __request__=pipe_request,
+            __user__=pipe_user,
+            __metadata__=pipe_metadata,
+        )
 
         assert result["choices"][0]["message"]["content"] == "answer"
         await _drain_completed_turn_prefetch_tasks()
@@ -21784,7 +24594,11 @@ async def test_task_completed_turn_prefetch_skips_summary_generation(
 
     async def forward_target(**kwargs):
         return {
-            "usage": {"total_tokens": 150, "prompt_tokens": 100, "completion_tokens": 50},
+            "usage": {
+                "total_tokens": 150,
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+            },
             "choices": [
                 {
                     "message": {"role": "assistant", "content": "task answer"},
@@ -21794,14 +24608,24 @@ async def test_task_completed_turn_prefetch_skips_summary_generation(
         }
 
     def start_soft_prefetch(**kwargs):
-        calls.append({key: copy.deepcopy(value) for key, value in kwargs.items() if key != "event_emitter"})
+        calls.append(
+            {
+                key: copy.deepcopy(value)
+                for key, value in kwargs.items()
+                if key != "event_emitter"
+            }
+        )
         return True
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
@@ -21816,7 +24640,9 @@ async def test_task_completed_turn_prefetch_skips_summary_generation(
     body = {
         "model": wrapper_id,
         "stream": False,
-        "messages": [{"role": "user", "content": "Task:\nold task input\nactive task input"}],
+        "messages": [
+            {"role": "user", "content": "Task:\nold task input\nactive task input"}
+        ],
     }
     metadata = {
         **pipe_metadata,
@@ -21828,7 +24654,9 @@ async def test_task_completed_turn_prefetch_skips_summary_generation(
         },
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata
+    )
     await _drain_completed_turn_prefetch_tasks()
 
     assert result["choices"][0]["message"]["content"] == "task answer"
@@ -21854,23 +24682,39 @@ async def test_streaming_task_completed_turn_prefetch_does_not_register_on_compl
 
     async def rebuild_task_body_from_compacted_history(**kwargs):
         rebuild_calls.append(kwargs)
-        return {"messages": [{"role": "user", "content": "rebuilt completed task prompt"}]}
+        return {
+            "messages": [{"role": "user", "content": "rebuilt completed task prompt"}]
+        }
 
     async def forward_target(**kwargs):
         captured["on_complete"] = kwargs.get("on_complete")
         return {"ok": True}
 
     def start_soft_prefetch(**kwargs):
-        calls.append({key: copy.deepcopy(value) for key, value in kwargs.items() if key != "event_emitter"})
+        calls.append(
+            {
+                key: copy.deepcopy(value)
+                for key, value in kwargs.items()
+                if key != "event_emitter"
+            }
+        )
         return True
 
     monkeypatch.setattr(mod, "_SOFT_PREFETCH_TASKS", set())
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "_rebuild_task_body_from_compacted_history", rebuild_task_body_from_compacted_history)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod,
+        "_rebuild_task_body_from_compacted_history",
+        rebuild_task_body_from_compacted_history,
+    )
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
@@ -21885,7 +24729,9 @@ async def test_streaming_task_completed_turn_prefetch_does_not_register_on_compl
     body = {
         "model": wrapper_id,
         "stream": True,
-        "messages": [{"role": "user", "content": "Task:\nold task input\nactive task input"}],
+        "messages": [
+            {"role": "user", "content": "Task:\nold task input\nactive task input"}
+        ],
     }
     metadata = {
         **pipe_metadata,
@@ -21897,7 +24743,9 @@ async def test_streaming_task_completed_turn_prefetch_does_not_register_on_compl
         },
     }
 
-    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata
+    )
 
     assert captured["on_complete"] is None
     assert mod._SOFT_PREFETCH_TASKS == set()
@@ -21944,9 +24792,13 @@ async def test_pipe_skips_completed_turn_soft_prefetch_for_tool_call_response(
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_call_target_completion", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
     _install_candidate_token_estimate(monkeypatch, 150)
 
     pipe = mod.Pipe()
@@ -21963,7 +24815,9 @@ async def test_pipe_skips_completed_turn_soft_prefetch_for_tool_call_response(
         ],
     }
 
-    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     assert len(calls) == 1
     assert calls[0]["body"]["messages"] == body["messages"]
@@ -22005,16 +24859,26 @@ async def _run_completed_turn_prefetch_usage_case(
         return response
 
     def start_soft_prefetch(**kwargs):
-        calls.append(copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"}))
+        calls.append(
+            copy.deepcopy(
+                {key: value for key, value in kwargs.items() if key != "event_emitter"}
+            )
+        )
         return True
 
-    body_reusable_checkpoint_match = body_reusable_checkpoint_match or reusable_checkpoint_match
+    body_reusable_checkpoint_match = (
+        body_reusable_checkpoint_match or reusable_checkpoint_match
+    )
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_call_target_completion", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
@@ -22031,7 +24895,9 @@ async def _run_completed_turn_prefetch_usage_case(
         ],
     }
 
-    await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
 
     return calls
 
@@ -22067,7 +24933,11 @@ def _completed_turn_registry_case(monkeypatch):
 
     async def forward_target(**kwargs):
         response = {
-            "usage": {"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+            "usage": {
+                "total_tokens": 500,
+                "prompt_tokens": 400,
+                "completion_tokens": 100,
+            },
             "choices": [
                 {
                     "message": {"role": "assistant", "content": "answer"},
@@ -22092,9 +24962,13 @@ def _completed_turn_registry_case(monkeypatch):
     monkeypatch.setattr(mod, "_SOFT_PREFETCH_INFLIGHT_TASKS", {})
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_call_target_completion", forward_target)
-    monkeypatch.setattr(mod, "_prefetch_compaction_checkpoint", prefetch_compaction_checkpoint)
+    monkeypatch.setattr(
+        mod, "_prefetch_compaction_checkpoint", prefetch_compaction_checkpoint
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
@@ -22153,10 +25027,17 @@ async def test_completed_turn_coordinator_owns_completed_body_key_before_parent_
 ):
     pipe, body, child_calls = _completed_turn_registry_case(monkeypatch)
     release_parent = asyncio.Event()
-    parent_task = _install_registry_parent_prefetch((pipe_user, pipe_metadata), body, release_parent)
+    parent_task = _install_registry_parent_prefetch(
+        (pipe_user, pipe_metadata), body, release_parent
+    )
 
     try:
-        result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        result = await pipe.pipe(
+            body,
+            __request__=pipe_request,
+            __user__=pipe_user,
+            __metadata__=pipe_metadata,
+        )
         completed_key = _completed_turn_registry_key(pipe_user, pipe_metadata, body)
         coordinator = await _wait_for_completed_turn_child_task(completed_key)
 
@@ -22183,13 +25064,32 @@ async def test_completed_turn_coordinator_rejects_duplicate_completed_body_attem
     _install_registry_parent_prefetch((pipe_user, pipe_metadata), body, release_parent)
 
     try:
-        await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
-        await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        await pipe.pipe(
+            body,
+            __request__=pipe_request,
+            __user__=pipe_user,
+            __metadata__=pipe_metadata,
+        )
+        await pipe.pipe(
+            body,
+            __request__=pipe_request,
+            __user__=pipe_user,
+            __metadata__=pipe_metadata,
+        )
         await asyncio.sleep(0)
         completed_key = _completed_turn_registry_key(pipe_user, pipe_metadata, body)
 
         assert completed_key in mod._SOFT_PREFETCH_INFLIGHT_KEYS
-        assert len([task for key, task in mod._SOFT_PREFETCH_INFLIGHT_TASKS.items() if key == completed_key]) == 1
+        assert (
+            len(
+                [
+                    task
+                    for key, task in mod._SOFT_PREFETCH_INFLIGHT_TASKS.items()
+                    if key == completed_key
+                ]
+            )
+            == 1
+        )
         assert child_calls == []
 
         release_parent.set()
@@ -22213,13 +25113,22 @@ async def test_completed_turn_coordinator_parent_wait_timeout_starts_no_child(
 ):
     pipe, body, child_calls = _completed_turn_registry_case(monkeypatch)
     release_parent = asyncio.Event()
-    parent_task = _install_registry_parent_prefetch((pipe_user, pipe_metadata), body, release_parent)
+    parent_task = _install_registry_parent_prefetch(
+        (pipe_user, pipe_metadata), body, release_parent
+    )
     monkeypatch.setattr(mod, "CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS", 0)
 
     try:
-        await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        await pipe.pipe(
+            body,
+            __request__=pipe_request,
+            __user__=pipe_user,
+            __metadata__=pipe_metadata,
+        )
         await asyncio.sleep(0)
-        coordinators = [task for task in mod._SOFT_PREFETCH_TASKS if task is not parent_task]
+        coordinators = [
+            task for task in mod._SOFT_PREFETCH_TASKS if task is not parent_task
+        ]
         assert len(coordinators) == 1
 
         await asyncio.wait_for(asyncio.shield(coordinators[0]), timeout=0.1)
@@ -22230,7 +25139,9 @@ async def test_completed_turn_coordinator_parent_wait_timeout_starts_no_child(
         for task in list(mod._SOFT_PREFETCH_TASKS):
             if not task.done():
                 task.cancel()
-        await asyncio.gather(parent_task, *list(mod._SOFT_PREFETCH_TASKS), return_exceptions=True)
+        await asyncio.gather(
+            parent_task, *list(mod._SOFT_PREFETCH_TASKS), return_exceptions=True
+        )
 
 
 @pytest.mark.asyncio
@@ -22242,10 +25153,17 @@ async def test_cancelling_completed_turn_coordinator_while_waiting_starts_no_chi
 ):
     pipe, body, child_calls = _completed_turn_registry_case(monkeypatch)
     release_parent = asyncio.Event()
-    parent_task = _install_registry_parent_prefetch((pipe_user, pipe_metadata), body, release_parent)
+    parent_task = _install_registry_parent_prefetch(
+        (pipe_user, pipe_metadata), body, release_parent
+    )
 
     try:
-        await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        await pipe.pipe(
+            body,
+            __request__=pipe_request,
+            __user__=pipe_user,
+            __metadata__=pipe_metadata,
+        )
         completed_key = _completed_turn_registry_key(pipe_user, pipe_metadata, body)
         coordinator = await _wait_for_completed_turn_child_task(completed_key)
         assert coordinator is not None
@@ -22272,10 +25190,17 @@ async def test_cancelled_parent_prefetch_starts_no_completed_turn_child(
 ):
     pipe, body, child_calls = _completed_turn_registry_case(monkeypatch)
     release_parent = asyncio.Event()
-    parent_task = _install_registry_parent_prefetch((pipe_user, pipe_metadata), body, release_parent)
+    parent_task = _install_registry_parent_prefetch(
+        (pipe_user, pipe_metadata), body, release_parent
+    )
 
     try:
-        await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+        await pipe.pipe(
+            body,
+            __request__=pipe_request,
+            __user__=pipe_user,
+            __metadata__=pipe_metadata,
+        )
         completed_key = _completed_turn_registry_key(pipe_user, pipe_metadata, body)
         coordinator = await _wait_for_completed_turn_child_task(completed_key)
         assert coordinator is not None
@@ -22318,7 +25243,11 @@ async def test_pipe_completed_turn_prefetch_fires_from_response_usage(
         pipe_request,
         pipe_user,
         pipe_metadata,
-        response_usage={"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+        response_usage={
+            "total_tokens": 500,
+            "prompt_tokens": 400,
+            "completion_tokens": 100,
+        },
     )
 
     await _drain_completed_turn_prefetch_tasks()
@@ -22343,7 +25272,11 @@ async def test_pipe_completed_turn_prefetch_requires_core_persisted_message_id(
         pipe_request,
         pipe_user,
         metadata,
-        response_usage={"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+        response_usage={
+            "total_tokens": 500,
+            "prompt_tokens": 400,
+            "completion_tokens": 100,
+        },
     )
 
     await _drain_completed_turn_prefetch_tasks()
@@ -22372,7 +25305,11 @@ async def test_pipe_skips_checkpoints_without_core_persisted_message_id(
     async def forward_target(**kwargs):
         captured["body"] = copy.deepcopy(kwargs["body"])
         return {
-            "usage": {"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+            "usage": {
+                "total_tokens": 500,
+                "prompt_tokens": 400,
+                "completion_tokens": 100,
+            },
             "choices": [
                 {
                     "message": {"role": "assistant", "content": "answer"},
@@ -22388,9 +25325,13 @@ async def test_pipe_skips_checkpoints_without_core_persisted_message_id(
     monkeypatch.setattr(mod, "_SOFT_PREFETCH_TASKS", set())
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
@@ -22407,7 +25348,9 @@ async def test_pipe_skips_checkpoints_without_core_persisted_message_id(
     }
     metadata = {"chat_id": pipe_metadata["chat_id"]}
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=metadata
+    )
     await _drain_completed_turn_prefetch_tasks()
 
     assert result["choices"][0]["message"]["content"] == "answer"
@@ -22426,14 +25369,20 @@ async def test_pipe_completed_turn_prefetch_skips_parent_lookup_without_parent_k
         parent_lookups.append(kwargs)
         return None
 
-    monkeypatch.setattr(mod, "_soft_prefetch_inflight_task_for_body", lookup_parent_task)
+    monkeypatch.setattr(
+        mod, "_soft_prefetch_inflight_task_for_body", lookup_parent_task
+    )
 
     calls = await _run_completed_turn_prefetch_usage_case(
         monkeypatch,
         pipe_request,
         pipe_user,
         pipe_metadata,
-        response_usage={"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+        response_usage={
+            "total_tokens": 500,
+            "prompt_tokens": 400,
+            "completion_tokens": 100,
+        },
         messages=[{"role": "user", "content": "large first turn"}],
     )
 
@@ -22461,7 +25410,11 @@ async def test_pipe_completed_turn_prefetch_background_error_does_not_block_resp
 
     async def forward_target(**kwargs):
         return {
-            "usage": {"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+            "usage": {
+                "total_tokens": 500,
+                "prompt_tokens": 400,
+                "completion_tokens": 100,
+            },
             "choices": [
                 {
                     "message": {"role": "assistant", "content": "answer"},
@@ -22479,9 +25432,13 @@ async def test_pipe_completed_turn_prefetch_background_error_does_not_block_resp
     monkeypatch.setattr(mod, "_SOFT_PREFETCH_TASKS", set())
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match)
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", reusable_checkpoint_match
+    )
     monkeypatch.setattr(mod, "_call_target_completion", forward_target)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
     monkeypatch.setattr(mod.LOG, "exception", log_exception)
 
     pipe = mod.Pipe()
@@ -22498,7 +25455,9 @@ async def test_pipe_completed_turn_prefetch_background_error_does_not_block_resp
         ],
     }
 
-    result = await pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata)
+    result = await pipe.pipe(
+        body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata
+    )
     retained_tasks = list(mod._SOFT_PREFETCH_TASKS)
     if retained_tasks:
         await asyncio.gather(*retained_tasks, return_exceptions=True)
@@ -22544,14 +25503,22 @@ async def test_pipe_completed_turn_prefetch_does_not_lookup_or_estimate_before_r
         return None
 
     async def estimate_checkpoint_applied_body_tokens(**kwargs):
-        raise AssertionError("completed-turn prefetch must not estimate before the response returns")
+        raise AssertionError(
+            "completed-turn prefetch must not estimate before the response returns"
+        )
 
     async def estimate_task_checkpoint_applied_body_tokens(**kwargs):
-        raise AssertionError("completed-turn task prefetch must not estimate before the response returns")
+        raise AssertionError(
+            "completed-turn task prefetch must not estimate before the response returns"
+        )
 
     async def forward_target(**kwargs):
         return {
-            "usage": {"total_tokens": 500, "prompt_tokens": 400, "completion_tokens": 100},
+            "usage": {
+                "total_tokens": 500,
+                "prompt_tokens": 400,
+                "completion_tokens": 100,
+            },
             "choices": [
                 {
                     "message": {"role": "assistant", "content": "answer"},
@@ -22561,7 +25528,11 @@ async def test_pipe_completed_turn_prefetch_does_not_lookup_or_estimate_before_r
         }
 
     def start_soft_prefetch(**kwargs):
-        calls.append(copy.deepcopy({key: value for key, value in kwargs.items() if key != "event_emitter"}))
+        calls.append(
+            copy.deepcopy(
+                {key: value for key, value in kwargs.items() if key != "event_emitter"}
+            )
+        )
         return True
 
     def prepare_completed_turn_prefetch_body(body, assistant_message):
@@ -22572,13 +25543,29 @@ async def test_pipe_completed_turn_prefetch_does_not_lookup_or_estimate_before_r
     monkeypatch.setattr(mod, "_SOFT_PREFETCH_TASKS", set())
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
-    monkeypatch.setattr(mod, "_estimate_task_checkpoint_applied_body_tokens", estimate_task_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(
+        mod, "_resolve_core_chat_model_route", resolve_core_chat_model_route
+    )
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod,
+        "_estimate_checkpoint_applied_body_tokens",
+        estimate_checkpoint_applied_body_tokens,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_estimate_task_checkpoint_applied_body_tokens",
+        estimate_task_checkpoint_applied_body_tokens,
+    )
     monkeypatch.setattr(mod, "_call_target_completion", forward_target)
-    monkeypatch.setattr(mod, "_completed_turn_prefetch_body", prepare_completed_turn_prefetch_body)
-    monkeypatch.setattr(mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False)
+    monkeypatch.setattr(
+        mod, "_completed_turn_prefetch_body", prepare_completed_turn_prefetch_body
+    )
+    monkeypatch.setattr(
+        mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
+    )
 
     pipe = mod.Pipe()
     pipe.valves.soft_trigger_ratio = 0.1
@@ -22594,7 +25581,14 @@ async def test_pipe_completed_turn_prefetch_does_not_lookup_or_estimate_before_r
         ],
     }
 
-    pipe_task = asyncio.create_task(pipe.pipe(body, __request__=pipe_request, __user__=pipe_user, __metadata__=pipe_metadata))
+    pipe_task = asyncio.create_task(
+        pipe.pipe(
+            body,
+            __request__=pipe_request,
+            __user__=pipe_user,
+            __metadata__=pipe_metadata,
+        )
+    )
     try:
         result = await asyncio.wait_for(pipe_task, timeout=0.1)
         assert not lookup_started.is_set()
@@ -22640,12 +25634,26 @@ async def test_soft_prefetch_worker_skips_exact_reusable_checkpoint(
         )
 
     async def get_or_create_compaction_summary(**kwargs):
-        raise AssertionError("exact reusable checkpoint must skip background summary generation")
+        raise AssertionError(
+            "exact reusable checkpoint must skip background summary generation"
+        )
 
-    monkeypatch.setattr(mod, "_build_prefix_file_fingerprint_resolver", build_prefix_file_fingerprint_resolver)
-    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", lookup_pending_checkpoint_for_source_prefix)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod,
+        "_build_prefix_file_fingerprint_resolver",
+        build_prefix_file_fingerprint_resolver,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        lookup_pending_checkpoint_for_source_prefix,
+    )
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     prefetched = await mod._prefetch_compaction_checkpoint(
         request=pipe_request,
@@ -22653,7 +25661,10 @@ async def test_soft_prefetch_worker_skips_exact_reusable_checkpoint(
         user_id=pipe_user["id"],
         chat_id=pipe_metadata["chat_id"],
         metadata=pipe_metadata,
-        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        body={
+            "model": "target",
+            "messages": [*source_messages, {"role": "user", "content": "active"}],
+        },
         pipe_function_id="auto_compact",
         summary_model_id="target",
         source_messages=source_messages,
@@ -22698,16 +25709,34 @@ async def test_soft_prefetch_worker_logs_and_skips_when_parent_applied_estimate_
         return None
 
     async def get_or_create_compaction_summary(**kwargs):
-        raise AssertionError("soft prefetch must not generate without a checkpoint-applied threshold estimate")
+        raise AssertionError(
+            "soft prefetch must not generate without a checkpoint-applied threshold estimate"
+        )
 
     def log_error(message, *args, **kwargs):
         error_logs.append(message % args)
 
-    monkeypatch.setattr(mod, "_build_prefix_file_fingerprint_resolver", build_prefix_file_fingerprint_resolver)
-    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", lookup_pending_checkpoint_for_source_prefix)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod,
+        "_build_prefix_file_fingerprint_resolver",
+        build_prefix_file_fingerprint_resolver,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        lookup_pending_checkpoint_for_source_prefix,
+    )
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod,
+        "_estimate_checkpoint_applied_body_tokens",
+        estimate_checkpoint_applied_body_tokens,
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
     monkeypatch.setattr(mod.LOG, "error", log_error)
 
     prefetched = await mod._prefetch_compaction_checkpoint(
@@ -22716,7 +25745,10 @@ async def test_soft_prefetch_worker_logs_and_skips_when_parent_applied_estimate_
         user_id=pipe_user["id"],
         chat_id=pipe_metadata["chat_id"],
         metadata=pipe_metadata,
-        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        body={
+            "model": "target",
+            "messages": [*source_messages, {"role": "user", "content": "active"}],
+        },
         pipe_function_id="auto_compact",
         summary_model_id="target",
         source_messages=source_messages,
@@ -22767,13 +25799,31 @@ async def test_soft_prefetch_worker_skips_parent_below_soft(
         return 40
 
     async def get_or_create_compaction_summary(**kwargs):
-        raise AssertionError("below-soft parent-applied estimate must skip background summary generation")
+        raise AssertionError(
+            "below-soft parent-applied estimate must skip background summary generation"
+        )
 
-    monkeypatch.setattr(mod, "_build_prefix_file_fingerprint_resolver", build_prefix_file_fingerprint_resolver)
-    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", lookup_pending_checkpoint_for_source_prefix)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod,
+        "_build_prefix_file_fingerprint_resolver",
+        build_prefix_file_fingerprint_resolver,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        lookup_pending_checkpoint_for_source_prefix,
+    )
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod,
+        "_estimate_checkpoint_applied_body_tokens",
+        estimate_checkpoint_applied_body_tokens,
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     prefetched = await mod._prefetch_compaction_checkpoint(
         request=pipe_request,
@@ -22781,7 +25831,10 @@ async def test_soft_prefetch_worker_skips_parent_below_soft(
         user_id=pipe_user["id"],
         chat_id=pipe_metadata["chat_id"],
         metadata=pipe_metadata,
-        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        body={
+            "model": "target",
+            "messages": [*source_messages, {"role": "user", "content": "active"}],
+        },
         pipe_function_id="auto_compact",
         summary_model_id="target",
         source_messages=source_messages,
@@ -22837,11 +25890,27 @@ async def test_soft_prefetch_worker_proceeds_when_parent_applied_estimate_above_
         captured["source_messages"] = copy.deepcopy(kwargs["source_messages"])
         return "summary"
 
-    monkeypatch.setattr(mod, "_build_prefix_file_fingerprint_resolver", build_prefix_file_fingerprint_resolver)
-    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", lookup_pending_checkpoint_for_source_prefix)
-    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
-    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary)
+    monkeypatch.setattr(
+        mod,
+        "_build_prefix_file_fingerprint_resolver",
+        build_prefix_file_fingerprint_resolver,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        lookup_pending_checkpoint_for_source_prefix,
+    )
+    monkeypatch.setattr(
+        mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match
+    )
+    monkeypatch.setattr(
+        mod,
+        "_estimate_checkpoint_applied_body_tokens",
+        estimate_checkpoint_applied_body_tokens,
+    )
+    monkeypatch.setattr(
+        mod, "_get_or_create_compaction_summary", get_or_create_compaction_summary
+    )
 
     prefetched = await mod._prefetch_compaction_checkpoint(
         request=pipe_request,
@@ -22849,7 +25918,10 @@ async def test_soft_prefetch_worker_proceeds_when_parent_applied_estimate_above_
         user_id=pipe_user["id"],
         chat_id=pipe_metadata["chat_id"],
         metadata=pipe_metadata,
-        body={"model": "target", "messages": [*source_messages, {"role": "user", "content": "active"}]},
+        body={
+            "model": "target",
+            "messages": [*source_messages, {"role": "user", "content": "active"}],
+        },
         pipe_function_id="auto_compact",
         summary_model_id="target",
         source_messages=source_messages,
@@ -22875,7 +25947,10 @@ async def test_pipe_completed_turn_prefetch_still_requires_usage_even_when_check
             kind="exact",
             source_message_count=len(body["messages"]),
             source_kind="message",
-            checkpoint={"source_message_count": len(body["messages"]), "source_hash": "completed-body"},
+            checkpoint={
+                "source_message_count": len(body["messages"]),
+                "source_hash": "completed-body",
+            },
         )
 
     calls = await _run_completed_turn_prefetch_usage_case(
@@ -23006,12 +26081,15 @@ async def test_streaming_completion_observer_skips_tool_call_completion():
 
     assert emitted == chunks
     assert observed == []
-    assert mod.get_request_scoped_usage(
-        request=request,
-        chat_id="chat-1",
-        message_id="message-1",
-        wrapper_model_id="auto_compact.target",
-    )["total_tokens"] == 150
+    assert (
+        mod.get_request_scoped_usage(
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )["total_tokens"]
+        == 150
+    )
     assert mod.get_request_scoped_usage_anchor(
         request=request,
         chat_id="chat-1",
@@ -23060,12 +26138,15 @@ async def test_streaming_completion_observer_closes_inner_iterator_on_early_clos
 
     assert closed is True
     assert observed == []
-    assert mod.get_request_scoped_usage(
-        request=request,
-        chat_id="chat-1",
-        message_id="message-1",
-        wrapper_model_id="auto_compact.target",
-    ) is None
+    assert (
+        mod.get_request_scoped_usage(
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -23107,7 +26188,9 @@ async def test_streaming_completion_observer_close_failure_does_not_mask_stream_
 
 def _teardown_summary_model_cache():
     mod._LATEST_MODELS_CACHE.clear()
-    latest_provider_states = getattr(mod, "_LATEST_PROVIDER_MODEL_CACHE_ENABLED_STATES", None)
+    latest_provider_states = getattr(
+        mod, "_LATEST_PROVIDER_MODEL_CACHE_ENABLED_STATES", None
+    )
     if latest_provider_states is not None:
         latest_provider_states.clear()
     if hasattr(mod, "_LATEST_PROVIDER_MODEL_CACHE_STATE_ID"):
@@ -23189,18 +26272,38 @@ async def test_get_summary_model_options_keeps_config_disabled_provider_cache_hi
 
     state = SimpleNamespace(
         MODELS={
-            "stale-openai": {"id": "stale-openai", "name": "Stale OpenAI", "openai": {}},
-            "stale-ollama": {"id": "stale-ollama", "name": "Stale Ollama", "ollama": {}},
+            "stale-openai": {
+                "id": "stale-openai",
+                "name": "Stale OpenAI",
+                "openai": {},
+            },
+            "stale-ollama": {
+                "id": "stale-ollama",
+                "name": "Stale Ollama",
+                "ollama": {},
+            },
         },
         BASE_MODELS=[],
-        OPENAI_MODELS={"direct-openai": {"id": "direct-openai", "name": "Direct OpenAI", "openai": {}}},
-        OLLAMA_MODELS={"direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}},
+        OPENAI_MODELS={
+            "direct-openai": {
+                "id": "direct-openai",
+                "name": "Direct OpenAI",
+                "openai": {},
+            }
+        },
+        OLLAMA_MODELS={
+            "direct-ollama": {"model": "direct-ollama", "name": "Direct Ollama"}
+        },
         config=SimpleNamespace(),
     )
     config_module = types.ModuleType("open_webui.models.config")
     config_module.Config = FakeConfig
     monkeypatch.setitem(sys.modules, "open_webui.models.config", config_module)
-    monkeypatch.setitem(sys.modules, "open_webui.main", types.SimpleNamespace(app=types.SimpleNamespace(state=state)))
+    monkeypatch.setitem(
+        sys.modules,
+        "open_webui.main",
+        types.SimpleNamespace(app=types.SimpleNamespace(state=state)),
+    )
     monkeypatch.setattr(mod, "sync_wrapper_model_records", sync_wrapper_model_records)
 
     await mod.Pipe().pipes()
@@ -23245,7 +26348,9 @@ def test_update_latest_models_cache_ignores_empty():
     _teardown_summary_model_cache()
 
 
-def test_get_summary_model_options_excludes_wrappers_for_non_default_function_id(monkeypatch):
+def test_get_summary_model_options_excludes_wrappers_for_non_default_function_id(
+    monkeypatch,
+):
     """When loaded as function_<custom_id>, wrapper models for that id must be excluded."""
     _teardown_summary_model_cache()
     models = {
@@ -23260,8 +26365,14 @@ def test_get_summary_model_options_excludes_wrappers_for_non_default_function_id
         },
     }
     mod.update_latest_models_cache(list(models.values()))
-    monkeypatch.setattr(mod, "_iter_cache_models_from_state", lambda state: list(models.values()))
-    monkeypatch.setitem(sys.modules, "open_webui.main", types.SimpleNamespace(app=types.SimpleNamespace(state=object())))
+    monkeypatch.setattr(
+        mod, "_iter_cache_models_from_state", lambda state: list(models.values())
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "open_webui.main",
+        types.SimpleNamespace(app=types.SimpleNamespace(state=object())),
+    )
 
     monkeypatch.setattr(mod.Pipe.Valves, "__module__", "function_custom_pipe")
     options = mod.Pipe.Valves.get_summary_model_options()
@@ -23273,7 +26384,9 @@ def test_get_summary_model_options_excludes_wrappers_for_non_default_function_id
     _teardown_summary_model_cache()
 
 
-def test_refresh_latest_models_cache_from_app_state_replaces_stale_populated_cache(monkeypatch):
+def test_refresh_latest_models_cache_from_app_state_replaces_stale_populated_cache(
+    monkeypatch,
+):
     """Schema-time refresh should repair a stale non-empty pipes() snapshot."""
     _teardown_summary_model_cache()
     mod.update_latest_models_cache([{"id": "base-only", "name": "Base Only"}])
@@ -23288,7 +26401,11 @@ def test_refresh_latest_models_cache_from_app_state_replaces_stale_populated_cac
         return fake_models
 
     monkeypatch.setattr(mod, "_iter_cache_models_from_state", _fake_iter)
-    monkeypatch.setitem(sys.modules, "open_webui.main", types.SimpleNamespace(app=types.SimpleNamespace(state=object())))
+    monkeypatch.setitem(
+        sys.modules,
+        "open_webui.main",
+        types.SimpleNamespace(app=types.SimpleNamespace(state=object())),
+    )
 
     mod.refresh_latest_models_cache_from_app_state()
     assert set(mod._LATEST_MODELS_CACHE.keys()) == {"custom-preset", "base-only"}
@@ -23296,12 +26413,18 @@ def test_refresh_latest_models_cache_from_app_state_replaces_stale_populated_cac
     _teardown_summary_model_cache()
 
 
-def test_refresh_latest_models_cache_from_app_state_keeps_existing_on_empty_state(monkeypatch):
+def test_refresh_latest_models_cache_from_app_state_keeps_existing_on_empty_state(
+    monkeypatch,
+):
     _teardown_summary_model_cache()
     mod.update_latest_models_cache([{"id": "existing", "name": "Existing"}])
 
     monkeypatch.setattr(mod, "_iter_cache_models_from_state", lambda state: [])
-    monkeypatch.setitem(sys.modules, "open_webui.main", types.SimpleNamespace(app=types.SimpleNamespace(state=object())))
+    monkeypatch.setitem(
+        sys.modules,
+        "open_webui.main",
+        types.SimpleNamespace(app=types.SimpleNamespace(state=object())),
+    )
 
     mod.refresh_latest_models_cache_from_app_state()
     assert set(mod._LATEST_MODELS_CACHE.keys()) == {"existing"}
@@ -23315,7 +26438,11 @@ def test_refresh_latest_models_cache_from_app_state_silent_on_failure(monkeypatc
         raise ImportError("no app")
 
     monkeypatch.setattr(mod, "_iter_cache_models_from_state", _raise_import_error)
-    monkeypatch.setitem(sys.modules, "open_webui.main", types.SimpleNamespace(app=types.SimpleNamespace(state=object())))
+    monkeypatch.setitem(
+        sys.modules,
+        "open_webui.main",
+        types.SimpleNamespace(app=types.SimpleNamespace(state=object())),
+    )
 
     # Should not raise
     mod.refresh_latest_models_cache_from_app_state()
@@ -23331,7 +26458,9 @@ def test_refresh_latest_models_cache_from_app_state_silent_on_failure(monkeypatc
         b'data: {"type": "response.failed", "response": {"error": {"code": "server_error", "message": "boom"}}}\n\n',
     ],
 )
-async def test_streaming_completion_observer_skips_error_terminated_completion(error_chunk):
+async def test_streaming_completion_observer_skips_error_terminated_completion(
+    error_chunk,
+):
     observed = []
     request = SimpleNamespace(state=SimpleNamespace())
     chunks = [
@@ -23356,9 +26485,5165 @@ async def test_streaming_completion_observer_skips_error_terminated_completion(e
 
     assert emitted == chunks
     assert observed == []
-    assert mod.get_request_scoped_usage(
-        request=request,
+    assert (
+        mod.get_request_scoped_usage(
+            request=request,
+            chat_id="chat-1",
+            message_id="message-1",
+            wrapper_model_id="auto_compact.target",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_reuse_survives_mode_flip(
+    monkeypatch,
+    pipe_user,
+):
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    raw_branch = [*source_messages, {"role": "user", "content": "active"}]
+    source = mod._build_canonical_history_source_sync(
+        tuple(raw_branch),
+        len(source_messages),
+        None,
+    )
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
         chat_id="chat-1",
-        message_id="message-1",
-        wrapper_model_id="auto_compact.target",
-    ) is None
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_summary_source_hash(source_messages),
+        source_message_count=len(source_messages),
+        summary_text="stable summary",
+        summary_meta={
+            "history_ref": {
+                "format": "canonical-history-jsonl-v1",
+                "raw_source_hash": source.raw_source_hash,
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    forwarded = []
+
+    class ExistingCheckpointStore(ClaimCheckpointStore):
+        async def claim_pending(self, row):
+            raise AssertionError("mode transitions must reuse the existing checkpoint")
+
+    store = ExistingCheckpointStore([checkpoint])
+
+    class FakeChats:
+        @staticmethod
+        async def is_chat_owner(chat_id, user_id):
+            assert (chat_id, user_id) == ("chat-1", "user-1")
+            return True
+
+    chats_module = types.ModuleType("open_webui.models.chats")
+    chats_module.Chats = FakeChats
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
+
+    async def validate_target_access(**_kwargs):
+        return None
+
+    async def model_dict_from_request(_request):
+        return {
+            "target": {
+                "id": "target",
+                "name": "Target",
+                "info": {"meta": {"capabilities": {"function_calling": True}}},
+            }
+        }
+
+    async def noop_initialize(**_kwargs):
+        return None
+
+    async def generate_summary_text(**_kwargs):
+        raise AssertionError("mode transitions must not regenerate the checkpoint")
+
+    async def load_authorized_raw_chat_branch(**_kwargs):
+        return copy.deepcopy(raw_branch)
+
+    async def forward_target(**kwargs):
+        forwarded.append(copy.deepcopy(kwargs["body"]))
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(
+        mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch
+    )
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+    _install_candidate_token_estimate(monkeypatch, 10)
+
+    pipe = mod.Pipe()
+    pipe.valves.ref_exec_enabled = True
+    pipe.valves.trigger_input_tokens = 100_000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+
+    async def run(active, *, valve_enabled=True):
+        pipe.valves.ref_exec_enabled = valve_enabled
+        registry = {"existing": {"spec": {"name": "existing"}}} if active else {}
+        metadata = {
+            "chat_id": "chat-1",
+            "message_id": "message-1",
+            "user_message_id": "message-1",
+            "session_id": "session-1",
+        }
+        body = {
+            "model": wrapper_id,
+            "stream": True,
+            "messages": copy.deepcopy(raw_branch),
+        }
+        if active:
+            metadata.update(
+                {
+                    "params": {"function_calling": "native"},
+                    "tools": registry,
+                }
+            )
+            body["tools"] = [{"type": "function", "function": {"name": "existing"}}]
+        request = SimpleNamespace(
+            state=SimpleNamespace(),
+            app=SimpleNamespace(state=SimpleNamespace(MODELS={})),
+        )
+        result = await pipe.pipe(
+            body,
+            __request__=request,
+            __user__=pipe_user,
+            __metadata__=metadata,
+            __tools__=registry,
+        )
+        return result, request, registry
+
+    first_result, _, _ = await run(True)
+    checkpoint_after_active = copy.deepcopy(store.rows)
+    inactive_result, inactive_request, inactive_registry = await run(False)
+    checkpoint_after_inactive = copy.deepcopy(store.rows)
+    valve_off_result, valve_off_request, valve_off_registry = await run(
+        False,
+        valve_enabled=False,
+    )
+    checkpoint_after_valve_off = copy.deepcopy(store.rows)
+    reactivated_result, _, _ = await run(True)
+    checkpoint_after_reactivated = copy.deepcopy(store.rows)
+
+    first_active, inactive, valve_off, reactivated = forwarded
+    expected_ref = f"history:{checkpoint['id']}"
+    assert (
+        first_result
+        == inactive_result
+        == valve_off_result
+        == reactivated_result
+        == {"ok": True}
+    )
+    assert inactive == valve_off
+    assert inactive_registry == valve_off_registry == {}
+    assert (
+        getattr(inactive_request.state, mod.REQUEST_STATE_REF_STORE_KEY, None) is None
+    )
+    assert (
+        getattr(valve_off_request.state, mod.REQUEST_STATE_REF_STORE_KEY, None) is None
+    )
+    assert (
+        checkpoint_after_active
+        == checkpoint_after_inactive
+        == checkpoint_after_valve_off
+        == checkpoint_after_reactivated
+    )
+    assert len(store.rows) == 1
+    assert store.rows[0]["id"] == checkpoint["id"]
+    assert store.rows[0]["profile_hash"] == mod.compute_profile_hash()
+
+    assert first_active["messages"] == reactivated["messages"]
+    assert inactive["messages"] == valve_off["messages"]
+    for inactive_body in (inactive, valve_off):
+        assert "auto_compact_ref_manifests" not in inactive_body.get("metadata", {})
+        assert all(
+            tool["function"]["name"] != mod.REF_EXEC_TOOL_NAME
+            for tool in inactive_body.get("tools", [])
+        )
+    for active_body in (first_active, reactivated):
+        assert active_body["metadata"]["auto_compact_ref_manifests"] == [
+            {
+                "ref": expected_ref,
+                "sha256": source.raw_source_hash,
+            }
+        ]
+        assert any(
+            tool["function"]["name"] == mod.REF_EXEC_TOOL_NAME
+            for tool in active_body["tools"]
+        )
+        assert set(active_body["messages"][0]) == {"role", "content"}
+        assert (
+            active_body["messages"][0]["content"].count(
+                '<auto_compact_ref_manifests version="1">'
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_history_ref_cas_enrichment_preserves_single_lineage(
+    monkeypatch, tmp_path
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "stable-image-hash"},
+    }
+    parent_messages = [{"role": "user", "content": "before image"}]
+    messages = [
+        *parent_messages,
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,abc"},
+                },
+            ],
+        },
+    ]
+    db_chain = [
+        copy.deepcopy(parent_messages[0]),
+        {"role": "user", "content": "describe", "files": [image]},
+    ]
+    parent_source = mod._build_canonical_history_source_sync(
+        tuple(messages),
+        len(parent_messages),
+        None,
+    )
+    parent_checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_summary_source_hash(parent_messages),
+        source_message_count=len(parent_messages),
+        summary_text="valid ancestor summary",
+        summary_meta={
+            "history_ref": {
+                "format": mod.HISTORY_REF_FORMAT,
+                "raw_source_hash": parent_source.raw_source_hash,
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_summary_source_hash(
+            messages,
+            file_backed_image_db_chain=db_chain,
+        ),
+        source_message_count=len(messages),
+        summary_text="stored summary",
+        summary_meta={"has_multimodal": True},
+        parent_checkpoint_id=parent_checkpoint["id"],
+    )
+
+    async def load_authorized_raw_chat_branch(**_kwargs):
+        return copy.deepcopy(messages)
+
+    file_identity_revalidations = 0
+
+    async def load_chat_message_chain(_request, chat_id, current_message_id):
+        nonlocal file_identity_revalidations
+        assert (chat_id, current_message_id) == ("chat-1", "message-1")
+        file_identity_revalidations += 1
+        return copy.deepcopy(db_chain)
+
+    monkeypatch.setattr(
+        mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch
+    )
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    completed_revalidations = 0
+    resolve_history_ref_catalog_entry = mod.resolve_history_ref_catalog_entry
+
+    async def track_completed_revalidation(*args, **kwargs):
+        nonlocal completed_revalidations
+        result = await resolve_history_ref_catalog_entry(*args, **kwargs)
+        completed_revalidations += 1
+        return result
+
+    monkeypatch.setattr(
+        mod,
+        "resolve_history_ref_catalog_entry",
+        track_completed_revalidation,
+    )
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path}/history-ref-cas.db",
+        poolclass=NullPool,
+        connect_args={"timeout": 30},
+    )
+    monkeypatch.setattr(mod, "_CHECKPOINT_SCHEMA_READY", False)
+    await mod.ensure_checkpoint_table_initialized(async_engine=engine)
+    sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False)
+
+    class EngineCheckpointStore(mod.CheckpointStore):
+        async def _context(self):
+            return sessionmaker()
+
+    store = EngineCheckpointStore()
+    await store.upsert_ready(parent_checkpoint)
+    await store.upsert_ready(checkpoint)
+    request = SimpleNamespace(state=SimpleNamespace())
+    metadata = {"chat_id": "chat-1", "user_message_id": "message-1"}
+
+    try:
+        enriched = await asyncio.gather(
+            mod.enrich_checkpoint_history_ref(
+                store=EngineCheckpointStore(),
+                checkpoint=copy.deepcopy(checkpoint),
+                request=request,
+                metadata=metadata,
+            ),
+            mod.enrich_checkpoint_history_ref(
+                store=EngineCheckpointStore(),
+                checkpoint=copy.deepcopy(checkpoint),
+                request=request,
+                metadata=metadata,
+            ),
+        )
+        stored = await store.lookup_ready_by_id(
+            checkpoint["id"],
+            namespace=checkpoint["namespace"],
+            user_id=checkpoint["user_id"],
+            chat_id=checkpoint["chat_id"],
+            pipe_function_id=checkpoint["pipe_function_id"],
+            profile_hash=checkpoint["profile_hash"],
+        )
+        valid_ancestor = await mod.enrich_checkpoint_history_ref(
+            store=EngineCheckpointStore(),
+            checkpoint=copy.deepcopy(parent_checkpoint),
+            request=request,
+            metadata=metadata,
+        )
+        await store.upsert_ready(checkpoint)
+        revalidations_before_conflict = completed_revalidations
+        conflicting_history_ref = copy.deepcopy(
+            parent_checkpoint["summary_meta"]["history_ref"]
+        )
+
+        class ConflictingWinnerStore(EngineCheckpointStore):
+            async def compare_and_swap_history_ref(
+                self,
+                checkpoint_id,
+                *,
+                expected_summary_meta,
+                history_ref,
+            ):
+                assert completed_revalidations == revalidations_before_conflict + 1
+                assert history_ref != conflicting_history_ref
+                assert await super().compare_and_swap_history_ref(
+                    checkpoint_id,
+                    expected_summary_meta=expected_summary_meta,
+                    history_ref=conflicting_history_ref,
+                )
+                return await super().compare_and_swap_history_ref(
+                    checkpoint_id,
+                    expected_summary_meta=expected_summary_meta,
+                    history_ref=history_ref,
+                )
+
+        conflicting = await mod.enrich_checkpoint_history_ref(
+            store=ConflictingWinnerStore(),
+            checkpoint=copy.deepcopy(checkpoint),
+            request=request,
+            metadata=metadata,
+        )
+        conflicting_stored = await store.lookup_ready_by_id(
+            checkpoint["id"],
+            namespace=checkpoint["namespace"],
+            user_id=checkpoint["user_id"],
+            chat_id=checkpoint["chat_id"],
+            pipe_function_id=checkpoint["pipe_function_id"],
+            profile_hash=checkpoint["profile_hash"],
+        )
+    finally:
+        await engine.dispose()
+
+    assert all(result is not None for result in enriched)
+    assert stored is not None
+    assert checkpoint["source_hash"] != mod.compute_summary_source_hash(messages)
+    assert stored["summary_text"] == "stored summary"
+    assert set(stored["summary_meta"]) == {"has_multimodal", "history_ref"}
+    assert {result["id"] for result in enriched} == {checkpoint["id"]}
+    assert {
+        result["summary_meta"]["history_ref"]["raw_source_hash"] for result in enriched
+    } == {stored["summary_meta"]["history_ref"]["raw_source_hash"]}
+    assert valid_ancestor is not None
+    assert valid_ancestor["id"] == parent_checkpoint["id"]
+    assert file_identity_revalidations >= 1
+    assert conflicting is None
+    assert conflicting_stored is not None
+    assert conflicting_stored["id"] == checkpoint["id"]
+    assert conflicting_stored["parent_checkpoint_id"] == parent_checkpoint["id"]
+    assert conflicting_stored["summary_text"] == "stored summary"
+    assert conflicting_stored["summary_meta"] == {
+        "has_multimodal": True,
+        "history_ref": conflicting_history_ref,
+    }
+
+
+class _Task6Encoder:
+    def encode(self, _text, **_kwargs):
+        return list(range(1_000))
+
+
+def _task6_projection_surface():
+    surface = getattr(mod, "apply_ref_projection_surfaces", None)
+    assert callable(surface), "Task 6 shared projection surface is not implemented"
+    return surface
+
+
+def _task6_native_round(text, *, call_id="call-1", tool_name="lookup"):
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call_id, "content": text},
+    ]
+
+
+async def _task6_plan(messages):
+    return await mod.project_native_tool_texts(
+        messages,
+        threshold_tokens=1_000,
+        encoder=_Task6Encoder(),
+    )
+
+
+def _task6_ref_schema(body):
+    return next(
+        tool
+        for tool in body.get("tools", [])
+        if tool["function"]["name"] == mod.REF_EXEC_TOOL_NAME
+    )
+
+
+def _task6_render_fingerprint(
+    body,
+    *,
+    mode="active",
+    threshold=1_000,
+    encoding_state="cl100k_base:ready",
+    reader_contract="ref-reader-v1",
+    checkpoint=None,
+    transient_projection=(),
+):
+    messages = body["messages"]
+    metadata = body.get("metadata", {})
+    checkpoint_projection = None
+    if checkpoint is not None:
+        checkpoint_projection = {
+            key: copy.deepcopy(checkpoint.get(key))
+            for key in (
+                "id",
+                "profile_hash",
+                "source_hash",
+                "source_message_count",
+                "summary_text",
+                "summary_meta",
+                "parent_checkpoint_id",
+            )
+        }
+    payload = {
+        "mode": mode,
+        "threshold": threshold,
+        "encoding_state": encoding_state,
+        "reader_contract": reader_contract,
+        "checkpoint": checkpoint_projection,
+        "rendered_checkpoint": [
+            copy.deepcopy(message)
+            for message in messages
+            if mod._is_rendered_summary_context_message(message)
+        ],
+        "systems": [
+            copy.deepcopy(message)
+            for message in messages
+            if message.get("role") == "system"
+        ],
+        "transients": copy.deepcopy(transient_projection),
+        "file_context": {
+            "files": copy.deepcopy(body.get("files")),
+            "metadata_files": copy.deepcopy(metadata.get("files")),
+            "sources": copy.deepcopy(metadata.get("sources")),
+        },
+        "route_model": body.get("model"),
+        "tool_schema": {
+            "tools": copy.deepcopy(body.get("tools")),
+            "functions": copy.deepcopy(body.get("functions")),
+        },
+        "controls": {
+            key: copy.deepcopy(value)
+            for key, value in body.items()
+            if key not in {"model", "messages", "metadata", "tools", "functions"}
+        },
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _task6_cache_projection(fingerprint, messages):
+    def frame(payload):
+        return len(payload).to_bytes(8, "big") + payload
+
+    encoded_messages = (
+        json.dumps(
+            message,
+            ensure_ascii=False,
+            sort_keys=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+        for message in messages
+    )
+    return (
+        b"auto-compact-cache-prefix-v1\0"
+        + frame(fingerprint.encode("ascii"))
+        + b"".join(frame(message) for message in encoded_messages)
+    )
+
+
+def _task6_install_summary_capture(monkeypatch, responses):
+    captured = []
+
+    async def prepare_file_context(**_kwargs):
+        return None
+
+    async def resolve_route(*_args, **_kwargs):
+        return mod.CoreChatModelRoute(model_id="target")
+
+    async def resolve_arena_route(**kwargs):
+        return kwargs["route"], None
+
+    async def model_dict_from_request(_request):
+        return {"target": {"id": "target", "name": "Target"}}
+
+    async def ensure_model(*_args, **_kwargs):
+        return None
+
+    async def generate_chat_completion(request, form_data, **_kwargs):
+        captured.append((request, copy.deepcopy(form_data)))
+        return copy.deepcopy(responses.pop(0))
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+    monkeypatch.setattr(mod, "_prepare_summary_file_context", prepare_file_context)
+    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_route)
+    monkeypatch.setattr(
+        mod, "_resolve_arena_chat_model_route_with_access", resolve_arena_route
+    )
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "_ensure_model_in_request_models", ensure_model)
+    monkeypatch.setattr(mod, "coerce_open_webui_user", lambda user: user)
+    return captured
+
+
+async def _task6_run_checkpoint_handoffs(
+    monkeypatch, tmp_path, *, include_stream=False
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    forwarded = []
+    summaries = []
+    render_phases = {"prior": [], "current": []}
+    phase = "prior"
+    estimated_tokens = 1
+
+    class FakeChats:
+        @staticmethod
+        async def is_chat_owner(chat_id, user_id):
+            return (chat_id, user_id) == ("chat-1", "user-1")
+
+    chats_module = types.ModuleType("open_webui.models.chats")
+    chats_module.Chats = FakeChats
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
+
+    async def no_refresh(_request):
+        return None
+
+    async def core_compaction_enabled():
+        return False
+
+    async def validate_target_access(**_kwargs):
+        return None
+
+    async def model_dict_from_request(_request):
+        return {
+            "target": {
+                "id": "target",
+                "name": "Target",
+                "info": {"meta": {"capabilities": {"function_calling": True}}},
+            }
+        }
+
+    async def resolve_route(*_args, **_kwargs):
+        return mod.CoreChatModelRoute(model_id="target")
+
+    async def resolve_arena_route(**kwargs):
+        return kwargs["route"], None
+
+    async def estimate_tokens(*_args, **_kwargs):
+        return estimated_tokens
+
+    async def forward_target(**kwargs):
+        forwarded.append(copy.deepcopy(kwargs["body"]))
+        return {"ok": True}
+
+    async def prepare_file_context(**_kwargs):
+        return None
+
+    async def ensure_model(*_args, **_kwargs):
+        return None
+
+    async def generate_chat_completion(_request, form_data, **_kwargs):
+        summaries.append(copy.deepcopy(form_data))
+        return {"choices": [{"message": {"content": "extended summary"}}]}
+
+    real_render_checkpoint = mod.render_summary_message_from_checkpoint
+
+    def render_checkpoint(checkpoint, **kwargs):
+        render_phases[phase].append(checkpoint["id"])
+        return real_render_checkpoint(checkpoint, **kwargs)
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path}/task6-prefix.db",
+        poolclass=NullPool,
+        connect_args={"timeout": 30},
+    )
+    monkeypatch.setattr(mod, "_CHECKPOINT_SCHEMA_READY", False)
+    await mod.ensure_checkpoint_table_initialized(async_engine=engine)
+    sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False)
+
+    class EngineCheckpointStore(mod.CheckpointStore):
+        async def _context(self):
+            return sessionmaker()
+
+    async def checkpoint_schema_ready(**_kwargs):
+        return None
+
+    chat_module = types.ModuleType("open_webui.utils.chat")
+    chat_module.generate_chat_completion = generate_chat_completion
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat", chat_module)
+
+    monkeypatch.setattr(mod, "_refresh_tiktoken_encoding_config", no_refresh)
+    monkeypatch.setattr(
+        mod, "_core_context_compaction_enabled", core_compaction_enabled
+    )
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "_resolve_core_chat_model_route", resolve_route)
+    monkeypatch.setattr(
+        mod, "_resolve_arena_chat_model_route_with_access", resolve_arena_route
+    )
+    monkeypatch.setattr(mod, "_estimate_provider_input_tokens_async", estimate_tokens)
+    monkeypatch.setattr(
+        mod, "_target_model_supports_file_context", lambda *_args: False
+    )
+    monkeypatch.setattr(mod, "_forward_non_streaming_target", forward_target)
+    monkeypatch.setattr(mod, "_prepare_summary_file_context", prepare_file_context)
+    monkeypatch.setattr(mod, "_ensure_model_in_request_models", ensure_model)
+    monkeypatch.setattr(mod, "coerce_open_webui_user", lambda user: user)
+    monkeypatch.setattr(
+        mod, "ensure_checkpoint_table_initialized", checkpoint_schema_ready
+    )
+    monkeypatch.setattr(mod, "CheckpointStore", EngineCheckpointStore)
+    monkeypatch.setattr(
+        mod, "render_summary_message_from_checkpoint", render_checkpoint
+    )
+
+    raw = "shared checkpoint payload" * 2_000
+    parent_source = _task6_native_round(raw, call_id="parent-call")
+    prior_source = [*parent_source, {"role": "user", "content": "continue"}]
+    persisted_delta = _task6_native_round(
+        raw,
+        call_id="delta-call",
+        tool_name="delta_lookup",
+    )
+    current_source = [
+        *prior_source,
+        *persisted_delta,
+        {"role": "user", "content": "next"},
+    ]
+    parent = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_summary_source_hash(parent_source),
+        source_message_count=len(parent_source),
+        summary_text="parent summary",
+        summary_meta=mod.build_checkpoint_summary_meta(
+            parent_source,
+            historical_message_excerpt_bytes=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+            historical_message_excerpt_count=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+        ),
+        parent_checkpoint_id=None,
+    )
+    await EngineCheckpointStore().upsert_ready(parent)
+
+    pipe = mod.Pipe()
+    pipe.valves.ref_exec_enabled = True
+    pipe.valves.ref_substitution_threshold_tokens = 1_000
+    pipe.valves.trigger_input_tokens = 2
+
+    async def run_turn(messages, message_id):
+        registry = {"existing": {"spec": {"name": "existing"}}}
+        request = SimpleNamespace(
+            state=SimpleNamespace(),
+            app=SimpleNamespace(state=SimpleNamespace(MODELS={})),
+        )
+        body = {
+            "model": mod.build_wrapper_model_id("auto_compact", "target"),
+            "messages": copy.deepcopy(messages),
+            "tools": [{"type": "function", "function": {"name": "existing"}}],
+            "tool_choice": "auto",
+        }
+        if include_stream:
+            body["stream"] = False
+        result = await pipe.pipe(
+            body,
+            __request__=request,
+            __user__={"id": "user-1", "role": "user"},
+            __metadata__={
+                "chat_id": "chat-1",
+                "message_id": message_id,
+                "session_id": "session-1",
+                "params": {"function_calling": "native"},
+                "tools": registry,
+            },
+            __tools__=registry,
+        )
+        assert result == {"ok": True}
+
+    try:
+        await run_turn(prior_source, "message-1")
+        phase = "current"
+        estimated_tokens = 10
+        await run_turn(current_source, "message-2")
+        async with sessionmaker() as session:
+            rows = list(
+                (await session.execute(mod.CHECKPOINT_TABLE.select())).mappings()
+            )
+    finally:
+        await engine.dispose()
+
+    assert len(forwarded) == 2
+    assert len(summaries) == 1
+    parent_row, child_row = sorted(rows, key=lambda row: row["source_message_count"])
+    return {
+        "parent": dict(parent_row),
+        "child": dict(child_row),
+        "prior_target": forwarded[0],
+        "summary": summaries[0],
+        "current_source": current_source,
+        "persisted_delta": persisted_delta,
+        "render_phases": render_phases,
+    }
+
+
+@pytest.mark.asyncio
+async def test_summary_ref_projection_matches_target_prefix_and_schema(
+    monkeypatch, pipe_request, pipe_user
+):
+    apply_surfaces = _task6_projection_surface()
+    raw = "shared projection" * 5_000
+    source = [*_task6_native_round(raw), {"role": "user", "content": "continue"}]
+    plan = await _task6_plan(source)
+    target = {
+        "model": "target",
+        "messages": await mod.apply_ref_projection_plan(source, plan),
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        "metadata": {},
+    }
+    apply_surfaces(target, plan, include_reader_schema=True)
+    captured = _task6_install_summary_capture(
+        monkeypatch,
+        [{"choices": [{"message": {"content": "summary"}}]}],
+    )
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        source_messages=source,
+        base_body={
+            "model": "target",
+            "messages": source,
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        },
+        ref_projection_plan=plan,
+    )
+
+    summary = captured[0][1]
+    manifests = mod.ref_render_manifest_payloads(plan)
+    assert result == "summary"
+    assert summary["messages"][:-1] == target["messages"]
+    assert _task6_ref_schema(summary) == _task6_ref_schema(target)
+    assert (
+        summary["metadata"]["auto_compact_ref_manifests"]
+        == target["metadata"]["auto_compact_ref_manifests"]
+    )
+    assert len(plan.catalog) == len(plan.manifests) == len(manifests) == 1
+    assert set(manifests[0]) == {"bytes", "kind", "lines", "ref", "tool", "version"}
+    assert all("call-1" not in str(value) for value in manifests[0].values())
+
+
+@pytest.mark.asyncio
+async def test_cross_turn_summary_shared_prefix_matches_prior_target_bytes(
+    monkeypatch, tmp_path
+):
+    _task6_projection_surface()
+    handoffs = await _task6_run_checkpoint_handoffs(
+        monkeypatch, tmp_path, include_stream=True
+    )
+    parent = handoffs["parent"]
+    prior_target = handoffs["prior_target"]
+    summary = handoffs["summary"]
+    current_source = handoffs["current_source"]
+    persisted_delta = handoffs["persisted_delta"]
+    plan = await _task6_plan(current_source)
+    prior_fingerprint = _task6_render_fingerprint(prior_target, checkpoint=parent)
+    summary_fingerprint = _task6_render_fingerprint(summary, checkpoint=parent)
+    prior_messages = prior_target["messages"]
+    summary_messages = summary["messages"]
+    expected_delta = await mod.apply_ref_projection_plan(persisted_delta, plan)
+    assert parent["id"] in handoffs["render_phases"]["prior"]
+    assert parent["id"] in handoffs["render_phases"]["current"]
+    assert summary_fingerprint == prior_fingerprint
+    assert _task6_cache_projection(summary_fingerprint, summary_messages).startswith(
+        _task6_cache_projection(prior_fingerprint, prior_messages)
+    )
+    assert summary_messages[: len(prior_messages)] == prior_messages
+    assert summary_messages[len(prior_messages) :] == [
+        *expected_delta,
+        mod.build_summary_request_message(),
+    ]
+    assert all(
+        '<auto_compact_ref_manifests version="1">' not in message.get("content", "")
+        for message in prior_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_invisible_metadata_catalog_mutation_preserves_render_fingerprint(
+    monkeypatch, tmp_path
+):
+    _task6_projection_surface()
+    handoffs = await _task6_run_checkpoint_handoffs(
+        monkeypatch, tmp_path, include_stream=True
+    )
+    parent = handoffs["parent"]
+    summary = handoffs["summary"]
+    baseline_fingerprint = _task6_render_fingerprint(summary, checkpoint=parent)
+    catalog_transition = copy.deepcopy(summary)
+    catalog_transition["metadata"]["auto_compact_ref_manifests"].append(
+        {
+            "bytes": 1,
+            "kind": "history",
+            "lines": 1,
+            "ref": "history:provider-invisible-catalog-entry",
+            "tool": None,
+            "version": 1,
+        }
+    )
+
+    assert (
+        _task6_render_fingerprint(catalog_transition, checkpoint=parent)
+        == baseline_fingerprint
+    )
+
+
+@pytest.mark.asyncio
+async def test_projection_setting_transitions_preserve_checkpoint_profile_and_lineage(
+    monkeypatch, tmp_path
+):
+    _task6_projection_surface()
+    handoffs = await _task6_run_checkpoint_handoffs(
+        monkeypatch, tmp_path, include_stream=True
+    )
+    parent = handoffs["parent"]
+    child = handoffs["child"]
+    prior_target = handoffs["prior_target"]
+    summary = handoffs["summary"]
+    source = handoffs["current_source"][:-1]
+    baseline_profile = mod.compute_profile_hash()
+    baseline_source_hash = mod.compute_summary_source_hash(source)
+    baseline_fingerprint = _task6_render_fingerprint(summary, checkpoint=parent)
+    assert baseline_fingerprint == _task6_render_fingerprint(
+        prior_target, checkpoint=parent
+    )
+    assert prior_target["stream"] is False
+    assert summary["stream"] is False
+
+    changed_checkpoint = copy.deepcopy(parent)
+    changed_checkpoint["summary_meta"] = {"history_ref": "enriched"}
+    rendered_transition = copy.deepcopy(summary)
+    rendered_transition["messages"][0]["content"] = "changed summary"
+    system_transition = copy.deepcopy(summary)
+    system_transition["messages"].insert(0, {"role": "system", "content": "system-b"})
+    file_transition = copy.deepcopy(summary)
+    file_transition["metadata"]["sources"] = [{"id": "file-b"}]
+    route_transition = copy.deepcopy(summary)
+    route_transition["model"] = "other-target"
+    schema_transition = copy.deepcopy(summary)
+    schema_transition["tools"] = [{"type": "function", "function": {"name": "changed"}}]
+    stream_transition = copy.deepcopy(summary)
+    stream_transition.pop("stream")
+    transitions = [
+        (summary, {"mode": "inactive"}),
+        (summary, {"threshold": 2_000}),
+        (summary, {"encoding_state": "cl100k_base:unavailable"}),
+        (summary, {"reader_contract": "ref-reader-v2"}),
+        (summary, {"checkpoint": changed_checkpoint}),
+        (rendered_transition, {}),
+        (system_transition, {}),
+        (
+            summary,
+            {"transient_projection": ({"role": "user", "content": "transient-b"},)},
+        ),
+        (file_transition, {}),
+        (route_transition, {}),
+        (schema_transition, {}),
+        (stream_transition, {}),
+    ]
+
+    for changed_body, changed_context in transitions:
+        assert (
+            _task6_render_fingerprint(
+                changed_body,
+                checkpoint=changed_context.pop("checkpoint", parent),
+                **changed_context,
+            )
+            != baseline_fingerprint
+        )
+
+    assert (
+        mod.compute_profile_hash(
+            ref_exec_enabled=False,
+            model="other-target",
+            ref_substitution_threshold_tokens=2_000,
+            encoding="unavailable",
+            reader_contract="ref-reader-v2",
+        )
+        == baseline_profile
+    )
+    assert mod.compute_summary_source_hash(source) == baseline_source_hash
+    assert parent["profile_hash"] == baseline_profile
+    assert child["profile_hash"] == baseline_profile
+    assert child["source_hash"] == baseline_source_hash
+    assert parent["parent_checkpoint_id"] is None
+    assert child["parent_checkpoint_id"] == parent["id"]
+    assert parent["summary_text"] == "parent summary"
+
+
+@pytest.mark.asyncio
+async def test_summary_always_strip_matches_fallback_retry_projection_without_reader_schema(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    apply_surfaces = _task6_projection_surface()
+    raw = "always strip payload" * 5_000
+    source = _task6_native_round(raw)
+    plan = await _task6_plan(source)
+    base_body = {
+        "model": "target",
+        "messages": source,
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        "tool_choice": "required",
+        "functions": [{"name": "legacy"}],
+        "function_call": {"name": "legacy"},
+        "parallel_tool_calls": True,
+    }
+    target = copy.deepcopy(base_body)
+    target["messages"] = await mod.apply_ref_projection_plan(source, plan)
+    target["metadata"] = {}
+    apply_surfaces(target, plan, include_reader_schema=True)
+    responses = [
+        {"choices": [{"message": {"content": "summary"}}]},
+        {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "reader-call",
+                                "type": "function",
+                                "function": {
+                                    "name": mod.REF_EXEC_TOOL_NAME,
+                                    "arguments": "{}",
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+        {"choices": [{"message": {"content": "summary"}}]},
+    ]
+    captured = _task6_install_summary_capture(monkeypatch, responses)
+
+    await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        source_messages=source,
+        base_body=base_body,
+        summary_tool_policy="always_strip",
+        ref_projection_plan=plan,
+    )
+    await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        source_messages=source,
+        base_body=base_body,
+        summary_tool_policy="fallback_on_tool_call",
+        ref_projection_plan=plan,
+    )
+
+    always_body = captured[0][1]
+    fallback_first = captured[1][1]
+    fallback_retry = captured[2][1]
+    reserved = {
+        "tools",
+        "tool_choice",
+        "functions",
+        "function_call",
+        "parallel_tool_calls",
+    }
+    assert not reserved & always_body.keys()
+    assert not reserved & fallback_retry.keys()
+    assert always_body == fallback_retry
+    assert fallback_first["messages"] == always_body["messages"]
+    assert (
+        fallback_first["metadata"]["auto_compact_ref_manifests"]
+        == always_body["metadata"]["auto_compact_ref_manifests"]
+    )
+    assert _task6_ref_schema(target)["function"]["name"] == mod.REF_EXEC_TOOL_NAME
+
+
+@pytest.mark.asyncio
+async def test_summary_error_policy_preserves_schema_and_existing_error_behavior(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    _task6_projection_surface()
+    source = _task6_native_round("error policy payload" * 5_000)
+    plan = await _task6_plan(source)
+    captured = _task6_install_summary_capture(
+        monkeypatch,
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "reader-call",
+                                    "type": "function",
+                                    "function": {
+                                        "name": mod.REF_EXEC_TOOL_NAME,
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+        ],
+    )
+
+    with pytest.raises(mod.SummaryToolCallError):
+        await mod._generate_summary_text(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={"chat_id": "chat-1"},
+            summary_model_id="target",
+            source_messages=source,
+            base_body={"model": "target", "messages": source},
+            summary_tool_policy="error_on_tool_call",
+            ref_projection_plan=plan,
+        )
+
+    assert len(captured) == 1
+    assert (
+        _task6_ref_schema(captured[0][1])["function"]["name"] == mod.REF_EXEC_TOOL_NAME
+    )
+
+
+@pytest.mark.asyncio
+async def test_summary_ref_registry_is_empty_and_reader_is_not_called(
+    monkeypatch, pipe_user
+):
+    _task6_projection_surface()
+    source = _task6_native_round("registry payload" * 5_000)
+    plan = await _task6_plan(source)
+    reader_calls = 0
+
+    async def reader(_command):
+        nonlocal reader_calls
+        reader_calls += 1
+        raise AssertionError("summary flow must not execute the target reader")
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            metadata={"tools": {"target-reader": {"callable": reader}}},
+        ),
+        app=SimpleNamespace(state=SimpleNamespace(MODELS={})),
+    )
+    captured = _task6_install_summary_capture(
+        monkeypatch,
+        [{"choices": [{"message": {"content": "summary"}}]}],
+    )
+
+    await mod._generate_summary_text(
+        request=request,
+        user=pipe_user,
+        metadata={
+            "chat_id": "chat-1",
+            "tools": {"target-reader": {"callable": reader}},
+        },
+        summary_model_id="target",
+        source_messages=source,
+        base_body={"model": "target", "messages": source},
+        ref_projection_plan=plan,
+    )
+
+    assert reader_calls == 0
+    assert captured[0][0].state.metadata["tools"] == {}
+    assert mod.summary_ref_registry() == {}
+
+
+@pytest.mark.asyncio
+async def test_summary_ref_tool_call_retries_without_execution(
+    monkeypatch, pipe_request, pipe_user
+):
+    _task6_projection_surface()
+    source = _task6_native_round("retry reader payload" * 5_000)
+    plan = await _task6_plan(source)
+    reader_calls = 0
+
+    async def reader(_command):
+        nonlocal reader_calls
+        reader_calls += 1
+        return "unexpected"
+
+    pipe_request.state.metadata = {
+        "tools": {mod.REF_EXEC_TOOL_NAME: {"callable": reader}}
+    }
+    captured = _task6_install_summary_capture(
+        monkeypatch,
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "reader-call",
+                                    "type": "function",
+                                    "function": {
+                                        "name": mod.REF_EXEC_TOOL_NAME,
+                                        "arguments": '{"command":"ls"}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+            {"choices": [{"message": {"content": "summary"}}]},
+        ],
+    )
+
+    result = await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        source_messages=source,
+        base_body={"model": "target", "messages": source},
+        summary_tool_policy="fallback_on_tool_call",
+        ref_projection_plan=plan,
+    )
+
+    assert result == "summary"
+    assert len(captured) == 2
+    assert reader_calls == 0
+    assert mod.REF_EXEC_TOOL_NAME not in captured[1][0].state.metadata["tools"]
+
+
+@pytest.mark.asyncio
+async def test_summary_retry_preserves_projected_messages(
+    monkeypatch, pipe_request, pipe_user
+):
+    _task6_projection_surface()
+    source = _task6_native_round("stable retry payload" * 5_000)
+    plan = await _task6_plan(source)
+    captured = _task6_install_summary_capture(
+        monkeypatch,
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "reader-call",
+                                    "type": "function",
+                                    "function": {
+                                        "name": mod.REF_EXEC_TOOL_NAME,
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+            {"choices": [{"message": {"content": "summary"}}]},
+        ],
+    )
+
+    await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        source_messages=source,
+        base_body={"model": "target", "messages": source},
+        summary_tool_policy="fallback_on_tool_call",
+        ref_projection_plan=plan,
+    )
+
+    first = captured[0][1]
+    retry = captured[1][1]
+    assert retry["messages"] == first["messages"]
+    assert (
+        retry["metadata"]["auto_compact_ref_manifests"]
+        == first["metadata"]["auto_compact_ref_manifests"]
+    )
+    assert all(
+        message.get("content") != source[1]["content"] for message in retry["messages"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_parent_extension_projects_same_delta_for_target_and_summary(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    apply_surfaces = _task6_projection_surface()
+    parent_source = [{"role": "user", "content": "old"}]
+    delta = [
+        *_task6_native_round("parent delta payload" * 5_000, call_id="delta-call"),
+        {"role": "user", "content": "continue"},
+    ]
+    all_source = [*parent_source, *delta]
+    parent = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_summary_source_hash(parent_source),
+        source_message_count=1,
+        summary_text="parent summary",
+        summary_meta=None,
+        parent_checkpoint_id=None,
+    )
+    cut = mod.MessageCut(
+        preserved_system_message=None,
+        summarization_prefix=all_source,
+        tail_messages=[],
+        source_message_count=len(all_source),
+    )
+    target_messages = mod.replace_prefix_with_parent_checkpoint_and_delta(cut, parent)
+    plan = await _task6_plan(all_source)
+    target = {
+        "messages": await mod.apply_ref_projection_plan(target_messages, plan),
+        "metadata": {},
+    }
+    apply_surfaces(target, plan, include_reader_schema=True)
+    captured = _task6_install_summary_capture(
+        monkeypatch,
+        [{"choices": [{"message": {"content": "summary"}}]}],
+    )
+
+    await mod._generate_summary_text(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1"},
+        summary_model_id="target",
+        source_messages=target_messages,
+        base_body={"model": "target", "messages": target_messages},
+        ref_projection_plan=plan,
+    )
+
+    summary_messages = captured[0][1]["messages"][:-1]
+    assert summary_messages == target["messages"]
+    assert summary_messages[1:] == await mod.apply_ref_projection_plan(delta, plan)
+
+
+def test_rendered_checkpoint_mechanically_preserves_hidden_refs():
+    apply_surfaces = _task6_projection_surface()
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash="source-hash",
+        source_message_count=2,
+        summary_text="stored summary",
+        summary_meta={
+            "history_ref": {
+                "format": mod.HISTORY_REF_FORMAT,
+                "raw_source_hash": "b" * 64,
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    history_ref = f"history:{checkpoint['id']}"
+    source = mod.HistoryRefSourceHandle(
+        checkpoint_id=checkpoint["id"],
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash="source-hash",
+        source_message_count=2,
+        raw_source_hash="b" * 64,
+        user_message_id="message-1",
+        transient_message_patterns=None,
+    )
+    plan = mod.build_history_ref_projection_plan(
+        (
+            mod.RefCatalogEntry(
+                manifest=mod.RefManifest(
+                    ref=history_ref,
+                    utf8_bytes=None,
+                    sha256="b" * 64,
+                ),
+                source=source,
+            ),
+        )
+    )
+    checkpoint_before = copy.deepcopy(checkpoint)
+    rendered = mod.render_summary_message_from_checkpoint(checkpoint)
+    summary_before = rendered["content"]
+    body = {
+        "messages": [rendered, {"role": "user", "content": "continue"}],
+        "metadata": {},
+    }
+
+    expected_payload = [
+        {
+            "bytes": None,
+            "kind": "history",
+            "lines": None,
+            "ref": history_ref,
+            "tool": "history",
+            "version": 1,
+        }
+    ]
+    compact_json = json.dumps(
+        expected_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected_block = (
+        '<auto_compact_ref_manifests version="1">'
+        f"{mod._xml_cdata(compact_json)}"
+        "</auto_compact_ref_manifests>"
+    )
+
+    apply_surfaces(body, plan, include_reader_schema=True)
+    apply_surfaces(body, plan, include_reader_schema=True)
+
+    content = body["messages"][0]["content"]
+    assert set(body["messages"][0]) == {"role", "content"}
+    assert content.count('<auto_compact_ref_manifests version="1">') == 1
+    assert content.endswith(f"{expected_block}\n</auto_compaction_context>")
+    assert body["metadata"]["auto_compact_ref_manifests"] == [
+        {"ref": history_ref, "sha256": "b" * 64}
+    ]
+    summary_after = mod.extract_compaction_summary_text_from_messages(body["messages"])
+    summary_before_apply = mod.extract_compaction_summary_text_from_messages(
+        [{"role": "user", "content": summary_before}]
+    )
+    assert summary_after == summary_before_apply == "stored summary"
+    assert checkpoint == checkpoint_before
+
+
+def _task17_render_manifest_payload(content):
+    block_start = '<auto_compact_ref_manifests version="1">'
+    block_end = "</auto_compact_ref_manifests>"
+    encoded = content.rpartition(block_start)[2].partition(block_end)[0]
+    return json.loads(mod._decode_xml_cdata(encoded))
+
+
+def _task17_plan(*render_manifests):
+    manifests = tuple(
+        mod.RefManifest(
+            ref=render_manifest.ref,
+            utf8_bytes=render_manifest.utf8_bytes,
+            sha256=render_manifest.ref.rpartition(":")[2],
+        )
+        for render_manifest in render_manifests
+    )
+    return mod.RefProjectionPlan(
+        catalog=(),
+        manifests=manifests,
+        reader_schema=None,
+        render_manifests=render_manifests,
+    )
+
+
+def test_rendered_checkpoint_manifest_contains_only_own_history_ref():
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash="source-a",
+        source_message_count=2,
+        summary_text="checkpoint A summary",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=1,
+    )
+    own_ref = f"history:{checkpoint['id']}"
+    other_ref = f"history:accp_{'b' * 64}"
+    tool_ref = f"tool:{'c' * 64}"
+    own_manifest = mod.RefRenderManifest(
+        ref=own_ref,
+        utf8_bytes=None,
+        kind="history",
+        line_count=None,
+        tool="history",
+    )
+    plan = _task17_plan(
+        mod.RefRenderManifest(
+            ref=other_ref,
+            utf8_bytes=42,
+            kind="history",
+            line_count=2,
+            tool="history",
+        ),
+        mod.RefRenderManifest(
+            ref=tool_ref,
+            utf8_bytes=99,
+            kind="tool",
+            line_count=3,
+            tool="lookup",
+        ),
+        own_manifest,
+    )
+    body = {
+        "messages": [mod.render_summary_message_from_checkpoint(checkpoint)],
+        "metadata": {},
+    }
+
+    mod._apply_ref_manifests(body, plan)
+
+    assert _task17_render_manifest_payload(body["messages"][0]["content"]) == [
+        {
+            "bytes": None,
+            "kind": "history",
+            "lines": None,
+            "ref": own_ref,
+            "tool": "history",
+            "version": 1,
+        }
+    ]
+    assert [
+        manifest["ref"]
+        for manifest in body["metadata"]["auto_compact_ref_manifests"]
+    ] == [other_ref, tool_ref, own_ref]
+
+
+@pytest.mark.asyncio
+async def test_rendered_checkpoint_manifest_bytes_stay_stable_after_post_boundary_tool_growth():
+    historical_prefix = [
+        {"role": "user", "content": "checkpoint A question"},
+        {"role": "assistant", "content": "checkpoint A answer"},
+    ]
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_summary_source_hash(historical_prefix),
+        source_message_count=len(historical_prefix),
+        summary_text="persisted checkpoint A summary",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=1,
+    )
+    own_manifest = mod.RefRenderManifest(
+        ref=f"history:{checkpoint['id']}",
+        utf8_bytes=None,
+        kind="history",
+        line_count=None,
+        tool="history",
+    )
+    other_manifest = mod.RefRenderManifest(
+        ref=f"history:accp_{'b' * 64}",
+        utf8_bytes=42,
+        kind="history",
+        line_count=2,
+        tool="history",
+    )
+    raw_tool_result = "post-boundary result\n" + "x" * 4_096
+    post_boundary_round = _task6_native_round(
+        raw_tool_result,
+        call_id="post-boundary-call",
+        tool_name="lookup",
+    )
+    turn_n_plus_one_source = [*historical_prefix, *post_boundary_round]
+
+    class AboveThresholdEncoder:
+        def encode(self, _text, **_kwargs):
+            return list(range(1_001))
+
+    threshold_tokens = 1_000
+    encoder = AboveThresholdEncoder()
+    assert len(encoder.encode(raw_tool_result)) > threshold_tokens
+    tool_plan = await mod.project_native_tool_texts(
+        turn_n_plus_one_source,
+        threshold_tokens=threshold_tokens,
+        encoder=encoder,
+    )
+    history_plan = mod.build_history_ref_projection_plan(
+        tuple(
+            mod.RefCatalogEntry(
+                manifest=mod.RefManifest(
+                    ref=render_manifest.ref,
+                    utf8_bytes=render_manifest.utf8_bytes,
+                    sha256=render_manifest.ref.rpartition(":")[2],
+                ),
+                source=mod.ZeroCopySourceHandle(text=""),
+            )
+            for render_manifest in (other_manifest, own_manifest)
+        )
+    )
+    turn_n_plus_one_plan = mod.merge_ref_projection_plans(history_plan, tool_plan)
+    assert turn_n_plus_one_plan is not None
+    expected_tool_ref = f"tool:{hashlib.sha256(raw_tool_result.encode()).hexdigest()}"
+    turn_n_messages = await mod.apply_ref_projection_plan(
+        [mod.render_summary_message_from_checkpoint(checkpoint)],
+        history_plan,
+    )
+    turn_n_plus_one_messages = await mod.apply_ref_projection_plan(
+        [
+            mod.render_summary_message_from_checkpoint(checkpoint),
+            *turn_n_plus_one_source[checkpoint["source_message_count"] :],
+        ],
+        turn_n_plus_one_plan,
+    )
+    turn_n = {"messages": turn_n_messages, "metadata": {}}
+    turn_n_plus_one = {"messages": turn_n_plus_one_messages, "metadata": {}}
+
+    mod._apply_ref_manifests(turn_n, history_plan)
+    mod._apply_ref_manifests(turn_n_plus_one, turn_n_plus_one_plan)
+
+    turn_n_summary = mod.provider_visible_ref_estimate_body(turn_n)["messages"][0]
+    turn_n_plus_one_summary = mod.provider_visible_ref_estimate_body(turn_n_plus_one)[
+        "messages"
+    ][0]
+
+    assert checkpoint["source_message_count"] == len(historical_prefix)
+    assert turn_n_plus_one_source[checkpoint["source_message_count"] :] == (
+        post_boundary_round
+    )
+    assert len(tool_plan.catalog) == len(tool_plan.render_manifests) == 1
+    assert tool_plan.catalog[0].manifest.ref == expected_tool_ref
+    assert tool_plan.render_manifests[0].ref == expected_tool_ref
+    assert tool_plan.render_manifests[0].kind == "tool"
+    assert tool_plan.render_manifests[0].tool == "lookup"
+    assert turn_n_plus_one["messages"][-1]["content"] == expected_tool_ref
+    assert set(turn_n_summary) == set(turn_n_plus_one_summary) == {"role", "content"}
+    assert json.dumps(turn_n_plus_one_summary).encode("utf-8") == json.dumps(
+        turn_n_summary
+    ).encode("utf-8")
+    assert _task17_render_manifest_payload(
+        turn_n_plus_one_summary["content"]
+    ) == [
+        {
+            "bytes": None,
+            "kind": "history",
+            "lines": None,
+            "ref": own_manifest.ref,
+            "tool": "history",
+            "version": 1,
+        }
+    ]
+    assert [
+        manifest["ref"]
+        for manifest in turn_n["metadata"]["auto_compact_ref_manifests"]
+    ] == [other_manifest.ref, own_manifest.ref]
+    assert [
+        manifest["ref"]
+        for manifest in turn_n_plus_one["metadata"]["auto_compact_ref_manifests"]
+    ] == [other_manifest.ref, own_manifest.ref, expected_tool_ref]
+
+
+def test_provider_visible_ref_estimate_retains_rendered_manifest_content():
+    class LengthEncoder:
+        def encode(self, text, **_kwargs):
+            return list(range(len(text)))
+
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash="source-hash",
+        source_message_count=1,
+        summary_text="stored summary",
+        summary_meta={},
+        parent_checkpoint_id=None,
+    )
+    rendered = mod.render_summary_message_from_checkpoint(checkpoint)
+    rendered_without_manifest = copy.deepcopy(rendered)
+    history_ref = f"history:{checkpoint['id']}"
+    plan = mod.RefProjectionPlan(
+        catalog=(),
+        manifests=(
+            mod.RefManifest(ref=history_ref, utf8_bytes=None, sha256="c" * 64),
+        ),
+        reader_schema=None,
+        render_manifests=(
+            mod.RefRenderManifest(
+                ref=history_ref,
+                utf8_bytes=None,
+                kind="history",
+                line_count=None,
+                tool="查找]]>history",
+            ),
+        ),
+    )
+    body = {"messages": [rendered], "metadata": {"private": True}}
+    mod._apply_ref_manifests(body, plan)
+
+    visible = mod.provider_visible_ref_estimate_body(body)
+
+    assert "metadata" not in visible
+    assert visible["messages"] == body["messages"]
+    assert "查找]]]]><![CDATA[>history" in visible["messages"][0]["content"]
+    assert mod.estimate_body_tokens(
+        visible,
+        encoder=LengthEncoder(),
+        encoding_name="unit-test",
+    ) > mod.estimate_body_tokens(
+        {"messages": [rendered_without_manifest]},
+        encoder=LengthEncoder(),
+        encoding_name="unit-test",
+    )
+
+
+def test_ref_manifest_reapplication_preserves_literal_structural_tags_in_summary():
+    summary_text = (
+        "keep </auto_compaction_context> and "
+        '<auto_compact_ref_manifests version="1">literal</'
+        "auto_compact_ref_manifests> plus Unicode 查找 and ]]> safely"
+    )
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash="source-hash",
+        source_message_count=1,
+        summary_text=summary_text,
+        summary_meta={},
+        parent_checkpoint_id=None,
+    )
+    checkpoint_before = copy.deepcopy(checkpoint)
+    history_ref = f"history:{checkpoint['id']}"
+    first_plan = mod.RefProjectionPlan(
+        catalog=(),
+        manifests=(
+            mod.RefManifest(ref=history_ref, utf8_bytes=None, sha256="a" * 64),
+        ),
+        reader_schema=None,
+        render_manifests=(
+            mod.RefRenderManifest(
+                ref=history_ref,
+                utf8_bytes=None,
+                kind="history",
+                line_count=None,
+                tool="history",
+            ),
+        ),
+    )
+    second_plan = mod.RefProjectionPlan(
+        catalog=(),
+        manifests=(
+            mod.RefManifest(ref=history_ref, utf8_bytes=None, sha256="a" * 64),
+            mod.RefManifest(ref=f"tool:{'b' * 64}", utf8_bytes=12, sha256="b" * 64),
+        ),
+        reader_schema=None,
+        render_manifests=(
+            mod.RefRenderManifest(
+                ref=history_ref,
+                utf8_bytes=None,
+                kind="history",
+                line_count=None,
+                tool="history",
+            ),
+            mod.RefRenderManifest(
+                ref=f"tool:{'b' * 64}",
+                utf8_bytes=12,
+                kind="tool",
+                line_count=1,
+                tool="再検索]]>second",
+            ),
+        ),
+    )
+    body = {
+        "messages": [mod.render_summary_message_from_checkpoint(checkpoint)],
+        "metadata": {},
+    }
+
+    for plan in (first_plan, first_plan, second_plan):
+        mod._apply_ref_manifests(body, plan)
+
+        content = body["messages"][0]["content"]
+        context_prefix, structural_close, trailing = content.rpartition(
+            "\n</auto_compaction_context>"
+        )
+        compact_json = json.dumps(
+            [
+                manifest
+                for manifest in mod.ref_render_manifest_payloads(plan)
+                if manifest["ref"] == history_ref
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        expected_block = (
+            '<auto_compact_ref_manifests version="1">'
+            f"{mod._xml_cdata(compact_json)}"
+            "</auto_compact_ref_manifests>"
+        )
+        assert structural_close == "\n</auto_compaction_context>"
+        assert trailing == ""
+        assert context_prefix.endswith(expected_block)
+        assert context_prefix.rpartition("</checkpoint_summary>")[2].count(
+            '<auto_compact_ref_manifests version="1">'
+        ) == 1
+        assert set(body["messages"][0]) == {"role", "content"}
+        assert mod.extract_compaction_summary_text_from_messages(body["messages"]) == (
+            summary_text
+        )
+        assert checkpoint == checkpoint_before
+
+
+class _Task7Request:
+    def __init__(self):
+        self.state = SimpleNamespace()
+        self.app = SimpleNamespace(state=SimpleNamespace(MODELS={}, redis=None))
+        self.headers = {}
+        self.cookies = {}
+
+
+def _task7_key(*, model="wrapper-a", assistant="assistant-a", branch="branch-a"):
+    return mod.RefBindingKey(
+        user_id="user-1",
+        chat_id="chat-1",
+        user_message_id="user-message-1",
+        assistant_message_id=assistant,
+        incoming_model_id=model,
+        base_pipe_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        branch_anchor=branch,
+    )
+
+
+def _task7_plan(text, *, ref_suffix="a"):
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    entry = mod.RefCatalogEntry(
+        manifest=mod.RefManifest(
+            ref=f"tool:{digest}",
+            utf8_bytes=len(text.encode()),
+            sha256=digest,
+        ),
+        source=mod.ZeroCopySourceHandle(text=text),
+    )
+    return mod.RefProjectionPlan(
+        catalog=(entry,),
+        manifests=(entry.manifest,),
+        reader_schema=mod.REF_EXEC_TOOL_SPEC,
+    )
+
+
+async def _task7_reserve(request, key, registry):
+    reservation = await mod.reserve_ref_binding(request, key, registry)
+    assert reservation is not None
+    return reservation
+
+
+def _task7_native_round(text):
+    return [
+        {"role": "user", "content": "run the tool"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": text},
+    ]
+
+
+def _task7_install_pipe_runtime(monkeypatch, *, estimate_tokens=10):
+    observed = {
+        "classification": 0,
+        "checkpoint": 0,
+        "events": [],
+        "owner": 0,
+        "estimates": [],
+        "forwards": [],
+        "summaries": 0,
+    }
+    project_native_tool_texts = mod.project_native_tool_texts
+
+    async def validate_target_access(**kwargs):
+        return None
+
+    async def model_dict_from_request(request):
+        return {
+            "target": {
+                "id": "target",
+                "name": "Target",
+                "info": {"meta": {"capabilities": {"function_calling": True}}},
+            }
+        }
+
+    async def owner_authorized(chat_id, user_id):
+        observed["events"].append("owner")
+        observed["owner"] += 1
+        return True
+
+    async def classify(*args, **kwargs):
+        observed["events"].append("classification")
+        observed["classification"] += 1
+        return await project_native_tool_texts(*args, **kwargs)
+
+    async def checkpoint(**kwargs):
+        observed["events"].append("checkpoint")
+        observed["checkpoint"] += 1
+        return None
+
+    async def estimate(body, **kwargs):
+        observed["events"].append("estimate")
+        observed["estimates"].append(body)
+        return estimate_tokens(body) if callable(estimate_tokens) else estimate_tokens
+
+    async def summary(**kwargs):
+        observed["summaries"] += 1
+        return "task-7 summary"
+
+    async def forward(**kwargs):
+        observed["events"].append("forward")
+        observed["forwards"].append(kwargs["body"])
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "_chat_owner_authorized", owner_authorized)
+    monkeypatch.setattr(mod, "project_native_tool_texts", classify)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", checkpoint)
+    monkeypatch.setattr(mod, "_estimate_provider_input_tokens_async", estimate)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", summary)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward)
+    return observed
+
+
+async def _task7_pipe_call(
+    *,
+    request,
+    registry,
+    text,
+    enabled,
+    detached=False,
+    params=None,
+    assistant_message_id="assistant-a",
+    model_id="target",
+    body=None,
+    metadata_override=None,
+    outer_metadata=None,
+):
+    pipe = mod.Pipe()
+    pipe.valves.ref_exec_enabled = enabled
+    pipe.valves.ref_substitution_threshold_tokens = 12_000
+    pipe.valves.trigger_input_tokens = 100
+    pipe.valves.soft_trigger_ratio = 0
+    metadata = metadata_override or {
+        "chat_id": "chat-1",
+        "message_id": assistant_message_id,
+        "params": params or {"function_calling": "native"},
+        "tools": registry,
+    }
+    if outer_metadata is not None:
+        request.state.metadata = outer_metadata
+    injected = {} if detached else registry
+    call_body = body or {
+        "model": mod.build_wrapper_model_id("auto_compact", model_id),
+        "stream": True,
+        "messages": _task7_native_round(text),
+    }
+    result = await pipe.pipe(
+        call_body,
+        __request__=request,
+        __user__={"id": "user-1"},
+        __metadata__=metadata,
+        __tools__=injected,
+    )
+    return result, metadata
+
+
+async def _task7_dispatch_with_current_core(monkeypatch, registry, ref, outer_metadata):
+    import open_webui.utils.filter as core_filter
+    import open_webui.utils.middleware as core_middleware
+
+    emitted = []
+
+    async def event_emitter(event):
+        emitted.append(event)
+
+    async def event_caller(event):
+        raise AssertionError(f"unexpected direct tool call: {event}")
+
+    async def generate_chat_completion(*args, **kwargs):
+        return StreamingResponse(
+            iter(
+                [
+                    b'data: {"choices":[{"delta":{"content":"done"}}]}\n\n',
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+            media_type="text/event-stream",
+        )
+
+    async def config_get(key, default=None):
+        return default
+
+    async def no_filters(*args, **kwargs):
+        return []
+
+    async def no_oauth(*args, **kwargs):
+        return None
+
+    async def no_background(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        core_middleware, "generate_chat_completion", generate_chat_completion
+    )
+    monkeypatch.setattr(core_filter, "get_sorted_filter_ids", no_filters)
+    if hasattr(core_middleware, "get_sorted_filter_ids"):
+        monkeypatch.setattr(core_middleware, "get_sorted_filter_ids", no_filters)
+    monkeypatch.setattr(core_middleware, "get_system_oauth_token", no_oauth)
+    monkeypatch.setattr(core_middleware, "outlet_filter_handler", no_background)
+    monkeypatch.setattr(core_middleware, "background_tasks_handler", no_background)
+    monkeypatch.setattr(core_middleware, "Config", SimpleNamespace(get=config_get))
+    initial = StreamingResponse(
+        iter(
+            [
+                (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": "call-ref",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": mod.REF_EXEC_TOOL_NAME,
+                                                    "arguments": json.dumps(
+                                                        {"command": f"cat {ref}"}
+                                                    ),
+                                                },
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    )
+                    + "\n\n"
+                ).encode(),
+                b"data: [DONE]\n\n",
+            ]
+        ),
+        media_type="text/event-stream",
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(metadata=outer_metadata),
+        app=SimpleNamespace(state=SimpleNamespace()),
+    )
+    await core_middleware.streaming_chat_response_handler(
+        initial,
+        {
+            "request": request,
+            "form_data": {
+                "model": "target",
+                "stream": True,
+                "messages": [{"role": "user", "content": "read the ref"}],
+            },
+            "user": SimpleNamespace(id="user-1"),
+            "model": {"id": "target", "info": {"meta": {"capabilities": {}}}},
+            "metadata": outer_metadata,
+            "events": [],
+            "event_emitter": event_emitter,
+            "event_caller": event_caller,
+        },
+    )
+    return emitted
+
+
+async def _task8_run_current_core_route(
+    monkeypatch,
+    *,
+    registry=None,
+    user_id="user-1",
+    role="user",
+    owner=True,
+    model_access=True,
+    dispatch_reader=True,
+    text=None,
+    valve_enabled=True,
+    request=None,
+    assistant_message_id="assistant-a",
+    message_ids=None,
+    registries_by_message=None,
+    cancel_model_id=None,
+    params=None,
+    omit_injected_function_calling=False,
+    chat_id="chat-1",
+    previous_response_id=None,
+    trigger_input_tokens=100_000_000,
+    observe_hard_compaction=False,
+    target_model=None,
+):
+    import open_webui.functions as core_functions
+    import open_webui.main as core_main
+    import open_webui.models.oauth_sessions as core_oauth_sessions
+    import open_webui.tasks as core_tasks
+    import open_webui.utils.chat as core_chat
+    import open_webui.utils.filter as core_filter
+    import open_webui.utils.middleware as core_middleware
+    import open_webui.utils.models as core_models
+    from open_webui.models.users import UserModel
+
+    request = request or _Task7Request()
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+    request.app.state.MODELS = {
+        wrapper_id: {
+            "id": wrapper_id,
+            "name": "Auto Compact",
+            "owned_by": "openai",
+            "pipe": {"type": "pipe"},
+            "info": {"meta": {"capabilities": {"builtin_tools": False}}},
+        },
+        "target": target_model
+        or {
+            "id": "target",
+            "name": "Target",
+            "owned_by": "openai",
+            "info": {
+                "meta": {
+                    "capabilities": {
+                        "builtin_tools": False,
+                        "file_context": False,
+                    }
+                }
+            },
+        },
+    }
+    user = UserModel(
+        id=user_id,
+        email=f"{user_id}@example.test",
+        role=role,
+        name=user_id,
+        last_active_at=0,
+        updated_at=0,
+        created_at=0,
+    )
+    pipe = mod.Pipe()
+    pipe.valves.ref_exec_enabled = valve_enabled
+    pipe.valves.ref_substitution_threshold_tokens = 1
+    pipe.valves.trigger_input_tokens = trigger_input_tokens
+    pipe.valves.soft_trigger_ratio = 0
+    injected_calls = []
+    original_pipe = pipe.pipe
+
+    async def observed_pipe(*args, **kwargs):
+        if omit_injected_function_calling:
+            kwargs["__metadata__"]["params"].pop("function_calling", None)
+        entry_registry = kwargs["__tools__"]
+        reader_entry = entry_registry.get(mod.REF_EXEC_TOOL_NAME)
+        metadata_snapshot = {
+            key: copy.deepcopy(value)
+            for key, value in kwargs["__metadata__"].items()
+            if key != "tools"
+        }
+        metadata_snapshot["tools"] = kwargs["__metadata__"].get("tools")
+        injected_calls.append(
+            {
+                **kwargs,
+                "body": copy.deepcopy(kwargs["body"]),
+                "__metadata__": metadata_snapshot,
+                "entry_reader_callable": (
+                    reader_entry.get("callable")
+                    if isinstance(reader_entry, dict)
+                    else None
+                ),
+            }
+        )
+        return await original_pipe(*args, **kwargs)
+
+    observed_pipe.__signature__ = inspect.signature(original_pipe)
+    pipe.pipe = observed_pipe
+    emitted = []
+    provider_calls = []
+    response_context_metadata = []
+    lifecycle = []
+    active_readers = []
+    authorization = {"allowed": True}
+    branch_loads = []
+    checkpoint_activity = []
+    checkpoint_rows = []
+    summary_requests = []
+    registries_by_model = {}
+    process_chat_payload = inspect.unwrap(core_main.process_chat_payload)
+    chat_completion_handler = inspect.unwrap(core_main.chat_completion_handler)
+    build_chat_response_context = inspect.unwrap(core_main.build_chat_response_context)
+    process_chat_response = inspect.unwrap(core_main.process_chat_response)
+
+    async def config_get(key, default=None):
+        return default
+
+    async def no_model_info(model_id):
+        return None
+
+    async def check_route_model_access(route_user, model, model_info=None):
+        if not model_access:
+            raise HTTPException(status_code=403, detail="model denied")
+
+    async def check_target_model_access(*args, **kwargs):
+        return None
+
+    async def is_chat_owner(chat_id, candidate_user_id):
+        return owner and candidate_user_id == user_id
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def no_messages(*args, **kwargs):
+        return None
+
+    async def channel_by_id(channel_id):
+        return SimpleNamespace(id=channel_id, type="group")
+
+    async def channel_member(channel_id, candidate_user_id):
+        return True
+
+    async def channel_message(message_id):
+        return SimpleNamespace(channel_id="chat")
+
+    async def no_filters(*args, **kwargs):
+        return []
+
+    async def observe_reusable_checkpoint(**kwargs):
+        checkpoint_activity.append(
+            {
+                "action": "lookup",
+                "messages": copy.deepcopy(kwargs["body"]["messages"]),
+            }
+        )
+        return None
+
+    async def observe_pending_checkpoint(**kwargs):
+        checkpoint_activity.append(
+            {
+                "action": "pending_lookup",
+                "source_messages": copy.deepcopy(kwargs["source_messages"]),
+            }
+        )
+        return None
+
+    async def observe_summary(**kwargs):
+        summary_text = "task-8 hard-compaction summary"
+        checkpoint_activity.extend(
+            [
+                {"action": "create"},
+                {"action": "claim"},
+                {"action": "complete"},
+            ]
+        )
+        summary_requests.append(
+            {
+                "base_body": copy.deepcopy(kwargs["base_body"]),
+                "source_messages": copy.deepcopy(kwargs["source_messages"]),
+                "summary_meta": copy.deepcopy(kwargs["summary_meta"]),
+                "summary_model_id": kwargs["summary_model_id"],
+            }
+        )
+        row = {
+            "id": "task-8-hard-checkpoint",
+            "parent_checkpoint_id": None,
+            "profile_hash": mod.compute_profile_hash(),
+            "source_hash": mod.compute_summary_source_hash(kwargs["source_messages"]),
+            "source_message_count": len(kwargs["source_messages"]),
+            "state": "ready",
+            "summary_text": summary_text,
+            "summary_meta": copy.deepcopy(kwargs["summary_meta"]),
+        }
+        checkpoint_rows.append(copy.deepcopy(row))
+        return mod.CompactionSummaryResult(summary_text, checkpoint=row)
+
+    async def identity_pipeline(request, form_data, user, models):
+        return form_data
+
+    async def identity_filters(**kwargs):
+        return kwargs["form_data"], {}
+
+    async def no_file_context(request, form_data, extra_params, user):
+        return form_data, {}
+
+    async def get_tools(request, tool_ids, user, extra_params):
+        if registries_by_message is None:
+            return registry if registry is not None else {}
+        metadata = extra_params["__metadata__"]
+        message_registry = registries_by_message.get(metadata["message_id"])
+        if message_registry is not None:
+            return message_registry
+        return registries_by_model[extra_params["__model__"]["id"]]
+
+    async def get_function_module(request, function_id):
+        assert function_id == "auto_compact"
+        return pipe
+
+    async def event_emitter(event):
+        emitted.append(event)
+
+    async def get_event_emitter(*args, **kwargs):
+        return event_emitter
+
+    async def get_event_call(*args, **kwargs):
+        return None
+
+    async def provider(request, form_data, user):
+        provider_calls.append(copy.deepcopy(form_data))
+        candidate_registries = (
+            registries_by_message.values()
+            if registries_by_message is not None
+            else (registry,)
+        )
+        for candidate_registry in candidate_registries:
+            if candidate_registry is None:
+                continue
+            reader_entry = candidate_registry.get(mod.REF_EXEC_TOOL_NAME)
+            reader_callable = (
+                reader_entry.get("callable") if isinstance(reader_entry, dict) else None
+            )
+            if reader_entry is not None and not any(
+                captured["registry"] is candidate_registry
+                and captured["entry"]["callable"] is reader_callable
+                for captured in active_readers
+            ):
+                active_readers.append(
+                    {
+                        "registry": candidate_registry,
+                        "entry": {
+                            "spec": copy.deepcopy(reader_entry["spec"]),
+                            "callable": reader_callable,
+                        },
+                        "catalog": next(
+                            binding.catalog
+                            for binding in getattr(
+                                request.state,
+                                mod.REQUEST_STATE_REF_STORE_KEY,
+                            ).bindings.values()
+                            if binding.registry is candidate_registry
+                        ),
+                    }
+                )
+        if form_data["model"] == cancel_model_id:
+            raise asyncio.CancelledError
+        model_calls = [
+            call for call in provider_calls if call["model"] == form_data["model"]
+        ]
+        if not dispatch_reader:
+            payload = {"choices": [{"delta": {"content": "done"}}]}
+        elif len(model_calls) == 1:
+            payload = {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call-wc",
+                                    "type": "function",
+                                    "function": {
+                                        "name": mod.REF_EXEC_TOOL_NAME,
+                                        "arguments": json.dumps({"command": "wc"}),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        elif registries_by_message is None and len(model_calls) == 2:
+            payload = {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call-head",
+                                    "type": "function",
+                                    "function": {
+                                        "name": mod.REF_EXEC_TOOL_NAME,
+                                        "arguments": json.dumps({"command": "head"}),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        else:
+            payload = {"choices": [{"delta": {"content": "done"}}]}
+        return StreamingResponse(
+            iter(
+                [
+                    ("data: " + json.dumps(payload) + "\n\n").encode(),
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+            media_type="text/event-stream",
+        )
+
+    async def capture_response_context(
+        request, form_data, user, model, metadata, tasks, events
+    ):
+        response_context_metadata.append(metadata)
+        return await build_chat_response_context(
+            request, form_data, user, model, metadata, tasks, events
+        )
+
+    async def observed_process_chat_payload(request, form_data, user, metadata, model):
+        lifecycle.append("process_chat_payload")
+        return await process_chat_payload(request, form_data, user, metadata, model)
+
+    async def observed_chat_completion_handler(request, form_data, user):
+        lifecycle.append("chat_completion_handler")
+        return await chat_completion_handler(request, form_data, user)
+
+    async def observed_process_chat_response(response, context):
+        lifecycle.append("process_chat_response")
+        return await process_chat_response(response, context)
+
+    observed_process_chat_payload.__wrapped__ = process_chat_payload
+    observed_chat_completion_handler.__wrapped__ = chat_completion_handler
+    capture_response_context.__wrapped__ = build_chat_response_context
+    observed_process_chat_response.__wrapped__ = process_chat_response
+
+    monkeypatch.setattr(core_main.Config, "get", config_get)
+    monkeypatch.setattr(core_main.Models, "get_model_by_id", no_model_info)
+    monkeypatch.setattr(core_main, "check_model_access", check_route_model_access)
+    monkeypatch.setattr(core_main.Chats, "is_chat_owner", is_chat_owner)
+    monkeypatch.setattr(core_main.Chats, "get_chat_by_id", no_messages)
+    monkeypatch.setattr(
+        core_main.Chats, "get_message_by_id_and_message_id", no_messages
+    )
+    monkeypatch.setattr(
+        core_main.Chats, "upsert_message_to_chat_by_id_and_message_id", noop
+    )
+    monkeypatch.setattr(core_main, "publish_event", noop)
+    monkeypatch.setattr(core_main.Channels, "get_channel_by_id", channel_by_id)
+    monkeypatch.setattr(core_main.Channels, "is_user_channel_member", channel_member)
+    monkeypatch.setattr(core_main.Messages, "get_message_by_id", channel_message)
+    monkeypatch.setattr(
+        core_main, "process_chat_payload", observed_process_chat_payload
+    )
+    monkeypatch.setattr(
+        core_main, "chat_completion_handler", observed_chat_completion_handler
+    )
+    monkeypatch.setattr(
+        core_main, "build_chat_response_context", capture_response_context
+    )
+    monkeypatch.setattr(
+        core_main, "process_chat_response", observed_process_chat_response
+    )
+    monkeypatch.setattr(core_middleware, "load_messages_from_db", no_messages)
+    monkeypatch.setattr(core_middleware.Chats, "get_chat_folder_id", no_messages)
+    monkeypatch.setattr(core_filter, "get_sorted_filter_ids", no_filters)
+    if hasattr(core_middleware, "get_sorted_filter_ids"):
+        monkeypatch.setattr(core_middleware, "get_sorted_filter_ids", no_filters)
+    monkeypatch.setattr(core_filter.Functions, "get_functions_by_ids", no_filters)
+    if hasattr(core_middleware, "Functions"):
+        monkeypatch.setattr(
+            core_middleware.Functions, "get_functions_by_ids", no_filters
+        )
+    monkeypatch.setattr(
+        core_middleware, "process_pipeline_inlet_filter", identity_pipeline
+    )
+    monkeypatch.setattr(core_middleware, "process_filter_functions", identity_filters)
+    monkeypatch.setattr(
+        core_middleware, "chat_completion_files_handler", no_file_context
+    )
+    monkeypatch.setattr(core_middleware, "get_tools", get_tools)
+    monkeypatch.setattr(core_middleware, "get_event_emitter", get_event_emitter)
+    monkeypatch.setattr(core_middleware, "get_event_call", get_event_call)
+    monkeypatch.setattr(core_middleware, "get_system_oauth_token", noop)
+    monkeypatch.setattr(core_middleware, "outlet_filter_handler", noop)
+    monkeypatch.setattr(core_middleware, "background_tasks_handler", noop)
+    monkeypatch.setattr(
+        core_functions, "get_function_module_by_id", get_function_module
+    )
+    monkeypatch.setattr(core_functions.Models, "get_model_by_id", no_model_info)
+    monkeypatch.setattr(core_functions, "get_event_emitter", get_event_emitter)
+    monkeypatch.setattr(core_functions, "get_event_call", get_event_call)
+    monkeypatch.setattr(
+        core_oauth_sessions.OAuthSessions, "get_sessions_by_user_id", no_filters
+    )
+    monkeypatch.setattr(core_chat, "check_model_access", check_target_model_access)
+    monkeypatch.setattr(core_chat, "generate_openai_chat_completion", provider)
+    monkeypatch.setattr(core_models, "check_model_access", check_target_model_access)
+    if observe_hard_compaction:
+        monkeypatch.setattr(
+            mod, "_body_reusable_checkpoint_match", observe_reusable_checkpoint
+        )
+        monkeypatch.setattr(
+            mod,
+            "_lookup_pending_checkpoint_for_source_prefix",
+            observe_pending_checkpoint,
+        )
+        monkeypatch.setattr(mod, "_get_or_create_compaction_summary", observe_summary)
+
+    persisted_tool_text = text or "persisted reader payload\nsecond line" * 3_000
+    if message_ids is not None:
+        for entry in message_ids:
+            target_wrapper_id = entry["model_id"]
+            target_id = mod.decode_wrapper_model_id(target_wrapper_id).target_model_id
+            request.app.state.MODELS[target_wrapper_id] = {
+                **request.app.state.MODELS[wrapper_id],
+                "id": target_wrapper_id,
+            }
+            request.app.state.MODELS[target_id] = {
+                **request.app.state.MODELS["target"],
+                "id": target_id,
+                "name": target_id,
+            }
+            registries_by_model[target_id] = registries_by_message[entry["message_id"]]
+            registries_by_model[target_wrapper_id] = registries_by_message[
+                entry["message_id"]
+            ]
+    input_messages = _task7_native_round(persisted_tool_text)
+    if observe_hard_compaction:
+        input_messages.append({"role": "user", "content": "answer after compaction"})
+    body = {
+        "model": wrapper_id,
+        "chat_id": chat_id,
+        "id": assistant_message_id,
+        "assistant_message_id": assistant_message_id,
+        "user_message": {
+            "id": "user-message-1",
+            "role": "user",
+            "content": "run the tool",
+        },
+        "messages": input_messages,
+        "params": (params if params is not None else {"function_calling": "native"}),
+        "stream": True,
+        "tool_ids": ["unrelated"]
+        if registry is not None or registries_by_message
+        else [],
+    }
+    if previous_response_id is not None:
+        body["previous_response_id"] = previous_response_id
+    if message_ids is not None:
+        body["model"] = message_ids[0]["model_id"]
+        body["message_ids"] = message_ids
+        body["session_id"] = "session-1"
+        body.pop("assistant_message_id", None)
+
+    async def load_authorized_raw_chat_branch(**kwargs):
+        assert kwargs["chat_id"] == chat_id
+        assert kwargs["user_id"] == user_id
+        branch_loads.append(dict(kwargs))
+        if not authorization["allowed"]:
+            return None
+        return [
+            {"role": "user", "content": "run the tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "lookup",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call-1",
+                        "output": [{"type": "input_text", "text": persisted_tool_text}],
+                    },
+                ],
+            },
+        ]
+
+    monkeypatch.setattr(
+        mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch
+    )
+    result = await core_main.chat_completion(request, body, user)
+    if isinstance(result, dict) and result.get("task_ids"):
+        await asyncio.gather(
+            *(core_tasks.tasks[task_id] for task_id in result["task_ids"]),
+            return_exceptions=True,
+        )
+    return {
+        "active_readers": active_readers,
+        "authorization": authorization,
+        "branch_loads": branch_loads,
+        "checkpoint_activity": checkpoint_activity,
+        "checkpoint_rows": checkpoint_rows,
+        "emitted": emitted,
+        "injected": injected_calls,
+        "lifecycle": lifecycle,
+        "outer": response_context_metadata[0] if response_context_metadata else None,
+        "outers": response_context_metadata,
+        "provider": provider_calls,
+        "request": request,
+        "result": result,
+        "raw_tool_text": persisted_tool_text,
+        "summary_requests": summary_requests,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ref_mode_collision_matches_valve_off_at_all_sizes(monkeypatch):
+    assert mod.REQUEST_STATE_REF_STORE_KEY == "_skyzi000_auto_compact_ref_exec_v1"
+    for size, estimate in (
+        (8, 10),
+        (50 * 1024, 10),
+        (30 * 1024 * 1024, 10),
+        (65_537, 200),
+    ):
+        observed = _task7_install_pipe_runtime(monkeypatch, estimate_tokens=estimate)
+        enabled_request, disabled_request = _Task7Request(), _Task7Request()
+        existing = {
+            "spec": mod.ref_exec_tool_spec_payload(),
+            "callable": lambda command: command,
+        }
+        registry = {
+            mod.REF_EXEC_TOOL_NAME: existing,
+            "unrelated": {"spec": {"name": "other"}},
+        }
+        snapshot = dict(registry)
+
+        enabled, _ = await _task7_pipe_call(
+            request=enabled_request,
+            registry=registry,
+            text="x" * size,
+            enabled=True,
+        )
+        disabled, _ = await _task7_pipe_call(
+            request=disabled_request,
+            registry=registry,
+            text="x" * size,
+            enabled=False,
+        )
+
+        assert enabled == disabled == {"ok": True}
+        assert observed["forwards"][-2] == observed["forwards"][-1]
+        assert registry == snapshot
+        assert observed["classification"] == observed["owner"] == 0
+        assert not hasattr(enabled_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+
+
+@pytest.mark.asyncio
+async def test_inactive_ref_contexts_match_valve_off_at_all_sizes(monkeypatch):
+    for size, estimate in (
+        (8, 10),
+        (50 * 1024, 10),
+        (30 * 1024 * 1024, 10),
+        (65_537, 200),
+    ):
+        observed = _task7_install_pipe_runtime(monkeypatch, estimate_tokens=estimate)
+        registry = {"unrelated": {}}
+        enabled_request, disabled_request = _Task7Request(), _Task7Request()
+
+        enabled, _ = await _task7_pipe_call(
+            request=enabled_request,
+            registry=registry,
+            text="x" * size,
+            enabled=True,
+            params={"function_calling": "legacy"},
+        )
+        disabled, _ = await _task7_pipe_call(
+            request=disabled_request,
+            registry=registry,
+            text="x" * size,
+            enabled=False,
+            params={"function_calling": "legacy"},
+        )
+
+        assert enabled == disabled == {"ok": True}
+        assert observed["forwards"][-2] == observed["forwards"][-1]
+        assert observed["classification"] == observed["owner"] == 0
+        assert not hasattr(enabled_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+
+
+@pytest.mark.asyncio
+async def test_provider_visible_tokens_alone_drive_compaction_across_ref_counts(
+    monkeypatch,
+):
+    def estimate(candidate):
+        names = [
+            tool.get("function", {}).get("name") for tool in candidate.get("tools", [])
+        ]
+        return 10 if mod.REF_EXEC_TOOL_NAME in names else 200
+
+    observed = _task7_install_pipe_runtime(monkeypatch, estimate_tokens=estimate)
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+
+    result, _ = await _task7_pipe_call(
+        request=request,
+        registry=registry,
+        text="provider-visible" * 5_000,
+        enabled=True,
+    )
+
+    assert result == {"ok": True}
+    assert observed["summaries"] == 0
+    assert observed["estimates"][-1] is observed["forwards"][0]
+    assert observed["estimates"][-1]["messages"][-1]["content"].startswith("tool:")
+    assert any(
+        tool.get("function", {}).get("name") == mod.REF_EXEC_TOOL_NAME
+        for tool in observed["estimates"][-1]["tools"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_ref_registry_contains_only_spec_and_callable():
+    request = _Task7Request()
+    registry = {"unrelated": {"spec": {"name": "other"}}}
+    reservation = await _task7_reserve(request, _task7_key(), registry)
+    attempt = mod.stage_ref_attempt(request, reservation, _task7_plan("alpha"))
+
+    await mod.commit_ref_attempt(request, attempt)
+
+    assert set(registry[mod.REF_EXEC_TOOL_NAME]) == {"spec", "callable"}
+    assert registry["unrelated"] == {"spec": {"name": "other"}}
+
+
+@pytest.mark.asyncio
+async def test_ref_registry_reuses_only_exact_owned_callable():
+    request = _Task7Request()
+    registry = {"unrelated": {"spec": {"name": "other"}}}
+    key = _task7_key()
+    first = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        _task7_plan("alpha"),
+    )
+    await mod.commit_ref_attempt(request, first)
+    owned = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
+
+    second = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        _task7_plan("beta"),
+    )
+    await mod.commit_ref_attempt(request, second)
+
+    assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is owned
+
+
+@pytest.mark.asyncio
+async def test_ref_registry_rejects_same_spec_spoof():
+    request = _Task7Request()
+    spoof = {
+        mod.REF_EXEC_TOOL_NAME: {
+            "spec": mod.ref_exec_tool_spec_payload(),
+            "callable": lambda command: command,
+        }
+    }
+    snapshot = dict(spoof)
+
+    assert await mod.reserve_ref_binding(request, _task7_key(), spoof) is None
+    assert spoof == snapshot
+    assert not hasattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+
+
+@pytest.mark.asyncio
+async def test_multimodel_store_keys_bindings_by_model_and_assistant_message():
+    request = _Task7Request()
+    first_registry = {"first": {}}
+    second_registry = {"second": {}}
+    keys = (
+        _task7_key(model="wrapper-a", assistant="assistant-a"),
+        _task7_key(model="wrapper-b", assistant="assistant-a"),
+        _task7_key(model="wrapper-a", assistant="assistant-b"),
+    )
+    third_registry = {"third": {}}
+    for key, registry, text in zip(
+        keys,
+        (first_registry, second_registry, third_registry),
+        ("alpha", "beta", "gamma"),
+        strict=True,
+    ):
+        attempt = mod.stage_ref_attempt(
+            request,
+            await _task7_reserve(request, key, registry),
+            _task7_plan(text),
+        )
+        await mod.commit_ref_attempt(request, attempt)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert set(store.bindings) == set(keys)
+    assert store.bindings[keys[0]].registry is first_registry
+    assert store.bindings[keys[1]].registry is second_registry
+    assert store.bindings[keys[2]].registry is third_registry
+
+
+@pytest.mark.asyncio
+async def test_generation_token_cas_cannot_rollback_newer_or_sibling_commit():
+    request = _Task7Request()
+    registry_a, registry_b = {"a": {}}, {"b": {}}
+    key_a, key_b = _task7_key(), _task7_key(model="wrapper-b", assistant="assistant-b")
+    old = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key_a, registry_a),
+        _task7_plan("old"),
+    )
+    sibling = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key_b, registry_b),
+        _task7_plan("sibling"),
+    )
+    await mod.commit_ref_attempt(request, sibling)
+    newer = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key_a, registry_a),
+        _task7_plan("new"),
+    )
+    await mod.commit_ref_attempt(request, newer)
+
+    await mod.rollback_ref_attempt(request, old)
+
+    assert registry_a[mod.REF_EXEC_TOOL_NAME]["callable"] is newer.reader
+    assert registry_b[mod.REF_EXEC_TOOL_NAME]["callable"] is sibling.reader
+
+
+@pytest.mark.asyncio
+async def test_cleanup_defers_while_newer_generation_depends_on_committed_binding(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    key = _task7_key()
+    first_plan = _task7_plan("first")
+    first = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        first_plan,
+        threshold_tokens=100_000,
+    )
+    await mod.commit_ref_attempt(request, first)
+    second_plan = _task7_plan("second")
+    second = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        second_plan,
+        threshold_tokens=100_000,
+    )
+
+    await mod.cleanup_ref_attempt(request, first)
+    await mod.commit_ref_attempt(request, second)
+
+    assert await second.reader(f"cat {first_plan.catalog[0].manifest.ref}") == "first"
+    assert await second.reader(f"cat {second_plan.catalog[0].manifest.ref}") == "second"
+
+
+async def _task7_staged_reentry():
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    key = _task7_key()
+    first_plan = _task7_plan("first")
+    first = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        first_plan,
+        threshold_tokens=100_000,
+    )
+    await mod.commit_ref_attempt(request, first)
+    second_plan = _task7_plan("second")
+    second = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        second_plan,
+        threshold_tokens=100_000,
+    )
+    return request, registry, key, first_plan, first, second_plan, second
+
+
+@pytest.mark.asyncio
+async def test_stale_rollback_preserves_binding_required_by_newer_staged_reservation(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    (
+        request,
+        registry,
+        key,
+        first_plan,
+        first,
+        second_plan,
+        second,
+    ) = await _task7_staged_reentry()
+
+    await mod.rollback_ref_attempt(request, first)
+    await mod.commit_ref_attempt(request, second)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert store.bindings[key].generation == second.generation
+    assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is second.reader
+    assert await second.reader(f"cat {first_plan.catalog[0].manifest.ref}") == "first"
+    assert await second.reader(f"cat {second_plan.catalog[0].manifest.ref}") == "second"
+
+
+@pytest.mark.asyncio
+async def test_deferred_cleanup_completes_when_newer_staged_attempt_rolls_back(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
+
+    await mod.cleanup_ref_attempt(request, first)
+    await mod.rollback_ref_attempt(request, second)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert key not in store.bindings
+    assert id(registry) not in store.registry_owners
+    assert key not in store.reservations
+    assert id(registry) not in store.registry_reservations
+    assert key not in store.deferred_cleanups
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+    assert (
+        await first.reader(f"cat {first_plan.catalog[0].manifest.ref}")
+        == "Error: externalized ref binding is unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deferred_cleanup_completes_when_newer_reservation_is_released(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
+    reservation = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY).reservations[
+        key
+    ]
+
+    await mod.cleanup_ref_attempt(request, first)
+    await mod.release_ref_reservation(request, reservation)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert key not in store.bindings
+    assert id(registry) not in store.registry_owners
+    assert key not in store.reservations
+    assert id(registry) not in store.registry_reservations
+    assert key not in store.deferred_cleanups
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+    assert (
+        await second.reader(f"cat {first_plan.catalog[0].manifest.ref}")
+        == "Error: externalized ref binding is unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_newer_commit_supersedes_deferred_cleanup_without_deleting_new_binding(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    (
+        request,
+        registry,
+        key,
+        first_plan,
+        first,
+        second_plan,
+        second,
+    ) = await _task7_staged_reentry()
+
+    await mod.cleanup_ref_attempt(request, first)
+    await mod.commit_ref_attempt(request, second)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    cleanup = store.deferred_cleanups[key]
+    assert cleanup.generation == first.generation
+    assert cleanup.successor_generation == second.generation
+    assert cleanup.registry is registry
+    assert cleanup.reader is second.reader
+    assert {field.name for field in dataclasses.fields(cleanup)} == {
+        "generation",
+        "successor_generation",
+        "registry",
+        "reader",
+    }
+    assert store.bindings[key].generation == second.generation
+    assert store.registry_owners[id(registry)] == key
+    assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is second.reader
+    assert await second.reader(f"cat {first_plan.catalog[0].manifest.ref}") == "first"
+    assert await second.reader(f"cat {second_plan.catalog[0].manifest.ref}") == "second"
+
+
+@pytest.mark.asyncio
+async def test_rollback_after_newer_commit_does_not_resurrect_cleaned_predecessor(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
+
+    await mod.cleanup_ref_attempt(request, first)
+    await mod.commit_ref_attempt(request, second)
+    await mod.rollback_ref_attempt(request, second)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert key not in store.bindings
+    assert id(registry) not in store.registry_owners
+    assert key not in store.reservations
+    assert id(registry) not in store.registry_reservations
+    assert key not in store.deferred_cleanups
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+    assert (
+        await second.reader(f"cat {first_plan.catalog[0].manifest.ref}")
+        == "Error: externalized ref binding is unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollback_after_newer_commit_restores_uncleaned_predecessor_exactly(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request, registry, key, first_plan, _, _, second = await _task7_staged_reentry()
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    previous_binding = store.bindings[key]
+    previous_reader_entry = registry[mod.REF_EXEC_TOOL_NAME]
+
+    await mod.commit_ref_attempt(request, second)
+    await mod.rollback_ref_attempt(request, second)
+
+    assert store.bindings[key] is previous_binding
+    assert store.registry_owners[id(registry)] == key
+    assert registry[mod.REF_EXEC_TOOL_NAME] is previous_reader_entry
+    assert key not in store.deferred_cleanups
+    assert await second.reader(f"cat {first_plan.catalog[0].manifest.ref}") == "first"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_state", ["foreign", "missing"])
+async def test_cleanup_tombstone_rollback_preserves_foreign_or_missing_registry_entry(
+    monkeypatch,
+    registry_state,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
+    await mod.cleanup_ref_attempt(request, first)
+    await mod.commit_ref_attempt(request, second)
+    foreign = {"spec": {"name": "foreign"}, "callable": lambda command: command}
+    if registry_state == "foreign":
+        registry[mod.REF_EXEC_TOOL_NAME] = foreign
+    else:
+        registry.pop(mod.REF_EXEC_TOOL_NAME)
+
+    await mod.rollback_ref_attempt(request, second)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert key not in store.bindings
+    assert id(registry) not in store.registry_owners
+    assert key not in store.deferred_cleanups
+    if registry_state == "foreign":
+        assert registry[mod.REF_EXEC_TOOL_NAME] is foreign
+    else:
+        assert mod.REF_EXEC_TOOL_NAME not in registry
+    assert (
+        await second.reader(f"cat {first_plan.catalog[0].manifest.ref}")
+        == "Error: externalized ref binding is unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_successor_terminal_cleanup_consumes_predecessor_tombstone(monkeypatch):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
+    await mod.cleanup_ref_attempt(request, first)
+    await mod.commit_ref_attempt(request, second)
+
+    await mod.cleanup_ref_attempt(request, second)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert key not in store.bindings
+    assert id(registry) not in store.registry_owners
+    assert key not in store.deferred_cleanups
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+    assert (
+        await second.reader(f"cat {first_plan.catalog[0].manifest.ref}")
+        == "Error: externalized ref binding is unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_tombstone_transfers_once_across_an_additional_generation(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
+    await mod.cleanup_ref_attempt(request, first)
+    await mod.commit_ref_attempt(request, second)
+    third = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        _task7_plan("third"),
+        threshold_tokens=100_000,
+    )
+    await mod.cleanup_ref_attempt(request, second)
+    await mod.commit_ref_attempt(request, third)
+
+    await mod.rollback_ref_attempt(request, third)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert key not in store.bindings
+    assert id(registry) not in store.registry_owners
+    assert key not in store.deferred_cleanups
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+    assert (
+        await third.reader(f"cat {first_plan.catalog[0].manifest.ref}")
+        == "Error: externalized ref binding is unavailable"
+    )
+
+
+async def _task7_superseded_staged_reentry():
+    request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    second_reservation = store.reservations[key]
+    await mod.cleanup_ref_attempt(request, first)
+    third_reservation = await _task7_reserve(request, key, registry)
+    third = mod.stage_ref_attempt(
+        request,
+        third_reservation,
+        _task7_plan("third"),
+        threshold_tokens=100_000,
+    )
+    return SimpleNamespace(
+        request=request,
+        registry=registry,
+        key=key,
+        first_plan=first_plan,
+        first=first,
+        second=second,
+        second_reservation=second_reservation,
+        third=third,
+        third_reservation=third_reservation,
+    )
+
+
+def _assert_task7_cleanup_retargets_to_reservation(
+    scenario,
+    reservation,
+):
+    store = getattr(scenario.request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    cleanup = store.deferred_cleanups[scenario.key]
+    assert cleanup.generation == scenario.first.generation
+    assert cleanup.successor_generation == reservation.generation
+    assert cleanup.registry is scenario.registry
+    assert store.reservations[scenario.key] is reservation
+    assert store.registry_reservations[id(scenario.registry)] is reservation
+
+
+async def _assert_task7_ref_authority_removed(
+    scenario,
+    reader,
+):
+    store = getattr(scenario.request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    ref = scenario.first_plan.catalog[0].manifest.ref
+    assert scenario.key not in store.bindings
+    assert id(scenario.registry) not in store.registry_owners
+    assert scenario.key not in store.reservations
+    assert id(scenario.registry) not in store.registry_reservations
+    assert scenario.key not in store.deferred_cleanups
+    assert mod.REF_EXEC_TOOL_NAME not in scenario.registry
+    assert not any(
+        entry.manifest.ref == ref
+        for binding in store.bindings.values()
+        for entry in binding.catalog
+    )
+    assert (
+        await reader(f"cat {ref}") == "Error: externalized ref binding is unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_superseded_cleanup_tombstone_completes_on_current_reservation_release(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    scenario = await _task7_superseded_staged_reentry()
+    _assert_task7_cleanup_retargets_to_reservation(
+        scenario,
+        scenario.third_reservation,
+    )
+
+    await mod.release_ref_reservation(scenario.request, scenario.third_reservation)
+
+    await _assert_task7_ref_authority_removed(
+        scenario,
+        scenario.third.reader,
+    )
+
+
+@pytest.mark.asyncio
+async def test_superseded_cleanup_tombstone_completes_on_current_commit_rollback(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    scenario = await _task7_superseded_staged_reentry()
+    _assert_task7_cleanup_retargets_to_reservation(
+        scenario,
+        scenario.third_reservation,
+    )
+
+    await mod.commit_ref_attempt(scenario.request, scenario.third)
+    await mod.rollback_ref_attempt(scenario.request, scenario.third)
+
+    await _assert_task7_ref_authority_removed(
+        scenario,
+        scenario.third.reader,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_superseded_commit_cannot_consume_transferred_cleanup_tombstone(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    scenario = await _task7_superseded_staged_reentry()
+
+    with pytest.raises(mod.RefProjectionError, match="generation CAS"):
+        await mod.commit_ref_attempt(scenario.request, scenario.second)
+    _assert_task7_cleanup_retargets_to_reservation(
+        scenario,
+        scenario.third_reservation,
+    )
+    await mod.release_ref_reservation(scenario.request, scenario.third_reservation)
+
+    await _assert_task7_ref_authority_removed(
+        scenario,
+        scenario.third.reader,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_superseded_rollback_cannot_consume_transferred_cleanup_tombstone(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    scenario = await _task7_superseded_staged_reentry()
+
+    await mod.rollback_ref_attempt(scenario.request, scenario.second)
+    _assert_task7_cleanup_retargets_to_reservation(
+        scenario,
+        scenario.third_reservation,
+    )
+    await mod.release_ref_reservation(scenario.request, scenario.third_reservation)
+
+    await _assert_task7_ref_authority_removed(
+        scenario,
+        scenario.third.reader,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_superseded_release_cannot_consume_transferred_cleanup_tombstone(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    scenario = await _task7_superseded_staged_reentry()
+
+    await mod.release_ref_reservation(scenario.request, scenario.second_reservation)
+    _assert_task7_cleanup_retargets_to_reservation(
+        scenario,
+        scenario.third_reservation,
+    )
+    await mod.release_ref_reservation(scenario.request, scenario.third_reservation)
+
+    await _assert_task7_ref_authority_removed(
+        scenario,
+        scenario.third.reader,
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_key_reservation_replacement_without_cleanup_retains_binding(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request, registry, key, first_plan, _, _, _ = await _task7_staged_reentry()
+    third_reservation = await _task7_reserve(request, key, registry)
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+
+    await mod.release_ref_reservation(request, third_reservation)
+
+    assert store.bindings[key].generation < third_reservation.generation
+    assert store.registry_owners[id(registry)] == key
+    assert key not in store.reservations
+    assert id(registry) not in store.registry_reservations
+    assert key not in store.deferred_cleanups
+    assert (
+        await store.bindings[key].reader(f"cat {first_plan.catalog[0].manifest.ref}")
+        == "first"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_tombstone_does_not_transfer_to_same_key_foreign_registry():
+    request, registry, key, _, first, _, _ = await _task7_staged_reentry()
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    second_reservation = store.reservations[key]
+    await mod.cleanup_ref_attempt(request, first)
+    foreign_registry = {"foreign": {}}
+
+    foreign_reservation = await mod.reserve_ref_binding(request, key, foreign_registry)
+
+    cleanup = store.deferred_cleanups[key]
+    assert cleanup.successor_generation == second_reservation.generation
+    assert cleanup.registry is registry
+    assert foreign_reservation is None
+    assert store.reservations[key] is second_reservation
+    assert store.registry_reservations[id(registry)] is second_reservation
+    assert id(foreign_registry) not in store.registry_reservations
+
+
+async def _task7_foreign_registry_replacement_attempt():
+    request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    second_reservation = store.reservations[key]
+    await mod.cleanup_ref_attempt(request, first)
+    foreign_registry = {"foreign": {}}
+    foreign_reservation = await mod.reserve_ref_binding(
+        request,
+        key,
+        foreign_registry,
+    )
+    return SimpleNamespace(
+        request=request,
+        registry=registry,
+        key=key,
+        first_plan=first_plan,
+        first=first,
+        second=second,
+        second_reservation=second_reservation,
+        foreign_registry=foreign_registry,
+        foreign_reservation=foreign_reservation,
+    )
+
+
+@pytest.mark.asyncio
+async def test_foreign_registry_replacement_cannot_displace_cleanup_before_release(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    scenario = await _task7_foreign_registry_replacement_attempt()
+
+    assert scenario.foreign_reservation is None
+    _assert_task7_cleanup_retargets_to_reservation(
+        scenario,
+        scenario.second_reservation,
+    )
+    await mod.release_ref_reservation(
+        scenario.request,
+        scenario.second_reservation,
+    )
+
+    await _assert_task7_ref_authority_removed(
+        scenario,
+        scenario.second.reader,
+    )
+    assert (
+        id(scenario.foreign_registry)
+        not in getattr(
+            scenario.request.state,
+            mod.REQUEST_STATE_REF_STORE_KEY,
+        ).registry_reservations
+    )
+    assert mod.REF_EXEC_TOOL_NAME not in scenario.foreign_registry
+
+
+@pytest.mark.asyncio
+async def test_foreign_registry_replacement_cannot_displace_cleanup_before_commit_rollback(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    scenario = await _task7_foreign_registry_replacement_attempt()
+
+    assert scenario.foreign_reservation is None
+    _assert_task7_cleanup_retargets_to_reservation(
+        scenario,
+        scenario.second_reservation,
+    )
+    await mod.commit_ref_attempt(scenario.request, scenario.second)
+    await mod.rollback_ref_attempt(scenario.request, scenario.second)
+
+    await _assert_task7_ref_authority_removed(
+        scenario,
+        scenario.second.reader,
+    )
+    assert (
+        id(scenario.foreign_registry)
+        not in getattr(
+            scenario.request.state,
+            mod.REQUEST_STATE_REF_STORE_KEY,
+        ).registry_reservations
+    )
+    assert mod.REF_EXEC_TOOL_NAME not in scenario.foreign_registry
+
+
+async def _task7_committed_foreign_registry_replacement_attempt():
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    key = _task7_key()
+    first_plan = _task7_plan("first")
+    first = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        first_plan,
+        threshold_tokens=100_000,
+    )
+    await mod.commit_ref_attempt(request, first)
+    foreign_registry = {"foreign": {}}
+    foreign_reservation = await mod.reserve_ref_binding(
+        request,
+        key,
+        foreign_registry,
+    )
+    return SimpleNamespace(
+        request=request,
+        registry=registry,
+        key=key,
+        first_plan=first_plan,
+        first=first,
+        foreign_registry=foreign_registry,
+        foreign_reservation=foreign_reservation,
+    )
+
+
+@pytest.mark.asyncio
+async def test_foreign_registry_cannot_reserve_committed_key_before_cleanup(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    scenario = await _task7_committed_foreign_registry_replacement_attempt()
+
+    assert scenario.foreign_reservation is None
+    await mod.cleanup_ref_attempt(scenario.request, scenario.first)
+
+    await _assert_task7_ref_authority_removed(
+        scenario,
+        scenario.first.reader,
+    )
+    store = getattr(scenario.request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert id(scenario.foreign_registry) not in store.registry_owners
+    assert id(scenario.foreign_registry) not in store.registry_reservations
+    assert mod.REF_EXEC_TOOL_NAME not in scenario.foreign_registry
+
+
+@pytest.mark.asyncio
+async def test_rejected_foreign_registry_preserves_same_registry_commit_cleanup(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    scenario = await _task7_committed_foreign_registry_replacement_attempt()
+
+    assert scenario.foreign_reservation is None
+    second = mod.stage_ref_attempt(
+        scenario.request,
+        await _task7_reserve(
+            scenario.request,
+            scenario.key,
+            scenario.registry,
+        ),
+        _task7_plan("second"),
+        threshold_tokens=100_000,
+    )
+    await mod.commit_ref_attempt(scenario.request, second)
+    await mod.cleanup_ref_attempt(scenario.request, second)
+
+    await _assert_task7_ref_authority_removed(
+        scenario,
+        second.reader,
+    )
+    store = getattr(scenario.request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert id(scenario.foreign_registry) not in store.registry_owners
+    assert id(scenario.foreign_registry) not in store.registry_reservations
+    assert mod.REF_EXEC_TOOL_NAME not in scenario.foreign_registry
+
+
+@pytest.mark.asyncio
+async def test_cleanup_tombstone_does_not_transfer_to_sibling_reservation():
+    request, registry, key, _, first, _, _ = await _task7_staged_reentry()
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    second_reservation = store.reservations[key]
+    await mod.cleanup_ref_attempt(request, first)
+    sibling_registry = {"sibling": {}}
+    sibling_key = _task7_key(model="wrapper-b", assistant="assistant-b")
+
+    sibling_reservation = await _task7_reserve(
+        request,
+        sibling_key,
+        sibling_registry,
+    )
+
+    cleanup = store.deferred_cleanups[key]
+    assert cleanup.successor_generation == second_reservation.generation
+    assert cleanup.registry is registry
+    assert sibling_reservation.key == sibling_key
+    assert store.reservations[key] is second_reservation
+
+
+@pytest.mark.asyncio
+async def test_cleanup_and_rollback_clear_internal_state_without_overwriting_foreign_registry():
+    for operation in (mod.cleanup_ref_attempt, mod.rollback_ref_attempt):
+        request = _Task7Request()
+        registry = {"unrelated": {}}
+        key = _task7_key()
+        attempt = mod.stage_ref_attempt(
+            request,
+            await _task7_reserve(request, key, registry),
+            _task7_plan("content"),
+        )
+        await mod.commit_ref_attempt(request, attempt)
+        foreign = {"spec": {"name": "foreign"}, "callable": lambda command: command}
+        registry[mod.REF_EXEC_TOOL_NAME] = foreign
+
+        await operation(request, attempt)
+
+        store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+        assert key not in store.bindings
+        assert id(registry) not in store.registry_owners
+        assert registry[mod.REF_EXEC_TOOL_NAME] is foreign
+
+
+async def _task7_committed_reentry():
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    key = _task7_key()
+    first_plan = _task7_plan("first")
+    first = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        first_plan,
+    )
+    await mod.commit_ref_attempt(request, first)
+    previous_binding = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY).bindings[
+        key
+    ]
+    previous_reader_entry = registry[mod.REF_EXEC_TOOL_NAME]
+    second = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        _task7_plan("second"),
+    )
+    await mod.commit_ref_attempt(request, second)
+    return (
+        request,
+        registry,
+        key,
+        first_plan,
+        second,
+        previous_binding,
+        previous_reader_entry,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reentry_rollback_restores_exact_owned_binding_and_registry_entry(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    (
+        request,
+        registry,
+        key,
+        first_plan,
+        second,
+        previous_binding,
+        previous_reader_entry,
+    ) = await _task7_committed_reentry()
+
+    await mod.rollback_ref_attempt(request, second)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert store.bindings[key] is previous_binding
+    assert store.registry_owners[id(registry)] == key
+    assert registry[mod.REF_EXEC_TOOL_NAME] is previous_reader_entry
+    assert await second.reader(f"cat {first_plan.catalog[0].manifest.ref}") == "first"
+
+
+@pytest.mark.asyncio
+async def test_reentry_rollback_removes_internal_state_without_overwriting_foreign_registry(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request, registry, key, first_plan, second, _, _ = await _task7_committed_reentry()
+    foreign = {"spec": {"name": "foreign"}, "callable": lambda command: command}
+    registry[mod.REF_EXEC_TOOL_NAME] = foreign
+
+    await mod.rollback_ref_attempt(request, second)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert key not in store.bindings
+    assert id(registry) not in store.registry_owners
+    assert registry[mod.REF_EXEC_TOOL_NAME] is foreign
+    assert (
+        await second.reader(f"cat {first_plan.catalog[0].manifest.ref}")
+        == "Error: externalized ref binding is unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reentry_rollback_removes_internal_state_without_recreating_missing_registry_entry(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request, registry, key, first_plan, second, _, _ = await _task7_committed_reentry()
+    registry.pop(mod.REF_EXEC_TOOL_NAME)
+
+    await mod.rollback_ref_attempt(request, second)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert key not in store.bindings
+    assert id(registry) not in store.registry_owners
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+    assert (
+        await second.reader(f"cat {first_plan.catalog[0].manifest.ref}")
+        == "Error: externalized ref binding is unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_global_generation_nonce_prevents_deleted_binding_aba():
+    request = _Task7Request()
+    registry = {"other": {}}
+    key = _task7_key()
+    stale = await _task7_reserve(request, key, registry)
+    stale_nonce = stale.generation
+    await mod.release_ref_reservation(request, stale)
+    recreated = await _task7_reserve(request, key, registry)
+
+    assert recreated.generation > stale_nonce
+    assert not await mod.compare_and_swap_ref_generation(
+        request,
+        mod.stage_ref_attempt(request, stale, _task7_plan("stale")),
+    )
+
+
+@pytest.mark.asyncio
+async def test_reentry_updates_reader_key_in_place_without_replacing_tools_mapping():
+    request = _Task7Request()
+    registry = {"other": {}}
+    registry_identity = id(registry)
+    key = _task7_key()
+    first = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        _task7_plan("alpha"),
+    )
+    await mod.commit_ref_attempt(request, first)
+    second = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        _task7_plan("beta"),
+    )
+    await mod.commit_ref_attempt(request, second)
+
+    assert id(registry) == registry_identity
+    assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is second.reader
+    assert registry["other"] == {}
+
+
+@pytest.mark.asyncio
+async def test_reader_callable_cannot_resolve_sibling_catalog(monkeypatch):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request = _Task7Request()
+    registries = ({"a": {}}, {"b": {}})
+    keys = (_task7_key(), _task7_key(model="wrapper-b", assistant="assistant-b"))
+    attempts = []
+    for key, registry, text in zip(keys, registries, ("alpha", "beta"), strict=True):
+        attempt = mod.stage_ref_attempt(
+            request,
+            await _task7_reserve(request, key, registry),
+            _task7_plan(text),
+            threshold_tokens=100_000,
+        )
+        await mod.commit_ref_attempt(request, attempt)
+        attempts.append(attempt)
+
+    sibling_ref = _task7_plan("beta").catalog[0].manifest.ref
+    result = await attempts[0].reader(f"cat {sibling_ref}")
+
+    assert "this binding" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_over_128_legitimate_private_bindings_remain_zero_copy_until_request_cleanup(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request = _Task7Request()
+    source = "zero-copy" * 6_000
+    plans = []
+    registries = []
+    for index in range(129):
+        registry = {f"unrelated-{index}": {}}
+        key = _task7_key(model=f"wrapper-{index}", assistant=f"assistant-{index}")
+        plan = _task7_plan(source)
+        attempt = mod.stage_ref_attempt(
+            request,
+            await _task7_reserve(request, key, registry),
+            plan,
+            threshold_tokens=100_000,
+        )
+        await mod.commit_ref_attempt(request, attempt)
+        plans.append(plan)
+        registries.append(registry)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert len(store.bindings) == 129
+    assert all(
+        binding.catalog[0].source.text is source
+        for binding in store.bindings.values()
+    )
+    assert (
+        len(
+            {
+                id(registry[mod.REF_EXEC_TOOL_NAME]["callable"])
+                for registry in registries
+            }
+        )
+        == 129
+    )
+    for plan, registry in zip(plans, registries, strict=True):
+        advertised = {"messages": [], "metadata": {"tools": registry}}
+        mod.apply_ref_projection_surfaces(advertised, plan, include_reader_schema=True)
+        assert any(
+            tool.get("function", {}).get("name") == mod.REF_EXEC_TOOL_NAME
+            for tool in advertised["tools"]
+        )
+        reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
+        assert await reader(f"cat {plan.catalog[0].manifest.ref}") == source
+
+
+@pytest.mark.asyncio
+async def test_unselected_attempt_leaves_request_body_registry_and_catalog_unchanged(
+    monkeypatch,
+):
+    observed = _task7_install_pipe_runtime(monkeypatch)
+    request, disabled_request = _Task7Request(), _Task7Request()
+    registry, disabled_registry = {"other": {}}, {"other": {}}
+    registry_snapshot = copy.deepcopy(registry)
+    disabled_registry_snapshot = copy.deepcopy(disabled_registry)
+
+    result, _ = await _task7_pipe_call(
+        request=request,
+        registry=registry,
+        text="small",
+        enabled=True,
+    )
+    disabled_result, _ = await _task7_pipe_call(
+        request=disabled_request,
+        registry=disabled_registry,
+        text="small",
+        enabled=False,
+    )
+
+    assert result == disabled_result == {"ok": True}
+    assert not hasattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert registry == registry_snapshot
+    assert disabled_registry == disabled_registry_snapshot
+    assert not hasattr(disabled_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    enabled_forward, disabled_forward = observed["forwards"]
+    assert enabled_forward["metadata"]["tools"] is registry
+    assert disabled_forward["metadata"]["tools"] is disabled_registry
+    for forwarded in (enabled_forward, disabled_forward):
+        assert "auto_compact_ref_manifests" not in forwarded["metadata"]
+        assert mod.REF_EXEC_TOOL_NAME not in forwarded["metadata"]["tools"]
+        assert not any(
+            tool.get("function", {}).get("name") == mod.REF_EXEC_TOOL_NAME
+            for tool in forwarded.get("tools", [])
+        )
+        assert all(
+            not str(message.get("content", "")).startswith(("tool:", "history:"))
+            for message in forwarded["messages"]
+        )
+    enabled_visible, disabled_visible = (
+        copy.deepcopy(enabled_forward),
+        copy.deepcopy(disabled_forward),
+    )
+    enabled_visible["metadata"].pop("tools")
+    disabled_visible["metadata"].pop("tools")
+    assert enabled_visible == disabled_visible
+
+
+@pytest.mark.asyncio
+async def test_reentry_preserves_projection_reachable_refs_and_updates_only_its_binding_catalog(
+    monkeypatch,
+):
+    async def authorized(_chat_id, _user_id):
+        return True
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
+    request = _Task7Request()
+    registry = {"other": {}}
+    key = _task7_key()
+    sibling_registry = {"sibling": {}}
+    sibling_key = _task7_key(model="wrapper-sibling", assistant="assistant-sibling")
+    sibling_plan = _task7_plan("sibling")
+    sibling = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, sibling_key, sibling_registry),
+        sibling_plan,
+        threshold_tokens=100_000,
+    )
+    await mod.commit_ref_attempt(request, sibling)
+    first_plan = _task7_plan("alpha")
+    first = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        first_plan,
+        threshold_tokens=100_000,
+    )
+    await mod.commit_ref_attempt(request, first)
+    second_plan = _task7_plan("beta")
+    second = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        second_plan,
+        threshold_tokens=100_000,
+    )
+    await mod.commit_ref_attempt(request, second)
+    empty = mod.RefProjectionPlan(
+        catalog=(), manifests=(), reader_schema=mod.REF_EXEC_TOOL_SPEC
+    )
+    third = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        empty,
+        threshold_tokens=100_000,
+    )
+    await mod.commit_ref_attempt(request, third)
+
+    assert await third.reader(f"cat {first_plan.catalog[0].manifest.ref}") == "alpha"
+    assert await third.reader(f"cat {second_plan.catalog[0].manifest.ref}") == "beta"
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert len(store.bindings[key].catalog) == 2
+    assert store.bindings[sibling_key].catalog == sibling_plan.catalog
+    assert (
+        await sibling.reader(f"cat {sibling_plan.catalog[0].manifest.ref}") == "sibling"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_ref_attempt_removes_empty_reservation():
+    request = _Task7Request()
+    registry = {"other": {}}
+    reservation = await _task7_reserve(request, _task7_key(), registry)
+
+    await mod.release_ref_reservation(request, reservation)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert store.next_generation == reservation.generation
+    assert store.bindings == {}
+    assert store.reservations == {}
+    assert registry == {"other": {}}
+
+
+@pytest.mark.asyncio
+async def test_absent_or_detached_outer_tools_match_valve_off_at_all_sizes(monkeypatch):
+    for size, estimate in (
+        (8, 10),
+        (50 * 1024, 10),
+        (30 * 1024 * 1024, 10),
+        (65_537, 200),
+    ):
+        observed = _task7_install_pipe_runtime(monkeypatch, estimate_tokens=estimate)
+        registry = {"outer": {}}
+        enabled_request, disabled_request = _Task7Request(), _Task7Request()
+
+        enabled, metadata = await _task7_pipe_call(
+            request=enabled_request,
+            registry=registry,
+            text="x" * size,
+            enabled=True,
+            detached=True,
+        )
+        disabled, _ = await _task7_pipe_call(
+            request=disabled_request,
+            registry=registry,
+            text="x" * size,
+            enabled=False,
+            detached=True,
+        )
+
+        assert enabled == disabled == {"ok": True}
+        assert observed["forwards"][-2] == observed["forwards"][-1]
+        assert observed["classification"] == observed["owner"] == 0
+        assert not hasattr(enabled_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+        assert metadata["tools"] is registry
+
+
+@pytest.mark.asyncio
+async def test_attached_outer_registry_is_mutated_in_place_preserving_unrelated_entries(
+    monkeypatch,
+):
+    observed = _task7_install_pipe_runtime(monkeypatch)
+    for initial_registry in ({}, {"unrelated": {"spec": {"name": "other"}}}):
+        request = _Task7Request()
+        registry = copy.deepcopy(initial_registry)
+        injected_metadata = {
+            "chat_id": "chat-1",
+            "message_id": "assistant-a",
+            "params": {"function_calling": "native"},
+            "tools": registry,
+        }
+        outer_metadata = {
+            "chat_id": "local:task-7",
+            "message_id": "assistant-a",
+            "tools": registry,
+        }
+        assert injected_metadata is not outer_metadata
+
+        result, _ = await _task7_pipe_call(
+            request=request,
+            registry=registry,
+            text="alpha" * 20_000,
+            enabled=True,
+            metadata_override=injected_metadata,
+            outer_metadata=outer_metadata,
+        )
+
+        assert result == {"ok": True}
+        assert request.state.metadata is outer_metadata
+        assert injected_metadata["tools"] is outer_metadata["tools"] is registry
+        forwarded = observed["forwards"][-1]
+        assert forwarded["metadata"]["tools"] is registry
+        manifest = forwarded["metadata"]["auto_compact_ref_manifests"][0]
+        events = await _task7_dispatch_with_current_core(
+            monkeypatch,
+            registry,
+            manifest["ref"],
+            outer_metadata,
+        )
+        assert "function_call_output" in json.dumps(events)
+        for name, value in initial_registry.items():
+            assert registry[name] == value
+        assert callable(registry[mod.REF_EXEC_TOOL_NAME]["callable"])
+
+
+@pytest.mark.asyncio
+async def test_attached_registry_reader_key_rolls_back_only_matching_generation():
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    key = _task7_key()
+    stale = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        _task7_plan("stale"),
+    )
+    current = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        _task7_plan("current"),
+    )
+    await mod.commit_ref_attempt(request, current)
+
+    await mod.rollback_ref_attempt(request, stale)
+
+    assert registry["unrelated"] == {}
+    assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is current.reader
+
+
+@pytest.mark.asyncio
+async def test_sibling_owned_registry_mapping_matches_valve_off_without_mutation(
+    monkeypatch,
+):
+    monkeypatch.setattr(mod, "_REF_BINDING_LABEL_HMAC_KEY", b"k" * 32)
+    captured_warnings = []
+
+    def capture_warning(message, *args, **kwargs):
+        captured_warnings.append(message % args)
+
+    monkeypatch.setattr(mod.LOG, "warning", capture_warning)
+    observed = _task7_install_pipe_runtime(monkeypatch)
+    resolve_ref_mode_preflight = mod.resolve_ref_mode_preflight
+
+    def resolve_and_record(preflight):
+        mode = resolve_ref_mode_preflight(preflight)
+        assert mode is not None
+        observed["events"].append(f"mode:{mode.active}:{mode.reason}")
+        return mode
+
+    monkeypatch.setattr(mod, "resolve_ref_mode_preflight", resolve_and_record)
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    owner_key = _task7_key(model="owner", assistant="owner-assistant")
+    owner_plan = _task7_plan("private-owner-content")
+    owner = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, owner_key, registry),
+        owner_plan,
+    )
+    await mod.commit_ref_attempt(request, owner)
+    snapshot = dict(registry)
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    nonce = store.next_generation
+    catalog = store.bindings[owner_key].catalog
+    reader = store.bindings[owner_key].reader
+    sentinel_values = (
+        "sibling-user",
+        "sibling-chat",
+        "sibling-model",
+        "tool:" + "f" * 64,
+    )
+    sibling_user = {"id": sentinel_values[0]}
+    sibling_metadata = {
+        "chat_id": sentinel_values[1],
+        "message_id": "sibling-assistant",
+        "user_message_id": "sibling-user-message",
+        "params": {"function_calling": "native"},
+        "tools": registry,
+    }
+    body = {
+        "model": mod.build_wrapper_model_id("auto_compact", "target"),
+        "stream": True,
+        "messages": _task7_native_round("sibling-private-content" * 5_000),
+    }
+    second_request = _Task7Request()
+    second_registry = {"unrelated": {}}
+    second_plan = _task7_plan("private-owner-content")
+    before_outer_metadata = {
+        "chat_id": "local:task-7",
+        "message_id": "assistant-a",
+        "tools": second_registry,
+    }
+    schema_before = {"messages": [], "metadata": before_outer_metadata}
+    mod.apply_ref_projection_surfaces(
+        schema_before, second_plan, include_reader_schema=True
+    )
+    second_owner = mod.stage_ref_attempt(
+        second_request,
+        await _task7_reserve(second_request, owner_key, second_registry),
+        second_plan,
+    )
+    await mod.commit_ref_attempt(second_request, second_owner)
+    before_events = await _task7_dispatch_with_current_core(
+        monkeypatch,
+        second_registry,
+        second_plan.catalog[0].manifest.ref,
+        before_outer_metadata,
+    )
+
+    disabled_pipe = mod.Pipe()
+    disabled_pipe.valves.ref_exec_enabled = False
+    disabled_event_start = len(observed["events"])
+    disabled_result = await disabled_pipe.pipe(
+        copy.deepcopy(body),
+        __request__=request,
+        __user__=sibling_user,
+        __metadata__=sibling_metadata,
+        __tools__=registry,
+    )
+    disabled_events = observed["events"][disabled_event_start:]
+    disabled_forward = copy.deepcopy(observed["forwards"][-1])
+
+    sibling_pipe = mod.Pipe()
+    sibling_pipe.valves.ref_exec_enabled = True
+    first_event_start = len(observed["events"])
+    first_result = await sibling_pipe.pipe(
+        copy.deepcopy(body),
+        __request__=request,
+        __user__=sibling_user,
+        __metadata__=sibling_metadata,
+        __tools__=registry,
+    )
+    first_events = observed["events"][first_event_start:]
+    first_forward = copy.deepcopy(observed["forwards"][-1])
+    second_event_start = len(observed["events"])
+    second_result = await sibling_pipe.pipe(
+        copy.deepcopy(body),
+        __request__=request,
+        __user__=sibling_user,
+        __metadata__=sibling_metadata,
+        __tools__=registry,
+    )
+    second_events = observed["events"][second_event_start:]
+    second_forward = copy.deepcopy(observed["forwards"][-1])
+    second_sibling_pipe = mod.Pipe()
+    second_sibling_pipe.valves.ref_exec_enabled = True
+    await second_sibling_pipe.pipe(
+        copy.deepcopy(body),
+        __request__=second_request,
+        __user__=sibling_user,
+        __metadata__={**sibling_metadata, "tools": second_registry},
+        __tools__=second_registry,
+    )
+    after_outer_metadata = {
+        "chat_id": "local:task-7",
+        "message_id": "assistant-a",
+        "tools": registry,
+    }
+    schema_after = {"messages": [], "metadata": after_outer_metadata}
+    mod.apply_ref_projection_surfaces(
+        schema_after, owner_plan, include_reader_schema=True
+    )
+    after_events = await _task7_dispatch_with_current_core(
+        monkeypatch,
+        registry,
+        owner_plan.catalog[0].manifest.ref,
+        after_outer_metadata,
+    )
+    warnings = [
+        warning for warning in captured_warnings if "shared_registry_mapping" in warning
+    ]
+
+    assert disabled_result == first_result == second_result == {"ok": True}
+    assert first_forward == second_forward == disabled_forward
+    assert all(
+        not any(
+            tool.get("function", {}).get("name") == mod.REF_EXEC_TOOL_NAME
+            for tool in forwarded.get("tools", [])
+        )
+        for forwarded in (first_forward, second_forward, disabled_forward)
+    )
+    assert disabled_events[0] == "mode:False:valve_off"
+    assert first_events[0].startswith("mode:False:")
+    assert second_events[0].startswith("mode:False:")
+    assert first_events[1:] == second_events[1:] == disabled_events[1:]
+    assert "function_call_output" in json.dumps(after_events)
+    assert "function_call_output" in json.dumps(before_events)
+    assert len(warnings) == 2
+    assert all(re.search(r"\b[0-9a-f]{16}\b", warning) for warning in warnings)
+    assert not any(value in "".join(warnings) for value in sentinel_values)
+    assert registry == snapshot
+    assert store.next_generation == nonce
+    assert store.bindings[owner_key].catalog is catalog
+    assert store.bindings[owner_key].reader is reader
+    assert observed["owner"] == 2
+    assert observed["classification"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_attempt_rolls_back_only_matching_binding_generation(monkeypatch):
+    _task7_install_pipe_runtime(monkeypatch)
+    request = _Task7Request()
+    registry, sibling_registry = {"first": {}}, {"sibling": {}}
+    sibling_key = _task7_key(model="wrapper-b", assistant="assistant-b")
+    sibling = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, sibling_key, sibling_registry),
+        _task7_plan("sibling"),
+    )
+    await mod.commit_ref_attempt(request, sibling)
+    attempts = []
+
+    async def forward(**kwargs):
+        entry = registry.get(mod.REF_EXEC_TOOL_NAME)
+        attempts.append(entry.get("callable") if isinstance(entry, dict) else None)
+        if len(attempts) == 1:
+            raise mod.RetryableContextOverflow("retry")
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward)
+    result, _ = await _task7_pipe_call(
+        request=request,
+        registry=registry,
+        text="retry content" * 10_000,
+        enabled=True,
+    )
+
+    await mod.rollback_ref_attempt(
+        request,
+        mod.RefAttempt(
+            key=_task7_key(),
+            generation=1,
+            plan=_task7_plan("stale"),
+            registry=registry,
+            reader=attempts[0],
+            previous_binding=None,
+            previous_reader_entry=mod.REF_REGISTRY_ENTRY_MISSING,
+        ),
+    )
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert result == {"ok": True}
+    assert len(attempts) == 2
+    assert all(callable(reader) for reader in attempts)
+    pipe_key = next(key for key in store.bindings if key != sibling_key)
+    assert store.bindings[pipe_key].reader is attempts[1]
+    assert store.bindings[sibling_key].generation == sibling.generation
+    assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is attempts[1]
+    assert sibling_registry[mod.REF_EXEC_TOOL_NAME]["callable"] is sibling.reader
+
+    for failure in (RuntimeError("pre-output"), asyncio.CancelledError()):
+        failed_request = _Task7Request()
+        failed_registry = {}
+
+        async def fail_forward(**kwargs):
+            assert mod.REF_EXEC_TOOL_NAME in failed_registry
+            raise failure
+
+        monkeypatch.setattr(mod, "_forward_streaming_target", fail_forward)
+        with pytest.raises(type(failure)):
+            await _task7_pipe_call(
+                request=failed_request,
+                registry=failed_registry,
+                text="failed content" * 5_000,
+                enabled=True,
+            )
+        failed_store = getattr(failed_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+        assert not failed_store.bindings
+        assert not failed_store.reservations
+        assert not failed_store.registry_reservations
+        assert mod.REF_EXEC_TOOL_NAME not in failed_registry
+
+
+@pytest.mark.asyncio
+async def test_ref_lifecycle_cleans_real_pipe_success_and_malformed_active_context(
+    monkeypatch,
+):
+    _task7_install_pipe_runtime(monkeypatch)
+
+    async def target_completion(**_kwargs):
+        return {
+            "choices": [
+                {"message": {"role": "assistant", "content": "terminal response"}}
+            ]
+        }
+
+    monkeypatch.setattr(mod, "_call_target_completion", target_completion)
+    success_request = _Task7Request()
+    success_registry = {}
+    success, _ = await _task7_pipe_call(
+        request=success_request,
+        registry=success_registry,
+        text="terminal content" * 10_000,
+        enabled=True,
+        body={
+            "model": mod.build_wrapper_model_id("auto_compact", "target"),
+            "stream": False,
+            "messages": _task7_native_round("terminal content" * 10_000),
+        },
+    )
+    success_store = getattr(success_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert success["choices"][0]["message"]["content"] == "terminal response"
+    assert not success_store.bindings
+    assert not success_store.reservations
+    assert not success_store.registry_reservations
+    assert mod.REF_EXEC_TOOL_NAME not in success_registry
+
+    malformed_request = _Task7Request()
+    malformed_registry = {}
+
+    def malformed_patterns(_value):
+        raise ValueError("malformed active context")
+
+    monkeypatch.setattr(mod, "parse_transient_message_patterns", malformed_patterns)
+    malformed, _ = await _task7_pipe_call(
+        request=malformed_request,
+        registry=malformed_registry,
+        text="malformed content" * 10_000,
+        enabled=True,
+    )
+    malformed_store = getattr(
+        malformed_request.state,
+        mod.REQUEST_STATE_REF_STORE_KEY,
+        mod.RefRequestStore(),
+    )
+    assert malformed["error"]["code"] == "invalid_transient_message_patterns"
+    assert not malformed_store.bindings
+    assert not malformed_store.reservations
+    assert not malformed_store.registry_reservations
+    assert mod.REF_EXEC_TOOL_NAME not in malformed_registry
+
+
+@pytest.mark.asyncio
+async def test_active_reservation_failure_is_fail_closed_and_terminal_cleanup_is_generation_cas(
+    monkeypatch,
+):
+    _task7_install_pipe_runtime(monkeypatch)
+    request = _Task7Request()
+    registry = {}
+
+    async def reservation_failed(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mod, "reserve_ref_binding", reservation_failed)
+    result, _ = await _task7_pipe_call(
+        request=request,
+        registry=registry,
+        text="reservation content" * 10_000,
+        enabled=True,
+    )
+    assert result["error"]["code"] == "ref_projection_failed"
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+
+    monkeypatch.undo()
+    _task7_install_pipe_runtime(monkeypatch)
+    request = _Task7Request()
+    registry = {}
+    key = _task7_key()
+    first = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        _task7_plan("first"),
+    )
+    await mod.commit_ref_attempt(request, first)
+    second = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        _task7_plan("second"),
+    )
+    await mod.commit_ref_attempt(request, second)
+
+    await mod.cleanup_ref_attempt(request, first)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert store.bindings[key].generation == second.generation
+    assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is second.reader
+
+
+@pytest.mark.asyncio
+async def test_selected_attempt_commits_only_readable_projected_refs_immediately_before_forward(
+    monkeypatch,
+):
+    _task7_install_pipe_runtime(monkeypatch)
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    observed = {}
+
+    async def forward(**kwargs):
+        refs = [
+            message["content"]
+            for message in kwargs["body"]["messages"]
+            if message.get("role") == "tool"
+        ]
+        observed["refs"] = refs
+        observed["results"] = [
+            await registry[mod.REF_EXEC_TOOL_NAME]["callable"](f"cat {ref}")
+            for ref in refs
+        ]
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward)
+    result, _ = await _task7_pipe_call(
+        request=request,
+        registry=registry,
+        text="readable immediately" * 5_000,
+        enabled=True,
+    )
+
+    assert result == {"ok": True}
+    assert all(ref.startswith("tool:") for ref in observed["refs"])
+    assert all("readable immediately" in value for value in observed["results"])
+    assert registry["unrelated"] == {}
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_never_mutates_ref_request_store_or_registry():
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    request.state.metadata = {"chat_id": "chat-1", "tools": registry}
+    key = _task7_key()
+    committed = mod.stage_ref_attempt(
+        request,
+        await _task7_reserve(request, key, registry),
+        _task7_plan("foreground"),
+    )
+    await mod.commit_ref_attempt(request, committed)
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    generation = store.next_generation
+    catalog_refs = tuple(entry.manifest.ref for entry in store.bindings[key].catalog)
+    captured = {}
+
+    async def prefetch(**kwargs):
+        captured.update(kwargs)
+        prefetch_request = kwargs["request"]
+        assert prefetch_request is not request
+        assert not hasattr(prefetch_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+        assert "tools" not in prefetch_request.state.metadata
+        assert "tools" not in kwargs["metadata"]
+        assert "tools" not in kwargs["body"].get("metadata", {})
+        setattr(
+            prefetch_request.state,
+            mod.REQUEST_STATE_REF_STORE_KEY,
+            SimpleNamespace(next_generation=generation + 100, bindings={}),
+        )
+        prefetch_request.state.metadata["tools"] = {"detached": {}}
+        return True
+
+    original = mod._prefetch_compaction_checkpoint
+    mod._prefetch_compaction_checkpoint = prefetch
+    try:
+        prepared = mod._prepare_soft_compaction_prefetch(
+            request=request,
+            user={"id": "user-1"},
+            metadata={"chat_id": "chat-1", "tools": registry},
+            body={
+                "messages": [
+                    {"role": "user", "content": "one"},
+                    {"role": "assistant", "content": "two"},
+                    {"role": "user", "content": "three"},
+                ],
+                "metadata": {"tools": registry},
+            },
+            pipe_function_id="auto_compact",
+            summary_model_id="target",
+            summary_tool_policy="fallback_on_tool_call",
+            historical_message_excerpt_bytes=1024,
+            historical_message_excerpt_count=1,
+        )
+        assert prepared is not None
+        assert await prepared.run(None) is True
+    finally:
+        mod._prefetch_compaction_checkpoint = original
+
+    assert captured["request"] is not request
+    assert store.next_generation == generation
+    assert store.bindings[key].reader is committed.reader
+    assert (
+        tuple(entry.manifest.ref for entry in store.bindings[key].catalog)
+        == catalog_refs
+    )
+    assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is committed.reader
+    assert registry["unrelated"] == {}
+
+
+@pytest.mark.asyncio
+async def test_prefetch_profile_and_projection_match_foreground(monkeypatch):
+    body = {
+        "messages": [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"},
+        ]
+    }
+    captured = {}
+
+    async def capture_prefetch(**kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(mod, "_prefetch_compaction_checkpoint", capture_prefetch)
+    prepared = mod._prepare_soft_compaction_prefetch(
+        request=_Task7Request(),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=1,
+    )
+
+    assert prepared is not None
+    assert await prepared.run(None) is True
+    assert prepared.key[4] == mod.compute_profile_hash()
+    assert prepared.key == mod._soft_prefetch_inflight_key_for_body(
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+    )
+    source_messages = captured["source_messages"]
+    source_hash = mod.compute_summary_source_hash(source_messages)
+    checkpoint = {
+        "id": "checkpoint-child",
+        "parent_checkpoint_id": "checkpoint-parent",
+        "profile_hash": prepared.key[4],
+        "source_hash": source_hash,
+        "source_message_count": len(source_messages),
+        "state": "ready",
+        "summary_text": "stored summary",
+        "summary_meta": {},
+    }
+    store = ClaimCheckpointStore([checkpoint])
+    selected = await mod._find_reusable_checkpoint_for_source(
+        store=store,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=prepared.key[4],
+        source_messages=source_messages,
+    )
+    assert selected == ("exact", checkpoint)
+    rendered = mod.render_summary_message_from_checkpoint(selected[1])
+    projected = {"messages": [rendered], "metadata": {}}
+    plan = _task7_plan("active projection")
+    mod.apply_ref_projection_surfaces(projected, plan, include_reader_schema=True)
+    assert selected[1]["parent_checkpoint_id"] == "checkpoint-parent"
+    assert selected[1]["source_hash"] == source_hash
+    assert projected["metadata"]["auto_compact_ref_manifests"]
+    assert set(rendered) == {"role", "content"}
+    assert '<auto_compact_ref_manifests version="1">' not in rendered["content"]
+    assert selected[1]["summary_text"] == "stored summary"
+
+
+@pytest.mark.asyncio
+async def test_inactive_context_lifecycle_matches_valve_off_at_all_sizes(monkeypatch):
+    for size, params, chat_id, previous_response_id in (
+        (8, {"function_calling": "legacy"}, "chat-1", None),
+        (50 * 1024, {"function_calling": "native"}, "chat-1", "state"),
+        (30 * 1024 * 1024, {"function_calling": "native"}, "local:chat", None),
+        (65_537, {"function_calling": "native"}, "channel:chat", None),
+    ):
+        enabled_registry = {"unrelated": {}}
+        disabled_registry = {"unrelated": {}}
+        enabled = await _task8_run_current_core_route(
+            monkeypatch,
+            registry=enabled_registry,
+            text="x" * size,
+            dispatch_reader=False,
+            params=params,
+            chat_id=chat_id,
+            previous_response_id=previous_response_id,
+        )
+        disabled = await _task8_run_current_core_route(
+            monkeypatch,
+            registry=disabled_registry,
+            text="x" * size,
+            dispatch_reader=False,
+            valve_enabled=False,
+            params=params,
+            chat_id=chat_id,
+            previous_response_id=previous_response_id,
+        )
+        assert enabled["provider"] == disabled["provider"]
+        assert enabled["result"] == disabled["result"]
+        assert mod.REF_EXEC_TOOL_NAME not in enabled_registry
+        assert not hasattr(enabled["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
+        assert enabled["lifecycle"] == disabled["lifecycle"]
+
+    owner_registry = {"unrelated": {}}
+    owner_result = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=owner_registry,
+        dispatch_reader=False,
+        user_id="owner",
+    )
+    admin_registry = {"unrelated": {}}
+    admin_result = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=admin_registry,
+        dispatch_reader=False,
+        user_id="admin",
+        role="admin",
+        owner=False,
+    )
+    admin_valve_off = await _task8_run_current_core_route(
+        monkeypatch,
+        registry={"unrelated": {}},
+        dispatch_reader=False,
+        valve_enabled=False,
+        user_id="admin",
+        role="admin",
+        owner=False,
+    )
+    with pytest.raises(HTTPException) as ordinary_denial:
+        await _task8_run_current_core_route(
+            monkeypatch,
+            registry={"unrelated": {}},
+            dispatch_reader=False,
+            user_id="ordinary",
+            owner=False,
+        )
+    with pytest.raises(HTTPException) as model_denial:
+        await _task8_run_current_core_route(
+            monkeypatch,
+            registry={"unrelated": {}},
+            dispatch_reader=False,
+            user_id="denied-model",
+            model_access=False,
+        )
+
+    assert mod.REF_EXEC_TOOL_NAME not in owner_registry
+    owner_store = getattr(
+        owner_result["request"].state, mod.REQUEST_STATE_REF_STORE_KEY
+    )
+    assert not owner_store.bindings
+    assert not owner_store.reservations
+    assert owner_result["provider"]
+    assert mod.REF_EXEC_TOOL_NAME not in admin_registry
+    assert admin_result["provider"] == admin_valve_off["provider"]
+    assert admin_result["result"] == admin_valve_off["result"]
+    assert admin_result["provider"]
+    assert not admin_result["active_readers"]
+    assert not hasattr(
+        admin_result["request"].state,
+        mod.REQUEST_STATE_REF_STORE_KEY,
+    )
+    assert ordinary_denial.value.status_code == 404
+    assert model_denial.value.status_code == 403
+
+    hard_enabled_registry = {"unrelated": {}}
+    hard_disabled_registry = {"unrelated": {}}
+    hard_enabled = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=hard_enabled_registry,
+        text="hard threshold payload " * 512,
+        dispatch_reader=False,
+        params={"function_calling": "legacy"},
+        trigger_input_tokens=1,
+        observe_hard_compaction=True,
+    )
+    hard_disabled = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=hard_disabled_registry,
+        text="hard threshold payload " * 512,
+        dispatch_reader=False,
+        valve_enabled=False,
+        params={"function_calling": "legacy"},
+        trigger_input_tokens=1,
+        observe_hard_compaction=True,
+    )
+
+    assert hard_enabled["summary_requests"] == hard_disabled["summary_requests"]
+    assert hard_enabled["summary_requests"]
+    assert hard_enabled["checkpoint_activity"] == hard_disabled["checkpoint_activity"]
+    assert {entry["action"] for entry in hard_enabled["checkpoint_activity"]} >= {
+        "lookup",
+        "pending_lookup",
+        "create",
+        "claim",
+        "complete",
+    }
+    assert hard_enabled["checkpoint_rows"] == hard_disabled["checkpoint_rows"]
+    assert hard_enabled["checkpoint_rows"]
+    assert hard_enabled["provider"] == hard_disabled["provider"]
+    assert hard_enabled["result"] == hard_disabled["result"]
+    assert (
+        mod.extract_compaction_summary_text_from_messages(
+            hard_enabled["provider"][0]["messages"]
+        )
+        == "task-8 hard-compaction summary"
+    )
+    assert "hard threshold payload" not in json.dumps(
+        hard_enabled["provider"][0]["messages"]
+    )
+    assert hard_enabled_registry == hard_disabled_registry == {"unrelated": {}}
+    assert not hasattr(hard_enabled["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert not hasattr(hard_disabled["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
+
+
+@pytest.mark.asyncio
+async def test_real_core_native_reader_dispatches_and_reenters_pipe(monkeypatch):
+    registry = {
+        "unrelated": {
+            "spec": {"name": "unrelated", "parameters": {"type": "object"}},
+            "callable": lambda: None,
+        }
+    }
+
+    observed = await _task8_run_current_core_route(monkeypatch, registry=registry)
+
+    assert [call["body"]["model"] for call in observed["injected"]] == [
+        "auto_compact.target",
+        "auto_compact.target",
+        "auto_compact.target",
+    ]
+    assert len(observed["provider"]) == 3
+    assert observed["lifecycle"] == [
+        "process_chat_payload",
+        "chat_completion_handler",
+        "process_chat_response",
+    ]
+    assert len(observed["outers"]) == 1
+    assert observed["outer"] is not observed["injected"][0]["__metadata__"]
+    assert observed["outer"]["tools"] is registry
+    assert all(call["__tools__"] is registry for call in observed["injected"])
+    assert all(
+        call["__metadata__"]["tools"] is registry for call in observed["injected"]
+    )
+    recursive_entries = observed["injected"][1:]
+    assert len(recursive_entries) == 2
+    assert len(observed["active_readers"]) == 1
+    owned_reader = observed["active_readers"][0]["entry"]["callable"]
+    for entry in recursive_entries:
+        messages = entry["body"]["messages"]
+        serialized = json.dumps(messages)
+        assert any(
+            message.get("role") == "tool"
+            and "persisted reader payload\nsecond line" in str(message.get("content"))
+            for message in messages
+        )
+        assert re.search(r"tool:[0-9a-f]{64}", serialized) is None
+        assert re.search(r"history:accp_[0-9a-f]{64}", serialized) is None
+        assert "<auto_compaction_context" not in serialized
+        assert "<auto_compact_ref_manifests" not in serialized
+        assert "metadata" not in entry["body"]
+        assert entry["entry_reader_callable"] is owned_reader
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+    store = getattr(observed["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert not store.bindings
+    assert not store.reservations
+    assert "function_call_output" in json.dumps(observed["emitted"])
+
+
+@pytest.mark.asyncio
+async def test_real_connection_model_without_info_activates_ref_exec(monkeypatch):
+    registry = {"unrelated": {"spec": {"name": "unrelated"}}}
+
+    observed = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=registry,
+        dispatch_reader=False,
+        target_model={"id": "target", "name": "Target", "owned_by": "openai"},
+    )
+
+    assert len(observed["active_readers"]) == 1
+    assert observed["active_readers"][0]["registry"] is registry
+    assert observed["active_readers"][0]["catalog"]
+    assert "tool:" in json.dumps(observed["provider"][0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_real_workspace_model_without_function_calling_capability_activates_ref_exec(
+    monkeypatch,
+):
+    registry = {"unrelated": {"spec": {"name": "unrelated"}}}
+
+    observed = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=registry,
+        dispatch_reader=False,
+        target_model={
+            "id": "target",
+            "name": "Target",
+            "owned_by": "openai",
+            "info": {
+                "meta": {
+                    "capabilities": {
+                        "builtin_tools": False,
+                        "file_context": False,
+                    }
+                }
+            },
+        },
+    )
+
+    assert len(observed["active_readers"]) == 1
+    assert observed["active_readers"][0]["registry"] is registry
+    assert observed["active_readers"][0]["catalog"]
+    assert "tool:" in json.dumps(observed["provider"][0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_real_model_with_explicit_false_function_calling_capability_is_inactive(
+    monkeypatch,
+):
+    registry = {"unrelated": {"spec": {"name": "unrelated"}}}
+
+    observed = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=registry,
+        dispatch_reader=False,
+        target_model={
+            "id": "target",
+            "name": "Target",
+            "owned_by": "openai",
+            "info": {"meta": {"capabilities": {"function_calling": False}}},
+        },
+    )
+
+    assert observed["active_readers"] == []
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+    assert not any(
+        tool["function"]["name"] == mod.REF_EXEC_TOOL_NAME
+        for tool in observed["provider"][0].get("tools", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_model_with_explicit_true_function_calling_capability_activates_ref_exec(
+    monkeypatch,
+):
+    registry = {"unrelated": {"spec": {"name": "unrelated"}}}
+
+    observed = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=registry,
+        dispatch_reader=False,
+        target_model={
+            "id": "target",
+            "name": "Target",
+            "owned_by": "openai",
+            "info": {"meta": {"capabilities": {"function_calling": True}}},
+        },
+    )
+
+    assert len(observed["active_readers"]) == 1
+    assert observed["active_readers"][0]["registry"] is registry
+    assert observed["active_readers"][0]["catalog"]
+    assert "tool:" in json.dumps(observed["provider"][0]["messages"])
+
+
+@pytest.mark.parametrize(
+    ("target", "supported"),
+    (
+        (None, True),
+        ({"id": "target"}, True),
+        ({"id": "target", "info": None}, True),
+        ({"id": "target", "info": {}}, True),
+        ({"id": "target", "info": {"meta": None}}, True),
+        ({"id": "target", "info": {"meta": {}}}, True),
+        (
+            {"id": "target", "info": {"meta": {"capabilities": None}}},
+            True,
+        ),
+        (
+            {
+                "id": "target",
+                "info": {"meta": {"capabilities": {"function_calling": True}}},
+            },
+            True,
+        ),
+        (
+            {
+                "id": "target",
+                "info": {"meta": {"capabilities": {"function_calling": False}}},
+            },
+            False,
+        ),
+    ),
+)
+def test_model_function_calling_capability_is_explicit_opt_out(target, supported):
+    models = {} if target is None else {"target": target}
+
+    assert mod._target_model_supports_function_calling(models, "target") is supported
+
+
+@pytest.mark.asyncio
+async def test_real_current_core_missing_function_calling_activates_ref_binding_and_catalog(
+    monkeypatch,
+):
+    registry = {"unrelated": {"spec": {"name": "unrelated"}}}
+
+    observed = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=registry,
+        params={},
+        omit_injected_function_calling=True,
+        dispatch_reader=False,
+    )
+
+    assert len(observed["active_readers"]) == 1
+    active_reader = observed["active_readers"][0]
+    assert active_reader["registry"] is registry
+    assert active_reader["catalog"]
+    assert any(
+        tool["function"]["name"] == mod.REF_EXEC_TOOL_NAME
+        for tool in observed["provider"][0]["tools"]
+    )
+    assert "tool:" in json.dumps(observed["provider"][0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_real_core_absent_outer_tools_matches_valve_off_at_all_sizes(monkeypatch):
+    for size in (8, 50 * 1024, 30 * 1024 * 1024, 65_537):
+        enabled = await _task8_run_current_core_route(
+            monkeypatch,
+            text="x" * size,
+            dispatch_reader=False,
+        )
+        disabled = await _task8_run_current_core_route(
+            monkeypatch,
+            text="x" * size,
+            dispatch_reader=False,
+            valve_enabled=False,
+        )
+        assert enabled["provider"] == disabled["provider"]
+        assert enabled["result"] == disabled["result"]
+        assert "tools" not in enabled["outer"]
+        assert enabled["outer"] is not enabled["injected"][0]["__metadata__"]
+        assert enabled["injected"][0]["__tools__"] == {}
+        assert not hasattr(enabled["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
+
+    hard_enabled = await _task8_run_current_core_route(
+        monkeypatch,
+        text="hard threshold payload " * 512,
+        dispatch_reader=False,
+        trigger_input_tokens=1,
+        observe_hard_compaction=True,
+    )
+    hard_disabled = await _task8_run_current_core_route(
+        monkeypatch,
+        text="hard threshold payload " * 512,
+        dispatch_reader=False,
+        valve_enabled=False,
+        trigger_input_tokens=1,
+        observe_hard_compaction=True,
+    )
+
+    assert hard_enabled["summary_requests"] == hard_disabled["summary_requests"]
+    assert hard_enabled["summary_requests"]
+    assert hard_enabled["checkpoint_activity"] == hard_disabled["checkpoint_activity"]
+    assert {entry["action"] for entry in hard_enabled["checkpoint_activity"]} >= {
+        "lookup",
+        "pending_lookup",
+        "create",
+        "claim",
+        "complete",
+    }
+    assert hard_enabled["checkpoint_rows"] == hard_disabled["checkpoint_rows"]
+    assert hard_enabled["checkpoint_rows"]
+    assert hard_enabled["provider"] == hard_disabled["provider"]
+    assert hard_enabled["result"] == hard_disabled["result"]
+    assert (
+        mod.extract_compaction_summary_text_from_messages(
+            hard_enabled["provider"][0]["messages"]
+        )
+        == "task-8 hard-compaction summary"
+    )
+    assert "hard threshold payload" not in json.dumps(
+        hard_enabled["provider"][0]["messages"]
+    )
+    assert "tools" not in hard_enabled["outer"]
+    assert hard_enabled["injected"][0]["__tools__"] == {}
+    assert not hasattr(hard_enabled["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert not hasattr(hard_disabled["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
+
+
+@pytest.mark.asyncio
+async def test_real_core_context_dispatches_from_actual_outer_metadata_registry(
+    monkeypatch,
+):
+    registry = {"unrelated": {"spec": {"name": "unrelated"}}}
+    observed = await _task8_run_current_core_route(monkeypatch, registry=registry)
+    injected = observed["injected"][0]
+    assert observed["outer"] is not injected["__metadata__"]
+    assert observed["outer"]["tools"] is registry
+    assert injected["__metadata__"]["tools"] is registry
+    assert injected["__tools__"] is registry
+    assert set(registry) == {"unrelated"}
+    assert any(
+        tool["function"]["name"] == mod.REF_EXEC_TOOL_NAME
+        for tool in observed["provider"][0]["tools"]
+    )
+    assert "function_call_output" in json.dumps(observed["emitted"])
+
+
+@pytest.mark.asyncio
+async def test_real_core_reader_rejects_cross_owner(monkeypatch):
+    async def retain_binding(_request, _attempt):
+        return None
+
+    monkeypatch.setattr(mod, "cleanup_ref_attempt", retain_binding)
+    registry = {"unrelated": {}}
+    observed = await _task8_run_current_core_route(monkeypatch, registry=registry)
+    reader = observed["active_readers"][0]["entry"]["callable"]
+
+    async def cross_owner(_chat_id, _user_id):
+        return False
+
+    monkeypatch.setattr(mod, "_chat_owner_authorized", cross_owner)
+
+    assert (
+        await reader("ls") == "Error: externalized ref authorization is no longer valid"
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_core_two_reader_dispatches_keep_tools_identity_and_latest_generation(
+    monkeypatch,
+):
+    registry = {"unrelated": {}}
+    observed = await _task8_run_current_core_route(monkeypatch, registry=registry)
+    store = getattr(observed["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert len(observed["provider"]) == 3
+    assert len(observed["injected"]) == 3
+    assert all(call["__tools__"] is registry for call in observed["injected"])
+    assert store.next_generation == 3
+    assert not store.bindings
+    assert not store.reservations
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+    assert "call-wc" in json.dumps(observed["emitted"])
+    assert "call-head" in json.dumps(observed["emitted"])
+
+
+def test_pipe_omits_unreachable_projected_body_reentry_guard():
+    source = inspect.getsource(mod.Pipe.pipe)
+
+    assert "incoming_ref_manifests" not in source
+    assert "incoming_projected_refs" not in source
+    assert "ref_reentry_failed" not in source
+
+
+@pytest.mark.asyncio
+async def test_real_core_later_turn_serves_request_snapshot_without_branch_reload(monkeypatch):
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    first = await _task8_run_current_core_route(
+        monkeypatch, registry=registry, request=request
+    )
+    second = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=registry,
+        request=request,
+        assistant_message_id="assistant-b",
+    )
+    assert not first["branch_loads"]
+    assert not second["branch_loads"]
+    assert "function_call_output" in json.dumps(second["emitted"])
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert not store.bindings
+
+
+@pytest.mark.asyncio
+async def test_real_core_terminal_completion_invalidates_reader_binding(monkeypatch):
+    registry = {"unrelated": {}}
+    observed = await _task8_run_current_core_route(monkeypatch, registry=registry)
+    store = getattr(observed["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+    assert not store.bindings
+    assert not store.registry_owners
+
+
+@pytest.mark.asyncio
+async def test_real_core_multimodel_siblings_use_private_registries_and_both_dispatch(
+    monkeypatch,
+):
+    wrappers = tuple(
+        mod.build_wrapper_model_id("auto_compact", target)
+        for target in ("target-one", "target-two")
+    )
+    message_ids = [
+        {"model_id": wrapper, "message_id": f"assistant-{index}"}
+        for index, wrapper in enumerate(wrappers, 1)
+    ]
+    registries = {
+        entry["message_id"]: {f"tool-{index}": {}}
+        for index, entry in enumerate(message_ids, 1)
+    }
+    observed = await _task8_run_current_core_route(
+        monkeypatch,
+        message_ids=message_ids,
+        registries_by_message=registries,
+    )
+    first, second = registries.values()
+    assert first is not second
+    assert mod.REF_EXEC_TOOL_NAME not in first, (
+        registries,
+        observed["provider"],
+        observed["result"],
+    )
+    assert mod.REF_EXEC_TOOL_NAME not in second, (
+        registries,
+        observed["provider"],
+        observed["result"],
+    )
+    assert {id(metadata["tools"]) for metadata in observed["outers"]} == {
+        id(first),
+        id(second),
+    }
+    assert len(observed["provider"]) == 4
+    assert observed["lifecycle"].count("process_chat_payload") == 2
+    assert observed["lifecycle"].count("chat_completion_handler") == 2
+    assert observed["lifecycle"].count("process_chat_response") == 2
+    assert json.dumps(observed["emitted"]).count("function_call_output") >= 2
+
+
+@pytest.mark.asyncio
+async def test_real_core_multimodel_retry_cancel_isolation(monkeypatch):
+    targets = ("target-one", "target-two")
+    wrappers = tuple(
+        mod.build_wrapper_model_id("auto_compact", target) for target in targets
+    )
+    message_ids = [
+        {"model_id": wrapper, "message_id": f"assistant-{index}"}
+        for index, wrapper in enumerate(wrappers, 1)
+    ]
+    registries = {
+        entry["message_id"]: {f"tool-{index}": {}}
+        for index, entry in enumerate(message_ids, 1)
+    }
+    observed = await _task8_run_current_core_route(
+        monkeypatch,
+        message_ids=message_ids,
+        registries_by_message=registries,
+        cancel_model_id=targets[0],
+    )
+    cancelled, successful = registries.values()
+    store = getattr(observed["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert mod.REF_EXEC_TOOL_NAME not in cancelled
+    assert mod.REF_EXEC_TOOL_NAME not in successful
+    assert not store.bindings
+    assert len(observed["provider"]) == 3
+    assert observed["lifecycle"].count("process_chat_payload") == 2
+    assert observed["lifecycle"].count("chat_completion_handler") == 2
+    assert observed["lifecycle"].count("process_chat_response") == 2
+    assert "function_call_output" in json.dumps(observed["emitted"])

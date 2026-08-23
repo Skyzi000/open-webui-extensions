@@ -1682,6 +1682,64 @@ async def test_checkpoint_store_claim_conflict_returns_false():
 
 
 @pytest.mark.asyncio
+async def test_history_ref_cas_statement_avoids_whole_json_equality_cross_dialect():
+    from sqlalchemy.dialects import postgresql, sqlite
+    from sqlalchemy.sql import operators, visitors
+    from sqlalchemy.sql.elements import BinaryExpression
+
+    class Result:
+        rowcount = 0
+
+    class CapturingDb:
+        def __init__(self):
+            self.statement = None
+            self.rollback_calls = 0
+
+        async def execute(self, statement):
+            self.statement = statement
+            return Result()
+
+        async def commit(self):
+            raise AssertionError("rowcount-zero CAS must not commit")
+
+        async def rollback(self):
+            self.rollback_calls += 1
+
+    db = CapturingDb()
+    store = mod.CheckpointStore(db=db)
+
+    swapped = await store.compare_and_swap_history_ref(
+        "checkpoint-1",
+        expected_summary_meta={"has_multimodal": True},
+        history_ref={"format": mod.HISTORY_REF_FORMAT, "raw_source_hash": "a" * 64},
+    )
+
+    assert swapped is False
+    assert db.rollback_calls == 1
+    assert db.statement is not None
+    postgresql_sql = str(db.statement.compile(dialect=postgresql.dialect()))
+    sqlite_sql = str(db.statement.compile(dialect=sqlite.dialect()))
+    whole_json_equalities = [
+        expression
+        for expression in visitors.iterate(db.statement.whereclause)
+        if isinstance(expression, BinaryExpression)
+        and expression.operator is operators.eq
+        and any(
+            side is mod.CHECKPOINT_TABLE.c.summary_meta
+            for side in (expression.left, expression.right)
+        )
+    ]
+    assert whole_json_equalities == [], postgresql_sql
+    table_name = mod.CHECKPOINT_TABLE.name
+    assert f"{table_name}.id =" in postgresql_sql
+    assert f"{table_name}.state =" in postgresql_sql
+    assert "->>" in postgresql_sql and "IS NULL" in postgresql_sql
+    assert "JSON_EXTRACT" in sqlite_sql and "IS NULL" in sqlite_sql
+    assert f"{table_name}.summary_meta =" not in postgresql_sql
+    assert f"{table_name}.summary_meta =" not in sqlite_sql
+
+
+@pytest.mark.asyncio
 async def test_compact_body_extends_from_parent_summary_plus_delta(monkeypatch):
     parent_source = [
         {"role": "user", "content": "old"},
@@ -3356,3 +3414,273 @@ async def test_checkpoint_schema_init_tolerates_concurrent_and_repeated_runs(cla
 
     columns = await _checkpoint_table_columns(claim_engine)
     assert {"claim_token", "claim_expires_at"} <= columns
+
+
+def _history_checkpoint_rows(messages):
+    rows = []
+    parent_id = None
+    for count in range(1, len(messages) + 1):
+        source = mod._build_canonical_history_source_sync(tuple(messages), count, None)
+        row = mod.build_checkpoint_row(
+            namespace=mod.CHECKPOINT_NAMESPACE,
+            user_id="user-1",
+            chat_id="chat-1",
+            pipe_function_id="auto_compact",
+            profile_hash=mod.compute_profile_hash(),
+            source_hash=mod.compute_source_hash(messages[:count]),
+            source_message_count=count,
+            summary_text=f"summary-{count}",
+            summary_meta={
+                "history_ref": {
+                    "format": "canonical-history-jsonl-v1",
+                    "raw_source_hash": source.raw_source_hash,
+                }
+            },
+            parent_checkpoint_id=parent_id,
+            now=count,
+        )
+        rows.append(row)
+        parent_id = row["id"]
+    return rows
+
+
+class HistoryCatalogStore:
+    def __init__(self, rows):
+        self.rows = {row["id"]: copy.deepcopy(row) for row in rows}
+
+    async def lookup_ready_descriptor_by_id(self, checkpoint_id, **_identity):
+        row = self.rows.get(checkpoint_id)
+        return copy.deepcopy(row) if row is not None else None
+
+
+@pytest.mark.asyncio
+async def test_history_catalog_enumerates_over_128_ancestors_and_revalidates_requested_ref_on_read(
+    monkeypatch,
+    claim_engine,
+):
+    from sqlalchemy import event
+
+    messages = [{"role": "user", "content": f"message-{index}"} for index in range(130)]
+    rows = _history_checkpoint_rows(messages)
+    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
+    async with claim_engine.begin() as connection:
+        await connection.execute(mod.CHECKPOINT_TABLE.insert(), rows)
+    store = _engine_store_factory(claim_engine)()
+    load_calls = []
+    select_statements = []
+
+    async def load_authorized_raw_chat_branch(**kwargs):
+        load_calls.append(kwargs)
+        return copy.deepcopy(messages)
+
+    def capture_select(_connection, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            select_statements.append(statement)
+
+    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch)
+    event.listen(claim_engine.sync_engine, "before_cursor_execute", capture_select)
+    try:
+        catalog = await mod.build_history_ref_catalog(
+            store=store,
+            selected_checkpoint=rows[-1],
+            user_message_id="message-130",
+        )
+    finally:
+        event.remove(claim_engine.sync_engine, "before_cursor_execute", capture_select)
+
+    assert len(catalog) == 130
+    assert len(select_statements) == 129
+    assert all("summary_text" not in statement for statement in select_statements)
+    assert load_calls == []
+    assert {entry.manifest.ref for entry in catalog} == {
+        f"history:{row['id']}" for row in rows
+    }
+
+    for index in (0, 64, 129):
+        entry = next(item for item in catalog if item.manifest.ref == f"history:{rows[index]['id']}")
+        resolved = await mod.resolve_history_ref_catalog_entry(
+            entry,
+            request=SimpleNamespace(state=SimpleNamespace()),
+            metadata={"chat_id": "chat-1", "user_message_id": "message-130"},
+        )
+        assert resolved.manifest.sha256 == rows[index]["summary_meta"]["history_ref"]["raw_source_hash"]
+        assert resolved.source.line_count == index + 1
+
+    assert len(load_calls) == 3
+
+    async def reject_owner(**_kwargs):
+        raise mod.CanonicalHistoryError(reason="owner authorization failed")
+
+    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", reject_owner)
+    with pytest.raises(mod.CanonicalHistoryError, match="owner authorization"):
+        await mod.resolve_history_ref_catalog_entry(
+            catalog[0],
+            request=SimpleNamespace(state=SimpleNamespace()),
+            metadata={"chat_id": "chat-1", "user_message_id": "message-130"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_history_catalog_rejects_cycle_missing_parent_and_nonmonotonic_count():
+    messages = [{"role": "user", "content": f"message-{index}"} for index in range(3)]
+    rows = _history_checkpoint_rows(messages)
+    child = rows[-1]
+    malformed = [
+        [*rows[:-1], dict(child, parent_checkpoint_id=child["id"])],
+        [dict(child, parent_checkpoint_id="accp_" + "f" * 64)],
+        [rows[0], dict(rows[1], source_message_count=3), child],
+    ]
+
+    for case in malformed:
+        catalog = await mod.build_history_ref_catalog(
+            store=HistoryCatalogStore(case),
+            selected_checkpoint=case[-1],
+            user_message_id="message-3",
+        )
+        assert catalog == ()
+
+
+@pytest.mark.asyncio
+async def test_history_catalog_rejects_sibling_branch_owner_and_profile():
+    messages = [{"role": "user", "content": f"message-{index}"} for index in range(3)]
+    rows = _history_checkpoint_rows(messages)
+    sibling = dict(
+        rows[1],
+        id="accp_" + "a" * 64,
+        source_hash="sibling",
+        parent_checkpoint_id=rows[0]["id"],
+    )
+    valid_catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore([*rows, sibling]),
+        selected_checkpoint=rows[-1],
+        user_message_id="message-3",
+    )
+
+    assert f"history:{sibling['id']}" not in {entry.manifest.ref for entry in valid_catalog}
+
+    for mismatched_parent in (
+        dict(rows[1], user_id="user-2"),
+        dict(rows[1], profile_hash="other-profile"),
+    ):
+        catalog = await mod.build_history_ref_catalog(
+            store=HistoryCatalogStore([rows[0], mismatched_parent, rows[-1]]),
+            selected_checkpoint=rows[-1],
+            user_message_id="message-3",
+        )
+        assert catalog == ()
+
+
+@pytest.mark.asyncio
+async def test_history_unavailable_child_does_not_fallback_to_ancestor(monkeypatch):
+    messages = [{"role": "user", "content": "parent"}, {"role": "assistant", "content": "child"}]
+    rows = _history_checkpoint_rows(messages)
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore(rows),
+        selected_checkpoint=rows[-1],
+        user_message_id="message-2",
+    )
+    child = next(entry for entry in catalog if entry.manifest.ref == f"history:{rows[-1]['id']}")
+    parent = next(entry for entry in catalog if entry.manifest.ref == f"history:{rows[0]['id']}")
+
+    requested_branches = []
+
+    async def parent_only(**_kwargs):
+        requested_branches.append("missing-child")
+        return copy.deepcopy(messages[:1])
+
+    async def owner_denied(**_kwargs):
+        requested_branches.append("owner-denied")
+        raise mod.CanonicalHistoryError(reason="owner authorization failed")
+
+    async def corrupt_child(**_kwargs):
+        requested_branches.append("corrupt-child")
+        return [messages[0], {"role": "assistant", "content": "tampered"}]
+
+    for loader, error in (
+        (parent_only, "checkpoint count references an unsaved source"),
+        (owner_denied, "owner authorization"),
+        (corrupt_child, "raw source hash"),
+    ):
+        monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", loader)
+        with pytest.raises(mod.CanonicalHistoryError, match=error):
+            await mod.resolve_history_ref_catalog_entry(
+                child,
+                request=SimpleNamespace(state=SimpleNamespace()),
+                metadata={"chat_id": "chat-1", "user_message_id": "message-2"},
+            )
+
+    async def valid_branch(**_kwargs):
+        requested_branches.append("explicit-parent")
+        return copy.deepcopy(messages)
+
+    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", valid_branch)
+    resolved_parent = await mod.resolve_history_ref_catalog_entry(
+        parent,
+        request=SimpleNamespace(state=SimpleNamespace()),
+        metadata={"chat_id": "chat-1", "user_message_id": "message-2"},
+    )
+    assert resolved_parent.manifest.ref == f"history:{rows[0]['id']}"
+    assert requested_branches == [
+        "missing-child",
+        "owner-denied",
+        "corrupt-child",
+        "explicit-parent",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_history_manifest_is_rendered_but_not_stored(monkeypatch):
+    messages = [{"role": "user", "content": "history"}]
+    row = _history_checkpoint_rows(messages)[0]
+    stored_summary = row["summary_text"]
+
+    async def load_authorized_raw_chat_branch(**_kwargs):
+        return copy.deepcopy(messages)
+
+    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch)
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore([row]),
+        selected_checkpoint=row,
+        user_message_id="message-1",
+    )
+    plan = mod.build_history_ref_projection_plan(catalog)
+    body = {"messages": [mod.render_summary_message_from_checkpoint(row)]}
+    mod._apply_ref_manifests(body, plan)
+
+    assert body["metadata"]["auto_compact_ref_manifests"] == [
+        {
+            "ref": f"history:{row['id']}",
+            "sha256": row["summary_meta"]["history_ref"]["raw_source_hash"],
+        }
+    ]
+    assert row["summary_text"] == stored_summary
+    assert "history:" not in row["summary_text"]
+    assert "auto_compact_ref_manifests" not in row["summary_meta"]
+
+
+@pytest.mark.asyncio
+async def test_history_catalog_rejects_unverified_raw_hash(monkeypatch):
+    messages = [{"role": "user", "content": "history"}]
+    row = _history_checkpoint_rows(messages)[0]
+    row["summary_meta"]["history_ref"]["raw_source_hash"] = "0" * 64
+    load_calls = []
+
+    async def load_authorized_raw_chat_branch(**_kwargs):
+        load_calls.append(True)
+        return copy.deepcopy(messages)
+
+    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch)
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore([row]),
+        selected_checkpoint=row,
+        user_message_id="message-1",
+    )
+
+    assert [entry.manifest.ref for entry in catalog] == [f"history:{row['id']}"]
+    assert load_calls == []
+    with pytest.raises(mod.CanonicalHistoryError, match="raw source hash"):
+        await mod.resolve_history_ref_catalog_entry(
+            catalog[0],
+            request=SimpleNamespace(state=SimpleNamespace()),
+            metadata={"chat_id": "chat-1", "user_message_id": "message-1"},
+        )
