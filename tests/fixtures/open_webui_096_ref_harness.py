@@ -167,6 +167,7 @@ async def _single_route_assertions(harness, observations: dict) -> dict[str, boo
         not store.bindings
         and not store.reservations
         and not store.registry_reservations
+        and not store.registry_owners
     )
     emitted = json.dumps(observed["emitted"])
     assert "call-wc" in emitted and "call-head" in emitted
@@ -221,6 +222,7 @@ async def _single_route_assertions(harness, observations: dict) -> dict[str, boo
     assert raw_recursive_messages
     assert recursive_registry_identity
     assert recursive_reader_identity
+
     return {
         "same_request_reentry": len(recursive_entries) == 2,
         "outer_registry_dispatch": observed["outer"]["tools"] is registry,
@@ -240,31 +242,131 @@ async def _single_route_assertions(harness, observations: dict) -> dict[str, boo
     }
 
 
-async def _owner_gate_assertions(harness) -> dict[str, bool]:
-    admin_registry = _registry(harness, "admin-tool")
-    enabled = await _run_route(
+async def _exact_wc_assertions(harness) -> dict[str, bool]:
+    text = "λ" * 40_000
+    encoded = text.encode("utf-8")
+    assert len(encoded) > 65_536
+    assert len(encoded) == 80_000
+
+    owner_registry = _registry(harness, "owner-exact-wc-tool")
+    owner_observed = await _run_route(
+        harness,
+        registry=owner_registry,
+        owner=True,
+        role="user",
+        text=text,
+        ref_substitution_threshold_tokens=1_000,
+        dispatch_exact_ref_command=True,
+    )
+    admin_registry = _registry(harness, "admin-exact-wc-tool")
+    admin_observed = await _run_route(
         harness,
         registry=admin_registry,
         owner=False,
         role="admin",
-        dispatch_reader=False,
+        text=text,
+        ref_substitution_threshold_tokens=1_000,
+        dispatch_exact_ref_command=True,
     )
-    valve_off = await _run_route(
-        harness,
-        registry=admin_registry,
-        owner=False,
-        role="admin",
-        dispatch_reader=False,
-        valve_enabled=False,
-    )
-    assert enabled["provider"] == valve_off["provider"]
-    assert enabled["result"] == valve_off["result"]
-    assert enabled["provider"]
-    assert not enabled["active_readers"]
-    assert harness.mod.REF_EXEC_TOOL_NAME not in admin_registry
-    assert not hasattr(
-        enabled["request"].state, harness.mod.REQUEST_STATE_REF_STORE_KEY
-    )
+    assert owner_registry is not admin_registry
+
+    for observed, registry in (
+        (owner_observed, owner_registry),
+        (admin_observed, admin_registry),
+    ):
+        assert len(observed["provider"]) == 2
+        assert len(observed["injected"]) == 2
+        assert len(observed["active_readers"]) == 1
+        active_reader = observed["active_readers"][0]
+        assert active_reader["registry"] is registry
+        assert active_reader["catalog"]
+        reader_parameters = active_reader["entry"]["spec"]["parameters"]
+        assert set(reader_parameters["properties"]) == {"command"}
+        provider_reader_specs = [
+            tool["function"]
+            for call in observed["provider"]
+            for tool in call.get("tools", [])
+            if tool["function"]["name"] == harness.mod.REF_EXEC_TOOL_NAME
+        ]
+        assert provider_reader_specs
+        assert all(
+            set(spec["parameters"]["properties"]) == {"command"}
+            for spec in provider_reader_specs
+        )
+        projected_refs = set(
+            re.findall(
+                r"tool:[0-9a-f]{64}",
+                json.dumps(observed["provider"][0]["messages"]),
+            )
+        )
+        assert len(projected_refs) == 1
+        projected_ref = next(iter(projected_refs))
+        assert projected_ref in {
+            entry.manifest.ref for entry in active_reader["catalog"]
+        }
+        second_provider_messages = observed["provider"][1]["messages"]
+        reader_tool_calls = [
+            tool_call
+            for message in second_provider_messages
+            for tool_call in message.get("tool_calls", [])
+            if tool_call.get("function", {}).get("name")
+            == harness.mod.REF_EXEC_TOOL_NAME
+        ]
+        assert len(reader_tool_calls) == 1
+        reader_tool_call = reader_tool_calls[0]
+        assert json.loads(reader_tool_call["function"]["arguments"]) == {
+            "command": f"wc -c {projected_ref}"
+        }
+        reader_tool_messages = [
+            message
+            for message in second_provider_messages
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") == reader_tool_call["id"]
+        ]
+        assert len(reader_tool_messages) == 1
+        assert reader_tool_messages[0]["content"] == "80000"
+        function_call_outputs = [
+            item
+            for event in observed["emitted"]
+            if event.get("type") == "chat:completion"
+            for item in event.get("data", {}).get("output", [])
+            if item.get("type") == "function_call_output"
+            and item.get("call_id") == reader_tool_call["id"]
+        ]
+        assert function_call_outputs
+        assert all(
+            item.get("output") == [{"type": "input_text", "text": "80000"}]
+            for item in function_call_outputs
+        )
+        reader_output_surface = json.dumps(
+            {
+                "emitted": observed["emitted"],
+                "second_provider_messages": second_provider_messages,
+            }
+        )
+        assert (
+            f'Error: Tool "{harness.mod.REF_EXEC_TOOL_NAME}" not found.'
+            not in reader_output_surface
+        )
+        assert "Error: usage:" not in reader_output_surface
+        assert "not available in this binding" not in reader_output_surface
+        assert harness.mod.REF_EXEC_TOOL_NAME not in registry
+        store = getattr(
+            observed["request"].state, harness.mod.REQUEST_STATE_REF_STORE_KEY
+        )
+        assert not store.bindings
+        assert not store.reservations
+        assert not store.registry_reservations
+        assert not store.registry_owners
+
+    return {
+        "owner_exact_wc_output": True,
+        "admin_exact_wc_output": True,
+        "admin_non_owner_reader_dispatch_after_core_admission": True,
+    }
+
+
+async def _core_admission_assertions(harness) -> dict[str, bool]:
     denied = False
     try:
         await _run_route(
@@ -277,10 +379,7 @@ async def _owner_gate_assertions(harness) -> dict[str, bool]:
     except HTTPException as exc:
         denied = exc.status_code == 404
     assert denied
-    return {
-        "owner_admin_initial_denial_inactive_parity": True,
-        "ordinary_non_owner_denied_before_pipe": True,
-    }
+    return {"ordinary_non_owner_denied_before_pipe": True}
 
 
 async def _detached_parity_assertions(harness) -> dict[str, bool]:
@@ -567,9 +666,13 @@ async def _execute(scenario: str, harness) -> dict:
     observations = {}
     if scenario == "conversion_boundary":
         assertions.update(await _conversion_boundary_assertions(harness, observations))
-    elif scenario in {"registry_dispatch", "two_reader"}:
+    elif scenario == "registry_dispatch":
         assertions.update(await _single_route_assertions(harness, observations))
-        assertions.update(await _owner_gate_assertions(harness))
+        assertions.update(await _exact_wc_assertions(harness))
+        assertions.update(await _core_admission_assertions(harness))
+    elif scenario == "two_reader":
+        assertions.update(await _single_route_assertions(harness, observations))
+        assertions.update(await _core_admission_assertions(harness))
     elif scenario == "outer_context":
         assertions.update(await _single_route_assertions(harness, observations))
         assertions.update(await _detached_parity_assertions(harness))

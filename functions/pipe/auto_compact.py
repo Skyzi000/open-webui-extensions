@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.8.0
+version: 0.8.1
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -583,7 +583,6 @@ class RefModeReason(StrEnum):
     NON_NATIVE_CONTEXT = "non_native_context"
     NON_DURABLE_CONTEXT = "non_durable_context"
     USER_UNAVAILABLE = "user_unavailable"
-    OWNER_UNAVAILABLE = "owner_unavailable"
     MODEL_TOOLS_UNSUPPORTED = "model_tools_unsupported"
     PROVIDER_SCHEMA_UNSUPPORTED = "provider_schema_unsupported"
     SUMMARY_POLICY_UNSUPPORTED = "summary_policy_unsupported"
@@ -718,7 +717,6 @@ _REF_PROJECTION_DIAGNOSTIC_STAGES = MappingProxyType(
     {
         "reader schema rendering": "reader_schema",
         "reader schema registration": "reader_schema",
-        "authorization": "authorization",
         "registration": "registration",
         "generation CAS": "generation_cas",
     }
@@ -1955,10 +1953,9 @@ async def build_canonical_history_source(
     )
 
 
-async def load_authorized_raw_chat_branch(
+async def load_raw_chat_branch(
     *,
     chat_id: str,
-    user_id: str,
     metadata: dict[str, Any],
 ) -> list[dict[str, Any]]:
     from open_webui.models.chats import Chats
@@ -1967,14 +1964,12 @@ async def load_authorized_raw_chat_branch(
     current_user_message_id = metadata.get("user_message_id")
     if not isinstance(current_user_message_id, str) or not current_user_message_id:
         raise CanonicalHistoryError(reason="metadata user_message_id is required")
-    if not await Chats.is_chat_owner(chat_id, user_id):
-        raise CanonicalHistoryError(reason="owner authorization failed")
     messages_map = await Chats.get_messages_map_by_chat_id(chat_id)
     if not isinstance(messages_map, dict) or current_user_message_id not in messages_map:
-        raise CanonicalHistoryError(reason="authorized raw branch is unavailable")
+        raise CanonicalHistoryError(reason="raw branch is unavailable")
     branch = get_message_list(messages_map, current_user_message_id)
     if not branch or not all(isinstance(message, dict) for message in branch):
-        raise CanonicalHistoryError(reason="authorized raw branch is unavailable")
+        raise CanonicalHistoryError(reason="raw branch is unavailable")
     return branch
 
 
@@ -2105,13 +2100,12 @@ async def resolve_history_ref_catalog_entry(
     if not isinstance(source, HistoryRefSourceHandle):
         return entry
     if str(metadata.get("chat_id") or "") != source.chat_id:
-        raise CanonicalHistoryError(reason="current branch authorization failed")
+        raise CanonicalHistoryError(reason="current branch mismatch")
     current_user_message_id = str(metadata.get("user_message_id") or "")
     if not current_user_message_id or current_user_message_id != source.user_message_id:
-        raise CanonicalHistoryError(reason="current branch authorization failed")
-    raw_messages = await load_authorized_raw_chat_branch(
+        raise CanonicalHistoryError(reason="current branch mismatch")
+    raw_messages = await load_raw_chat_branch(
         chat_id=source.chat_id,
-        user_id=source.user_id,
         metadata=metadata,
     )
     canonical_source = await build_canonical_history_source(
@@ -2281,9 +2275,8 @@ async def enrich_checkpoint_history_ref(
         ),
         source=source,
     )
-    raw_messages = await load_authorized_raw_chat_branch(
+    raw_messages = await load_raw_chat_branch(
         chat_id=source.chat_id,
-        user_id=source.user_id,
         metadata=metadata,
     )
     canonical_source = await build_canonical_history_source(
@@ -4168,7 +4161,7 @@ def _measure_ref_source_checked(
     if isinstance(source, ZeroCopySourceHandle):
         return _measure_ref_text_checked(source.text, cancelled)
     if isinstance(source, HistoryRefSourceHandle):
-        raise RefExecError("Error: externalized history ref requires current authorization")
+        raise RefExecError("Error: externalized history ref is unresolved")
     digest = hashlib.sha256()
     utf8_bytes = 0
     emitted = 0
@@ -4197,7 +4190,7 @@ def _iter_ref_source_lines(
         yield from _iter_ref_text_lines(source.text, cancelled)
         return
     if isinstance(source, HistoryRefSourceHandle):
-        raise RefExecError("Error: externalized history ref requires current authorization")
+        raise RefExecError("Error: externalized history ref is unresolved")
     byte_start = 0
     char_start = 0
     for line_number, record in enumerate(source.iter_records(), 1):
@@ -6755,8 +6748,6 @@ def _new_ref_reader(
             )
             if active_request is None:
                 return "Error: externalized ref binding is unavailable"
-            if not await _chat_owner_authorized(key.chat_id, key.user_id):
-                return "Error: externalized ref authorization is no longer valid"
             stages = _parse_ref_exec_command(command)
             first_ref = stages[0].ref
             store = _ref_request_store(active_request, create=False)
@@ -6859,12 +6850,6 @@ def stage_ref_attempt(
             REF_REGISTRY_ENTRY_MISSING,
         ),
     )
-
-
-async def authorize_ref_attempt(attempt: RefAttempt) -> RefAttempt:
-    if not await _chat_owner_authorized(attempt.key.chat_id, attempt.key.user_id):
-        raise RefProjectionError(stage="authorization")
-    return attempt
 
 
 def register_ref_attempt(attempt: RefAttempt) -> RefStateDelta:
@@ -12599,12 +12584,6 @@ def _target_model_supports_function_calling(models: dict[str, Any], target_model
     )
 
 
-async def _chat_owner_authorized(chat_id: str, user_id: str) -> bool:
-    from open_webui.models.chats import Chats
-
-    return bool(await Chats.is_chat_owner(chat_id, user_id))
-
-
 async def _inject_target_file_context(
     *,
     request: Any,
@@ -13378,7 +13357,7 @@ def core_function_calling_is_native(
 
 def resolve_ref_mode_preflight(
     preflight: RefModePreflight,
-) -> EffectiveRefMode | None:
+) -> EffectiveRefMode:
     checks = (
         (preflight.valve_enabled, RefModeReason.VALVE_OFF),
         (preflight.native_function_calling, RefModeReason.NON_NATIVE_CONTEXT),
@@ -13404,7 +13383,7 @@ def resolve_ref_mode_preflight(
     for passed, reason in checks:
         if not passed:
             return EffectiveRefMode(active=False, reason=reason)
-    return None
+    return EffectiveRefMode(active=True, reason=RefModeReason.ACTIVE)
 
 
 def build_summary_request_message(
@@ -17400,16 +17379,6 @@ class Pipe:
                 registry_available=registry_available,
             )
         )
-        if effective_ref_mode is None:
-            owner_authorized = await _chat_owner_authorized(str(chat_id), user_id)
-            effective_ref_mode = EffectiveRefMode(
-                active=owner_authorized,
-                reason=(
-                    RefModeReason.ACTIVE
-                    if owner_authorized
-                    else RefModeReason.OWNER_UNAVAILABLE
-                ),
-            )
         if self.valves.ref_exec_enabled and not effective_ref_mode.active:
             LOG.info(
                 "Auto Compact ref mode inactive: %s",
@@ -18525,7 +18494,6 @@ class Pipe:
                             ref_projection_plan,
                             threshold_tokens=self.valves.ref_substitution_threshold_tokens,
                         )
-                        ref_attempt = await authorize_ref_attempt(ref_attempt)
                     elif ref_reservation is not None:
                         await release_ref_reservation(__request__, ref_reservation)
                         ref_reservation = None

@@ -59,8 +59,6 @@ async def _run_pipe_boundary(
     monkeypatch: pytest.MonkeyPatch,
     *,
     messages: list[dict[str, object]],
-    owner: bool = True,
-    owner_results: tuple[bool, ...] | None = None,
     user_id: str | None = "user-1",
     function_calling_capability: bool | str | None = None,
     valve_enabled: bool = True,
@@ -100,33 +98,20 @@ async def _run_pipe_boundary(
     request = SimpleNamespace(
         state=SimpleNamespace(), app=SimpleNamespace(state=SimpleNamespace(MODELS={}))
     )
-    request.state.owner_checks = []
     request.state.raw_branch_loads = 0
     if seed_ref_store:
         setattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY, mod.RefRequestStore())
-    user = {"role": "admin" if not owner else "user"}
+    user = {"role": "user"}
     if user_id is not None:
         user["id"] = user_id
     forwarded: list[dict[str, object]] = (
         forwarded_capture if forwarded_capture is not None else []
     )
     checkpoint_bodies: list[dict[str, object]] = []
-    owner_check_index = 0
     checkpoint_match_index = 0
     estimate_index = 0
 
     class FakeChats:
-        @staticmethod
-        async def is_chat_owner(chat_id: str, user_id: str) -> bool:
-            nonlocal owner_check_index
-            assert (chat_id, user_id) == ("chat-1", "user-1")
-            request.state.owner_checks.append((chat_id, user_id))
-            if owner_results:
-                result = owner_results[min(owner_check_index, len(owner_results) - 1)]
-                owner_check_index += 1
-                return result
-            return owner
-
         @staticmethod
         async def get_messages_map_by_chat_id(
             chat_id: str,
@@ -249,11 +234,9 @@ async def _run_pipe_boundary(
 @dataclasses.dataclass(frozen=True, slots=True)
 class RefModeBoundaryCase:
     expected_reason: mod.RefModeReason | None
-    expected_owner_checks: int = 0
     generation: mod.CoreFunctionCallingGeneration = (
         mod.CoreFunctionCallingGeneration.NATIVE_DEFAULT
     )
-    owner: bool = True
     user_id: str | None = "user-1"
     valve_enabled: bool = True
     function_calling_capability: bool | str | None = None
@@ -507,7 +490,6 @@ async def test_enabled_inactive_ref_mode_logs_only_reason_once_at_info(
         for sensitive in sensitive_values
     )
     assert not hasattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
-    assert request.state.owner_checks == []
 
 
 @pytest.mark.parametrize(
@@ -549,11 +531,6 @@ async def test_enabled_inactive_ref_mode_logs_only_reason_once_at_info(
             expected_reason=mod.RefModeReason.USER_UNAVAILABLE,
             user_id=None,
         ),
-        RefModeBoundaryCase(
-            expected_reason=mod.RefModeReason.OWNER_UNAVAILABLE,
-            expected_owner_checks=1,
-            owner=False,
-        ),
     ),
     ids=(
         "valve-off-no-log",
@@ -565,7 +542,6 @@ async def test_enabled_inactive_ref_mode_logs_only_reason_once_at_info(
         "core-registry-unavailable",
         "reader-collision",
         "user-unavailable",
-        "owner-unavailable",
     ),
 )
 @pytest.mark.asyncio
@@ -581,10 +557,9 @@ async def test_ref_mode_boundary_reports_truthful_reason_after_required_checks(
         lambda: case.generation,
     )
 
-    _, _, _, _, request = await _run_pipe_boundary(
+    _, _, _, _, _ = await _run_pipe_boundary(
         monkeypatch,
         messages=[{"role": "user", "content": "hello"}],
-        owner=case.owner,
         user_id=case.user_id,
         valve_enabled=case.valve_enabled,
         function_calling_capability=case.function_calling_capability,
@@ -609,11 +584,10 @@ async def test_ref_mode_boundary_reports_truthful_reason_after_required_checks(
         else [f"Auto Compact ref mode inactive: {case.expected_reason}"]
     )
     assert inactive_messages == expected_messages
-    assert len(request.state.owner_checks) == case.expected_owner_checks
 
 
 @pytest.mark.asyncio
-async def test_ref_mode_stage_one_priority_skips_owner_authorization(
+async def test_ref_mode_stage_one_priority_reports_first_reason(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -624,10 +598,9 @@ async def test_ref_mode_stage_one_priority_skips_owner_authorization(
         lambda: mod.CoreFunctionCallingGeneration.NATIVE_DEFAULT,
     )
 
-    _, _, _, _, request = await _run_pipe_boundary(
+    _, _, _, _, _ = await _run_pipe_boundary(
         monkeypatch,
         messages=[{"role": "user", "content": "hello"}],
-        owner=False,
         function_calling_capability=False,
         body_overrides={"tools": {}},
         registry_ref_collision=True,
@@ -641,33 +614,29 @@ async def test_ref_mode_stage_one_priority_skips_owner_authorization(
     assert inactive_messages == [
         "Auto Compact ref mode inactive: model_tools_unsupported"
     ]
-    assert request.state.owner_checks == []
 
 
-@pytest.mark.asyncio
-async def test_ref_mode_active_path_checks_owner_once(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    caplog.set_level("INFO", logger=mod.__name__)
-    monkeypatch.setattr(
-        mod,
-        "_core_function_calling_generation",
-        lambda: mod.CoreFunctionCallingGeneration.NATIVE_DEFAULT,
+def test_ref_mode_active_path_returns_active_without_owner_reauthorization() -> None:
+    # Given
+    tools = {}
+    preflight = mod.RefModePreflight(
+        valve_enabled=True,
+        native_function_calling=True,
+        durable_context=True,
+        user_available=True,
+        model_supports_tools=True,
+        provider_schema_supported=True,
+        summary_tool_policy="fallback_on_tool_call",
+        metadata_tools=tools,
+        injected_tools=tools,
+        registry_available=True,
     )
 
-    result, forwarded, _, _, request = await _run_pipe_boundary(
-        monkeypatch,
-        messages=[{"role": "user", "content": "hello"}],
-    )
+    # When
+    result = mod.resolve_ref_mode_preflight(preflight)
 
-    assert result == {"ok": True}
-    assert forwarded[0]["messages"] == [{"role": "user", "content": "hello"}]
-    assert request.state.owner_checks == [("chat-1", "user-1")]
-    assert not any(
-        record.getMessage().startswith("Auto Compact ref mode inactive:")
-        for record in caplog.records
-    )
+    # Then
+    assert result == mod.EffectiveRefMode(active=True, reason=mod.RefModeReason.ACTIVE)
 
 
 @pytest.mark.asyncio
@@ -1030,7 +999,6 @@ async def test_ref_projection_failure_never_forwards_eligible_text_raw(
     raw = "eligible" * 10_000
 
     stage_operations = (
-        "authorize_ref_attempt",
         "register_ref_attempt",
         "commit_ref_attempt",
         "compare_and_swap_ref_generation",
@@ -1056,7 +1024,6 @@ async def test_ref_projection_failure_never_forwards_eligible_text_raw(
         {"role": "user", "content": "continue"},
     ]
     async_operations = {
-        "authorize_ref_attempt",
         "commit_ref_attempt",
         "compare_and_swap_ref_generation",
     }
@@ -1640,10 +1607,6 @@ async def _reader_fixture(
         )
     registry: dict[str, object] = {"unrelated": {"spec": {"name": "unrelated"}}}
 
-    async def authorized(chat_id: str, user_id: str) -> bool:
-        return (chat_id, user_id) == ("chat-1", "user-1")
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     reader = mod._new_ref_reader(
         request,
         key,
@@ -1818,32 +1781,24 @@ async def test_ref_exec_reader_omitted_command_returns_usage_error(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("command"), (None, []), ids=("none", "list"))
-async def test_ref_exec_reader_rejects_non_string_before_authorization_and_parser(
+async def test_ref_exec_reader_rejects_non_string_before_parser(
     monkeypatch: pytest.MonkeyPatch,
     command: CoreFixtureValue,
 ) -> None:
     reader, _, _, _ = await _reader_fixture(monkeypatch)
-    owner_calls = 0
     parser_calls = 0
     original_parser = mod._parse_ref_exec_command
-
-    async def observed_owner(_chat_id: str, _user_id: str) -> bool:
-        nonlocal owner_calls
-        owner_calls += 1
-        return True
 
     def observed_parser(value: str) -> tuple[mod.RefExecStage, ...]:
         nonlocal parser_calls
         parser_calls += 1
         return original_parser(value)
 
-    monkeypatch.setattr(mod, "_chat_owner_authorized", observed_owner)
     monkeypatch.setattr(mod, "_parse_ref_exec_command", observed_parser)
 
     result = await reader(command=command)
 
     assert result == _REF_EXEC_USAGE_ERROR
-    assert owner_calls == 0
     assert parser_calls == 0
 
 
@@ -5762,20 +5717,11 @@ async def test_ref_exec_reports_descriptive_lookup_failures(
 
 
 @pytest.mark.asyncio
-async def test_ref_exec_lists_only_binding_local_refs_after_fresh_authorization(
+async def test_ref_exec_lists_only_binding_local_refs_across_repeated_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reader, refs, request, key = await _reader_fixture(monkeypatch, ("one", "two"))
-    calls = 0
-
-    async def authorized(*_args: object) -> bool:
-        nonlocal calls
-        calls += 1
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     assert (await _read(reader, "ls tool")).splitlines() == list(refs)
-    assert calls == 1
     store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
     sibling_key = dataclasses.replace(key, incoming_model_id="sibling")
     sibling_ref = "tool:" + "f" * 64
@@ -5795,7 +5741,6 @@ async def test_ref_exec_lists_only_binding_local_refs_after_fresh_authorization(
     listed = await _read(reader, "ls")
     assert sibling_ref not in listed
     assert "private-assistant" not in listed
-    assert calls == 2
 
 
 @pytest.mark.asyncio
@@ -5847,11 +5792,11 @@ async def test_ref_exec_final_response_cap_tracks_threshold_floor(
 
 
 def _task3_surface() -> tuple[object, object, object, object]:
-    loader = getattr(mod, "load_authorized_raw_chat_branch", None)
+    loader = getattr(mod, "load_raw_chat_branch", None)
     builder = getattr(mod, "build_canonical_history_source", None)
     source_type = getattr(mod, "CanonicalHistorySourceHandle", None)
     error_type = getattr(mod, "CanonicalHistoryError", None)
-    assert callable(loader), "Task 3 authorized raw branch loader is not implemented"
+    assert callable(loader), "Task 3 raw branch loader is not implemented"
     assert callable(builder), "Task 3 canonical history builder is not implemented"
     assert callable(source_type), "Task 3 canonical history source is not implemented"
     assert callable(error_type), "Task 3 canonical history error is not implemented"
@@ -6307,7 +6252,6 @@ async def test_history_jsonl_is_cumulative_allowlisted_and_deterministic(
 ) -> None:
     loader, builder, _, _ = _task3_surface()
     calls: list[str] = []
-    owner_authorized = True
     raw_messages = {
         "system": {
             "id": "system",
@@ -6346,9 +6290,9 @@ async def test_history_jsonl_is_cumulative_allowlisted_and_deterministic(
     class FakeChats:
         @staticmethod
         async def is_chat_owner(chat_id: str, user_id: str) -> bool:
-            calls.append("authorize")
-            assert (chat_id, user_id) == ("chat-1", "user-1")
-            return owner_authorized
+            raise AssertionError(
+                "history loader must not reauthorize admitted requests"
+            )
 
         @staticmethod
         async def get_messages_map_by_chat_id(
@@ -6364,7 +6308,6 @@ async def test_history_jsonl_is_cumulative_allowlisted_and_deterministic(
 
     branch = await loader(
         chat_id="chat-1",
-        user_id="user-1",
         metadata={"user_message_id": "current-user"},
     )
     source = await builder(branch, source_message_count=3)
@@ -6374,21 +6317,13 @@ async def test_history_jsonl_is_cumulative_allowlisted_and_deterministic(
         _canonical_json({"role": "user", "content": "next"}),
     )
 
-    assert calls == ["authorize", "load"]
+    assert calls == ["load"]
     assert branch[2]["output"] is raw_messages["assistant"]["output"]
     assert tuple(source.iter_records()) == expected
     assert tuple(source.iter_records()) == expected
     assert source.line_count == 3
     assert "\n".join(source.iter_records()) == "\n".join(expected)
     assert not "\n".join(source.iter_records()).endswith("\n")
-    owner_authorized = False
-    with pytest.raises(mod.CanonicalHistoryError, match="owner authorization"):
-        await loader(
-            chat_id="chat-1",
-            user_id="user-1",
-            metadata={"user_message_id": "current-user"},
-        )
-    assert calls == ["authorize", "load", "authorize"]
 
 
 @pytest.mark.asyncio
@@ -7278,64 +7213,6 @@ async def test_pipe_uses_existing_legacy_fallback_when_canonical_digest_is_unenc
 
 
 @pytest.mark.asyncio
-async def test_same_request_reader_reauthorizes_after_registration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    raw = "same-request-authority:" + "x" * 70_000
-    current_user = {"id": "current-user", "role": "user", "content": "run"}
-    unsaved_round = _raw_native_round(
-        assistant_id="unsaved-authority",
-        call_id="unsaved-authority-call",
-        name="existing",
-        output_parts=[{"type": "input_text", "text": raw}],
-    )
-
-    result, _, _, registry, request = await _run_pipe_boundary(
-        monkeypatch,
-        messages=_expanded_core_messages([current_user, unsaved_round]),
-        metadata_overrides={"user_message_id": "current-user"},
-        raw_message_map=_linked_raw_message_map([current_user]),
-        forward_response={
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "reader-call",
-                                "type": "function",
-                                "function": {
-                                    "name": mod.REF_EXEC_TOOL_NAME,
-                                    "arguments": "{}",
-                                },
-                            }
-                        ],
-                    }
-                }
-            ]
-        },
-    )
-
-    ref = f"tool:{hashlib.sha256(raw.encode()).hexdigest()}"
-    reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
-    source = _committed_ref_binding(request).catalog[0].source
-
-    async def ownership_changed(_chat_id: str, _user_id: str) -> bool:
-        request.state.owner_checks.append((_chat_id, _user_id))
-        return False
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", ownership_changed)
-    assert result["choices"][0]["message"]["tool_calls"]
-    assert isinstance(source, mod.ZeroCopySourceHandle)
-    assert source.text is raw
-    assert await _read(reader, f"cat {ref}") == (
-        "Error: externalized ref authorization is no longer valid"
-    )
-    assert len(request.state.owner_checks) >= 3
-
-
-@pytest.mark.asyncio
 async def test_over_128_tool_refs_remain_readable_with_hash_dedup_and_no_eviction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7557,101 +7434,6 @@ async def test_same_request_30mb_text_uses_source_reference_without_copy(
     assert raw not in repr(forwarded[0])
     assert isinstance(source, mod.ZeroCopySourceHandle)
     assert source.text is raw
-
-
-@pytest.mark.asyncio
-async def test_initial_owner_denial_is_inactive_and_matches_valve_off(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    raw = "initial-owner-denied:" + "x" * (70 * 1024)
-    records = [
-        {"id": "prior-user", "role": "user", "content": "lookup"},
-        _raw_native_round(
-            assistant_id="persisted-assistant",
-            call_id="persisted-call",
-            name="existing",
-            output_parts=[{"type": "input_text", "text": raw}],
-        ),
-        {"id": "current-user", "role": "user", "content": "continue"},
-    ]
-    expected_provider_messages = _expanded_core_messages(records)
-    assert len(raw.encode()) > 65_536
-    assert expected_provider_messages[2]["content"] is raw
-
-    result, forwarded, _, registry, request = await _run_pipe_boundary(
-        monkeypatch,
-        messages=_expanded_core_messages(records),
-        owner=False,
-        metadata_overrides={"user_message_id": "current-user"},
-        raw_message_map=_linked_raw_message_map(records),
-    )
-    (
-        valve_off,
-        valve_off_forwards,
-        _,
-        valve_off_registry,
-        valve_off_request,
-    ) = await _run_pipe_boundary(
-        monkeypatch,
-        messages=_expanded_core_messages(records),
-        owner=False,
-        valve_enabled=False,
-        metadata_overrides={"user_message_id": "current-user"},
-        raw_message_map=_linked_raw_message_map(records),
-    )
-
-    assert result == valve_off == {"ok": True}
-    assert len(forwarded) == len(valve_off_forwards) == 1
-    assert forwarded[0] == valve_off_forwards[0]
-    assert forwarded[0]["messages"] == expected_provider_messages
-    assert forwarded[0]["messages"][2]["content"] is raw
-    assert request.state.owner_checks == [("chat-1", "user-1")]
-    assert valve_off_request.state.owner_checks == []
-    assert mod.REF_EXEC_TOOL_NAME not in registry
-    assert mod.REF_EXEC_TOOL_NAME not in valve_off_registry
-    assert not hasattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
-    assert not hasattr(valve_off_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
-    assert "auto_compact_ref_manifests" not in forwarded[0].get("metadata", {})
-    expected_ref = f"tool:{hashlib.sha256(raw.encode()).hexdigest()}"
-    assert expected_ref not in repr(forwarded[0])
-    assert all(
-        tool.get("function", {}).get("name") != mod.REF_EXEC_TOOL_NAME
-        for tool in forwarded[0].get("tools", [])
-    )
-
-
-@pytest.mark.asyncio
-async def test_authorize_ref_attempt_keeps_owner_denial_fatal(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def owner_denied(_chat_id: str, _user_id: str) -> bool:
-        return False
-
-    async def reader(_command: str) -> str:
-        return "unused"
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", owner_denied)
-    attempt = mod.RefAttempt(
-        key=mod.RefBindingKey(
-            user_id="user-1",
-            chat_id="chat-1",
-            user_message_id="current-user",
-            assistant_message_id="assistant-1",
-            incoming_model_id="model-1",
-            base_pipe_id="auto_compact",
-            profile_hash="profile-1",
-            branch_anchor="current-user",
-        ),
-        generation=1,
-        plan=mod.RefProjectionPlan(catalog=(), manifests=(), reader_schema=None),
-        registry={},
-        reader=reader,
-        previous_binding=None,
-        previous_reader_entry=mod.REF_REGISTRY_ENTRY_MISSING,
-    )
-
-    with pytest.raises(mod.RefProjectionError, match="authorization"):
-        await mod.authorize_ref_attempt(attempt)
 
 
 @pytest.mark.asyncio
@@ -8193,10 +7975,10 @@ async def test_projection_warning_uses_only_fixed_privacy_safe_diagnostics(
         lambda _request=None: (CountingEncoder(count=12_000), "test"),
     )
 
-    async def fail_authorization(_attempt: mod.RefAttempt) -> mod.RefAttempt:
-        raise mod.RefProjectionError(stage="authorization")
+    def fail_registration(_attempt: mod.RefAttempt) -> mod.RefStateDelta:
+        raise mod.RefProjectionError(stage="registration")
 
-    monkeypatch.setattr(mod, "authorize_ref_attempt", fail_authorization)
+    monkeypatch.setattr(mod, "register_ref_attempt", fail_registration)
 
     result, forwarded, _, _, _ = await _run_pipe_boundary(
         monkeypatch,
@@ -8214,7 +7996,7 @@ async def test_projection_warning_uses_only_fixed_privacy_safe_diagnostics(
     assert result["error"]["code"] == "ref_projection_failed"
     assert forwarded == []
     assert warnings == [
-        "Auto Compact ref projection failed: stage=authorization reason=operation_failed"
+        "Auto Compact ref projection failed: stage=registration reason=operation_failed"
     ]
     assert all(value not in warnings[0] for value in sensitive)
 
@@ -9169,12 +8951,7 @@ async def test_checkpoint_ref_enrichment_maps_operational_error_to_storage_unava
 ) -> None:
     private_detail = "private enrichment driver detail"
 
-    class OwnerChats:
-        @staticmethod
-        async def is_chat_owner(chat_id: str, user_id: str) -> bool:
-            assert (chat_id, user_id) == ("chat-1", "user-1")
-            return True
-
+    class UnavailableChats:
         @staticmethod
         async def get_messages_map_by_chat_id(
             chat_id: str,
@@ -9187,7 +8964,7 @@ async def test_checkpoint_ref_enrichment_maps_operational_error_to_storage_unava
             )
 
     chats_module = types.ModuleType("open_webui.models.chats")
-    chats_module.Chats = OwnerChats
+    chats_module.Chats = UnavailableChats
     monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
 
     with pytest.raises(Exception) as failure:
@@ -9366,20 +9143,8 @@ async def test_persisted_core_tool_reader_sanitizes_operational_error(
         store.bindings[key],
         catalog=(entry,),
     )
-    outer_owner_checks: list[tuple[str, str]] = []
-
-    async def outer_owner_allowed(chat_id: str, user_id: str) -> bool:
-        outer_owner_checks.append((chat_id, user_id))
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", outer_owner_allowed)
 
     class UnavailableChats:
-        @staticmethod
-        async def is_chat_owner(chat_id: str, user_id: str) -> bool:
-            assert (chat_id, user_id) == ("chat-1", "user-1")
-            return True
-
         @staticmethod
         async def get_messages_map_by_chat_id(
             chat_id: str,
@@ -9398,7 +9163,6 @@ async def test_persisted_core_tool_reader_sanitizes_operational_error(
     assert await _read(reader, f"cat {entry.manifest.ref}") == (
         "Error: externalized ref reader is unavailable"
     )
-    assert outer_owner_checks == [("chat-1", "user-1")]
 
 
 @pytest.mark.asyncio
@@ -9454,20 +9218,18 @@ async def test_pipe_projects_persisted_tool_refs_as_zero_copy_without_branch_loa
 ) -> None:
     tool_text, records = _task25_persisted_tool_records("task25-projection")
     encoder = CountingEncoder(count=1_001)
-    original_branch_loader = mod.load_authorized_raw_chat_branch
+    original_branch_loader = mod.load_raw_chat_branch
     branch_load_calls = 0
 
     async def observed_branch_load(
         *,
         chat_id: str,
-        user_id: str,
         metadata: dict[str, CoreFixtureValue],
     ) -> list[dict[str, CoreFixtureValue]]:
         nonlocal branch_load_calls
         branch_load_calls += 1
         return await original_branch_loader(
             chat_id=chat_id,
-            user_id=user_id,
             metadata=metadata,
         )
 
@@ -9475,7 +9237,7 @@ async def test_pipe_projects_persisted_tool_refs_as_zero_copy_without_branch_loa
         pipe.valves.ref_exec_enabled = True
         pipe.valves.ref_substitution_threshold_tokens = 1_000
 
-    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", observed_branch_load)
+    monkeypatch.setattr(mod, "load_raw_chat_branch", observed_branch_load)
     monkeypatch.setattr(
         mod,
         "_get_tiktoken_encoder",
@@ -9504,87 +9266,23 @@ async def test_pipe_projects_persisted_tool_refs_as_zero_copy_without_branch_loa
 
 
 @pytest.mark.asyncio
-async def test_authorize_ref_attempt_skips_measurement_for_zero_copy_source(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    text = "task25-authorize-zero-copy"
-    digest = hashlib.sha256(text.encode()).hexdigest()
-    source = mod.ZeroCopySourceHandle(text=text)
-    entry = mod.RefCatalogEntry(
-        manifest=mod.RefManifest(
-            ref=f"tool:{digest}",
-            utf8_bytes=len(text.encode()),
-            sha256=digest,
-        ),
-        source=source,
-    )
-    original_measure = mod._measure_ref_source_checked
-    measure_calls = 0
-
-    async def owner_allowed(_chat_id: str, _user_id: str) -> bool:
-        return True
-
-    def observed_measure(
-        measured_source: mod.RefSourceHandle,
-        cancelled: threading.Event,
-    ) -> tuple[int, str]:
-        nonlocal measure_calls
-        measure_calls += 1
-        return original_measure(measured_source, cancelled)
-
-    async def reader(_command: str) -> str:
-        return "unused"
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", owner_allowed)
-    monkeypatch.setattr(mod, "_measure_ref_source_checked", observed_measure)
-    attempt = mod.RefAttempt(
-        key=mod.RefBindingKey(
-            user_id="user-1",
-            chat_id="chat-1",
-            user_message_id="current-user",
-            assistant_message_id="assistant-1",
-            incoming_model_id="target",
-            base_pipe_id="auto_compact",
-            profile_hash=mod.compute_profile_hash(),
-            branch_anchor="current-user",
-        ),
-        generation=1,
-        plan=mod.RefProjectionPlan(
-            catalog=(entry,),
-            manifests=(entry.manifest,),
-            reader_schema=mod.REF_EXEC_TOOL_SPEC,
-        ),
-        registry={},
-        reader=reader,
-        previous_binding=None,
-        previous_reader_entry=mod.REF_REGISTRY_ENTRY_MISSING,
-    )
-
-    await mod.authorize_ref_attempt(attempt)
-
-    assert measure_calls == 0
-
-
-@pytest.mark.asyncio
 async def test_pipe_registered_tool_reader_avoids_branch_loading_for_source_access(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tool_text, records = _task25_persisted_tool_records("task25-reader")
     encoder = CountingEncoder(count=1_001)
-    original_branch_loader = mod.load_authorized_raw_chat_branch
+    original_branch_loader = mod.load_raw_chat_branch
     branch_load_calls = 0
 
     async def observed_branch_load(
         *,
         chat_id: str,
-        user_id: str,
         metadata: dict[str, CoreFixtureValue],
     ) -> list[dict[str, CoreFixtureValue]]:
         nonlocal branch_load_calls
         branch_load_calls += 1
         return await original_branch_loader(
             chat_id=chat_id,
-            user_id=user_id,
             metadata=metadata,
         )
 
@@ -9592,7 +9290,7 @@ async def test_pipe_registered_tool_reader_avoids_branch_loading_for_source_acce
         pipe.valves.ref_exec_enabled = True
         pipe.valves.ref_substitution_threshold_tokens = 1_000
 
-    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", observed_branch_load)
+    monkeypatch.setattr(mod, "load_raw_chat_branch", observed_branch_load)
     monkeypatch.setattr(
         mod,
         "_get_tiktoken_encoder",

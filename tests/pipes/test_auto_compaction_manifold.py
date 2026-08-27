@@ -26,7 +26,7 @@ from functions.pipe import auto_compact as mod
 TRANSIENT_MARKER = r"(?s)<SYSTEM_CONTEXT>.*</SYSTEM_CONTEXT>\s*\Z"
 
 
-def test_auto_compact_release_header_is_080_with_096_floor():
+def test_auto_compact_release_header_is_081_with_096_floor():
     header = {
         key.strip(): value.strip()
         for line in (mod.__doc__ or "").splitlines()
@@ -35,7 +35,7 @@ def test_auto_compact_release_header_is_080_with_096_floor():
     }
     source_after_header = inspect.getsource(mod).split('"""', 2)[2]
 
-    assert header["version"] == "0.8.0"
+    assert header["version"] == "0.8.1"
     assert header["required_open_webui_version"] == "0.9.6"
     assert source_after_header.lstrip().startswith("# fmt: off")
 
@@ -16996,10 +16996,7 @@ async def test_pipe_rechecks_better_checkpoint_after_token_status_when_parent_wa
         captured["forward_body"] = copy.deepcopy(kwargs["body"])
         return {"ok": True}
 
-    async def owner_authorized(_chat_id, _user_id):
-        return True
-
-    async def load_raw_branch(**_kwargs):
+    async def load_raw_branch(*, chat_id, metadata):
         return [*exact_source, {"role": "user", "content": "active"}]
 
     def start_soft_prefetch(**kwargs):
@@ -17015,8 +17012,7 @@ async def test_pipe_rechecks_better_checkpoint_after_token_status_when_parent_wa
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
     monkeypatch.setattr(mod, "_inject_target_file_context", inject_target_file_context)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
-    monkeypatch.setattr(mod, "_chat_owner_authorized", owner_authorized)
-    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", load_raw_branch)
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_branch)
     monkeypatch.setattr(
         mod, "_start_soft_compaction_prefetch", start_soft_prefetch, raising=False
     )
@@ -17203,10 +17199,7 @@ async def test_pipe_first_compaction_forwards_exact_new_checkpoint_history_manif
         captured["summary_result"] = result
         return result
 
-    async def owner_authorized(_chat_id, _user_id):
-        return True
-
-    async def load_raw_branch(**_kwargs):
+    async def load_raw_branch(*, chat_id, metadata):
         captured["raw_branch_loads"] = captured.get("raw_branch_loads", 0) + 1
         return copy.deepcopy(raw_branch)
 
@@ -17223,8 +17216,7 @@ async def test_pipe_first_compaction_forwards_exact_new_checkpoint_history_manif
     monkeypatch.setattr(
         mod, "_get_or_create_checkpoint_summary", capture_checkpoint_summary
     )
-    monkeypatch.setattr(mod, "_chat_owner_authorized", owner_authorized)
-    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", load_raw_branch)
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_branch)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
 
     pipe = mod.Pipe()
@@ -26536,16 +26528,6 @@ async def test_checkpoint_reuse_survives_mode_flip(
 
     store = ExistingCheckpointStore([checkpoint])
 
-    class FakeChats:
-        @staticmethod
-        async def is_chat_owner(chat_id, user_id):
-            assert (chat_id, user_id) == ("chat-1", "user-1")
-            return True
-
-    chats_module = types.ModuleType("open_webui.models.chats")
-    chats_module.Chats = FakeChats
-    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
-
     async def validate_target_access(**_kwargs):
         return None
 
@@ -26564,7 +26546,7 @@ async def test_checkpoint_reuse_survives_mode_flip(
     async def generate_summary_text(**_kwargs):
         raise AssertionError("mode transitions must not regenerate the checkpoint")
 
-    async def load_authorized_raw_chat_branch(**_kwargs):
+    async def load_raw_chat_branch(*, chat_id, metadata):
         return copy.deepcopy(raw_branch)
 
     async def forward_target(**kwargs):
@@ -26576,9 +26558,7 @@ async def test_checkpoint_reuse_survives_mode_flip(
     monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
     monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
     monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
-    monkeypatch.setattr(
-        mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch
-    )
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
     monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
     _install_candidate_token_estimate(monkeypatch, 10)
 
@@ -26759,7 +26739,7 @@ async def test_history_ref_cas_enrichment_preserves_single_lineage(
         parent_checkpoint_id=parent_checkpoint["id"],
     )
 
-    async def load_authorized_raw_chat_branch(**_kwargs):
+    async def load_raw_chat_branch(*, chat_id, metadata):
         return copy.deepcopy(messages)
 
     file_identity_revalidations = 0
@@ -26770,9 +26750,7 @@ async def test_history_ref_cas_enrichment_preserves_single_lineage(
         file_identity_revalidations += 1
         return copy.deepcopy(db_chain)
 
-    monkeypatch.setattr(
-        mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch
-    )
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
     completed_revalidations = 0
     resolve_history_ref_catalog_entry = mod.resolve_history_ref_catalog_entry
@@ -27085,15 +27063,6 @@ async def _task6_run_checkpoint_handoffs(
     render_phases = {"prior": [], "current": []}
     phase = "prior"
     estimated_tokens = 1
-
-    class FakeChats:
-        @staticmethod
-        async def is_chat_owner(chat_id, user_id):
-            return (chat_id, user_id) == ("chat-1", "user-1")
-
-    chats_module = types.ModuleType("open_webui.models.chats")
-    chats_module.Chats = FakeChats
-    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
 
     async def no_refresh(_request):
         return None
@@ -28364,7 +28333,6 @@ def _task7_install_pipe_runtime(monkeypatch, *, estimate_tokens=10):
         "classification": 0,
         "checkpoint": 0,
         "events": [],
-        "owner": 0,
         "estimates": [],
         "forwards": [],
         "summaries": 0,
@@ -28382,11 +28350,6 @@ def _task7_install_pipe_runtime(monkeypatch, *, estimate_tokens=10):
                 "info": {"meta": {"capabilities": {"function_calling": True}}},
             }
         }
-
-    async def owner_authorized(chat_id, user_id):
-        observed["events"].append("owner")
-        observed["owner"] += 1
-        return True
 
     async def classify(*args, **kwargs):
         observed["events"].append("classification")
@@ -28414,7 +28377,6 @@ def _task7_install_pipe_runtime(monkeypatch, *, estimate_tokens=10):
 
     monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
     monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
-    monkeypatch.setattr(mod, "_chat_owner_authorized", owner_authorized)
     monkeypatch.setattr(mod, "project_native_tool_texts", classify)
     monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", checkpoint)
     monkeypatch.setattr(mod, "_estimate_provider_input_tokens_async", estimate)
@@ -28591,6 +28553,8 @@ async def _task8_run_current_core_route(
     chat_id="chat-1",
     previous_response_id=None,
     trigger_input_tokens=100_000_000,
+    ref_substitution_threshold_tokens=1,
+    dispatch_exact_ref_command=False,
     observe_hard_compaction=False,
     target_model=None,
 ):
@@ -28640,7 +28604,7 @@ async def _task8_run_current_core_route(
     )
     pipe = mod.Pipe()
     pipe.valves.ref_exec_enabled = valve_enabled
-    pipe.valves.ref_substitution_threshold_tokens = 1
+    pipe.valves.ref_substitution_threshold_tokens = ref_substitution_threshold_tokens
     pipe.valves.trigger_input_tokens = trigger_input_tokens
     pipe.valves.soft_trigger_ratio = 0
     injected_calls = []
@@ -28678,7 +28642,6 @@ async def _task8_run_current_core_route(
     response_context_metadata = []
     lifecycle = []
     active_readers = []
-    authorization = {"allowed": True}
     branch_loads = []
     checkpoint_activity = []
     checkpoint_rows = []
@@ -28846,25 +28809,45 @@ async def _task8_run_current_core_route(
         if not dispatch_reader:
             payload = {"choices": [{"delta": {"content": "done"}}]}
         elif len(model_calls) == 1:
-            payload = {
-                "choices": [
-                    {
-                        "delta": {
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "id": "call-wc",
-                                    "type": "function",
-                                    "function": {
-                                        "name": mod.REF_EXEC_TOOL_NAME,
-                                        "arguments": json.dumps({"command": "wc"}),
-                                    },
-                                }
-                            ]
+            projected_ref_match = (
+                re.search(
+                    r"tool:[0-9a-f]{64}",
+                    json.dumps(form_data["messages"]),
+                )
+                if dispatch_exact_ref_command
+                else None
+            )
+            if dispatch_exact_ref_command and projected_ref_match is None:
+                payload = {"choices": [{"delta": {"content": "done"}}]}
+            else:
+                command = (
+                    f"wc -c {projected_ref_match.group(0)}"
+                    if projected_ref_match is not None
+                    else "wc"
+                )
+                payload = {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call-wc",
+                                        "type": "function",
+                                        "function": {
+                                            "name": mod.REF_EXEC_TOOL_NAME,
+                                            "arguments": json.dumps(
+                                                {"command": command}
+                                            ),
+                                        },
+                                    }
+                                ]
+                            }
                         }
-                    }
-                ]
-            }
+                    ]
+                }
+        elif dispatch_exact_ref_command:
+            payload = {"choices": [{"delta": {"content": "done"}}]}
         elif registries_by_message is None and len(model_calls) == 2:
             payload = {
                 "choices": [
@@ -29041,12 +29024,10 @@ async def _task8_run_current_core_route(
         body["session_id"] = "session-1"
         body.pop("assistant_message_id", None)
 
-    async def load_authorized_raw_chat_branch(**kwargs):
+    async def load_raw_chat_branch(**kwargs):
         assert kwargs["chat_id"] == chat_id
-        assert kwargs["user_id"] == user_id
+        assert set(kwargs) == {"chat_id", "metadata"}
         branch_loads.append(dict(kwargs))
-        if not authorization["allowed"]:
-            return None
         return [
             {"role": "user", "content": "run the tool"},
             {
@@ -29068,9 +29049,7 @@ async def _task8_run_current_core_route(
             },
         ]
 
-    monkeypatch.setattr(
-        mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch
-    )
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
     result = await core_main.chat_completion(request, body, user)
     if isinstance(result, dict) and result.get("task_ids"):
         await asyncio.gather(
@@ -29079,7 +29058,6 @@ async def _task8_run_current_core_route(
         )
     return {
         "active_readers": active_readers,
-        "authorization": authorization,
         "branch_loads": branch_loads,
         "checkpoint_activity": checkpoint_activity,
         "checkpoint_rows": checkpoint_rows,
@@ -29133,7 +29111,7 @@ async def test_ref_mode_collision_matches_valve_off_at_all_sizes(monkeypatch):
         assert enabled == disabled == {"ok": True}
         assert observed["forwards"][-2] == observed["forwards"][-1]
         assert registry == snapshot
-        assert observed["classification"] == observed["owner"] == 0
+        assert observed["classification"] == 0
         assert not hasattr(enabled_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
 
 
@@ -29166,7 +29144,7 @@ async def test_inactive_ref_contexts_match_valve_off_at_all_sizes(monkeypatch):
 
         assert enabled == disabled == {"ok": True}
         assert observed["forwards"][-2] == observed["forwards"][-1]
-        assert observed["classification"] == observed["owner"] == 0
+        assert observed["classification"] == 0
         assert not hasattr(enabled_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
 
 
@@ -29317,10 +29295,6 @@ async def test_generation_token_cas_cannot_rollback_newer_or_sibling_commit():
 async def test_cleanup_defers_while_newer_generation_depends_on_committed_binding(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request = _Task7Request()
     registry = {"unrelated": {}}
     key = _task7_key()
@@ -29373,10 +29347,6 @@ async def _task7_staged_reentry():
 async def test_stale_rollback_preserves_binding_required_by_newer_staged_reservation(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     (
         request,
         registry,
@@ -29401,10 +29371,6 @@ async def test_stale_rollback_preserves_binding_required_by_newer_staged_reserva
 async def test_deferred_cleanup_completes_when_newer_staged_attempt_rolls_back(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
 
     await mod.cleanup_ref_attempt(request, first)
@@ -29427,10 +29393,6 @@ async def test_deferred_cleanup_completes_when_newer_staged_attempt_rolls_back(
 async def test_deferred_cleanup_completes_when_newer_reservation_is_released(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
     reservation = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY).reservations[
         key
@@ -29456,10 +29418,6 @@ async def test_deferred_cleanup_completes_when_newer_reservation_is_released(
 async def test_newer_commit_supersedes_deferred_cleanup_without_deleting_new_binding(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     (
         request,
         registry,
@@ -29496,10 +29454,6 @@ async def test_newer_commit_supersedes_deferred_cleanup_without_deleting_new_bin
 async def test_rollback_after_newer_commit_does_not_resurrect_cleaned_predecessor(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
 
     await mod.cleanup_ref_attempt(request, first)
@@ -29523,10 +29477,6 @@ async def test_rollback_after_newer_commit_does_not_resurrect_cleaned_predecesso
 async def test_rollback_after_newer_commit_restores_uncleaned_predecessor_exactly(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request, registry, key, first_plan, _, _, second = await _task7_staged_reentry()
     store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
     previous_binding = store.bindings[key]
@@ -29548,10 +29498,6 @@ async def test_cleanup_tombstone_rollback_preserves_foreign_or_missing_registry_
     monkeypatch,
     registry_state,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
     await mod.cleanup_ref_attempt(request, first)
     await mod.commit_ref_attempt(request, second)
@@ -29579,10 +29525,6 @@ async def test_cleanup_tombstone_rollback_preserves_foreign_or_missing_registry_
 
 @pytest.mark.asyncio
 async def test_successor_terminal_cleanup_consumes_predecessor_tombstone(monkeypatch):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
     await mod.cleanup_ref_attempt(request, first)
     await mod.commit_ref_attempt(request, second)
@@ -29604,10 +29546,6 @@ async def test_successor_terminal_cleanup_consumes_predecessor_tombstone(monkeyp
 async def test_cleanup_tombstone_transfers_once_across_an_additional_generation(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request, registry, key, first_plan, first, _, second = await _task7_staged_reentry()
     await mod.cleanup_ref_attempt(request, first)
     await mod.commit_ref_attempt(request, second)
@@ -29697,10 +29635,6 @@ async def _assert_task7_ref_authority_removed(
 async def test_superseded_cleanup_tombstone_completes_on_current_reservation_release(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     scenario = await _task7_superseded_staged_reentry()
     _assert_task7_cleanup_retargets_to_reservation(
         scenario,
@@ -29719,10 +29653,6 @@ async def test_superseded_cleanup_tombstone_completes_on_current_reservation_rel
 async def test_superseded_cleanup_tombstone_completes_on_current_commit_rollback(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     scenario = await _task7_superseded_staged_reentry()
     _assert_task7_cleanup_retargets_to_reservation(
         scenario,
@@ -29742,10 +29672,6 @@ async def test_superseded_cleanup_tombstone_completes_on_current_commit_rollback
 async def test_stale_superseded_commit_cannot_consume_transferred_cleanup_tombstone(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     scenario = await _task7_superseded_staged_reentry()
 
     with pytest.raises(mod.RefProjectionError, match="generation CAS"):
@@ -29766,10 +29692,6 @@ async def test_stale_superseded_commit_cannot_consume_transferred_cleanup_tombst
 async def test_stale_superseded_rollback_cannot_consume_transferred_cleanup_tombstone(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     scenario = await _task7_superseded_staged_reentry()
 
     await mod.rollback_ref_attempt(scenario.request, scenario.second)
@@ -29789,10 +29711,6 @@ async def test_stale_superseded_rollback_cannot_consume_transferred_cleanup_tomb
 async def test_stale_superseded_release_cannot_consume_transferred_cleanup_tombstone(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     scenario = await _task7_superseded_staged_reentry()
 
     await mod.release_ref_reservation(scenario.request, scenario.second_reservation)
@@ -29812,10 +29730,6 @@ async def test_stale_superseded_release_cannot_consume_transferred_cleanup_tombs
 async def test_same_key_reservation_replacement_without_cleanup_retains_binding(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request, registry, key, first_plan, _, _, _ = await _task7_staged_reentry()
     third_reservation = await _task7_reserve(request, key, registry)
     store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
@@ -29880,10 +29794,6 @@ async def _task7_foreign_registry_replacement_attempt():
 async def test_foreign_registry_replacement_cannot_displace_cleanup_before_release(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     scenario = await _task7_foreign_registry_replacement_attempt()
 
     assert scenario.foreign_reservation is None
@@ -29914,10 +29824,6 @@ async def test_foreign_registry_replacement_cannot_displace_cleanup_before_relea
 async def test_foreign_registry_replacement_cannot_displace_cleanup_before_commit_rollback(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     scenario = await _task7_foreign_registry_replacement_attempt()
 
     assert scenario.foreign_reservation is None
@@ -29975,10 +29881,6 @@ async def _task7_committed_foreign_registry_replacement_attempt():
 async def test_foreign_registry_cannot_reserve_committed_key_before_cleanup(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     scenario = await _task7_committed_foreign_registry_replacement_attempt()
 
     assert scenario.foreign_reservation is None
@@ -29998,10 +29900,6 @@ async def test_foreign_registry_cannot_reserve_committed_key_before_cleanup(
 async def test_rejected_foreign_registry_preserves_same_registry_commit_cleanup(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     scenario = await _task7_committed_foreign_registry_replacement_attempt()
 
     assert scenario.foreign_reservation is None
@@ -30109,10 +30007,6 @@ async def _task7_committed_reentry():
 async def test_reentry_rollback_restores_exact_owned_binding_and_registry_entry(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     (
         request,
         registry,
@@ -30136,10 +30030,6 @@ async def test_reentry_rollback_restores_exact_owned_binding_and_registry_entry(
 async def test_reentry_rollback_removes_internal_state_without_overwriting_foreign_registry(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request, registry, key, first_plan, second, _, _ = await _task7_committed_reentry()
     foreign = {"spec": {"name": "foreign"}, "callable": lambda command: command}
     registry[mod.REF_EXEC_TOOL_NAME] = foreign
@@ -30160,10 +30050,6 @@ async def test_reentry_rollback_removes_internal_state_without_overwriting_forei
 async def test_reentry_rollback_removes_internal_state_without_recreating_missing_registry_entry(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request, registry, key, first_plan, second, _, _ = await _task7_committed_reentry()
     registry.pop(mod.REF_EXEC_TOOL_NAME)
 
@@ -30222,10 +30108,6 @@ async def test_reentry_updates_reader_key_in_place_without_replacing_tools_mappi
 
 @pytest.mark.asyncio
 async def test_reader_callable_cannot_resolve_sibling_catalog(monkeypatch):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request = _Task7Request()
     registries = ({"a": {}}, {"b": {}})
     keys = (_task7_key(), _task7_key(model="wrapper-b", assistant="assistant-b"))
@@ -30250,10 +30132,6 @@ async def test_reader_callable_cannot_resolve_sibling_catalog(monkeypatch):
 async def test_over_128_legitimate_private_bindings_remain_zero_copy_until_request_cleanup(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request = _Task7Request()
     source = "zero-copy" * 6_000
     plans = []
@@ -30353,10 +30231,6 @@ async def test_unselected_attempt_leaves_request_body_registry_and_catalog_uncha
 async def test_reentry_preserves_projection_reachable_refs_and_updates_only_its_binding_catalog(
     monkeypatch,
 ):
-    async def authorized(_chat_id, _user_id):
-        return True
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", authorized)
     request = _Task7Request()
     registry = {"other": {}}
     key = _task7_key()
@@ -30451,7 +30325,7 @@ async def test_absent_or_detached_outer_tools_match_valve_off_at_all_sizes(monke
 
         assert enabled == disabled == {"ok": True}
         assert observed["forwards"][-2] == observed["forwards"][-1]
-        assert observed["classification"] == observed["owner"] == 0
+        assert observed["classification"] == 0
         assert not hasattr(enabled_request.state, mod.REQUEST_STATE_REF_STORE_KEY)
         assert metadata["tools"] is registry
 
@@ -30543,7 +30417,6 @@ async def test_sibling_owned_registry_mapping_matches_valve_off_without_mutation
 
     def resolve_and_record(preflight):
         mode = resolve_ref_mode_preflight(preflight)
-        assert mode is not None
         observed["events"].append(f"mode:{mode.active}:{mode.reason}")
         return mode
 
@@ -30692,7 +30565,6 @@ async def test_sibling_owned_registry_mapping_matches_valve_off_without_mutation
     assert store.next_generation == nonce
     assert store.bindings[owner_key].catalog is catalog
     assert store.bindings[owner_key].reader is reader
-    assert observed["owner"] == 2
     assert observed["classification"] == 0
 
 
@@ -31095,24 +30967,6 @@ async def test_inactive_context_lifecycle_matches_valve_off_at_all_sizes(monkeyp
         dispatch_reader=False,
         user_id="owner",
     )
-    admin_registry = {"unrelated": {}}
-    admin_result = await _task8_run_current_core_route(
-        monkeypatch,
-        registry=admin_registry,
-        dispatch_reader=False,
-        user_id="admin",
-        role="admin",
-        owner=False,
-    )
-    admin_valve_off = await _task8_run_current_core_route(
-        monkeypatch,
-        registry={"unrelated": {}},
-        dispatch_reader=False,
-        valve_enabled=False,
-        user_id="admin",
-        role="admin",
-        owner=False,
-    )
     with pytest.raises(HTTPException) as ordinary_denial:
         await _task8_run_current_core_route(
             monkeypatch,
@@ -31136,16 +30990,14 @@ async def test_inactive_context_lifecycle_matches_valve_off_at_all_sizes(monkeyp
     )
     assert not owner_store.bindings
     assert not owner_store.reservations
+    assert not owner_store.registry_reservations
+    assert not owner_store.registry_owners
     assert owner_result["provider"]
-    assert mod.REF_EXEC_TOOL_NAME not in admin_registry
-    assert admin_result["provider"] == admin_valve_off["provider"]
-    assert admin_result["result"] == admin_valve_off["result"]
-    assert admin_result["provider"]
-    assert not admin_result["active_readers"]
-    assert not hasattr(
-        admin_result["request"].state,
-        mod.REQUEST_STATE_REF_STORE_KEY,
+    assert any(
+        tool.get("function", {}).get("name") == mod.REF_EXEC_TOOL_NAME
+        for tool in owner_result["provider"][0]["tools"]
     )
+    assert owner_result["active_readers"]
     assert ordinary_denial.value.status_code == 404
     assert model_denial.value.status_code == 403
 
@@ -31199,23 +31051,45 @@ async def test_inactive_context_lifecycle_matches_valve_off_at_all_sizes(monkeyp
     assert not hasattr(hard_disabled["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
 
 
+@pytest.mark.parametrize(
+    ("owner", "role"),
+    (
+        pytest.param(True, "user", id="owner-user"),
+        pytest.param(False, "admin", id="admin-non-owner"),
+    ),
+)
 @pytest.mark.asyncio
-async def test_real_core_native_reader_dispatches_and_reenters_pipe(monkeypatch):
+async def test_real_core_native_reader_dispatches_and_reenters_pipe(
+    monkeypatch,
+    owner,
+    role,
+):
     registry = {
         "unrelated": {
             "spec": {"name": "unrelated", "parameters": {"type": "object"}},
             "callable": lambda: None,
         }
     }
+    source_text = "λ" * 40_000
+    source_utf8 = source_text.encode("utf-8")
+    expected_byte_count = str(len(source_utf8))
+    assert len(source_utf8) > 65_536
 
-    observed = await _task8_run_current_core_route(monkeypatch, registry=registry)
+    observed = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=registry,
+        owner=owner,
+        role=role,
+        text=source_text,
+        ref_substitution_threshold_tokens=1_000,
+        dispatch_exact_ref_command=True,
+    )
 
     assert [call["body"]["model"] for call in observed["injected"]] == [
         "auto_compact.target",
         "auto_compact.target",
-        "auto_compact.target",
     ]
-    assert len(observed["provider"]) == 3
+    assert len(observed["provider"]) == 2
     assert observed["lifecycle"] == [
         "process_chat_payload",
         "chat_completion_handler",
@@ -31228,29 +31102,103 @@ async def test_real_core_native_reader_dispatches_and_reenters_pipe(monkeypatch)
     assert all(
         call["__metadata__"]["tools"] is registry for call in observed["injected"]
     )
-    recursive_entries = observed["injected"][1:]
-    assert len(recursive_entries) == 2
     assert len(observed["active_readers"]) == 1
-    owned_reader = observed["active_readers"][0]["entry"]["callable"]
+    active_reader = observed["active_readers"][0]
+    assert active_reader["registry"] is registry
+    assert active_reader["catalog"]
+    active_reader_parameters = active_reader["entry"]["spec"]["parameters"]
+    assert set(active_reader_parameters["properties"]) == {"command"}
+    provider_reader_tools = [
+        tool
+        for tool in observed["provider"][0]["tools"]
+        if tool["function"]["name"] == mod.REF_EXEC_TOOL_NAME
+    ]
+    assert len(provider_reader_tools) == 1
+    assert set(
+        provider_reader_tools[0]["function"]["parameters"]["properties"]
+    ) == {"command"}
+    projected_refs = set(
+        re.findall(
+            r"tool:[0-9a-f]{64}",
+            json.dumps(observed["provider"][0]["messages"]),
+        )
+    )
+    assert len(projected_refs) == 1
+    projected_ref = next(iter(projected_refs))
+    assert projected_ref in {
+        entry.manifest.ref for entry in active_reader["catalog"]
+    }
+    expected_command = f"wc -c {projected_ref}"
+    second_provider_messages = observed["provider"][1]["messages"]
+    reader_tool_calls = [
+        tool_call
+        for message in second_provider_messages
+        for tool_call in message.get("tool_calls", [])
+        if tool_call.get("function", {}).get("name") == mod.REF_EXEC_TOOL_NAME
+    ]
+    assert len(reader_tool_calls) == 1
+    assert json.loads(reader_tool_calls[0]["function"]["arguments"]) == {
+        "command": expected_command
+    }
+    reader_tool_messages = [
+        message
+        for message in second_provider_messages
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == reader_tool_calls[0]["id"]
+    ]
+    assert len(reader_tool_messages) == 1
+    assert reader_tool_messages[0]["content"] == expected_byte_count
+    function_call_outputs = [
+        item
+        for event in observed["emitted"]
+        if event.get("type") == "chat:completion"
+        for item in event.get("data", {}).get("output", [])
+        if item.get("type") == "function_call_output"
+        and item.get("call_id") == reader_tool_calls[0]["id"]
+    ]
+    assert function_call_outputs
+    assert all(
+        item.get("output")
+        == [{"type": "input_text", "text": expected_byte_count}]
+        for item in function_call_outputs
+    )
+    recursive_entries = observed["injected"][1:]
+    assert len(recursive_entries) == 1
+    owned_reader = active_reader["entry"]["callable"]
     for entry in recursive_entries:
         messages = entry["body"]["messages"]
         serialized = json.dumps(messages)
         assert any(
             message.get("role") == "tool"
-            and "persisted reader payload\nsecond line" in str(message.get("content"))
+            and message.get("content") == source_text
             for message in messages
         )
-        assert re.search(r"tool:[0-9a-f]{64}", serialized) is None
+        assert set(re.findall(r"tool:[0-9a-f]{64}", serialized)) == {
+            projected_ref
+        }
         assert re.search(r"history:accp_[0-9a-f]{64}", serialized) is None
         assert "<auto_compaction_context" not in serialized
         assert "<auto_compact_ref_manifests" not in serialized
         assert "metadata" not in entry["body"]
         assert entry["entry_reader_callable"] is owned_reader
+    reader_output_surface = json.dumps(
+        {
+            "emitted": observed["emitted"],
+            "second_provider_messages": second_provider_messages,
+        }
+    )
+    assert "not available in this binding" not in reader_output_surface
+    assert "Error: usage:" not in reader_output_surface
+    assert (
+        f'Error: Tool "{mod.REF_EXEC_TOOL_NAME}" not found.'
+        not in reader_output_surface
+    )
     assert mod.REF_EXEC_TOOL_NAME not in registry
     store = getattr(observed["request"].state, mod.REQUEST_STATE_REF_STORE_KEY)
     assert not store.bindings
     assert not store.reservations
-    assert "function_call_output" in json.dumps(observed["emitted"])
+    assert not store.registry_reservations
+    assert not store.registry_owners
 
 
 @pytest.mark.asyncio
@@ -31494,26 +31442,6 @@ async def test_real_core_context_dispatches_from_actual_outer_metadata_registry(
         for tool in observed["provider"][0]["tools"]
     )
     assert "function_call_output" in json.dumps(observed["emitted"])
-
-
-@pytest.mark.asyncio
-async def test_real_core_reader_rejects_cross_owner(monkeypatch):
-    async def retain_binding(_request, _attempt):
-        return None
-
-    monkeypatch.setattr(mod, "cleanup_ref_attempt", retain_binding)
-    registry = {"unrelated": {}}
-    observed = await _task8_run_current_core_route(monkeypatch, registry=registry)
-    reader = observed["active_readers"][0]["entry"]["callable"]
-
-    async def cross_owner(_chat_id, _user_id):
-        return False
-
-    monkeypatch.setattr(mod, "_chat_owner_authorized", cross_owner)
-
-    assert (
-        await reader("ls") == "Error: externalized ref authorization is no longer valid"
-    )
 
 
 @pytest.mark.asyncio

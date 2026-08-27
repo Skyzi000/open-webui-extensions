@@ -3469,15 +3469,15 @@ async def test_history_catalog_enumerates_over_128_ancestors_and_revalidates_req
     load_calls = []
     select_statements = []
 
-    async def load_authorized_raw_chat_branch(**kwargs):
-        load_calls.append(kwargs)
+    async def load_raw_chat_branch(*, chat_id, metadata):
+        load_calls.append({"chat_id": chat_id, "metadata": metadata})
         return copy.deepcopy(messages)
 
     def capture_select(_connection, _cursor, statement, _parameters, _context, _executemany):
         if statement.lstrip().upper().startswith("SELECT"):
             select_statements.append(statement)
 
-    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch)
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
     event.listen(claim_engine.sync_engine, "before_cursor_execute", capture_select)
     try:
         catalog = await mod.build_history_ref_catalog(
@@ -3507,18 +3507,6 @@ async def test_history_catalog_enumerates_over_128_ancestors_and_revalidates_req
         assert resolved.source.line_count == index + 1
 
     assert len(load_calls) == 3
-
-    async def reject_owner(**_kwargs):
-        raise mod.CanonicalHistoryError(reason="owner authorization failed")
-
-    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", reject_owner)
-    with pytest.raises(mod.CanonicalHistoryError, match="owner authorization"):
-        await mod.resolve_history_ref_catalog_entry(
-            catalog[0],
-            request=SimpleNamespace(state=SimpleNamespace()),
-            metadata={"chat_id": "chat-1", "user_message_id": "message-130"},
-        )
-
 
 @pytest.mark.asyncio
 async def test_history_catalog_rejects_cycle_missing_parent_and_nonmonotonic_count():
@@ -3584,24 +3572,19 @@ async def test_history_unavailable_child_does_not_fallback_to_ancestor(monkeypat
 
     requested_branches = []
 
-    async def parent_only(**_kwargs):
+    async def parent_only(*, chat_id, metadata):
         requested_branches.append("missing-child")
         return copy.deepcopy(messages[:1])
 
-    async def owner_denied(**_kwargs):
-        requested_branches.append("owner-denied")
-        raise mod.CanonicalHistoryError(reason="owner authorization failed")
-
-    async def corrupt_child(**_kwargs):
+    async def corrupt_child(*, chat_id, metadata):
         requested_branches.append("corrupt-child")
         return [messages[0], {"role": "assistant", "content": "tampered"}]
 
     for loader, error in (
         (parent_only, "checkpoint count references an unsaved source"),
-        (owner_denied, "owner authorization"),
         (corrupt_child, "raw source hash"),
     ):
-        monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", loader)
+        monkeypatch.setattr(mod, "load_raw_chat_branch", loader)
         with pytest.raises(mod.CanonicalHistoryError, match=error):
             await mod.resolve_history_ref_catalog_entry(
                 child,
@@ -3609,11 +3592,11 @@ async def test_history_unavailable_child_does_not_fallback_to_ancestor(monkeypat
                 metadata={"chat_id": "chat-1", "user_message_id": "message-2"},
             )
 
-    async def valid_branch(**_kwargs):
+    async def valid_branch(*, chat_id, metadata):
         requested_branches.append("explicit-parent")
         return copy.deepcopy(messages)
 
-    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", valid_branch)
+    monkeypatch.setattr(mod, "load_raw_chat_branch", valid_branch)
     resolved_parent = await mod.resolve_history_ref_catalog_entry(
         parent,
         request=SimpleNamespace(state=SimpleNamespace()),
@@ -3622,7 +3605,6 @@ async def test_history_unavailable_child_does_not_fallback_to_ancestor(monkeypat
     assert resolved_parent.manifest.ref == f"history:{rows[0]['id']}"
     assert requested_branches == [
         "missing-child",
-        "owner-denied",
         "corrupt-child",
         "explicit-parent",
     ]
@@ -3634,10 +3616,10 @@ async def test_history_manifest_is_rendered_but_not_stored(monkeypatch):
     row = _history_checkpoint_rows(messages)[0]
     stored_summary = row["summary_text"]
 
-    async def load_authorized_raw_chat_branch(**_kwargs):
+    async def load_raw_chat_branch(*, chat_id, metadata):
         return copy.deepcopy(messages)
 
-    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch)
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
     catalog = await mod.build_history_ref_catalog(
         store=HistoryCatalogStore([row]),
         selected_checkpoint=row,
@@ -3665,11 +3647,11 @@ async def test_history_catalog_rejects_unverified_raw_hash(monkeypatch):
     row["summary_meta"]["history_ref"]["raw_source_hash"] = "0" * 64
     load_calls = []
 
-    async def load_authorized_raw_chat_branch(**_kwargs):
+    async def load_raw_chat_branch(*, chat_id, metadata):
         load_calls.append(True)
         return copy.deepcopy(messages)
 
-    monkeypatch.setattr(mod, "load_authorized_raw_chat_branch", load_authorized_raw_chat_branch)
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
     catalog = await mod.build_history_ref_catalog(
         store=HistoryCatalogStore([row]),
         selected_checkpoint=row,

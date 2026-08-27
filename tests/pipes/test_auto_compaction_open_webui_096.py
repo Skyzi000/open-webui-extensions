@@ -206,7 +206,11 @@ def test_open_webui_096_function_calling_gate_matches_legacy_opt_in(
 def test_open_webui_096_registry_dispatch_reenters_same_request(tmp_path: Path) -> None:
     report = _run_harness(tmp_path, "registry_dispatch")
     assert report["assertions"]["same_request_reentry"]
-    assert report["assertions"]["owner_admin_initial_denial_inactive_parity"]
+    assert report["assertions"]["owner_exact_wc_output"]
+    assert report["assertions"]["admin_exact_wc_output"]
+    assert report["assertions"][
+        "admin_non_owner_reader_dispatch_after_core_admission"
+    ]
     assert report["assertions"]["raw_recursive_messages"]
     assert report["assertions"]["recursive_registry_identity"]
     assert report["assertions"]["recursive_reader_identity"]
