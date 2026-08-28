@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.8.1
+version: 0.8.2
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -160,6 +160,7 @@ CANONICAL_HISTORY_IGNORED_MESSAGE_KEYS = frozenset(
         "context_summary",
         "error",
         "feedback",
+        "meta",
         "metadata",
     }
 )
@@ -582,10 +583,7 @@ class RefModeReason(StrEnum):
     VALVE_OFF = "valve_off"
     NON_NATIVE_CONTEXT = "non_native_context"
     NON_DURABLE_CONTEXT = "non_durable_context"
-    USER_UNAVAILABLE = "user_unavailable"
-    MODEL_TOOLS_UNSUPPORTED = "model_tools_unsupported"
     PROVIDER_SCHEMA_UNSUPPORTED = "provider_schema_unsupported"
-    SUMMARY_POLICY_UNSUPPORTED = "summary_policy_unsupported"
     CORE_REGISTRY_UNAVAILABLE = "core_registry_unavailable"
     READER_COLLISION = "reader_collision"
 
@@ -696,10 +694,7 @@ class RefModePreflight:
     valve_enabled: bool
     native_function_calling: bool
     durable_context: bool
-    user_available: bool
-    model_supports_tools: bool
     provider_schema_supported: bool
-    summary_tool_policy: str
     metadata_tools: Any
     injected_tools: Any
     registry_available: bool = True
@@ -2045,16 +2040,19 @@ async def build_history_ref_catalog(
     current = selected_checkpoint
     while True:
         checkpoint_id = current.get("id")
-        if not isinstance(checkpoint_id, str) or checkpoint_id in visited:
-            return ()
+        if (
+            not isinstance(checkpoint_id, str)
+            or checkpoint_id in visited
+        ):
+            return () if previous_count is None else tuple(entries)
         if current.get("state") != "ready" or any(current.get(key) != value for key, value in identity.items()):
-            return ()
+            return () if previous_count is None else tuple(entries)
         try:
             count = int(current.get("source_message_count") or 0)
         except (TypeError, ValueError):
-            return ()
+            return () if previous_count is None else tuple(entries)
         if count <= 0 or (previous_count is not None and count >= previous_count):
-            return ()
+            return () if previous_count is None else tuple(entries)
         visited.add(checkpoint_id)
         previous_count = count
 
@@ -2079,13 +2077,13 @@ async def build_history_ref_catalog(
         if parent_id is None:
             return tuple(entries)
         if not isinstance(parent_id, str) or parent_id in visited:
-            return ()
+            return tuple(entries)
         lookup = getattr(store, "lookup_ready_descriptor_by_id", None)
         if not callable(lookup):
-            return ()
+            return tuple(entries)
         parent = await lookup(parent_id, **identity)
         if not isinstance(parent, dict):
-            return ()
+            return tuple(entries)
         current = parent
 
 
@@ -2095,6 +2093,8 @@ async def resolve_history_ref_catalog_entry(
     request: Any,
     metadata: dict[str, Any],
     transient_message_patterns: TransientMessagePatterns | None = None,
+    raw_messages: list[dict[str, Any]] | None = None,
+    canonical_source: CanonicalHistorySourceHandle | None = None,
 ) -> RefCatalogEntry:
     source = entry.source
     if not isinstance(source, HistoryRefSourceHandle):
@@ -2104,15 +2104,17 @@ async def resolve_history_ref_catalog_entry(
     current_user_message_id = str(metadata.get("user_message_id") or "")
     if not current_user_message_id or current_user_message_id != source.user_message_id:
         raise CanonicalHistoryError(reason="current branch mismatch")
-    raw_messages = await load_raw_chat_branch(
-        chat_id=source.chat_id,
-        metadata=metadata,
-    )
-    canonical_source = await build_canonical_history_source(
-        raw_messages,
-        source_message_count=source.source_message_count,
-        transient_message_patterns=transient_message_patterns,
-    )
+    if raw_messages is None:
+        raw_messages = await load_raw_chat_branch(
+            chat_id=source.chat_id,
+            metadata=metadata,
+        )
+    if canonical_source is None:
+        canonical_source = await build_canonical_history_source(
+            raw_messages,
+            source_message_count=source.source_message_count,
+            transient_message_patterns=transient_message_patterns,
+        )
     if canonical_source.raw_source_hash != source.raw_source_hash:
         raise CanonicalHistoryError(reason="raw source hash integrity verification failed")
 
@@ -2291,6 +2293,8 @@ async def enrich_checkpoint_history_ref(
         request=request,
         metadata=metadata,
         transient_message_patterns=transient_message_patterns,
+        raw_messages=raw_messages,
+        canonical_source=canonical_source,
     )
 
     current_meta = normalize_summary_meta(checkpoint.get("summary_meta"))
@@ -2877,29 +2881,31 @@ async def _build_prefix_file_fingerprint_resolver(
     require_file_context_chain: bool = False,
     transient_message_patterns: TransientMessagePatterns | None = None,
 ) -> Callable[[int], str | None] | None:
+    chat_id = str(metadata.get("chat_id") or "")
+    current_message_id = str(metadata.get("user_message_id") or metadata.get("message_id") or "")
+    cache_key = (chat_id, current_message_id)
+    request_state = getattr(request, "state", None)
+    cache = (
+        getattr(request_state, PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY, None)
+        if request_state is not None
+        else None
+    )
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
     metadata_files = metadata.get("files")
     if not isinstance(metadata_files, list) or not metadata_files:
         if not _messages_have_user_image_url_parts(source_messages):
             return None
         metadata_files = []
     required_file_ids = _extract_non_image_file_ids(metadata_files)
-    chat_id = str(metadata.get("chat_id") or "")
-    current_message_id = str(metadata.get("user_message_id") or metadata.get("message_id") or "")
-    cache_key = (chat_id, current_message_id)
     # Cache the resolver on request.state so multiple checkpoint operations in
     # the same request share one DB-chain load. Different (chat_id, message_id)
     # pairs get independent resolvers.
-    request_state = getattr(request, "state", None)
     if request_state is not None:
-        cache = getattr(request_state, PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY, None)
         if cache is None:
             cache = {}
             with suppress(Exception):
                 setattr(request_state, PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY, cache)
-        elif cache_key in cache:
-            return cache[cache_key]
-    else:
-        cache = None
     try:
         db_chain = await _load_chat_message_chain(request, chat_id, current_message_id)
     except Exception:
@@ -3216,6 +3222,46 @@ def _classify_ref_text_sync(
     encoder: Any = None,
     request: Any = None,
 ) -> RefTextClassification:
+    utf8_bytes = 0
+    line_count = 0
+    for offset in range(0, len(text), REF_TEXT_HASH_CHUNK_CHARS):
+        chunk = text[offset : offset + REF_TEXT_HASH_CHUNK_CHARS]
+        try:
+            utf8_bytes += len(chunk.encode("utf-8"))
+        except UnicodeEncodeError:
+            return RefTextClassification(
+                eligible=False,
+                utf8_bytes=None,
+                sha256=None,
+                line_count=None,
+                token_count=None,
+                encoder_failed=False,
+            )
+        line_count += chunk.count("\n")
+    if text and not text.endswith("\n"):
+        line_count += 1
+    token_count = None
+    encoder_failed = False
+    eligible = utf8_bytes > MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES
+    resolved_encoder = encoder
+    if not eligible:
+        if resolved_encoder is None:
+            resolved_encoder, _ = _get_tiktoken_encoder(request)
+        if resolved_encoder is None:
+            encoder_failed = True
+        else:
+            token_count = _encode_text_token_count(resolved_encoder, text)
+            encoder_failed = token_count is None
+            eligible = token_count is not None and token_count >= threshold_tokens
+    if not eligible:
+        return RefTextClassification(
+            eligible=False,
+            utf8_bytes=utf8_bytes,
+            sha256=None,
+            line_count=line_count,
+            token_count=token_count,
+            encoder_failed=encoder_failed,
+        )
     measurement = _measure_ref_text(text)
     if measurement is None:
         return RefTextClassification(
@@ -3227,35 +3273,13 @@ def _classify_ref_text_sync(
             encoder_failed=False,
         )
     utf8_bytes, line_count, text_hash = measurement
-    if utf8_bytes > MESSAGE_TOKEN_EXACT_ENCODE_MAX_BYTES:
-        return RefTextClassification(
-            eligible=True,
-            utf8_bytes=utf8_bytes,
-            sha256=text_hash,
-            line_count=line_count,
-            token_count=None,
-            encoder_failed=False,
-        )
-    resolved_encoder = encoder
-    if resolved_encoder is None:
-        resolved_encoder, _ = _get_tiktoken_encoder(request)
-    if resolved_encoder is None:
-        return RefTextClassification(
-            eligible=False,
-            utf8_bytes=utf8_bytes,
-            sha256=text_hash,
-            line_count=line_count,
-            token_count=None,
-            encoder_failed=True,
-        )
-    token_count = _encode_text_token_count(resolved_encoder, text)
     return RefTextClassification(
-        eligible=token_count is not None and token_count >= threshold_tokens,
+        eligible=True,
         utf8_bytes=utf8_bytes,
         sha256=text_hash,
         line_count=line_count,
         token_count=token_count,
-        encoder_failed=token_count is None,
+        encoder_failed=False,
     )
 
 
@@ -3315,8 +3339,8 @@ async def project_native_tool_texts(
     render_manifest_by_hash: dict[str, RefRenderManifest] = {}
     names_by_call_id = _native_tool_names_by_call_id(messages)
 
-    eligible_results: list[tuple[int, str, RefTextMeasurement]] = []
-    for message_index, message in enumerate(messages):
+    eligible_results: list[tuple[str, str, RefTextMeasurement]] = []
+    for message in messages:
         if message.get("role") != "tool":
             continue
         content = message.get("content")
@@ -3328,8 +3352,6 @@ async def project_native_tool_texts(
             if isinstance(tool_call_id, str)
             else "unknown"
         )
-        if paired_name == REF_EXEC_TOOL_NAME:
-            continue
         classification = await classify_ref_text(
             content,
             threshold_tokens=threshold_tokens,
@@ -3344,10 +3366,9 @@ async def project_native_tool_texts(
         if utf8_bytes is None or line_count is None or text_hash is None:
             raise InvalidRefTextClassificationError
         measurement: RefTextMeasurement = (utf8_bytes, line_count, text_hash)
-        eligible_results.append((message_index, paired_name, measurement))
+        eligible_results.append((content, paired_name, measurement))
 
-    for message_index, paired_name, measurement in eligible_results:
-        content = messages[message_index]["content"]
+    for content, paired_name, measurement in eligible_results:
         utf8_bytes, line_count, text_hash = measurement
         ref = f"tool:{text_hash}"
         manifest = RefManifest(
@@ -3387,31 +3408,22 @@ def _apply_ref_projection_plan_sync(
     plan: RefProjectionPlan,
 ) -> list[dict[str, Any]]:
     projected = copy.deepcopy(messages)
-    names_by_call_id = _native_tool_names_by_call_id(projected)
     source_refs: dict[str, str] = {}
     for entry in plan.catalog:
         parsed = parse_ref(entry.manifest.ref)
-        if parsed is not None and parsed.kind == "tool":
-            source_refs.setdefault(parsed.value, entry.manifest.ref)
+        if (
+            parsed is not None
+            and parsed.kind == "tool"
+            and isinstance(entry.source, ZeroCopySourceHandle)
+        ):
+            source_refs.setdefault(entry.source.text, entry.manifest.ref)
     for message_index, message in enumerate(projected):
         if message.get("role") != "tool":
             continue
         content = message.get("content")
         if not isinstance(content, str):
             continue
-        tool_call_id = message.get("tool_call_id")
-        paired_name = (
-            names_by_call_id.get(tool_call_id, "unknown")
-            if isinstance(tool_call_id, str)
-            else "unknown"
-        )
-        if paired_name == REF_EXEC_TOOL_NAME:
-            continue
-        measurement = _measure_ref_text(content)
-        if measurement is None:
-            continue
-        _, _, text_hash = measurement
-        ref = source_refs.get(text_hash)
+        ref = source_refs.get(content)
         if ref is None:
             continue
         message["content"] = ref
@@ -5587,7 +5599,7 @@ def _ref_exec_sed(lines: Iterable[RefExecLine], start: int, end: int | None, can
 
 
 def _ref_exec_regex_requested(pattern: str, flags: frozenset[str]) -> bool:
-    return "E" in flags or any(marker in pattern for marker in (r"\|", ".*", ".+", ".?", r"\d", r"\w", r"\s")) or bool(re.search(r"\[.+\]", pattern))
+    return "E" in flags or any(marker in pattern for marker in ("|", ".*", ".+", ".?", r"\d", r"\w", r"\s")) or bool(re.search(r"\[.+\]", pattern))
 
 
 def _ref_exec_literal_component_spans(
@@ -6729,6 +6741,7 @@ def _new_ref_reader(
     encoder: Any = None,
 ) -> Callable[[str], Awaitable[str]]:
     request_state: dict[str, Any] = {"request": None}
+    resolved_history_refs: dict[str, RefCatalogEntry] = {}
     try:
         request_ref = weakref.ref(request)
     except TypeError:
@@ -6761,18 +6774,21 @@ def _new_ref_reader(
                     None,
                 )
                 if requested is not None and isinstance(requested.source, HistoryRefSourceHandle):
-                    try:
-                        resolved = await resolve_history_ref_catalog_entry(
-                            requested,
-                            request=active_request,
-                            metadata={
-                                "chat_id": requested.source.chat_id,
-                                "user_message_id": requested.source.user_message_id,
-                            },
-                            transient_message_patterns=requested.source.transient_message_patterns,
-                        )
-                    except CanonicalHistoryError as exc:
-                        return f"Error: externalized history ref unavailable: {exc.reason}"
+                    resolved = resolved_history_refs.get(first_ref)
+                    if resolved is None:
+                        try:
+                            resolved = await resolve_history_ref_catalog_entry(
+                                requested,
+                                request=active_request,
+                                metadata={
+                                    "chat_id": requested.source.chat_id,
+                                    "user_message_id": requested.source.user_message_id,
+                                },
+                                transient_message_patterns=requested.source.transient_message_patterns,
+                            )
+                        except CanonicalHistoryError as exc:
+                            return f"Error: externalized history ref unavailable: {exc.reason}"
+                        resolved_history_refs[first_ref] = resolved
                     catalog = tuple(
                         resolved if entry.manifest.ref == first_ref else entry
                         for entry in catalog
@@ -12567,23 +12583,6 @@ def _target_model_supports_file_context(models: dict[str, Any], target_model_id:
     return True
 
 
-def _target_model_supports_function_calling(models: dict[str, Any], target_model_id: str) -> bool:
-    target = models.get(target_model_id)
-    if not isinstance(target, dict):
-        return True
-    info = target.get("info")
-    if not isinstance(info, dict):
-        return True
-    info_meta = info.get("meta")
-    if not isinstance(info_meta, dict):
-        return True
-    capabilities = info_meta.get("capabilities")
-    return not (
-        isinstance(capabilities, dict)
-        and capabilities.get("function_calling") is False
-    )
-
-
 async def _inject_target_file_context(
     *,
     request: Any,
@@ -13362,13 +13361,7 @@ def resolve_ref_mode_preflight(
         (preflight.valve_enabled, RefModeReason.VALVE_OFF),
         (preflight.native_function_calling, RefModeReason.NON_NATIVE_CONTEXT),
         (preflight.durable_context, RefModeReason.NON_DURABLE_CONTEXT),
-        (preflight.model_supports_tools, RefModeReason.MODEL_TOOLS_UNSUPPORTED),
         (preflight.provider_schema_supported, RefModeReason.PROVIDER_SCHEMA_UNSUPPORTED),
-        (
-            preflight.summary_tool_policy
-            in {"fallback_on_tool_call", "always_strip", "error_on_tool_call"},
-            RefModeReason.SUMMARY_POLICY_UNSUPPORTED,
-        ),
         (
             isinstance(preflight.metadata_tools, dict)
             and preflight.metadata_tools is preflight.injected_tools,
@@ -13378,7 +13371,6 @@ def resolve_ref_mode_preflight(
             preflight.registry_available,
             RefModeReason.READER_COLLISION,
         ),
-        (preflight.user_available, RefModeReason.USER_UNAVAILABLE),
     )
     for passed, reason in checks:
         if not passed:
@@ -17342,10 +17334,6 @@ class Pipe:
                 metadata_params.get("function_calling"),
             )
         )
-        model_supports_tools = _target_model_supports_function_calling(
-            models,
-            target_route.model_id,
-        )
         user_id = str((user or {}).get("id") or "")
         ref_binding_key = RefBindingKey(
             user_id=user_id,
@@ -17370,10 +17358,7 @@ class Pipe:
                 valve_enabled=self.valves.ref_exec_enabled,
                 native_function_calling=native_function_calling,
                 durable_context=bool(supported_context),
-                user_available=bool(user_id),
-                model_supports_tools=model_supports_tools,
                 provider_schema_supported=provider_schema_supported,
-                summary_tool_policy=self.valves.summary_tool_policy,
                 metadata_tools=original_metadata_tools,
                 injected_tools=__tools__,
                 registry_available=registry_available,
@@ -17462,16 +17447,13 @@ class Pipe:
                     exc_info=True,
                 )
         if effective_ref_mode.active and reusable_checkpoint_match is not None:
-            try:
-                ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
-                    ref_projection_plan,
-                    reusable_checkpoint_match.checkpoint,
-                    request=__request__,
-                    metadata=metadata,
-                    transient_message_patterns=transient_message_patterns,
-                )
-            except (CanonicalHistoryError, RuntimeError):
-                pass
+            ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
+                ref_projection_plan,
+                reusable_checkpoint_match.checkpoint,
+                request=__request__,
+                metadata=metadata,
+                transient_message_patterns=transient_message_patterns,
+            )
         pre_rag_messages: list[dict[str, Any]] | None = None
         pre_injected_file_context_sources = None
         if (
@@ -17849,16 +17831,13 @@ class Pipe:
             if late_checkpoint_match is not None:
                 reusable_checkpoint_match = late_checkpoint_match
                 if effective_ref_mode.active:
-                    try:
-                        ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
-                            ref_projection_plan,
-                            late_checkpoint_match.checkpoint,
-                            request=__request__,
-                            metadata=metadata,
-                            transient_message_patterns=transient_message_patterns,
-                        )
-                    except (CanonicalHistoryError, RuntimeError):
-                        pass
+                    ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
+                        ref_projection_plan,
+                        late_checkpoint_match.checkpoint,
+                        request=__request__,
+                        metadata=metadata,
+                        transient_message_patterns=transient_message_patterns,
+                    )
                 prepared_reusable_key = None
                 prepared_reusable_candidate = None
                 prepared_reusable_forward_candidate = None
@@ -17951,16 +17930,13 @@ class Pipe:
                     if late_checkpoint_is_better:
                         reusable_checkpoint_match = late_checkpoint_match
                         if effective_ref_mode.active:
-                            try:
-                                ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
-                                    ref_projection_plan,
-                                    late_checkpoint_match.checkpoint,
-                                    request=__request__,
-                                    metadata=metadata,
-                                    transient_message_patterns=transient_message_patterns,
-                                )
-                            except (CanonicalHistoryError, RuntimeError):
-                                pass
+                            ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
+                                ref_projection_plan,
+                                late_checkpoint_match.checkpoint,
+                                request=__request__,
+                                metadata=metadata,
+                                transient_message_patterns=transient_message_patterns,
+                            )
                         prepared_reusable_key = None
                         prepared_reusable_candidate = None
                         prepared_reusable_forward_candidate = None
@@ -18451,16 +18427,13 @@ class Pipe:
                         ref_projection_plan.manifests,
                         ref_projection_plan.render_manifests,
                     ) if ref_projection_plan is not None else ((), ())
-                    try:
-                        ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
-                            ref_projection_plan,
-                            selected_history_checkpoint,
-                            request=__request__,
-                            metadata=metadata,
-                            transient_message_patterns=transient_message_patterns,
-                        )
-                    except (CanonicalHistoryError, RuntimeError):
-                        pass
+                    ref_projection_plan = await extend_ref_projection_plan_with_checkpoint(
+                        ref_projection_plan,
+                        selected_history_checkpoint,
+                        request=__request__,
+                        metadata=metadata,
+                        transient_message_patterns=transient_message_patterns,
+                    )
                     current_projection_surface = (
                         ref_projection_plan.manifests,
                         ref_projection_plan.render_manifests,

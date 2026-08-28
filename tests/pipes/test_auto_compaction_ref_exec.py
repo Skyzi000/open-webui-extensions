@@ -69,7 +69,6 @@ async def _run_pipe_boundary(
     metadata_overrides: dict[str, object] | None = None,
     raw_message_map: dict[str, dict[str, object]] | None = None,
     configure_pipe: Callable[[mod.Pipe], None] | None = None,
-    seed_ref_store: bool = False,
     forward_response: dict[str, object] | None = None,
     reusable_checkpoint_matches: tuple[mod.ReusableCheckpointMatch | None, ...]
     | None = None,
@@ -99,8 +98,6 @@ async def _run_pipe_boundary(
         state=SimpleNamespace(), app=SimpleNamespace(state=SimpleNamespace(MODELS={}))
     )
     request.state.raw_branch_loads = 0
-    if seed_ref_store:
-        setattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY, mod.RefRequestStore())
     user = {"role": "user"}
     if user_id is not None:
         user["id"] = user_id
@@ -237,12 +234,9 @@ class RefModeBoundaryCase:
     generation: mod.CoreFunctionCallingGeneration = (
         mod.CoreFunctionCallingGeneration.NATIVE_DEFAULT
     )
-    user_id: str | None = "user-1"
     valve_enabled: bool = True
-    function_calling_capability: bool | str | None = None
     metadata_overrides: dict[str, object] | None = None
     body_overrides: dict[str, object] | None = None
-    unsupported_summary_policy: bool = False
     registry_ref_collision: bool = False
 
 
@@ -508,16 +502,8 @@ async def test_enabled_inactive_ref_mode_logs_only_reason_once_at_info(
             metadata_overrides={"message_id": None},
         ),
         RefModeBoundaryCase(
-            expected_reason=mod.RefModeReason.MODEL_TOOLS_UNSUPPORTED,
-            function_calling_capability=False,
-        ),
-        RefModeBoundaryCase(
             expected_reason=mod.RefModeReason.PROVIDER_SCHEMA_UNSUPPORTED,
             body_overrides={"tools": {}},
-        ),
-        RefModeBoundaryCase(
-            expected_reason=mod.RefModeReason.SUMMARY_POLICY_UNSUPPORTED,
-            unsupported_summary_policy=True,
         ),
         RefModeBoundaryCase(
             expected_reason=mod.RefModeReason.CORE_REGISTRY_UNAVAILABLE,
@@ -527,21 +513,14 @@ async def test_enabled_inactive_ref_mode_logs_only_reason_once_at_info(
             expected_reason=mod.RefModeReason.READER_COLLISION,
             registry_ref_collision=True,
         ),
-        RefModeBoundaryCase(
-            expected_reason=mod.RefModeReason.USER_UNAVAILABLE,
-            user_id=None,
-        ),
     ),
     ids=(
         "valve-off-no-log",
         "non-native-context",
         "non-durable-context",
-        "model-tools-unsupported",
         "provider-schema-unsupported",
-        "summary-policy-unsupported",
         "core-registry-unavailable",
         "reader-collision",
-        "user-unavailable",
     ),
 )
 @pytest.mark.asyncio
@@ -560,16 +539,9 @@ async def test_ref_mode_boundary_reports_truthful_reason_after_required_checks(
     _, _, _, _, _ = await _run_pipe_boundary(
         monkeypatch,
         messages=[{"role": "user", "content": "hello"}],
-        user_id=case.user_id,
         valve_enabled=case.valve_enabled,
-        function_calling_capability=case.function_calling_capability,
         metadata_overrides=case.metadata_overrides,
         body_overrides=case.body_overrides,
-        configure_pipe=(
-            lambda pipe: setattr(pipe.valves, "summary_tool_policy", "unsupported")
-            if case.unsupported_summary_policy
-            else None
-        ),
         registry_ref_collision=case.registry_ref_collision,
     )
 
@@ -586,36 +558,6 @@ async def test_ref_mode_boundary_reports_truthful_reason_after_required_checks(
     assert inactive_messages == expected_messages
 
 
-@pytest.mark.asyncio
-async def test_ref_mode_stage_one_priority_reports_first_reason(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    caplog.set_level("INFO", logger=mod.__name__)
-    monkeypatch.setattr(
-        mod,
-        "_core_function_calling_generation",
-        lambda: mod.CoreFunctionCallingGeneration.NATIVE_DEFAULT,
-    )
-
-    _, _, _, _, _ = await _run_pipe_boundary(
-        monkeypatch,
-        messages=[{"role": "user", "content": "hello"}],
-        function_calling_capability=False,
-        body_overrides={"tools": {}},
-        registry_ref_collision=True,
-    )
-
-    inactive_messages = [
-        record.getMessage()
-        for record in caplog.records
-        if record.getMessage().startswith("Auto Compact ref mode inactive:")
-    ]
-    assert inactive_messages == [
-        "Auto Compact ref mode inactive: model_tools_unsupported"
-    ]
-
-
 def test_ref_mode_active_path_returns_active_without_owner_reauthorization() -> None:
     # Given
     tools = {}
@@ -623,10 +565,7 @@ def test_ref_mode_active_path_returns_active_without_owner_reauthorization() -> 
         valve_enabled=True,
         native_function_calling=True,
         durable_context=True,
-        user_available=True,
-        model_supports_tools=True,
         provider_schema_supported=True,
-        summary_tool_policy="fallback_on_tool_call",
         metadata_tools=tools,
         injected_tools=tools,
         registry_available=True,
@@ -759,12 +698,22 @@ async def test_invalid_eligible_ref_classification_is_rejected_before_projection
 
 
 @pytest.mark.asyncio
-async def test_valid_utf8_measurement_classification_and_projection_remain_exact() -> None:
+async def test_valid_utf8_measurement_classification_and_projection_remain_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     text = "valid-界\ntext"
+    below_threshold = "small"
     encoded = text.encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
     encoder = CountingEncoder(count=1_000)
-    messages = [{"role": "tool", "tool_call_id": "call-1", "content": text}]
+    messages = [
+        {"role": "tool", "tool_call_id": "call-1", "content": text},
+        {
+            "role": "tool",
+            "tool_call_id": "call-2",
+            "content": below_threshold,
+        },
+    ]
 
     measurement = mod._measure_ref_text(text)
     classification = await mod.classify_ref_text(
@@ -772,10 +721,22 @@ async def test_valid_utf8_measurement_classification_and_projection_remain_exact
         threshold_tokens=1_000,
         encoder=encoder,
     )
+    measured_texts = []
+    measure_ref_text = mod._measure_ref_text
+
+    def measure(candidate: str):
+        measured_texts.append(candidate)
+        return measure_ref_text(candidate)
+
+    class EligibilityEncoder:
+        def encode(self, candidate: str, **_kwargs: object) -> list[int]:
+            return list(range(1_000 if candidate == text else 1))
+
+    monkeypatch.setattr(mod, "_measure_ref_text", measure)
     plan = await mod.project_native_tool_texts(
         messages,
         threshold_tokens=1_000,
-        encoder=CountingEncoder(count=1_000),
+        encoder=EligibilityEncoder(),
     )
     projected = await mod.apply_ref_projection_plan(messages, plan)
 
@@ -790,11 +751,54 @@ async def test_valid_utf8_measurement_classification_and_projection_remain_exact
         encoder_failed=False,
     )
     assert projected == [
-        {"role": "tool", "tool_call_id": "call-1", "content": expected_ref}
+        {"role": "tool", "tool_call_id": "call-1", "content": expected_ref},
+        {
+            "role": "tool",
+            "tool_call_id": "call-2",
+            "content": below_threshold,
+        },
     ]
+    assert measured_texts == [text]
     assert plan.manifests == (
         mod.RefManifest(ref=expected_ref, utf8_bytes=len(encoded), sha256=digest),
     )
+
+
+@pytest.mark.asyncio
+async def test_projection_binds_classified_text_when_message_mutates_across_await(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classified_text = "classified-A"
+    mutated_text = "mutated-B"
+    digest = hashlib.sha256(classified_text.encode()).hexdigest()
+    messages = [
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": classified_text,
+        }
+    ]
+    classify_ref_text = mod.classify_ref_text
+
+    async def classify_and_mutate(text: str, **kwargs: object):
+        classification = await classify_ref_text(text, **kwargs)
+        messages[0]["content"] = mutated_text
+        return classification
+
+    monkeypatch.setattr(mod, "classify_ref_text", classify_and_mutate)
+    plan = await mod.project_native_tool_texts(
+        messages,
+        threshold_tokens=1_000,
+        encoder=CountingEncoder(count=1_000),
+    )
+    projected = await mod.apply_ref_projection_plan(messages, plan)
+
+    assert len(plan.catalog) == 1
+    entry = plan.catalog[0]
+    assert isinstance(entry.source, mod.ZeroCopySourceHandle)
+    assert entry.source.text == classified_text
+    assert entry.manifest.sha256 == digest
+    assert projected[0]["content"] == mutated_text
 
 
 @pytest.mark.asyncio
@@ -1054,37 +1058,12 @@ async def test_ref_projection_failure_never_forwards_eligible_text_raw(
 
 
 @pytest.mark.asyncio
-async def test_disabled_ref_mode_matches_valve_off(
+async def test_unavailable_ref_registry_matches_valve_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _task1_surface()
-    below_threshold = [{"role": "user", "content": "small"}]
     eligible = "x" * 70_000
     eligible_orphan = [{"role": "tool", "tool_call_id": "orphan", "content": eligible}]
-    compactable = [
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "large-call",
-                    "type": "function",
-                    "function": {"name": "existing", "arguments": "{}"},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "large-call", "content": eligible},
-        {"role": "user", "content": "continue"},
-    ]
-
-    async def summary_text(**_kwargs: object) -> str:
-        return "summary"
-
-    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", summary_text)
-
-    def compacting_pipe(pipe: mod.Pipe) -> None:
-        pipe.valves.trigger_input_tokens = 2
-
     controls = {
         "tools": [{"type": "function", "function": {"name": "existing"}}],
         "tool_choice": "auto",
@@ -1092,111 +1071,24 @@ async def test_disabled_ref_mode_matches_valve_off(
         "function_call": "auto",
         "parallel_tool_calls": True,
     }
-    scenarios = (
-        (eligible_orphan, {}, {"function_calling_capability": False}),
-        (
-            eligible_orphan,
-            controls,
-            {
-                "registry_has_tool": False,
-                "metadata_overrides": {"tools": {"detached": {}}},
-            },
-        ),
-        (
-            compactable,
-            controls,
-            {
-                "function_calling_capability": False,
-                "estimated_tokens": 10,
-                "configure_pipe": compacting_pipe,
-                "seed_ref_store": True,
-            },
-        ),
-    )
-
-    for scenario_messages, body_overrides, inactive_kwargs in scenarios:
-        valve_off = await _run_pipe_boundary(
-            monkeypatch,
-            messages=scenario_messages,
-            valve_enabled=False,
-            body_overrides=body_overrides,
-            registry_has_tool=inactive_kwargs.get("registry_has_tool", True),
-            metadata_overrides=inactive_kwargs.get("metadata_overrides"),
-            estimated_tokens=inactive_kwargs.get("estimated_tokens", 1),
-            configure_pipe=inactive_kwargs.get("configure_pipe"),
-            seed_ref_store=inactive_kwargs.get("seed_ref_store", False),
-        )
-        inactive = await _run_pipe_boundary(
-            monkeypatch,
-            messages=scenario_messages,
-            body_overrides=body_overrides,
-            **inactive_kwargs,
-        )
-
-        assert inactive[0] == valve_off[0] == {"ok": True}
-        assert inactive[1] == valve_off[1]
-        assert inactive[2] == valve_off[2]
-        assert inactive[3] == valve_off[3]
-        inactive_store = getattr(
-            inactive[4].state,
-            mod.REQUEST_STATE_REF_STORE_KEY,
-            None,
-        )
-        if inactive_kwargs.get("seed_ref_store"):
-            assert inactive_store is not None
-            assert inactive_store.bindings == {}
-            assert inactive_store.registry_owners == {}
-            assert inactive_store.next_generation == 0
-        else:
-            assert inactive_store is None
-
-    provider_error = {
-        "error": {
-            "code": "provider_error",
-            "message": "provider unavailable",
-        }
-    }
-    valve_off_provider_error = await _run_pipe_boundary(
+    valve_off = await _run_pipe_boundary(
         monkeypatch,
-        messages=below_threshold,
+        messages=eligible_orphan,
         valve_enabled=False,
-        forward_response=provider_error,
+        body_overrides=controls,
+        registry_has_tool=False,
+        metadata_overrides={"tools": {"detached": {}}},
     )
-    inactive_provider_error = await _run_pipe_boundary(
+    inactive = await _run_pipe_boundary(
         monkeypatch,
-        messages=below_threshold,
-        function_calling_capability=False,
-        forward_response=provider_error,
+        messages=eligible_orphan,
+        body_overrides=controls,
+        registry_has_tool=False,
+        metadata_overrides={"tools": {"detached": {}}},
     )
-    assert inactive_provider_error[0] == valve_off_provider_error[0] == provider_error
-    assert inactive_provider_error[1:] == valve_off_provider_error[1:]
 
-    with monkeypatch.context() as summary_error_patch:
-
-        async def fail_summary(**_kwargs: object) -> str:
-            raise RuntimeError("summary unavailable")
-
-        summary_error_patch.setattr(
-            mod, "_get_or_create_compaction_summary", fail_summary
-        )
-        valve_off_summary_error = await _run_pipe_boundary(
-            summary_error_patch,
-            messages=compactable,
-            valve_enabled=False,
-            estimated_tokens=10,
-            configure_pipe=compacting_pipe,
-        )
-        inactive_summary_error = await _run_pipe_boundary(
-            summary_error_patch,
-            messages=compactable,
-            function_calling_capability=False,
-            estimated_tokens=10,
-            configure_pipe=compacting_pipe,
-        )
-
-    assert inactive_summary_error[0] == valve_off_summary_error[0]
-    assert inactive_summary_error[0]["error"]["code"] == "summary_failed"
-    assert inactive_summary_error[1:] == valve_off_summary_error[1:]
+    assert inactive[0] == valve_off[0] == {"ok": True}
+    assert inactive[1:] == valve_off[1:]
 
 
 @pytest.mark.asyncio
@@ -5150,11 +5042,14 @@ async def test_ref_exec_grep_auto_detects_kb_exec_regex_markers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reader, refs, _, _ = await _reader_fixture(
-        monkeypatch, ("id=42\nword\nspace here",)
+        monkeypatch, ("id=42\nword\nspace here\nfoo\nbar\n|",)
     )
     ref = refs[0]
     assert await _read(reader, f"grep '\\d+' {ref}") == "id=42"
     assert await _read(reader, f"grep 'space.*here' {ref}") == "space here"
+    assert await _read(reader, f"grep 'foo|bar' {ref}") == "foo\nbar"
+    assert await _read(reader, f"grep '[|]' {ref}") == "|"
+    assert await _read(reader, f"grep '|' {ref}") == "id=42\nword\nspace here\nfoo\nbar\n|"
 
 
 @pytest.mark.asyncio
@@ -6907,6 +6802,7 @@ async def test_history_jsonl_omits_known_media_and_rejects_unknown_shapes() -> N
         {
             "id": "u",
             "role": "user",
+            "meta": {"ignored": "message metadata"},
             "content": [
                 {"type": "text", "text": "see"},
                 {"type": "input_image", "image_url": "data:image/png;base64,private"},
@@ -7172,7 +7068,7 @@ def test_canonical_digest_maps_unpaired_surrogate_and_prioritizes_cancellation()
 
 
 @pytest.mark.asyncio
-async def test_pipe_uses_existing_legacy_fallback_when_canonical_digest_is_unencodable(
+async def test_pipe_propagates_canonical_failure_when_legacy_checkpoint_digest_is_unencodable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     raw_message = {"id": "current-user", "role": "user", "content": "bad-\ud800"}
@@ -7197,19 +7093,21 @@ async def test_pipe_uses_existing_legacy_fallback_when_canonical_digest_is_unenc
         checkpoint=checkpoint,
     )
 
-    result, forwarded, _, _, _ = await _run_pipe_boundary(
-        monkeypatch,
-        messages=[raw_message],
-        function_calling_capability=True,
-        metadata_overrides={"user_message_id": "current-user"},
-        raw_message_map=_linked_raw_message_map([raw_message]),
-        reusable_checkpoint_matches=(match,),
-    )
-
-    assert result == {"ok": True}
-    assert len(forwarded) == 1
-    assert forwarded[0]["messages"] == [raw_message]
-    assert "history:accp_" not in repr(forwarded[0])
+    forwarded: list[dict[str, object]] = []
+    with pytest.raises(
+        mod.CanonicalHistoryError,
+        match="history source is not valid UTF-8",
+    ):
+        await _run_pipe_boundary(
+            monkeypatch,
+            messages=[raw_message],
+            function_calling_capability=True,
+            metadata_overrides={"user_message_id": "current-user"},
+            raw_message_map=_linked_raw_message_map([raw_message]),
+            reusable_checkpoint_matches=(match,),
+            forwarded_capture=forwarded,
+        )
+    assert forwarded == []
 
 
 @pytest.mark.asyncio
@@ -8104,7 +8002,7 @@ async def test_malformed_orphan_and_duplicate_call_ids_externalize_per_call_meta
         "valid": refs["valid"],
         "same": refs["same"],
         "ambiguous": refs["ambiguous"],
-        "reader": texts["reader"],
+        "reader": refs["reader"],
         "orphan": refs["orphan"],
     }
     assert labels == {
@@ -8113,11 +8011,20 @@ async def test_malformed_orphan_and_duplicate_call_ids_externalize_per_call_meta
         refs["valid"]: "existing",
         refs["same"]: "search_web",
         refs["ambiguous"]: "unknown",
+        refs["reader"]: mod.REF_EXEC_TOOL_NAME,
         refs["orphan"]: "unknown",
     }
     assert all(
         texts[key] not in repr(projected)
-        for key in ("empty", "missing", "valid", "same", "ambiguous", "orphan")
+        for key in (
+            "empty",
+            "missing",
+            "valid",
+            "same",
+            "ambiguous",
+            "reader",
+            "orphan",
+        )
     )
 
 
@@ -8271,6 +8178,19 @@ async def test_hard_late_checkpoint_reprojects_selected_history_ref_before_forwa
     binding = _committed_ref_binding(request)
     reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
     expected_history = "\n".join(history_source.iter_records())
+    resolve_calls = 0
+    resolve_history_ref_catalog_entry = mod.resolve_history_ref_catalog_entry
+
+    async def observe_history_resolution(*args: object, **kwargs: object):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return await resolve_history_ref_catalog_entry(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mod,
+        "resolve_history_ref_catalog_entry",
+        observe_history_resolution,
+    )
 
     assert result == {"ok": True}
     assert observed_checkpoint_ids == [None, checkpoint["id"], None]
@@ -8284,6 +8204,10 @@ async def test_hard_late_checkpoint_reprojects_selected_history_ref_before_forwa
     assert len(reader_specs) == 1
     assert selected_ref in {entry.manifest.ref for entry in binding.catalog}
     assert await _read(reader, f"cat {selected_ref}") == expected_history
+    assert await _read(reader, f"wc -l {selected_ref}") == str(
+        history_source.line_count
+    )
+    assert resolve_calls == 1
     assert checkpoint == checkpoint_before
 
 
@@ -8818,105 +8742,6 @@ async def test_multimodal_tool_result_stays_raw(
     assert caption not in repr(forwarded[0])
 
 
-@pytest.mark.asyncio
-async def test_reader_output_is_never_externalized(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ordinary = "ordinary:" + "x" * 70_000
-    reader_output = "reader-result:" + "y" * 70_000
-    records = [
-        {"id": "prior-user", "role": "user", "content": "lookup"},
-        _raw_native_round(
-            assistant_id="ordinary-assistant",
-            call_id="ordinary-call",
-            name="existing",
-            output_parts=[{"type": "input_text", "text": ordinary}],
-        ),
-        _raw_native_round(
-            assistant_id="reader-assistant",
-            call_id="reader-call",
-            name=mod.REF_EXEC_TOOL_NAME,
-            output_parts=[{"type": "input_text", "text": reader_output}],
-        ),
-        {"id": "current-user", "role": "user", "content": "continue"},
-    ]
-
-    result, forwarded, _, _, request = await _run_pipe_boundary(
-        monkeypatch,
-        messages=_expanded_core_messages(records),
-        metadata_overrides={"user_message_id": "current-user"},
-        raw_message_map=_linked_raw_message_map(records),
-    )
-
-    tool_contents = [
-        message["content"]
-        for message in forwarded[0]["messages"]
-        if message.get("role") == "tool"
-    ]
-    binding = _committed_ref_binding(request)
-    assert result == {"ok": True}
-    assert tool_contents == [
-        f"tool:{hashlib.sha256(ordinary.encode()).hexdigest()}",
-        reader_output,
-    ]
-    assert len(binding.catalog) == 1
-    assert isinstance(binding.catalog[0].source, mod.ZeroCopySourceHandle)
-
-
-@pytest.mark.asyncio
-async def test_reader_output_is_excluded_at_threshold_floor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ordinary = "ordinary-at-floor"
-    reader_output = "reader-at-floor"
-    records = [
-        {"id": "prior-user", "role": "user", "content": "lookup"},
-        _raw_native_round(
-            assistant_id="ordinary-assistant",
-            call_id="ordinary-call",
-            name="existing",
-            output_parts=[{"type": "input_text", "text": ordinary}],
-        ),
-        _raw_native_round(
-            assistant_id="reader-assistant",
-            call_id="reader-call",
-            name=mod.REF_EXEC_TOOL_NAME,
-            output_parts=[{"type": "input_text", "text": reader_output}],
-        ),
-        {"id": "current-user", "role": "user", "content": "continue"},
-    ]
-    encoder = CountingEncoder(count=1_000)
-    monkeypatch.setattr(
-        mod, "_get_tiktoken_encoder", lambda _request=None: (encoder, "test")
-    )
-
-    def threshold_floor(pipe: mod.Pipe) -> None:
-        pipe.valves.ref_substitution_threshold_tokens = 1_000
-
-    result, forwarded, _, _, request = await _run_pipe_boundary(
-        monkeypatch,
-        messages=_expanded_core_messages(records),
-        metadata_overrides={"user_message_id": "current-user"},
-        raw_message_map=_linked_raw_message_map(records),
-        configure_pipe=threshold_floor,
-    )
-
-    tool_contents = [
-        message["content"]
-        for message in forwarded[0]["messages"]
-        if message.get("role") == "tool"
-    ]
-    binding = _committed_ref_binding(request)
-    assert result == {"ok": True}
-    assert tool_contents == [
-        f"tool:{hashlib.sha256(ordinary.encode()).hexdigest()}",
-        reader_output,
-    ]
-    assert len(binding.catalog) == 1
-    assert isinstance(binding.catalog[0].source, mod.ZeroCopySourceHandle)
-    assert all(call[0] != reader_output for call in encoder.calls)
-
-
 @pytest.fixture
 def task22_ready_checkpoint() -> dict[str, object]:
     history_messages = [
@@ -9069,7 +8894,7 @@ async def test_pipe_surfaces_history_ref_storage_unavailable_without_target_forw
 
 
 @pytest.mark.asyncio
-async def test_pipe_degrades_canonical_history_failure_to_original_plan_and_forwards_target(
+async def test_pipe_propagates_canonical_history_failure_without_forwarding_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tool_text = "original projection:" + "x" * 70_000
@@ -9097,17 +8922,17 @@ async def test_pipe_degrades_canonical_history_failure_to_original_plan_and_forw
         canonical_failure,
     )
 
-    result, forwarded, _, _, _ = await _run_pipe_boundary(
-        monkeypatch,
-        messages=messages,
-        function_calling_capability=True,
-        metadata_overrides={"user_message_id": "current-user"},
-    )
+    forwarded: list[dict[str, object]] = []
+    with pytest.raises(mod.CanonicalHistoryError, match="task22 canonical fixture"):
+        await _run_pipe_boundary(
+            monkeypatch,
+            messages=messages,
+            function_calling_capability=True,
+            metadata_overrides={"user_message_id": "current-user"},
+            forwarded_capture=forwarded,
+        )
 
-    expected_ref = f"tool:{hashlib.sha256(tool_text.encode()).hexdigest()}"
-    assert result == {"ok": True}
-    assert len(forwarded) == 1
-    assert forwarded[0]["messages"][1]["content"] == expected_ref
+    assert forwarded == []
 
 
 @pytest.mark.asyncio

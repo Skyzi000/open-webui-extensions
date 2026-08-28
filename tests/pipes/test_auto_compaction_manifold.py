@@ -26,7 +26,7 @@ from functions.pipe import auto_compact as mod
 TRANSIENT_MARKER = r"(?s)<SYSTEM_CONTEXT>.*</SYSTEM_CONTEXT>\s*\Z"
 
 
-def test_auto_compact_release_header_is_081_with_096_floor():
+def test_auto_compact_release_header_is_082_with_096_floor():
     header = {
         key.strip(): value.strip()
         for line in (mod.__doc__ or "").splitlines()
@@ -35,7 +35,7 @@ def test_auto_compact_release_header_is_081_with_096_floor():
     }
     source_after_header = inspect.getsource(mod).split('"""', 2)[2]
 
-    assert header["version"] == "0.8.1"
+    assert header["version"] == "0.8.2"
     assert header["required_open_webui_version"] == "0.9.6"
     assert source_after_header.lstrip().startswith("# fmt: off")
 
@@ -17258,7 +17258,7 @@ async def test_pipe_first_compaction_forwards_exact_new_checkpoint_history_manif
     assert result == {"ok": True}
     assert len(store.claimed_rows) == len(store.completed_rows) == 1
     assert new_checkpoint_id == store.completed_rows[0]["id"]
-    assert captured["raw_branch_loads"] >= 2
+    assert captured["raw_branch_loads"] == 1
     assert rendered["content"].count(
         '<auto_compact_ref_manifests version="1">'
     ) == 1
@@ -26739,8 +26739,19 @@ async def test_history_ref_cas_enrichment_preserves_single_lineage(
         parent_checkpoint_id=parent_checkpoint["id"],
     )
 
+    branch_loads = 0
+    canonical_builds = 0
+    build_canonical_history_source = mod.build_canonical_history_source
+
     async def load_raw_chat_branch(*, chat_id, metadata):
+        nonlocal branch_loads
+        branch_loads += 1
         return copy.deepcopy(messages)
+
+    async def observe_canonical_build(*args, **kwargs):
+        nonlocal canonical_builds
+        canonical_builds += 1
+        return await build_canonical_history_source(*args, **kwargs)
 
     file_identity_revalidations = 0
 
@@ -26751,6 +26762,11 @@ async def test_history_ref_cas_enrichment_preserves_single_lineage(
         return copy.deepcopy(db_chain)
 
     monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
+    monkeypatch.setattr(
+        mod,
+        "build_canonical_history_source",
+        observe_canonical_build,
+    )
     monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
     completed_revalidations = 0
     resolve_history_ref_catalog_entry = mod.resolve_history_ref_catalog_entry
@@ -26870,6 +26886,9 @@ async def test_history_ref_cas_enrichment_preserves_single_lineage(
     } == {stored["summary_meta"]["history_ref"]["raw_source_hash"]}
     assert valid_ancestor is not None
     assert valid_ancestor["id"] == parent_checkpoint["id"]
+    assert completed_revalidations == 4
+    assert branch_loads == completed_revalidations
+    assert canonical_builds == completed_revalidations
     assert file_identity_revalidations >= 1
     assert conflicting is None
     assert conflicting_stored is not None
@@ -31250,7 +31269,7 @@ async def test_real_workspace_model_without_function_calling_capability_activate
 
 
 @pytest.mark.asyncio
-async def test_real_model_with_explicit_false_function_calling_capability_is_inactive(
+async def test_real_model_with_explicit_false_function_calling_capability_activates_ref_exec(
     monkeypatch,
 ):
     registry = {"unrelated": {"spec": {"name": "unrelated"}}}
@@ -31267,12 +31286,10 @@ async def test_real_model_with_explicit_false_function_calling_capability_is_ina
         },
     )
 
-    assert observed["active_readers"] == []
-    assert mod.REF_EXEC_TOOL_NAME not in registry
-    assert not any(
-        tool["function"]["name"] == mod.REF_EXEC_TOOL_NAME
-        for tool in observed["provider"][0].get("tools", [])
-    )
+    assert len(observed["active_readers"]) == 1
+    assert observed["active_readers"][0]["registry"] is registry
+    assert observed["active_readers"][0]["catalog"]
+    assert "tool:" in json.dumps(observed["provider"][0]["messages"])
 
 
 @pytest.mark.asyncio
@@ -31297,41 +31314,6 @@ async def test_real_model_with_explicit_true_function_calling_capability_activat
     assert observed["active_readers"][0]["registry"] is registry
     assert observed["active_readers"][0]["catalog"]
     assert "tool:" in json.dumps(observed["provider"][0]["messages"])
-
-
-@pytest.mark.parametrize(
-    ("target", "supported"),
-    (
-        (None, True),
-        ({"id": "target"}, True),
-        ({"id": "target", "info": None}, True),
-        ({"id": "target", "info": {}}, True),
-        ({"id": "target", "info": {"meta": None}}, True),
-        ({"id": "target", "info": {"meta": {}}}, True),
-        (
-            {"id": "target", "info": {"meta": {"capabilities": None}}},
-            True,
-        ),
-        (
-            {
-                "id": "target",
-                "info": {"meta": {"capabilities": {"function_calling": True}}},
-            },
-            True,
-        ),
-        (
-            {
-                "id": "target",
-                "info": {"meta": {"capabilities": {"function_calling": False}}},
-            },
-            False,
-        ),
-    ),
-)
-def test_model_function_calling_capability_is_explicit_opt_out(target, supported):
-    models = {} if target is None else {"target": target}
-
-    assert mod._target_model_supports_function_calling(models, "target") is supported
 
 
 @pytest.mark.asyncio

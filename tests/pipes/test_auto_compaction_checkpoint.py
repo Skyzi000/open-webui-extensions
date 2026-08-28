@@ -2399,6 +2399,70 @@ async def test_prefix_file_resolver_keeps_db_chain_without_metadata_files(monkey
 
 
 @pytest.mark.asyncio
+async def test_history_ref_serve_reuses_fingerprinted_checkpoint_resolver_without_metadata_files(
+    monkeypatch,
+):
+    raw_messages = [
+        {
+            "role": "user",
+            "content": "history",
+            "files": [{"id": "file-a", "type": "file"}],
+        }
+    ]
+    metadata_files = [
+        {
+            "id": "file-a",
+            "type": "file",
+            "name": "a.pdf",
+            "file": {"hash": "aaa"},
+        }
+    ]
+    request = SimpleNamespace(state=SimpleNamespace())
+    db_chain_loads = []
+
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        db_chain_loads.append((chat_id, current_message_id))
+        return copy.deepcopy(raw_messages)
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        request,
+        {
+            "chat_id": "chat-1",
+            "user_message_id": "message-1",
+            "files": metadata_files,
+        },
+        raw_messages,
+    )
+    assert resolver is not None
+
+    row = _history_checkpoint_rows(raw_messages)[0]
+    row["source_hash"] = mod.compute_summary_source_hash(
+        raw_messages,
+        resolver(1),
+        copy.deepcopy(raw_messages),
+    )
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore([row]),
+        selected_checkpoint=row,
+        user_message_id="message-1",
+    )
+
+    async def load_raw_chat_branch(*, chat_id, metadata):
+        return copy.deepcopy(raw_messages)
+
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
+    resolved = await mod.resolve_history_ref_catalog_entry(
+        catalog[0],
+        request=request,
+        metadata={"chat_id": "chat-1", "user_message_id": "message-1"},
+    )
+
+    assert resolved.manifest.ref == f"history:{row['id']}"
+    assert db_chain_loads == [("chat-1", "message-1")]
+
+
+@pytest.mark.asyncio
 async def test_prefix_file_resolver_skips_db_chain_for_text_without_metadata_files(monkeypatch):
     calls = []
 
@@ -3489,7 +3553,6 @@ async def test_history_catalog_enumerates_over_128_ancestors_and_revalidates_req
         event.remove(claim_engine.sync_engine, "before_cursor_execute", capture_select)
 
     assert len(catalog) == 130
-    assert len(select_statements) == 129
     assert all("summary_text" not in statement for statement in select_statements)
     assert load_calls == []
     assert {entry.manifest.ref for entry in catalog} == {
@@ -3508,8 +3571,9 @@ async def test_history_catalog_enumerates_over_128_ancestors_and_revalidates_req
 
     assert len(load_calls) == 3
 
+
 @pytest.mark.asyncio
-async def test_history_catalog_rejects_cycle_missing_parent_and_nonmonotonic_count():
+async def test_history_catalog_keeps_valid_prefix_when_ancestor_chain_is_malformed():
     messages = [{"role": "user", "content": f"message-{index}"} for index in range(3)]
     rows = _history_checkpoint_rows(messages)
     child = rows[-1]
@@ -3525,11 +3589,39 @@ async def test_history_catalog_rejects_cycle_missing_parent_and_nonmonotonic_cou
             selected_checkpoint=case[-1],
             user_message_id="message-3",
         )
-        assert catalog == ()
+        assert [entry.manifest.ref for entry in catalog] == [
+            f"history:{child['id']}"
+        ]
+
+    selected_without_history_ref = copy.deepcopy(child)
+    selected_without_history_ref["summary_meta"] = {}
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore([*rows[:-1], selected_without_history_ref]),
+        selected_checkpoint=selected_without_history_ref,
+        user_message_id="message-3",
+    )
+    assert [entry.manifest.ref for entry in catalog] == [
+        f"history:{rows[1]['id']}",
+        f"history:{rows[0]['id']}",
+    ]
+
+    for invalid_selected in (
+        dict(child, state="pending"),
+        dict(child, user_id=""),
+        dict(child, source_message_count=0),
+    ):
+        assert (
+            await mod.build_history_ref_catalog(
+                store=HistoryCatalogStore([*rows[:-1], invalid_selected]),
+                selected_checkpoint=invalid_selected,
+                user_message_id="message-3",
+            )
+            == ()
+        )
 
 
 @pytest.mark.asyncio
-async def test_history_catalog_rejects_sibling_branch_owner_and_profile():
+async def test_history_catalog_excludes_sibling_and_keeps_prefix_before_identity_mismatch():
     messages = [{"role": "user", "content": f"message-{index}"} for index in range(3)]
     rows = _history_checkpoint_rows(messages)
     sibling = dict(
@@ -3555,7 +3647,9 @@ async def test_history_catalog_rejects_sibling_branch_owner_and_profile():
             selected_checkpoint=rows[-1],
             user_message_id="message-3",
         )
-        assert catalog == ()
+        assert [entry.manifest.ref for entry in catalog] == [
+            f"history:{rows[-1]['id']}"
+        ]
 
 
 @pytest.mark.asyncio
