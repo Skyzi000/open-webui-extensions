@@ -26,7 +26,7 @@ from functions.pipe import auto_compact as mod
 TRANSIENT_MARKER = r"(?s)<SYSTEM_CONTEXT>.*</SYSTEM_CONTEXT>\s*\Z"
 
 
-def test_auto_compact_release_header_is_082_with_096_floor():
+def test_auto_compact_release_header_is_083_with_096_floor():
     header = {
         key.strip(): value.strip()
         for line in (mod.__doc__ or "").splitlines()
@@ -35,7 +35,7 @@ def test_auto_compact_release_header_is_082_with_096_floor():
     }
     source_after_header = inspect.getsource(mod).split('"""', 2)[2]
 
-    assert header["version"] == "0.8.2"
+    assert header["version"] == "0.8.3"
     assert header["required_open_webui_version"] == "0.9.6"
     assert source_after_header.lstrip().startswith("# fmt: off")
 
@@ -1847,7 +1847,12 @@ async def test_pipes_uses_config_provider_enable_flags_when_legacy_attrs_are_mis
 
     result = await mod.Pipe().pipes()
 
-    assert captured["config_keys"] == ("openai.enable", "ollama.enable")
+    assert captured["config_keys"] == (
+        "openai.enable",
+        "ollama.enable",
+        "evaluation.arena.enable",
+        "evaluation.arena.models",
+    )
     assert captured["target_ids"] == ["stale-ollama", "direct-ollama"]
     assert result == [
         {"id": "stale-ollama", "name": "Stale Ollama (AutoCompact)"},
@@ -1908,7 +1913,12 @@ async def test_pipes_falls_back_to_legacy_provider_enable_flags_when_config_erro
 
     result = await mod.Pipe().pipes()
 
-    assert captured["config_keys"] == ("openai.enable", "ollama.enable")
+    assert captured["config_keys"] == (
+        "openai.enable",
+        "ollama.enable",
+        "evaluation.arena.enable",
+        "evaluation.arena.models",
+    )
     assert captured["target_ids"] == ["stale-ollama", "direct-ollama"]
     assert result == [
         {"id": "stale-ollama", "name": "Stale Ollama (AutoCompact)"},
@@ -2013,6 +2023,271 @@ async def test_pipes_does_not_wait_when_empty_provider_cache_already_refreshed(
 
     assert captured["target_ids"] == []
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_pipes_lists_hidden_persisted_workspace_model_when_core_cache_is_empty(
+    monkeypatch,
+):
+    target_id = "hidden-workspace-clone"
+    records = {
+        target_id: FakeModelForm(
+            id=target_id,
+            base_model_id="provider-target",
+            name="Hidden Workspace Clone",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(hidden=True),
+            access_grants=[],
+            is_active=True,
+        )
+    }
+    records, calls = install_fake_open_webui_model_modules(monkeypatch, records)
+
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(
+        state=SimpleNamespace(
+            MODELS={},
+            BASE_MODELS=[],
+            OPENAI_MODELS={},
+            OLLAMA_MODELS={},
+            config=SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+
+    result = await mod.Pipe().pipes()
+
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", target_id)
+    assert calls["get_all"] == 1
+    assert wrapper_id in records
+    assert "hidden" not in records[wrapper_id].meta.model_dump(exclude_unset=True)
+    assert result == [
+        {
+            "id": target_id,
+            "name": "Hidden Workspace Clone (AutoCompact)",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipes_preserves_core_chat_variable_schema_for_persisted_workspace_model(
+    monkeypatch,
+):
+    from open_webui.models.models import ModelMeta, ModelModel, ModelParams
+    from open_webui.utils.chat_variables import get_chat_variables_schema
+
+    target_id = "workspace-with-chat-variables"
+    system_prompt = "{{ chat.variables.project | type=text:label=Project:required }}"
+    expected_schema = get_chat_variables_schema(system_prompt)
+    assert expected_schema is not None
+    records = {
+        target_id: ModelModel(
+            id=target_id,
+            user_id="workspace-owner",
+            base_model_id="provider-target",
+            name="Workspace With Chat Variables",
+            params=ModelParams(system=system_prompt),
+            meta=ModelMeta(),
+            access_grants=[],
+            is_active=True,
+            updated_at=1,
+            created_at=1,
+        )
+    }
+    records, _calls = install_fake_open_webui_model_modules(monkeypatch, records)
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(
+        state=SimpleNamespace(
+            MODELS={},
+            BASE_MODELS=[],
+            OPENAI_MODELS={},
+            OLLAMA_MODELS={},
+            config=SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+
+    result = await mod.Pipe().pipes()
+
+    wrapper = records[mod.build_wrapper_model_id("auto_compact", target_id)]
+    wrapper_meta = wrapper.meta.model_dump(exclude_unset=True)
+    assert wrapper_meta["chat_variables_schema"] == expected_schema
+    assert "system" not in wrapper.params.model_dump(exclude_unset=True)
+    assert result == [
+        {
+            "id": target_id,
+            "name": "Workspace With Chat Variables (AutoCompact)",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arena_id", "persistent_values", "legacy_values"),
+    [
+        (
+            "configured-arena",
+            {
+                "evaluation.arena.enable": True,
+                "evaluation.arena.models": [
+                    {"id": "configured-arena", "name": "Configured Arena", "meta": {}}
+                ],
+            },
+            {},
+        ),
+        (
+            "arena-model",
+            {
+                "evaluation.arena.enable": True,
+                "evaluation.arena.models": [],
+            },
+            {},
+        ),
+        (
+            "legacy-arena",
+            None,
+            {
+                "ENABLE_EVALUATION_ARENA_MODELS": True,
+                "EVALUATION_ARENA_MODELS": [
+                    {"id": "legacy-arena", "name": "Legacy Arena", "meta": {}}
+                ],
+            },
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pipes_skips_arena_backed_persisted_workspace_model(
+    monkeypatch,
+    arena_id,
+    persistent_values,
+    legacy_values,
+):
+    from open_webui.models.models import ModelMeta, ModelModel, ModelParams
+
+    target_id = "arena-workspace-preset"
+
+    if persistent_values is None:
+        install_unavailable_open_webui_config(monkeypatch)
+    else:
+        class FakeConfig:
+            @staticmethod
+            async def get_many(*keys):
+                return {
+                    key: persistent_values[key]
+                    for key in keys
+                    if key in persistent_values
+                }
+
+        install_fake_open_webui_config(monkeypatch, FakeConfig)
+    records = {
+        target_id: ModelModel(
+            id=target_id,
+            user_id="workspace-owner",
+            base_model_id=arena_id,
+            name="Arena Workspace Preset",
+            params=ModelParams(),
+            meta=ModelMeta(),
+            access_grants=[],
+            is_active=True,
+            updated_at=1,
+            created_at=1,
+        )
+    }
+    records, _calls = install_fake_open_webui_model_modules(monkeypatch, records)
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(
+        state=SimpleNamespace(
+            MODELS={},
+            BASE_MODELS=[],
+            OPENAI_MODELS={},
+            OLLAMA_MODELS={},
+            config=SimpleNamespace(
+                ENABLE_OPENAI_API=False,
+                ENABLE_OLLAMA_API=False,
+                **legacy_values,
+            ),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+
+    result = await mod.Pipe().pipes()
+
+    assert result == []
+    assert mod.build_wrapper_model_id("auto_compact", target_id) not in records
+
+
+@pytest.mark.asyncio
+async def test_pipes_preserves_workspace_wrapper_when_initial_model_load_fails(
+    monkeypatch,
+):
+    target_id = "hidden-workspace-clone"
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", target_id)
+    records = {
+        target_id: FakeModelForm(
+            id=target_id,
+            base_model_id="provider-target",
+            name="Hidden Workspace Clone",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                hidden=True,
+                auto_compaction_target_hidden_by={
+                    "pipe_function_id": "auto_compact",
+                    "had_hidden": False,
+                    "previous_hidden": False,
+                },
+            ),
+            access_grants=[],
+            is_active=True,
+        ),
+        wrapper_id: FakeModelForm(
+            id=wrapper_id,
+            base_model_id=None,
+            name="Hidden Workspace Clone (AutoCompact)",
+            params=FakeModelParams(),
+            meta=FakeModelMeta(
+                auto_compaction={
+                    "pipe_function_id": "auto_compact",
+                    "target_model_id": target_id,
+                }
+            ),
+            access_grants=[],
+            is_active=True,
+        ),
+    }
+    records, calls = install_fake_open_webui_model_modules(monkeypatch, records)
+    Models = sys.modules["open_webui.models.models"].Models
+    original_get_all_models = Models.get_all_models
+
+    async def fail_initial_model_load():
+        if calls["get_all"] == 0:
+            calls["get_all"] += 1
+            raise RuntimeError("initial model load failed")
+        return await original_get_all_models()
+
+    monkeypatch.setattr(
+        Models,
+        "get_all_models",
+        staticmethod(fail_initial_model_load),
+    )
+    main_module = types.ModuleType("open_webui.main")
+    main_module.app = SimpleNamespace(
+        state=SimpleNamespace(
+            MODELS={},
+            BASE_MODELS=[],
+            OPENAI_MODELS={},
+            OLLAMA_MODELS={},
+            config=SimpleNamespace(ENABLE_OPENAI_API=False, ENABLE_OLLAMA_API=False),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.main", main_module)
+
+    result = await mod.Pipe().pipes()
+
+    target_meta = records[target_id].meta.model_dump(exclude_unset=True)
+    assert result == []
+    assert calls["get_all"] == 2
+    assert records[wrapper_id].is_active is True
+    assert target_meta["hidden"] is True
+    assert target_meta["auto_compaction_target_hidden_by"]["pipe_function_id"] == "auto_compact"
 
 
 @pytest.mark.asyncio

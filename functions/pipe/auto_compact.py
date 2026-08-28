@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.8.2
+version: 0.8.3
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -72,6 +72,11 @@ try:
     from open_webui.utils.chat_variables import render_chat_variables as _render_chat_variables
 except ImportError:
     _render_chat_variables = None
+
+try:
+    from open_webui.utils.chat_variables import get_chat_variables_schema as _get_chat_variables_schema
+except ImportError:
+    _get_chat_variables_schema = None
 
 try:
     import markdown as _markdown_mod
@@ -219,6 +224,14 @@ PROVIDER_MODEL_CACHE_CONFIG_KEYS = {
     "OPENAI_MODELS": "openai.enable",
     "OLLAMA_MODELS": "ollama.enable",
 }
+ARENA_ENABLE_CONFIG_KEY = "evaluation.arena.enable"
+ARENA_MODELS_CONFIG_KEY = "evaluation.arena.models"
+DEFAULT_ARENA_MODEL_ID = "arena-model"
+MODEL_LISTING_CONFIG_KEYS = (
+    *PROVIDER_MODEL_CACHE_CONFIG_KEYS.values(),
+    ARENA_ENABLE_CONFIG_KEY,
+    ARENA_MODELS_CONFIG_KEY,
+)
 TIKTOKEN_ENCODING_CONFIG_KEY = "rag.tiktoken_encoding_name"
 CONFIG_VALUE_MISSING = object()
 MISSING_CORE_REQUEST = object()
@@ -10022,6 +10035,10 @@ def build_wrapper_model_form(
     meta = copy.deepcopy(target.meta)
     meta.pop("hidden", None)
     meta.pop(AUTO_COMPACTION_TARGET_HIDDEN_META_KEY, None)
+    if _get_chat_variables_schema is not None:
+        chat_variables_schema = _get_chat_variables_schema(target.target_params.get("system"))
+        if chat_variables_schema:
+            meta["chat_variables_schema"] = chat_variables_schema
     meta["auto_compaction"] = {
         "pipe_function_id": pipe_function_id,
         "target_model_id": target_id,
@@ -10423,6 +10440,8 @@ async def sync_wrapper_model_records(
     pipe_function_id: str,
     target_models: list[dict[str, Any]],
     valves: Any,
+    existing_models: list[Any] | None = None,
+    target_models_complete: bool = True,
 ) -> None:
     try:
         from open_webui.models.functions import Functions
@@ -10435,10 +10454,11 @@ async def sync_wrapper_model_records(
     if not owner_user_id:
         return
 
-    try:
-        existing_models: list[Any] | None = list(await Models.get_all_models())
-    except Exception:
-        existing_models = None
+    if existing_models is None:
+        try:
+            existing_models = list(await Models.get_all_models())
+        except Exception:
+            existing_models = None
     existing_models_by_id = (
         {
             existing_id: existing
@@ -10546,7 +10566,7 @@ async def sync_wrapper_model_records(
                         target_model_info=target_model_info,
                     )
             continue
-    if existing_models is not None:
+    if existing_models is not None and target_models_complete:
         await _deactivate_stale_wrapper_model_records(
             Models=Models,
             ModelForm=ModelForm,
@@ -10623,6 +10643,41 @@ async def _open_webui_config_get_many(*keys: str) -> dict[str, Any] | None:
     except Exception:
         return None
     return values if isinstance(values, dict) else None
+
+
+async def _effective_arena_model_ids(
+    state: Any,
+    config_values: Any = CONFIG_VALUE_MISSING,
+) -> set[str]:
+    if config_values is CONFIG_VALUE_MISSING:
+        config_values = await _open_webui_config_get_many(
+            ARENA_ENABLE_CONFIG_KEY,
+            ARENA_MODELS_CONFIG_KEY,
+        )
+    legacy_config = getattr(state, "config", None)
+    if isinstance(config_values, dict) and ARENA_ENABLE_CONFIG_KEY in config_values:
+        enabled = bool(config_values.get(ARENA_ENABLE_CONFIG_KEY))
+    else:
+        enabled = bool(getattr(legacy_config, "ENABLE_EVALUATION_ARENA_MODELS", False))
+    if not enabled:
+        return set()
+
+    if isinstance(config_values, dict) and ARENA_MODELS_CONFIG_KEY in config_values:
+        configured_models = config_values.get(ARENA_MODELS_CONFIG_KEY)
+    else:
+        configured_models = getattr(legacy_config, "EVALUATION_ARENA_MODELS", None)
+    if isinstance(configured_models, list):
+        configured_ids = {
+            model_id
+            for model in configured_models
+            if isinstance(model, dict)
+            and isinstance((model_id := model.get("id")), str)
+            and model_id
+        }
+        if configured_ids:
+            return configured_ids
+
+    return {DEFAULT_ARENA_MODEL_ID}
 
 
 def _config_value_is_enabled(value: Any) -> bool:
@@ -10703,8 +10758,12 @@ def _provider_model_cache_enabled_states_from_config(
     return states
 
 
-async def _provider_model_cache_enabled_states(state: Any) -> dict[str, bool | None]:
-    config_values = await _open_webui_config_get_many(*PROVIDER_MODEL_CACHE_CONFIG_KEYS.values())
+async def _provider_model_cache_enabled_states(
+    state: Any,
+    config_values: Any = CONFIG_VALUE_MISSING,
+) -> dict[str, bool | None]:
+    if config_values is CONFIG_VALUE_MISSING:
+        config_values = await _open_webui_config_get_many(*PROVIDER_MODEL_CACHE_CONFIG_KEYS.values())
     states = _provider_model_cache_enabled_states_from_config(state, config_values)
     update_latest_provider_model_cache_enabled_states(states, state=state)
     return states
@@ -17162,7 +17221,8 @@ class Pipe:
             return []
 
         pipe_function_id = runtime_pipe_function_id(self)
-        provider_enabled_states = await _provider_model_cache_enabled_states(state)
+        config_values = await _open_webui_config_get_many(*MODEL_LISTING_CONFIG_KEYS)
+        provider_enabled_states = await _provider_model_cache_enabled_states(state, config_values)
         provider_cache_attrs = _enabled_provider_model_cache_attrs_from_states(provider_enabled_states)
         disabled_provider_attrs = _disabled_provider_model_cache_attrs_from_states(provider_enabled_states)
         initial_provider_caches = {attr: getattr(state, attr, None) for attr in provider_cache_attrs}
@@ -17182,10 +17242,45 @@ class Pipe:
                 )
             except Exception:
                 LOG.exception("Failed to wait for provider model caches during AutoCompact pipe listing")
+        persisted_models: list[Any] | None = None
+        try:
+            from open_webui.models.models import Models
+
+            persisted_models = list(await Models.get_all_models())
+        except Exception:
+            LOG.exception("Failed to load persisted Workspace models during AutoCompact pipe listing")
+        else:
+            arena_model_ids = await _effective_arena_model_ids(state, config_values)
+            seen_model_ids = {
+                model_id
+                for model in model_candidates
+                if (model_id := _model_id(model)) is not None
+            }
+            for persisted_model in persisted_models:
+                persisted_id = _record_field(persisted_model, "id")
+                if (
+                    not isinstance(persisted_id, str)
+                    or not persisted_id
+                    or persisted_id in seen_model_ids
+                    or _record_field(persisted_model, "base_model_id") is None
+                    or _record_field(persisted_model, "is_active") is False
+                ):
+                    continue
+                candidate = _payload_dict(persisted_model)
+                if _record_field(persisted_model, "base_model_id") in arena_model_ids:
+                    candidate["owned_by"] = "arena"
+                model_candidates.append(candidate)
+                seen_model_ids.add(persisted_id)
         targets = filter_target_models(model_candidates, self.valves, pipe_function_id=pipe_function_id)
         update_latest_models_cache(model_candidates)
         try:
-            await sync_wrapper_model_records(pipe_function_id=pipe_function_id, target_models=targets, valves=self.valves)
+            await sync_wrapper_model_records(
+                pipe_function_id=pipe_function_id,
+                target_models=targets,
+                valves=self.valves,
+                existing_models=persisted_models,
+                target_models_complete=persisted_models is not None,
+            )
         except Exception:
             LOG.exception("Failed to sync AutoCompact wrapper model records")
 
