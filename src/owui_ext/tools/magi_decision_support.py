@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.13
+version: 0.2.14
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -630,7 +630,7 @@ class Tools:
         :param option_b: Second option to evaluate.
         :param prerequisites: Optional constraints and assumptions for the decision.
 
-        Returns a JSON string with:
+        :return: JSON string with:
         - decision: Majority vote result ("A", "B", "tie", or "no_decision")
         - vote_tally: Vote counts for each option
         - summary: Brief summary of the analysis

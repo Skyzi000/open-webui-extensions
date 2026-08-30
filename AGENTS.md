@@ -46,7 +46,7 @@
 - Every public method on `class Tools` is AI-callable. Expose only methods the AI should invoke; keep helpers at module scope because underscore names are still exposed.
 - Public Tool docstrings must guide an autonomous AI caller, not a human.
 - Do not document injected params such as `__user__`, `__request__`, `__event_emitter__`, or `__metadata__`.
-- Write each `:param name:` description on one line; continuation lines are dropped by Open WebUI's parser. Do not use Google-style `Args:` blocks.
+- Write each `:param name:` description on one line; Open WebUI's parser drops continuation lines (≤0.11.0) or glues them onto the previous param's description (0.11.1+). Put return-shape notes under a `:return:` line, never as bare prose after params. Do not use Google-style `Args:` blocks.
 - Avoid raw `dict`, `Dict`, and `list[dict]` public parameter schemas; use Pydantic `BaseModel` types for structured objects/lists.
 - Validate AI-provided arguments defensively and return concise actionable errors instead of uncaught exceptions.
 - Never add silent fallbacks that hide unrecoverable failures or speculate about unhandled paths; only fall back when degradation is clearly justified, otherwise return a clear actionable error.

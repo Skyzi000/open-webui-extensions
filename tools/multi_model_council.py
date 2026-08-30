@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.20
+version: 0.1.21
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -1049,7 +1049,16 @@ async def emit_terminal_tool_event(
                 parsed = tool_result
         if isinstance(parsed, dict) and parsed.get("exists") is False:
             return
-        event = {"type": "terminal:display_file", "data": {"path": path}}
+        page = tool_function_params.get("page")
+        # NOTE: nested calls cannot produce Core's top-level structured
+        # output pair, so inline requests open the viewer instead.
+        event = {
+            "type": "terminal:display_file",
+            "data": {
+                "path": path,
+                **({"page": page} if page else {}),
+            },
+        }
     elif tool_function_name in {"write_file", "replace_file_content"}:
         path = (
             tool_function_params.get("path", "")
@@ -1223,6 +1232,7 @@ async def execute_tool_call(
 # --- inlined from src/owui_ext/shared/builtin_tools.py (owui_ext.shared.builtin_tools) ---
 BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
     "time": {"get_current_timestamp", "calculate_timestamp"},
+    "user_input": {"ask_user"},
     "web": {"search_web", "fetch_url"},
     "image": {"generate_image", "edit_image"},
     "files": {
@@ -1575,6 +1585,7 @@ async def build_tools_dict(
     avoids re-reading ``request.body()`` when the caller already did
     so for its own bookkeeping.
     """
+    import inspect
     import logging
 
     log = logging.getLogger("owui_ext.shared.tool_loader")
@@ -1793,14 +1804,45 @@ async def build_tools_dict(
             "__oauth_token__": extra_params.get("__oauth_token__"),
         }
 
-        all_builtin_tools = await maybe_await(get_builtin_tools(
-            request=request,
-            extra_params=builtin_extra_params,
-            features=features,
-            model=model,
-        ))
+        builtin_kwargs = {
+            "request": request,
+            "extra_params": builtin_extra_params,
+            "features": features,
+            "model": model,
+        }
+        try:
+            supports_note_chat = (
+                "is_note_chat" in inspect.signature(get_builtin_tools).parameters
+            )
+        except (TypeError, ValueError):
+            supports_note_chat = False
+        if supports_note_chat:
+            from open_webui.models.chats import Chats
+            from open_webui.utils.chat_id import is_saved_chat_id
 
-        disabled_builtin_tools: set = set()
+            chat_id = metadata.get("chat_id")
+            chat = (
+                await maybe_await(Chats.get_chat_by_id(chat_id))
+                if is_saved_chat_id(chat_id)
+                else None
+            )
+            builtin_kwargs["is_note_chat"] = bool(
+                chat
+                and (chat.meta or {}).get("internal") is True
+                and (chat.meta or {}).get("type") == "note"
+            )
+
+        all_builtin_tools = await maybe_await(get_builtin_tools(**builtin_kwargs))
+
+        # NOTE: ask_user is excluded from nested loops. The callable itself
+        # would work over __event_call__, but the frontend keeps a single
+        # event callback, so concurrent request:user_input calls from
+        # parallel branches clobber each other and the losing call waits
+        # forever (Core overrides sio.call's 60s default timeout with
+        # WEBSOCKET_EVENT_CALLER_TIMEOUT, which defaults to None).
+        disabled_builtin_tools: set = set(
+            BUILTIN_TOOL_CATEGORIES.get("user_input", set())
+        )
         for valve_field, category in VALVE_TO_CATEGORY.items():
             if not getattr(valves, valve_field, True):
                 disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
@@ -2463,8 +2505,7 @@ CRITICAL RULES:
 
         :param query: Optional search string to filter models by ID or name; examples include "gpt", "claude", "gemini", and "ollama", and an empty string returns all available models.
 
-        Returns a JSON string:
-        {"models": ["id1", "id2", ...]}
+        :return: JSON string: {"models": ["id1", "id2", ...]}
         """
         if __request__ is None:
             return json.dumps(
@@ -2543,7 +2584,7 @@ CRITICAL RULES:
         :param prerequisites: Optional constraints and assumptions.
         :param models: Optional model ID list as a comma-separated string; example: "gpt-5.2, claude-4-5-sonnet, gemini-2.5-pro", and if omitted or empty, DEFAULT_MODELS (Valves) is used.
 
-        Returns a JSON string with:
+        :return: JSON string with:
         - decision: "A" | "B" | "tie" | "no_decision"
         - vote_tally: {"A": n, "B": n, "abstain": n}
         - members: per-model outputs

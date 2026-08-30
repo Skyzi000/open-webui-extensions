@@ -3,7 +3,7 @@
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from pydantic import BaseModel
@@ -51,6 +51,12 @@ TERMINAL_EVENT_MODULE_CASES = [
     (
         "parallel_tools",
         parallel_tools,
+        "tool_function_name",
+        "tool_function_params",
+    ),
+    (
+        "llm_review",
+        llm_review,
         "tool_function_name",
         "tool_function_params",
     ),
@@ -2139,6 +2145,36 @@ async def test_emit_terminal_tool_event_supports_run_command(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("_module_name", "module", "name_key", "params_key"),
+    TERMINAL_EVENT_MODULE_CASES,
+)
+async def test_emit_terminal_tool_event_preserves_page_for_inline_viewer_fallback(
+    _module_name, module, name_key, params_key
+):
+    events = []
+
+    async def event_emitter(event: dict):
+        events.append(event)
+
+    await module.emit_terminal_tool_event(
+        **{
+            name_key: "display_file",
+            params_key: {"path": "/tmp/report.pdf", "inline": True, "page": 3},
+            "tool_result": {"exists": True},
+            "event_emitter": event_emitter,
+        }
+    )
+
+    assert events == [
+        {
+            "type": "terminal:display_file",
+            "data": {"path": "/tmp/report.pdf", "page": 3},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_sub_agent_execute_direct_tool_without_event_call_fails_without_terminal_event():
     events = []
 
@@ -2489,6 +2525,11 @@ def test_builtin_catalog_includes_v011_tools(
     assert module.VALVE_TO_CATEGORY[valve_field] == category, module_name
 
 
+@pytest.mark.parametrize(("module_name", "module"), BUILTIN_CATALOG_MODULES)
+def test_builtin_catalog_includes_v0111_user_input_tool(module_name, module):
+    assert module.BUILTIN_TOOL_CATEGORIES["user_input"] == {"ask_user"}, module_name
+
+
 @pytest.mark.parametrize(
     ("module_name", "module", "expected_defaults"),
     CONFIGURABLE_BUILTIN_MODULES,
@@ -2548,6 +2589,81 @@ async def test_build_tools_dict_filters_disabled_v011_builtin_categories(
     )
 
     assert tools_dict == {}
+
+
+@pytest.mark.asyncio
+async def test_build_tools_dict_excludes_ask_user_from_nested_loops(
+    monkeypatch, dummy_request
+):
+    import open_webui.utils.tools as ow_tools
+
+    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
+        return {"ask_user": {"type": "builtin"}}
+
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+
+    tools_dict, _ = await sub_agent.build_tools_dict(
+        request=dummy_request,
+        model={},
+        metadata={"features": {}},
+        user=SimpleNamespace(id="u1"),
+        valves=sub_agent.Tools().valves,
+        extra_params={},
+        tool_id_list=[],
+        excluded_tool_ids=None,
+        resolved_terminal_id="",
+        resolved_direct_tool_servers=[],
+    )
+
+    assert "ask_user" not in tools_dict
+
+
+@pytest.mark.asyncio
+async def test_build_tools_dict_passes_v0111_note_chat_state(
+    monkeypatch, dummy_request
+):
+    import open_webui.models as ow_models
+    import open_webui.utils as ow_utils
+    import open_webui.utils.tools as ow_tools
+
+    received = []
+
+    def fake_get_builtin_tools(
+        request, extra_params, features=None, model=None, is_note_chat=False
+    ):
+        received.append(is_note_chat)
+        return {}
+
+    class FakeChats:
+        @staticmethod
+        async def get_chat_by_id(chat_id):
+            assert chat_id == "chat-note"
+            return SimpleNamespace(meta={"internal": True, "type": "note"})
+
+    chats_module = ModuleType("open_webui.models.chats")
+    chats_module.Chats = FakeChats
+    chat_id_module = ModuleType("open_webui.utils.chat_id")
+    chat_id_module.is_saved_chat_id = lambda chat_id: bool(chat_id)
+    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.chat_id", chat_id_module)
+    monkeypatch.setattr(ow_models, "chats", chats_module, raising=False)
+    monkeypatch.setattr(ow_utils, "chat_id", chat_id_module, raising=False)
+    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
+
+    await sub_agent.build_tools_dict(
+        request=dummy_request,
+        model={},
+        metadata={"features": {}, "chat_id": "chat-note"},
+        user=SimpleNamespace(id="u1"),
+        valves=sub_agent.Tools().valves,
+        extra_params={},
+        tool_id_list=[],
+        excluded_tool_ids=None,
+        resolved_terminal_id="",
+        resolved_direct_tool_servers=[],
+    )
+
+    assert received == [True]
 
 
 @pytest.mark.asyncio

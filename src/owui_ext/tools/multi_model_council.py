@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.20
+version: 0.1.21
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -603,8 +603,7 @@ CRITICAL RULES:
 
         :param query: Optional search string to filter models by ID or name; examples include "gpt", "claude", "gemini", and "ollama", and an empty string returns all available models.
 
-        Returns a JSON string:
-        {"models": ["id1", "id2", ...]}
+        :return: JSON string: {"models": ["id1", "id2", ...]}
         """
         if __request__ is None:
             return json.dumps(
@@ -683,7 +682,7 @@ CRITICAL RULES:
         :param prerequisites: Optional constraints and assumptions.
         :param models: Optional model ID list as a comma-separated string; example: "gpt-5.2, claude-4-5-sonnet, gemini-2.5-pro", and if omitted or empty, DEFAULT_MODELS (Valves) is used.
 
-        Returns a JSON string with:
+        :return: JSON string with:
         - decision: "A" | "B" | "tie" | "no_decision"
         - vote_tally: {"A": n, "B": n, "abstain": n}
         - members: per-model outputs

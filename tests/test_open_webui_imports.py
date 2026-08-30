@@ -12,7 +12,7 @@ Tested structures:
 - Internal ORM: Memories, Chats, Groups, Models
 
 Usage by extensions:
-- tools/memory.py: Memories, __user__["id"]
+- graphiti/tools/graphiti_memory_manage.py: Memories, __user__["id"]
 - functions/filter/user_info_injector.py: Groups, __user__["valves"]
 - graphiti/: Chats, Models, __metadata__["chat_id"], message["role"]
 """
@@ -1119,6 +1119,47 @@ class TestChatsModule:
                 "ChatModel missing 'chat' or 'messages' field"
         except ImportError:
             pytest.skip("ChatModel not available")
+
+
+class TestNoteChatDetectionContract:
+    """Test the Core APIs behind build_tools_dict's note-chat detection.
+
+    Used by: src/owui_ext/shared/tool_loader.py (and the five generated
+    tools/*.py). The loader feature-detects ``is_note_chat`` on
+    ``get_builtin_tools`` via ``inspect.signature``; if Core drops or renames
+    the parameter, the detection silently degrades to legacy behavior, so
+    this contract must fail loudly instead.
+    """
+
+    def test_get_builtin_tools_has_is_note_chat_param(self):
+        """Verify the real get_builtin_tools signature accepts is_note_chat."""
+        try:
+            from open_webui.utils.tools import get_builtin_tools
+        except ImportError as e:
+            pytest.fail(import_error_message("open_webui.utils.tools.get_builtin_tools") + f"\n{e}")
+        params = list(inspect.signature(get_builtin_tools).parameters.keys())
+        assert "is_note_chat" in params, \
+            signature_changed_message("utils.tools", "get_builtin_tools", "is_note_chat", str(params))
+
+    def test_is_saved_chat_id_rejects_non_saved_prefixes(self):
+        """Verify is_saved_chat_id exists and still classifies non-saved chat IDs."""
+        try:
+            from open_webui.utils.chat_id import is_saved_chat_id
+        except ImportError as e:
+            pytest.fail(import_error_message("open_webui.utils.chat_id.is_saved_chat_id") + f"\n{e}")
+        assert is_saved_chat_id("abc123") is True
+        assert is_saved_chat_id("temporary:abc") is False
+        assert is_saved_chat_id("local:abc") is False
+        assert is_saved_chat_id("channel:abc") is False
+        assert is_saved_chat_id(None) is False
+
+    def test_chat_model_has_meta_field(self):
+        """Verify ChatModel has 'meta' (note-chat detection reads meta.internal/meta.type)."""
+        try:
+            from open_webui.models.chats import ChatModel
+        except ImportError as e:
+            pytest.fail(import_error_message("open_webui.models.chats.ChatModel") + f"\n{e}")
+        assert "meta" in ChatModel.model_fields, "ChatModel missing 'meta' field"
 
 
 class TestGroupsModule:

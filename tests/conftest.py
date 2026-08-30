@@ -12,7 +12,14 @@ import pytest
 _temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _temp_db_path = _temp_db.name
 _temp_db.close()
+
+# open_webui.config wipes STATIC_DIR at import time and repopulates it from
+# the frontend build; point it away from the submodule's tracked static assets.
+# Unconditional override: an inherited STATIC_DIR would let Core delete files
+# under that real path. Restored in pytest_unconfigure.
 _temp_static_dir = tempfile.mkdtemp(prefix="owui-static-")
+_orig_static_dir = os.environ.get("STATIC_DIR")
+os.environ["STATIC_DIR"] = _temp_static_dir
 
 # Set environment variables before importing Open WebUI modules
 os.environ.setdefault("ENV", "dev")
@@ -20,7 +27,6 @@ os.environ.setdefault("WEBUI_SECRET_KEY", "test-secret-key")
 os.environ.setdefault("DATABASE_URL", f"sqlite:///{_temp_db_path}")
 os.environ.setdefault("ENABLE_OLLAMA_API", "false")
 os.environ.setdefault("ENABLE_OPENAI_API", "false")
-os.environ["STATIC_DIR"] = _temp_static_dir
 
 
 def pytest_configure(config):
@@ -36,12 +42,19 @@ def pytest_configure(config):
 
 
 def pytest_unconfigure(config):
-    """Clean up temporary database file after tests."""
+    """Clean up temporary database file and static dir after tests."""
     try:
         Path(_temp_db_path).unlink(missing_ok=True)
     except Exception:
         pass
-    shutil.rmtree(_temp_static_dir, ignore_errors=True)
+    try:
+        shutil.rmtree(_temp_static_dir, ignore_errors=True)
+    except Exception:
+        pass
+    if _orig_static_dir is None:
+        os.environ.pop("STATIC_DIR", None)
+    else:
+        os.environ["STATIC_DIR"] = _orig_static_dir
 
 
 @pytest.fixture

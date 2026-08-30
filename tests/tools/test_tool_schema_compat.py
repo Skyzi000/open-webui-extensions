@@ -183,7 +183,8 @@ def test_tool_schema_lint_does_not_flag_other_sphinx_directives_as_multiline(
         :param query: Single-line description.
         :type query: str
         :raises ValueError: Only raised internally.
-        :return: Result text.
+        :return: JSON string with:
+        - results: list of matches (invisible to Open WebUI's parsers, harmless)
         \"\"\"
         return \"\"
 """,
@@ -192,6 +193,32 @@ def test_tool_schema_lint_does_not_flag_other_sphinx_directives_as_multiline(
 
     errors = lint_module_under_test.check_paths([sample_file])
     assert errors == []
+
+
+def test_tool_schema_lint_flags_prose_that_glues_into_param_description(
+    lint_module_under_test, tmp_path
+):
+    # Open WebUI 0.11.1's parse_docstring does not treat blank lines or bare
+    # prose as a boundary, so this "Returns ..." block glues onto 'query'.
+    sample_file = tmp_path / "bad_trailing_prose.py"
+    sample_file.write_text(
+        """class Tools:
+    async def search(self, query: str):
+        \"\"\"
+        Bad trailing prose.
+
+        :param query: Single-line description.
+
+        Returns a JSON string with:
+        - results: list of matches
+        \"\"\"
+        return \"\"
+""",
+        encoding="utf-8",
+    )
+
+    errors = lint_module_under_test.check_paths([sample_file])
+    assert any("has multiline :param for 'query'" in error for error in errors)
 
 
 def test_tool_schema_lint_checks_keyword_only_public_params(lint_module_under_test, tmp_path):

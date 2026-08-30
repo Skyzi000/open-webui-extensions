@@ -19,7 +19,6 @@ from pathlib import Path
 
 
 PARAM_PATTERN = re.compile(r":param\s+(\w+)\s*:(.*)$")
-SPHINX_DIRECTIVE_PATTERN = re.compile(r"^:[A-Za-z_][\w-]*\b")
 DEFAULT_PATHS = (Path("tools"), Path("graphiti/tools"))
 RAW_OBJECT_PASSTHROUGH_ALLOWLIST: dict[str, dict[str, set[str]]] = {
     "parallel_tools.py": {
@@ -230,41 +229,27 @@ def _iter_public_params(
     return [param for param in params if param.arg != "self" and not param.arg.startswith("__")]
 
 
-def _starts_new_docstring_block(line: str) -> bool:
-    stripped = line.strip()
-    if not stripped:
-        return True
-    if SPHINX_DIRECTIVE_PATTERN.match(stripped):
-        return True
-    if stripped.startswith(("Args:", "Returns", "Raises", "Example", "Examples")):
-        return True
-    return False
-
-
 def _find_multiline_param_names(docstring: str) -> set[str]:
-    multiline_names: set[str] = set()
-    lines = docstring.splitlines()
-    for index, line in enumerate(lines):
-        match = PARAM_PATTERN.match(line.strip())
-        if not match:
-            continue
+    """Mirror Open WebUI's parse_docstring line handling.
 
-        param_name = match.group(1)
-        if match.group(2).strip():
-            inline_description = True
-        else:
-            inline_description = False
-        cursor = index + 1
-        while cursor < len(lines):
-            next_line = lines[cursor]
-            stripped = next_line.strip()
-            if not stripped:
-                break
-            if _starts_new_docstring_block(next_line):
-                break
-            if inline_description or next_line[:1].isspace():
-                multiline_names.add(param_name)
-            break
+    After a ``:param`` line, every non-empty line that does not start with
+    ``:`` continues that description: 0.11.1+ glues it into the description
+    and <=0.11.0 drops it. Blank lines and bare prose (``Returns ...``,
+    ``Example:``) do NOT end a description; only another ``:`` line does.
+    """
+    multiline_names: set[str] = set()
+    current_param: str | None = None
+    for line in docstring.splitlines():
+        stripped = line.strip()
+        match = PARAM_PATTERN.match(stripped)
+        if match:
+            current_param = match.group(1)
+            continue
+        if stripped.startswith(":"):
+            current_param = None
+            continue
+        if current_param and stripped:
+            multiline_names.add(current_param)
     return multiline_names
 
 
@@ -305,7 +290,9 @@ def check_tools_class(filepath: Path) -> list[str]:
             if arg.arg in multiline_params:
                 errors.append(
                     f"{filepath}:{method.lineno}: {method.name} has multiline :param for "
-                    f"'{arg.arg}'; only the first line is parsed by Open WebUI."
+                    f"'{arg.arg}'; Open WebUI glues continuation lines into the "
+                    "description (0.11.1+) or drops them (older). Keep it on one line; "
+                    "put return-shape notes under a :return: line."
                 )
             if _public_param_uses_raw_schema(arg):
                 annotation = ast.unparse(arg.annotation) if arg.annotation is not None else "unknown"

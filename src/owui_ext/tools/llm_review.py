@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.7
+version: 0.5.8
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -3834,7 +3834,7 @@ CRITICAL RULES:
 
         :param query: Optional case-insensitive substring to filter model IDs/names; pass an empty string for all.
 
-        Returns a JSON string. The shape varies with operator configuration:
+        :return: JSON string; the shape varies with operator configuration:
         - {"models": ["id1", "id2", ...]} when free model selection is enabled
         - {"message": "...", "models_that_will_be_used": [...]} when the operator has locked the model lineup
         """

@@ -51,15 +51,20 @@ jobs:
       - name: Fetch pinned Open WebUI v0.9.6 compatibility commit
         run: git -C references/open-webui fetch --depth=1 origin 1a97751e376e00a1897bc3679215ae1c7bd8fd42
 
-      - name: Install dependencies (including Open WebUI)
-        run: uv sync --extra test --group dev
+      - name: Install dependencies
+        # open-webui itself is skipped: installing it runs its build backend,
+        # whose frontend build (npm) OOMs on CI runners. Tests import Core
+        # from references/open-webui/backend via tests/conftest.py instead.
+        run: uv sync --extra test --group dev --no-install-package open-webui
 
       - name: Run all tests
         # No path argument: `testpaths` in pyproject.toml drives discovery
         # (currently `tests/` + `open_webui_plugins_builder/tests/`).
         # Passing an explicit path here would silently shadow `testpaths`
         # and skip whichever directory wasn't named.
-        run: uv run pytest -v --tb=short
+        # --no-sync: a bare `uv run` re-syncs the environment and would try
+        # to install the skipped open-webui package, hitting the same OOM.
+        run: uv run --no-sync pytest -v --tb=short
         env:
           ENV: dev
           WEBUI_SECRET_KEY: test-secret-key

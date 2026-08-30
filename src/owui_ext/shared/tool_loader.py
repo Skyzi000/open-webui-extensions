@@ -83,6 +83,7 @@ async def build_tools_dict(
     avoids re-reading ``request.body()`` when the caller already did
     so for its own bookkeeping.
     """
+    import inspect
     import logging
 
     log = logging.getLogger("owui_ext.shared.tool_loader")
@@ -301,14 +302,45 @@ async def build_tools_dict(
             "__oauth_token__": extra_params.get("__oauth_token__"),
         }
 
-        all_builtin_tools = await maybe_await(get_builtin_tools(
-            request=request,
-            extra_params=builtin_extra_params,
-            features=features,
-            model=model,
-        ))
+        builtin_kwargs = {
+            "request": request,
+            "extra_params": builtin_extra_params,
+            "features": features,
+            "model": model,
+        }
+        try:
+            supports_note_chat = (
+                "is_note_chat" in inspect.signature(get_builtin_tools).parameters
+            )
+        except (TypeError, ValueError):
+            supports_note_chat = False
+        if supports_note_chat:
+            from open_webui.models.chats import Chats
+            from open_webui.utils.chat_id import is_saved_chat_id
 
-        disabled_builtin_tools: set = set()
+            chat_id = metadata.get("chat_id")
+            chat = (
+                await maybe_await(Chats.get_chat_by_id(chat_id))
+                if is_saved_chat_id(chat_id)
+                else None
+            )
+            builtin_kwargs["is_note_chat"] = bool(
+                chat
+                and (chat.meta or {}).get("internal") is True
+                and (chat.meta or {}).get("type") == "note"
+            )
+
+        all_builtin_tools = await maybe_await(get_builtin_tools(**builtin_kwargs))
+
+        # NOTE: ask_user is excluded from nested loops. The callable itself
+        # would work over __event_call__, but the frontend keeps a single
+        # event callback, so concurrent request:user_input calls from
+        # parallel branches clobber each other and the losing call waits
+        # forever (Core overrides sio.call's 60s default timeout with
+        # WEBSOCKET_EVENT_CALLER_TIMEOUT, which defaults to None).
+        disabled_builtin_tools: set = set(
+            BUILTIN_TOOL_CATEGORIES.get("user_input", set())
+        )
         for valve_field, category in VALVE_TO_CATEGORY.items():
             if not getattr(valves, valve_field, True):
                 disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))

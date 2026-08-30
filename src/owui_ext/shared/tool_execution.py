@@ -208,7 +208,16 @@ async def emit_terminal_tool_event(
                 parsed = tool_result
         if isinstance(parsed, dict) and parsed.get("exists") is False:
             return
-        event = {"type": "terminal:display_file", "data": {"path": path}}
+        page = tool_function_params.get("page")
+        # NOTE: nested calls cannot produce Core's top-level structured
+        # output pair, so inline requests open the viewer instead.
+        event = {
+            "type": "terminal:display_file",
+            "data": {
+                "path": path,
+                **({"page": page} if page else {}),
+            },
+        }
     elif tool_function_name in {"write_file", "replace_file_content"}:
         path = (
             tool_function_params.get("path", "")

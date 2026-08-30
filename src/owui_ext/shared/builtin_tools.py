@@ -16,6 +16,7 @@ Two related maps used by plugins that expose category-level on/off Valves:
 
 BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
     "time": {"get_current_timestamp", "calculate_timestamp"},
+    "user_input": {"ask_user"},
     "web": {"search_web", "fetch_url"},
     "image": {"generate_image", "edit_image"},
     "files": {
