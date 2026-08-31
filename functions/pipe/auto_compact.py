@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.8.3
+version: 0.8.4
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -39,6 +39,7 @@ from dataclasses import dataclass, field as dataclass_field, replace
 from enum import StrEnum
 from functools import lru_cache
 from html.parser import HTMLParser
+from itertools import islice
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Literal, TypeAlias, assert_never
 
@@ -58,7 +59,9 @@ from sqlalchemy import (
     UniqueConstraint,
     delete,
     exists,
+    func,
     insert,
+    literal,
     or_,
     select,
     update,
@@ -206,6 +209,7 @@ SUMMARY_META_HISTORICAL_USER_MESSAGES_KEY = "historical_user_messages"
 SUMMARY_META_HISTORICAL_USER_MESSAGES_FORMAT_VERSION = 1
 SUMMARY_META_HISTORY_REF_KEY = "history_ref"
 HISTORY_REF_FORMAT = "canonical-history-jsonl-v1"
+HISTORY_REF_LOGICAL_FORMAT = "canonical-history-jsonl-v2-logical"
 PROVIDER_MODEL_CACHE_WAIT_DEFAULT_TIMEOUT_SECONDS = 10.0
 PROVIDER_MODEL_CACHE_WAIT_POLL_SECONDS = 0.05
 OLLAMA_PROVIDER_MODEL_CACHE_REFRESH_REQUESTS = 2
@@ -452,6 +456,7 @@ class ReusableCheckpointMatch:
     source_message_count: int
     source_kind: str = "message"
     checkpoint: dict[str, Any] | None = None
+    logical_snapshot: LogicalHistorySnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -520,6 +525,32 @@ class CanonicalHistorySourceHandle:
 
 
 @dataclass(frozen=True, slots=True)
+class LogicalHistorySnapshot:
+    identity: tuple[str, str, str, str, str]
+    records: tuple[str, ...]
+    source_hash_messages: tuple[str, ...]
+    prefix_file_fingerprints: tuple[str | None, ...]
+    prefix_raw_source_hashes: tuple[str, ...]
+    prefix_utf8_bytes: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalHistorySourceHandle:
+    snapshot: LogicalHistorySnapshot
+    source_message_count: int
+    utf8_bytes: int
+    raw_source_hash: str
+    line_count: int
+
+    @property
+    def sha256(self) -> str:
+        return self.raw_source_hash
+
+    def iter_records(self) -> Iterable[str]:
+        return islice(self.snapshot.records, self.source_message_count)
+
+
+@dataclass(frozen=True, slots=True)
 class HistoryRefSourceHandle:
     checkpoint_id: str
     namespace: str
@@ -532,9 +563,25 @@ class HistoryRefSourceHandle:
     raw_source_hash: str
     user_message_id: str
     transient_message_patterns: TransientMessagePatterns | None
+    format: str = HISTORY_REF_FORMAT
+    logical_snapshot: LogicalHistorySnapshot | None = None
 
 
-RefSourceHandle = ZeroCopySourceHandle | CanonicalHistorySourceHandle | HistoryRefSourceHandle
+HistoryRefMetadataState = Literal["absent", "valid-v1", "valid-v2", "invalid"]
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedHistoryRefMetadata:
+    state: HistoryRefMetadataState
+    value: dict[str, str] | None
+
+
+RefSourceHandle = (
+    ZeroCopySourceHandle
+    | CanonicalHistorySourceHandle
+    | LogicalHistorySourceHandle
+    | HistoryRefSourceHandle
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1961,6 +2008,246 @@ async def build_canonical_history_source(
     )
 
 
+def _build_logical_history_snapshot_sync(
+    messages: tuple[dict[str, Any], ...],
+    file_backed_image_db_chain: tuple[dict[str, Any], ...],
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None,
+    transient_message_patterns: TransientMessagePatterns | None,
+    identity: tuple[str, str, str, str, str],
+) -> LogicalHistorySnapshot:
+    logical_messages = list(messages)
+    source_hash_messages = _stable_file_backed_image_source_messages(
+        logical_messages,
+        list(file_backed_image_db_chain) or None,
+        transient_message_patterns=transient_message_patterns,
+    )
+    mask = _transient_message_mask(logical_messages, transient_message_patterns)
+    records: list[str] = []
+    canonical_source_messages: list[str] = []
+    prefix_file_fingerprints: list[str | None] = []
+    prefix_raw_source_hashes: list[str] = []
+    prefix_utf8_bytes: list[int] = []
+    digest = hashlib.sha256()
+    utf8_bytes = 0
+    for index, message in enumerate(logical_messages):
+        if not _is_source_identity_message(
+            message,
+            transient_message_patterns=transient_message_patterns,
+            transient_message_mask=mask,
+            index=index,
+        ):
+            continue
+        record = _canonical_history_record(
+            canonicalize_message_for_source_hash(
+                _canonical_direct_history_message(message)
+            )
+        )
+        utf8_bytes += _update_canonical_history_digest(
+            digest,
+            record,
+            separator=bool(records),
+        )
+        records.append(record)
+        prefix_raw_source_hashes.append(digest.hexdigest())
+        prefix_utf8_bytes.append(utf8_bytes)
+        canonical_source_messages.append(
+            _canonical_history_record(
+                canonicalize_message_for_source_hash(source_hash_messages[index])
+            )
+        )
+        count = len(records)
+        prefix_file_fingerprints.append(
+            prefix_file_fingerprint_resolver(count)
+            if prefix_file_fingerprint_resolver is not None
+            else None
+        )
+    return LogicalHistorySnapshot(
+        identity=identity,
+        records=tuple(records),
+        source_hash_messages=tuple(canonical_source_messages),
+        prefix_file_fingerprints=tuple(prefix_file_fingerprints),
+        prefix_raw_source_hashes=tuple(prefix_raw_source_hashes),
+        prefix_utf8_bytes=tuple(prefix_utf8_bytes),
+    )
+
+
+async def build_logical_history_snapshot(
+    messages: list[dict[str, Any]],
+    *,
+    identity: tuple[str, str, str, str, str],
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> LogicalHistorySnapshot:
+    return await asyncio.to_thread(
+        _build_logical_history_snapshot_sync,
+        tuple(copy.deepcopy(messages)),
+        tuple(
+            copy.deepcopy(
+                _prefix_file_fingerprint_resolver_db_chain(
+                    prefix_file_fingerprint_resolver
+                )
+                or []
+            )
+        ),
+        prefix_file_fingerprint_resolver,
+        transient_message_patterns,
+        identity,
+    )
+
+
+REQUEST_STATE_LOGICAL_HISTORY_SNAPSHOT_CACHE_KEY = (
+    "_auto_compact_logical_history_snapshot_cache"
+)
+
+
+async def get_or_build_logical_history_snapshot(
+    request: Any,
+    messages: list[dict[str, Any]],
+    *,
+    identity: tuple[str, str, str, str, str],
+    prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
+    transient_message_patterns: TransientMessagePatterns | None = None,
+) -> LogicalHistorySnapshot:
+    state = getattr(request, "state", None)
+    if state is None:
+        return await build_logical_history_snapshot(
+            messages,
+            identity=identity,
+            prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+            transient_message_patterns=transient_message_patterns,
+        )
+    source_message_count = _source_identity_message_count(
+        messages,
+        transient_message_patterns=transient_message_patterns,
+    )
+    source_fingerprint = (
+        prefix_file_fingerprint_resolver(source_message_count)
+        if prefix_file_fingerprint_resolver is not None
+        and source_message_count > 0
+        else None
+    )
+    cache_key = (
+        identity,
+        compute_summary_source_hash(
+            messages,
+            source_fingerprint,
+            _prefix_file_fingerprint_resolver_db_chain(
+                prefix_file_fingerprint_resolver
+            ),
+            transient_message_patterns=transient_message_patterns,
+        ),
+        source_message_count,
+    )
+    cache = getattr(
+        state,
+        REQUEST_STATE_LOGICAL_HISTORY_SNAPSHOT_CACHE_KEY,
+        None,
+    )
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(
+            state,
+            REQUEST_STATE_LOGICAL_HISTORY_SNAPSHOT_CACHE_KEY,
+            cache,
+        )
+    cached_slot = cache.get(identity)
+    cached = (
+        cached_slot[1]
+        if cached_slot is not None and cached_slot[0] == cache_key
+        else None
+    )
+    if isinstance(cached, LogicalHistorySnapshot):
+        return cached
+    if isinstance(cached, asyncio.Task):
+        return await asyncio.shield(cached)
+
+    build_task = asyncio.create_task(
+        build_logical_history_snapshot(
+            messages,
+            identity=identity,
+            prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+            transient_message_patterns=transient_message_patterns,
+        )
+    )
+    cache[identity] = (cache_key, build_task)
+
+    def finish_snapshot(task: asyncio.Task[LogicalHistorySnapshot]) -> None:
+        current_slot = cache.get(identity)
+        if (
+            current_slot is None
+            or current_slot[0] != cache_key
+            or current_slot[1] is not task
+        ):
+            return
+        try:
+            cache[identity] = (cache_key, task.result())
+        except (asyncio.CancelledError, Exception):
+            cache.pop(identity, None)
+
+    build_task.add_done_callback(finish_snapshot)
+    return await asyncio.shield(build_task)
+
+
+def _logical_snapshot_source_hash(
+    snapshot: LogicalHistorySnapshot,
+    source_message_count: int,
+) -> str | None:
+    if source_message_count <= 0 or source_message_count > len(snapshot.records):
+        return None
+    payload: dict[str, Any] = {
+        "family": SOURCE_HASH_FAMILY,
+        "messages": [
+            json.loads(message)
+            for message in snapshot.source_hash_messages[:source_message_count]
+        ],
+    }
+    prefix_file_fingerprint = snapshot.prefix_file_fingerprints[
+        source_message_count - 1
+    ]
+    if prefix_file_fingerprint:
+        payload["prefix_file_fingerprint"] = prefix_file_fingerprint
+    return _json_hash(payload)
+
+
+def _logical_snapshot_matches_checkpoint(
+    snapshot: LogicalHistorySnapshot,
+    checkpoint: dict[str, Any],
+) -> bool:
+    identity = (
+        str(checkpoint.get("namespace") or ""),
+        str(checkpoint.get("user_id") or ""),
+        str(checkpoint.get("chat_id") or ""),
+        str(checkpoint.get("pipe_function_id") or ""),
+        str(checkpoint.get("profile_hash") or ""),
+    )
+    try:
+        source_message_count = int(checkpoint.get("source_message_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        snapshot.identity == identity
+        and _logical_snapshot_source_hash(snapshot, source_message_count)
+        == checkpoint.get("source_hash")
+    )
+
+
+def _logical_history_source_handle(
+    snapshot: LogicalHistorySnapshot,
+    source_message_count: int,
+) -> LogicalHistorySourceHandle:
+    if source_message_count <= 0 or source_message_count > len(snapshot.records):
+        raise CanonicalHistoryError(reason="checkpoint count references an unsaved source")
+    return LogicalHistorySourceHandle(
+        snapshot=snapshot,
+        source_message_count=source_message_count,
+        utf8_bytes=snapshot.prefix_utf8_bytes[source_message_count - 1],
+        raw_source_hash=snapshot.prefix_raw_source_hashes[
+            source_message_count - 1
+        ],
+        line_count=source_message_count,
+    )
+
+
 async def load_raw_chat_branch(
     *,
     chat_id: str,
@@ -1981,18 +2268,28 @@ async def load_raw_chat_branch(
     return branch
 
 
-def _normalized_history_ref_metadata(summary_meta: Any) -> dict[str, str] | None:
+def _parse_history_ref_metadata(summary_meta: Any) -> ParsedHistoryRefMetadata:
     if not isinstance(summary_meta, dict):
-        return None
+        return ParsedHistoryRefMetadata(state="invalid", value=None)
+    if SUMMARY_META_HISTORY_REF_KEY not in summary_meta:
+        return ParsedHistoryRefMetadata(state="absent", value=None)
     value = summary_meta.get(SUMMARY_META_HISTORY_REF_KEY)
     if not isinstance(value, dict) or set(value) != {"format", "raw_source_hash"}:
-        return None
-    if value.get("format") != HISTORY_REF_FORMAT:
-        return None
+        return ParsedHistoryRefMetadata(state="invalid", value=None)
+    format_value = value.get("format")
+    if format_value not in {HISTORY_REF_FORMAT, HISTORY_REF_LOGICAL_FORMAT}:
+        return ParsedHistoryRefMetadata(state="invalid", value=None)
     raw_source_hash = value.get("raw_source_hash")
     if not isinstance(raw_source_hash, str) or re.fullmatch(r"[0-9a-f]{64}", raw_source_hash) is None:
-        return None
-    return {"format": HISTORY_REF_FORMAT, "raw_source_hash": raw_source_hash}
+        return ParsedHistoryRefMetadata(state="invalid", value=None)
+    return ParsedHistoryRefMetadata(
+        state="valid-v1" if format_value == HISTORY_REF_FORMAT else "valid-v2",
+        value={"format": str(format_value), "raw_source_hash": raw_source_hash},
+    )
+
+
+def _normalized_history_ref_metadata(summary_meta: Any) -> dict[str, str] | None:
+    return _parse_history_ref_metadata(summary_meta).value
 
 
 def _history_ref_source_handle(
@@ -2000,6 +2297,8 @@ def _history_ref_source_handle(
     *,
     user_message_id: str,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    logical_snapshot: LogicalHistorySnapshot | None = None,
+    require_logical_snapshot_match: bool = True,
 ) -> HistoryRefSourceHandle | None:
     metadata = _normalized_history_ref_metadata(checkpoint.get("summary_meta"))
     checkpoint_id = checkpoint.get("id")
@@ -2013,6 +2312,19 @@ def _history_ref_source_handle(
         return None
     if source_message_count <= 0 or not user_message_id:
         return None
+    logical_source_snapshot = None
+    if metadata["format"] == HISTORY_REF_LOGICAL_FORMAT:
+        if logical_snapshot is None:
+            return None
+        logical_source_snapshot = logical_snapshot
+        if (
+            require_logical_snapshot_match
+            and not _logical_snapshot_matches_checkpoint(
+                logical_source_snapshot,
+                checkpoint,
+            )
+        ):
+            return None
     return HistoryRefSourceHandle(
         checkpoint_id=checkpoint_id,
         namespace=str(checkpoint.get("namespace") or ""),
@@ -2025,6 +2337,8 @@ def _history_ref_source_handle(
         raw_source_hash=metadata["raw_source_hash"],
         user_message_id=user_message_id,
         transient_message_patterns=transient_message_patterns,
+        format=metadata["format"],
+        logical_snapshot=logical_source_snapshot,
     )
 
 
@@ -2034,6 +2348,7 @@ async def build_history_ref_catalog(
     selected_checkpoint: dict[str, Any] | None,
     user_message_id: str,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    logical_snapshot: LogicalHistorySnapshot | None = None,
 ) -> tuple[RefCatalogEntry, ...]:
     if not isinstance(selected_checkpoint, dict) or selected_checkpoint.get("state") != "ready":
         return ()
@@ -2052,6 +2367,7 @@ async def build_history_ref_catalog(
     previous_count: int | None = None
     current = selected_checkpoint
     while True:
+        is_selected_checkpoint = previous_count is None
         checkpoint_id = current.get("id")
         if (
             not isinstance(checkpoint_id, str)
@@ -2073,6 +2389,8 @@ async def build_history_ref_catalog(
             current,
             user_message_id=user_message_id,
             transient_message_patterns=transient_message_patterns,
+            logical_snapshot=logical_snapshot,
+            require_logical_snapshot_match=is_selected_checkpoint,
         )
         if source is not None:
             entries.append(
@@ -2117,6 +2435,39 @@ async def resolve_history_ref_catalog_entry(
     current_user_message_id = str(metadata.get("user_message_id") or "")
     if not current_user_message_id or current_user_message_id != source.user_message_id:
         raise CanonicalHistoryError(reason="current branch mismatch")
+    if source.format == HISTORY_REF_LOGICAL_FORMAT:
+        snapshot = source.logical_snapshot
+        if snapshot is None:
+            raise CanonicalHistoryError(reason="logical source snapshot is unavailable")
+        if snapshot.identity != (
+            source.namespace,
+            source.user_id,
+            source.chat_id,
+            source.pipe_function_id,
+            source.profile_hash,
+        ):
+            raise CanonicalHistoryError(reason="checkpoint source identity verification failed")
+        if (
+            _logical_snapshot_source_hash(snapshot, source.source_message_count)
+            != source.source_hash
+        ):
+            raise CanonicalHistoryError(reason="checkpoint source integrity verification failed")
+        logical_source = _logical_history_source_handle(
+            snapshot,
+            source.source_message_count,
+        )
+        if logical_source.raw_source_hash != source.raw_source_hash:
+            raise CanonicalHistoryError(
+                reason="logical source hash integrity verification failed"
+            )
+        return RefCatalogEntry(
+            manifest=RefManifest(
+                ref=entry.manifest.ref,
+                utf8_bytes=logical_source.utf8_bytes,
+                sha256=logical_source.raw_source_hash,
+            ),
+            source=logical_source,
+        )
     if raw_messages is None:
         raw_messages = await load_raw_chat_branch(
             chat_id=source.chat_id,
@@ -2172,7 +2523,11 @@ async def resolve_history_ref_catalog_entry(
 def _default_ref_render_manifest(entry: RefCatalogEntry) -> RefRenderManifest:
     kind: RefKind = "history" if entry.manifest.ref.startswith("history:") else "tool"
     source = entry.source
-    line_count = source.line_count if isinstance(source, CanonicalHistorySourceHandle) else None
+    line_count = (
+        source.line_count
+        if isinstance(source, (CanonicalHistorySourceHandle, LogicalHistorySourceHandle))
+        else None
+    )
     return RefRenderManifest(
         ref=entry.manifest.ref,
         utf8_bytes=entry.manifest.utf8_bytes,
@@ -2219,6 +2574,70 @@ def merge_ref_projection_plans(
     )
 
 
+def build_summary_ref_projection_plan(
+    plan: RefProjectionPlan | None,
+    parent_checkpoint: dict[str, Any] | None,
+    *,
+    ref_mode_active: bool,
+) -> RefProjectionPlan | None:
+    if not ref_mode_active:
+        return None
+    catalog = tuple(
+        entry for entry in (plan.catalog if plan is not None else ())
+        if entry.manifest.ref.startswith("tool:")
+    )
+    manifests = [
+        manifest for manifest in (plan.manifests if plan is not None else ())
+        if manifest.ref.startswith("tool:")
+    ]
+    render_manifests = [
+        manifest
+        for manifest in (plan.render_manifests if plan is not None else ())
+        if manifest.ref.startswith("tool:")
+    ]
+    if isinstance(parent_checkpoint, dict):
+        checkpoint_id = parent_checkpoint.get("id")
+        parent_ref = (
+            f"history:{checkpoint_id}" if isinstance(checkpoint_id, str) else None
+        )
+        history_manifest = next(
+            (
+                manifest
+                for manifest in (plan.manifests if plan is not None else ())
+                if manifest.ref == parent_ref
+            ),
+            None,
+        )
+        history_render_manifest = next(
+            (
+                manifest
+                for manifest in (plan.render_manifests if plan is not None else ())
+                if manifest.ref == parent_ref
+            ),
+            None,
+        )
+        if parent_ref is not None and history_manifest is not None:
+            manifests.append(history_manifest)
+            render_manifests.append(
+                history_render_manifest
+                or RefRenderManifest(
+                    ref=parent_ref,
+                    utf8_bytes=history_manifest.utf8_bytes,
+                    kind="history",
+                    line_count=None,
+                    tool="history",
+                )
+            )
+    if not catalog and not manifests and not render_manifests:
+        return None
+    return RefProjectionPlan(
+        catalog=catalog,
+        manifests=tuple(manifests),
+        reader_schema=None,
+        render_manifests=tuple(render_manifests),
+    )
+
+
 async def extend_ref_projection_plan_with_checkpoint(
     plan: RefProjectionPlan | None,
     checkpoint: dict[str, Any] | None,
@@ -2226,6 +2645,7 @@ async def extend_ref_projection_plan_with_checkpoint(
     request: Any,
     metadata: dict[str, Any],
     transient_message_patterns: TransientMessagePatterns | None = None,
+    logical_snapshot: LogicalHistorySnapshot | None = None,
 ) -> RefProjectionPlan | None:
     user_message_id = str(metadata.get("user_message_id") or "")
     if not isinstance(checkpoint, dict) or not user_message_id:
@@ -2238,13 +2658,24 @@ async def extend_ref_projection_plan_with_checkpoint(
             request=request,
             metadata=metadata,
             transient_message_patterns=transient_message_patterns,
+            logical_snapshot=logical_snapshot,
         )
+        if enriched is None:
+            raise CanonicalHistoryError(
+                reason="selected checkpoint history ref proof failed"
+            )
         catalog = await build_history_ref_catalog(
             store=store,
             selected_checkpoint=enriched,
             user_message_id=user_message_id,
             transient_message_patterns=transient_message_patterns,
+            logical_snapshot=logical_snapshot,
         )
+        selected_ref = f"history:{enriched.get('id')}"
+        if not any(entry.manifest.ref == selected_ref for entry in catalog):
+            raise CanonicalHistoryError(
+                reason="selected checkpoint history ref proof failed"
+            )
     except SQLAlchemyError as exc:
         LOG.exception(
             "Auto-compaction history-ref enrichment hit a database error "
@@ -2252,9 +2683,44 @@ async def extend_ref_projection_plan_with_checkpoint(
             metadata.get("chat_id"),
         )
         raise HistoryRefStorageUnavailableError(CHECKPOINT_STORE_UNAVAILABLE_MESSAGE) from exc
-    return merge_ref_projection_plans(
-        plan,
-        build_history_ref_projection_plan(catalog),
+    except HistoryRefStorageUnavailableError:
+        raise
+    except Exception as exc:  # noqa: BLE001  # noqa: BROAD_EXCEPT_OK - unverified refs must not reach the provider
+        raise RefProjectionError(stage="history verification") from exc
+    history_plan = build_history_ref_projection_plan(catalog)
+    if plan is None:
+        return history_plan
+    retained_catalog = tuple(
+        entry
+        for entry in plan.catalog
+        if not entry.manifest.ref.startswith("history:")
+    )
+    retained_render_by_ref = {
+        manifest.ref: manifest
+        for manifest in plan.render_manifests
+        if not manifest.ref.startswith("history:")
+    }
+    for entry in retained_catalog:
+        retained_render_by_ref.setdefault(
+            entry.manifest.ref,
+            _default_ref_render_manifest(entry),
+        )
+    merged_catalog = (*retained_catalog, *history_plan.catalog)
+    return RefProjectionPlan(
+        catalog=merged_catalog,
+        manifests=(
+            *(
+                manifest
+                for manifest in plan.manifests
+                if not manifest.ref.startswith("history:")
+            ),
+            *history_plan.manifests,
+        ),
+        reader_schema=REF_EXEC_TOOL_SPEC if merged_catalog else None,
+        render_manifests=(
+            *retained_render_by_ref.values(),
+            *history_plan.render_manifests,
+        ),
     )
 
 
@@ -2265,10 +2731,30 @@ async def enrich_checkpoint_history_ref(
     request: Any,
     metadata: dict[str, Any],
     transient_message_patterns: TransientMessagePatterns | None = None,
+    logical_snapshot: LogicalHistorySnapshot | None = None,
 ) -> dict[str, Any] | None:
     user_message_id = str(metadata.get("user_message_id") or "")
     if not user_message_id:
         return None
+    current_meta = normalize_summary_meta(checkpoint.get("summary_meta"))
+    parsed_existing = _parse_history_ref_metadata(current_meta)
+    if parsed_existing.state == "invalid":
+        return None
+    existing = parsed_existing.value
+    use_logical_snapshot = (
+        logical_snapshot is not None
+        and _logical_snapshot_matches_checkpoint(logical_snapshot, checkpoint)
+        and (
+            existing is None
+            or existing.get("format") == HISTORY_REF_LOGICAL_FORMAT
+        )
+    )
+    if existing is not None and existing.get("format") == HISTORY_REF_LOGICAL_FORMAT:
+        if not use_logical_snapshot:
+            return None
+    source_format = (
+        HISTORY_REF_LOGICAL_FORMAT if use_logical_snapshot else HISTORY_REF_FORMAT
+    )
     source = HistoryRefSourceHandle(
         checkpoint_id=str(checkpoint.get("id") or ""),
         namespace=str(checkpoint.get("namespace") or ""),
@@ -2281,6 +2767,8 @@ async def enrich_checkpoint_history_ref(
         raw_source_hash="0" * 64,
         user_message_id=user_message_id,
         transient_message_patterns=transient_message_patterns,
+        format=source_format,
+        logical_snapshot=logical_snapshot if use_logical_snapshot else None,
     )
     provisional = RefCatalogEntry(
         manifest=RefManifest(
@@ -2290,28 +2778,61 @@ async def enrich_checkpoint_history_ref(
         ),
         source=source,
     )
-    raw_messages = await load_raw_chat_branch(
-        chat_id=source.chat_id,
-        metadata=metadata,
-    )
-    canonical_source = await build_canonical_history_source(
-        raw_messages,
-        source_message_count=source.source_message_count,
-        transient_message_patterns=transient_message_patterns,
-    )
-    desired = {"format": HISTORY_REF_FORMAT, "raw_source_hash": canonical_source.raw_source_hash}
-    source = replace(source, raw_source_hash=canonical_source.raw_source_hash)
-    await resolve_history_ref_catalog_entry(
-        replace(provisional, source=source, manifest=replace(provisional.manifest, sha256=source.raw_source_hash)),
-        request=request,
-        metadata=metadata,
-        transient_message_patterns=transient_message_patterns,
-        raw_messages=raw_messages,
-        canonical_source=canonical_source,
-    )
+    if use_logical_snapshot:
+        assert logical_snapshot is not None
+        canonical_source = _logical_history_source_handle(
+            logical_snapshot,
+            source.source_message_count,
+        )
+        desired = {
+            "format": HISTORY_REF_LOGICAL_FORMAT,
+            "raw_source_hash": canonical_source.raw_source_hash,
+        }
+        source = replace(source, raw_source_hash=canonical_source.raw_source_hash)
+        await resolve_history_ref_catalog_entry(
+            replace(
+                provisional,
+                source=source,
+                manifest=replace(
+                    provisional.manifest,
+                    sha256=source.raw_source_hash,
+                ),
+            ),
+            request=request,
+            metadata=metadata,
+            transient_message_patterns=transient_message_patterns,
+        )
+    else:
+        raw_messages = await load_raw_chat_branch(
+            chat_id=source.chat_id,
+            metadata=metadata,
+        )
+        canonical_source = await build_canonical_history_source(
+            raw_messages,
+            source_message_count=source.source_message_count,
+            transient_message_patterns=transient_message_patterns,
+        )
+        desired = {
+            "format": HISTORY_REF_FORMAT,
+            "raw_source_hash": canonical_source.raw_source_hash,
+        }
+        source = replace(source, raw_source_hash=canonical_source.raw_source_hash)
+        await resolve_history_ref_catalog_entry(
+            replace(
+                provisional,
+                source=source,
+                manifest=replace(
+                    provisional.manifest,
+                    sha256=source.raw_source_hash,
+                ),
+            ),
+            request=request,
+            metadata=metadata,
+            transient_message_patterns=transient_message_patterns,
+            raw_messages=raw_messages,
+            canonical_source=canonical_source,
+        )
 
-    current_meta = normalize_summary_meta(checkpoint.get("summary_meta"))
-    existing = _normalized_history_ref_metadata(current_meta)
     if existing is not None:
         return copy.deepcopy(checkpoint) if existing == desired else None
     compare_and_swap = getattr(store, "compare_and_swap_history_ref", None)
@@ -2786,6 +3307,7 @@ def _soft_prefetch_inflight_key_for_body(
     pipe_function_id: str,
     transient_message_patterns: TransientMessagePatterns | None = None,
     source_messages: list[dict[str, Any]] | None = None,
+    checkpoint_profile_hash: str | None = None,
 ) -> tuple[str, str, str, str, str, str] | None:
     if source_messages is None:
         prefetch_source = _soft_prefetch_source_messages(
@@ -2804,7 +3326,7 @@ def _soft_prefetch_inflight_key_for_body(
         user_id,
         chat_id,
         pipe_function_id,
-        compute_profile_hash(),
+        checkpoint_profile_hash or ACTIVE_CHECKPOINT_PROFILE_HASH,
         _soft_prefetch_inflight_source_hash(
             source_messages,
             metadata,
@@ -2821,6 +3343,7 @@ def _soft_prefetch_inflight_task_for_body(
     pipe_function_id: str,
     transient_message_patterns: TransientMessagePatterns | None = None,
     inflight_key: tuple[str, str, str, str, str, str] | None = None,
+    checkpoint_profile_hash: str | None = None,
 ) -> asyncio.Task | None:
     key = inflight_key or _soft_prefetch_inflight_key_for_body(
         user=user,
@@ -2828,6 +3351,7 @@ def _soft_prefetch_inflight_task_for_body(
         body=body,
         pipe_function_id=pipe_function_id,
         transient_message_patterns=transient_message_patterns,
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
     if key is None:
         return None
@@ -2964,6 +3488,21 @@ def compute_profile_hash(
             "schema_family": schema_family,
             "summary_format_family": summary_format_family,
             "source_hash_family": source_hash_family,
+        }
+    )
+
+
+ACTIVE_CHECKPOINT_PROFILE_HASH = compute_profile_hash()
+INACTIVE_CHECKPOINT_PROFILE_DISCRIMINATOR = "ref-mode-inactive-v1"
+
+
+def checkpoint_profile_hash_for_ref_mode(*, ref_mode_active: bool) -> str:
+    if ref_mode_active:
+        return ACTIVE_CHECKPOINT_PROFILE_HASH
+    return _json_hash(
+        {
+            "active_profile_hash": ACTIVE_CHECKPOINT_PROFILE_HASH,
+            "discriminator": INACTIVE_CHECKPOINT_PROFILE_DISCRIMINATOR,
         }
     )
 
@@ -3480,7 +4019,36 @@ def ref_render_manifest_payloads(plan: RefProjectionPlan) -> list[dict[str, Any]
     ]
 
 
+def _require_provider_bound_history_ref_manifests(
+    body: dict[str, Any],
+    plan: RefProjectionPlan | None,
+) -> None:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return
+    manifest_refs = {manifest.ref for manifest in plan.manifests} if plan is not None else set()
+    render_refs = (
+        {
+            manifest.ref
+            for manifest in plan.render_manifests
+            if manifest.kind == "history"
+        }
+        if plan is not None
+        else set()
+    )
+    proven_refs = manifest_refs & render_refs
+    for message in messages:
+        if not isinstance(message, dict) or not _is_rendered_summary_context_message(
+            message
+        ):
+            continue
+        history_ref = getattr(message, "history_ref", None)
+        if isinstance(history_ref, str) and history_ref not in proven_refs:
+            raise RefProjectionError(stage="history manifest proof")
+
+
 def _apply_ref_manifests(body: dict[str, Any], plan: RefProjectionPlan) -> None:
+    _require_provider_bound_history_ref_manifests(body, plan)
     if not plan.manifests:
         return
     metadata = body.get("metadata")
@@ -3508,6 +4076,8 @@ def _apply_ref_manifests(body: dict[str, Any], plan: RefProjectionPlan) -> None:
                 flags=re.DOTALL,
             )
             history_ref = getattr(message, "history_ref", None)
+            if not isinstance(history_ref, str):
+                continue
             own_manifest = next(
                 (
                     manifest
@@ -3517,8 +4087,7 @@ def _apply_ref_manifests(body: dict[str, Any], plan: RefProjectionPlan) -> None:
                 None,
             )
             if own_manifest is None:
-                message["content"] = f"{context_prefix}{context_close}"
-                continue
+                raise RefProjectionError(stage="history manifest proof")
             compact_json = json.dumps(
                 [own_manifest],
                 ensure_ascii=False,
@@ -6787,7 +7356,14 @@ def _new_ref_reader(
                     None,
                 )
                 if requested is not None and isinstance(requested.source, HistoryRefSourceHandle):
-                    resolved = resolved_history_refs.get(first_ref)
+                    is_v2_history_ref = (
+                        requested.source.format == HISTORY_REF_LOGICAL_FORMAT
+                    )
+                    resolved = (
+                        None
+                        if is_v2_history_ref
+                        else resolved_history_refs.get(first_ref)
+                    )
                     if resolved is None:
                         try:
                             resolved = await resolve_history_ref_catalog_entry(
@@ -6801,7 +7377,8 @@ def _new_ref_reader(
                             )
                         except CanonicalHistoryError as exc:
                             return f"Error: externalized history ref unavailable: {exc.reason}"
-                        resolved_history_refs[first_ref] = resolved
+                        if not is_v2_history_ref:
+                            resolved_history_refs[first_ref] = resolved
                     catalog = tuple(
                         resolved if entry.manifest.ref == first_ref else entry
                         for entry in catalog
@@ -6926,7 +7503,25 @@ async def compare_and_swap_ref_generation(
             for entry in (current.catalog if current is not None else ())
         }
         for entry in attempt.plan.catalog:
-            catalog_by_ref.setdefault(entry.manifest.ref, entry)
+            existing_entry = catalog_by_ref.get(entry.manifest.ref)
+            if existing_entry is None:
+                catalog_by_ref[entry.manifest.ref] = entry
+                continue
+            existing_is_v2_history = (
+                isinstance(existing_entry.source, HistoryRefSourceHandle)
+                and existing_entry.source.format == HISTORY_REF_LOGICAL_FORMAT
+            )
+            incoming_is_v2_history = (
+                isinstance(entry.source, HistoryRefSourceHandle)
+                and entry.source.format == HISTORY_REF_LOGICAL_FORMAT
+            )
+            if not (existing_is_v2_history and incoming_is_v2_history):
+                continue
+            if existing_entry.manifest != entry.manifest:
+                raise RefProjectionError(
+                    stage="v2 history re-advertisement integrity"
+                )
+            catalog_by_ref[entry.manifest.ref] = entry
         attempt.registry[REF_EXEC_TOOL_NAME] = {
             "spec": ref_exec_tool_spec_payload()["function"],
             "callable": attempt.reader,
@@ -9061,12 +9656,31 @@ class CheckpointStore:
         updated_meta[SUMMARY_META_HISTORY_REF_KEY] = dict(history_ref)
         async with await self._context() as db:
             try:
+                dialect_name = db.get_bind().dialect.name
+                if dialect_name == "postgresql":
+                    summary_meta_is_object = func.json_typeof(
+                        CHECKPOINT_TABLE.c.summary_meta
+                    ) == literal("object")
+                    history_ref_absent = func.json_typeof(
+                        CHECKPOINT_TABLE.c.summary_meta.op("->")(
+                            literal(SUMMARY_META_HISTORY_REF_KEY)
+                        )
+                    ).is_(None)
+                else:
+                    summary_meta_is_object = func.json_type(
+                        CHECKPOINT_TABLE.c.summary_meta
+                    ) == literal("object")
+                    history_ref_absent = func.json_type(
+                        CHECKPOINT_TABLE.c.summary_meta,
+                        f'$."{SUMMARY_META_HISTORY_REF_KEY}"',
+                    ).is_(None)
                 result = await db.execute(
                     update(CHECKPOINT_TABLE)
                     .where(
                         CHECKPOINT_TABLE.c.id == checkpoint_id,
                         CHECKPOINT_TABLE.c.state == "ready",
-                        CHECKPOINT_TABLE.c.summary_meta[SUMMARY_META_HISTORY_REF_KEY].as_string().is_(None),
+                        summary_meta_is_object,
+                        history_ref_absent,
                     )
                     .values(summary_meta=updated_meta, updated_at=int(time.time()))
                 )
@@ -12301,10 +12915,17 @@ async def _load_chat_message_chain(
         chain = get_message_list(messages_map, current_message_id)
         # Expand assistant-with-output messages to align positional indices
         # with the body.messages the pipe receives (Core runs
-        # process_messages_with_output before the pipe). reasoning_format
-        # does not change message COUNT (only reasoning content formatting),
-        # so None is safe for positional alignment.
-        return process_messages_with_output(chain)
+        # process_messages_with_output before the pipe). Core strips files
+        # during that conversion, so retain each raw row's files on its first
+        # expanded message for boundary-aware file classification.
+        expanded_chain: list[dict[str, Any]] = []
+        for message in chain:
+            expanded_messages = process_messages_with_output([message])
+            files = message.get("files") if isinstance(message, dict) else None
+            if expanded_messages and files is not None:
+                expanded_messages[0]["files"] = files
+            expanded_chain.extend(expanded_messages)
+        return expanded_chain
     except Exception:
         return None
 
@@ -13496,6 +14117,7 @@ async def _generate_summary_text(
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
     ref_projection_plan: RefProjectionPlan | None = None,
+    ref_mode_active: bool | None = None,
 ) -> str:
     summary_metadata = build_summary_task_metadata(metadata)
     summary_metadata.pop("files", None)
@@ -13516,6 +14138,16 @@ async def _generate_summary_text(
         file_context_enabled=file_context_enabled,
         transient_message_patterns=transient_message_patterns,
     )
+    active_ref_mode = (
+        ref_projection_plan is not None
+        if ref_mode_active is None
+        else ref_mode_active
+    )
+    if active_ref_mode:
+        _require_provider_bound_history_ref_manifests(
+            {"messages": source_messages},
+            ref_projection_plan,
+        )
     if ref_projection_plan is not None:
         source_messages = await apply_ref_projection_plan(
             source_messages,
@@ -13560,7 +14192,7 @@ async def _generate_summary_text(
         apply_ref_projection_surfaces(
             body,
             ref_projection_plan,
-            include_reader_schema=summary_tool_policy != "always_strip",
+            include_reader_schema=False,
         )
     finalize_summary_tool_policy(body, summary_tool_policy)
     retry_body = (
@@ -13615,6 +14247,8 @@ async def _compact_retry_tool_results(
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
     ref_projection_plan: RefProjectionPlan | None = None,
+    ref_mode_active: bool | None = None,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> tuple[list[dict[str, Any]], bool, int]:
     cut = select_tool_result_compaction_cut(
         messages,
@@ -13657,6 +14291,7 @@ async def _compact_retry_tool_results(
         source_messages=source_messages,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
         transient_message_patterns=transient_message_patterns,
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
     if pending_checkpoint is not None and not _checkpoint_matches_exact_source(
         pending_checkpoint,
@@ -13723,6 +14358,8 @@ async def _compact_retry_tool_results(
             summary_prompt=summary_prompt,
             transient_message_patterns=transient_message_patterns,
             ref_projection_plan=ref_projection_plan,
+            ref_mode_active=ref_mode_active,
+            checkpoint_profile_hash=checkpoint_profile_hash,
         )
     except Exception as exc:
         if isinstance(exc, ParentCheckpointExtensionFailed) and (
@@ -14024,8 +14661,9 @@ async def _get_or_create_checkpoint_summary(
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
     use_generation_lease: bool = True,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> str:
-    profile_hash = compute_profile_hash()
+    profile_hash = checkpoint_profile_hash
     file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
     source_hash = compute_summary_source_hash(
         source_messages,
@@ -14160,7 +14798,11 @@ async def _get_or_create_checkpoint_summary(
                             if use_generation_lease
                             else await summary_factory(parent)
                         )
-                    except SummaryFileContextUnavailable:
+                    except (
+                        SummaryFileContextUnavailable,
+                        RefProjectionError,
+                        HistoryRefStorageUnavailableError,
+                    ):
                         raise
                     except Exception as exc:
                         if parent:
@@ -14246,8 +14888,22 @@ async def _get_or_create_compaction_summary(
     transient_message_patterns: TransientMessagePatterns | None = None,
     use_generation_lease: bool = False,
     ref_projection_plan: RefProjectionPlan | None = None,
+    ref_mode_active: bool | None = None,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> str:
     summary_source_prefix = copy.deepcopy(source_messages)
+    active_ref_mode = (
+        ref_projection_plan is not None
+        if ref_mode_active is None
+        else ref_mode_active
+    )
+    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
+        request,
+        metadata,
+        source_messages,
+        require_file_context_chain=file_context_enabled,
+        transient_message_patterns=transient_message_patterns,
+    )
 
     async def summary_factory(parent: dict[str, Any] | None) -> str:
         parent_count = 0
@@ -14277,6 +14933,40 @@ async def _get_or_create_compaction_summary(
             ]
         else:
             source = copy.deepcopy(summary_source_prefix)
+        verified_projection_plan = build_summary_ref_projection_plan(
+            ref_projection_plan,
+            None,
+            ref_mode_active=active_ref_mode,
+        )
+        if active_ref_mode and parent is not None:
+            logical_snapshot = await get_or_build_logical_history_snapshot(
+                request,
+                summary_source_prefix,
+                identity=(
+                    CHECKPOINT_NAMESPACE,
+                    user_id,
+                    chat_id,
+                    pipe_function_id,
+                    checkpoint_profile_hash,
+                ),
+                prefix_file_fingerprint_resolver=(
+                    prefix_file_fingerprint_resolver
+                ),
+                transient_message_patterns=transient_message_patterns,
+            )
+            verified_projection_plan = await extend_ref_projection_plan_with_checkpoint(
+                verified_projection_plan,
+                parent,
+                request=request,
+                metadata=metadata,
+                transient_message_patterns=transient_message_patterns,
+                logical_snapshot=logical_snapshot,
+            )
+        summary_ref_projection_plan = build_summary_ref_projection_plan(
+            verified_projection_plan,
+            parent,
+            ref_mode_active=active_ref_mode,
+        )
         return await _generate_summary_text(
             request=request,
             user=user,
@@ -14296,16 +14986,10 @@ async def _get_or_create_compaction_summary(
             file_context_enabled=file_context_enabled,
             summary_prompt=summary_prompt,
             transient_message_patterns=transient_message_patterns,
-            ref_projection_plan=ref_projection_plan,
+            ref_projection_plan=summary_ref_projection_plan,
+            ref_mode_active=active_ref_mode,
         )
 
-    prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
-        request,
-        metadata,
-        source_messages,
-        require_file_context_chain=file_context_enabled,
-        transient_message_patterns=transient_message_patterns,
-    )
     identity_fingerprint = (
         prefix_file_fingerprint_resolver(
             _source_identity_message_count(
@@ -14331,6 +15015,7 @@ async def _get_or_create_compaction_summary(
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
         transient_message_patterns=transient_message_patterns,
         use_generation_lease=use_generation_lease,
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
 
 
@@ -14344,6 +15029,7 @@ async def _lookup_ready_checkpoint_for_source(
     prefix_file_fingerprint: str | None = None,
     file_backed_image_db_chain: list[dict[str, Any]] | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> dict[str, Any] | None:
     await ensure_checkpoint_table_initialized(request=request)
     return await CheckpointStore().lookup_ready(
@@ -14351,7 +15037,7 @@ async def _lookup_ready_checkpoint_for_source(
         user_id=user_id,
         chat_id=chat_id,
         pipe_function_id=pipe_function_id,
-        profile_hash=compute_profile_hash(),
+        profile_hash=checkpoint_profile_hash,
         source_hash=compute_summary_source_hash(
             source_messages,
             prefix_file_fingerprint,
@@ -14370,6 +15056,7 @@ async def _lookup_pending_checkpoint_for_source_prefix(
     source_messages: list[dict[str, Any]],
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> dict[str, Any] | None:
     if not source_messages:
         return None
@@ -14383,7 +15070,7 @@ async def _lookup_pending_checkpoint_for_source_prefix(
         user_id=user_id,
         chat_id=chat_id,
         pipe_function_id=pipe_function_id,
-        profile_hash=compute_profile_hash(),
+        profile_hash=checkpoint_profile_hash,
         source_messages=source_messages,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
         transient_message_patterns=transient_message_patterns,
@@ -14523,6 +15210,9 @@ async def _prefetch_compaction_checkpoint(
     transient_message_patterns: TransientMessagePatterns | None = None,
     token_system_prompt: str | None = None,
     dropped_message_keys: frozenset[str] = frozenset(),
+    ref_mode_active: bool = False,
+    ref_substitution_threshold_tokens: int = 10_000,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> bool:
     if not source_messages:
         return False
@@ -14548,6 +15238,7 @@ async def _prefetch_compaction_checkpoint(
         source_messages=source_messages,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
         transient_message_patterns=transient_message_patterns,
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
     if pending_checkpoint is not None:
         ready_checkpoint = await _wait_for_pending_checkpoint_ready(pending_checkpoint)
@@ -14558,6 +15249,15 @@ async def _prefetch_compaction_checkpoint(
         historical_message_excerpt_bytes=historical_message_excerpt_bytes,
         historical_message_excerpt_count=historical_message_excerpt_count,
         transient_message_patterns=transient_message_patterns,
+    )
+    summary_projection_plan = (
+        await project_native_tool_texts(
+            copy.deepcopy(source_messages),
+            threshold_tokens=ref_substitution_threshold_tokens,
+            request=request,
+        )
+        if ref_mode_active
+        else None
     )
 
     source_kind = "message"
@@ -14617,6 +15317,7 @@ async def _prefetch_compaction_checkpoint(
                 transient_message_patterns=transient_message_patterns,
                 token_system_prompt=token_system_prompt,
                 dropped_message_keys=dropped_message_keys,
+                checkpoint_profile_hash=checkpoint_profile_hash,
             )
         if task_metadata_body is not None:
             return None
@@ -14633,6 +15334,7 @@ async def _prefetch_compaction_checkpoint(
             transient_message_patterns=transient_message_patterns,
             token_system_prompt=token_system_prompt,
             dropped_message_keys=dropped_message_keys,
+            checkpoint_profile_hash=checkpoint_profile_hash,
         )
 
     reusable_checkpoint_match = await _body_reusable_checkpoint_match(
@@ -14642,6 +15344,7 @@ async def _prefetch_compaction_checkpoint(
         body=body,
         pipe_function_id=pipe_function_id,
         transient_message_patterns=transient_message_patterns,
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
     if reusable_checkpoint_match is not None and reusable_match_covers_prefetch_source(reusable_checkpoint_match):
         if reusable_checkpoint_match.kind == "exact":
@@ -14764,6 +15467,9 @@ async def _prefetch_compaction_checkpoint(
             summary_prompt=summary_prompt,
             transient_message_patterns=transient_message_patterns,
             use_generation_lease=True,
+            ref_projection_plan=summary_projection_plan,
+            ref_mode_active=ref_mode_active,
+            checkpoint_profile_hash=checkpoint_profile_hash,
         )
     except _CheckpointGenerationSkipped:
         return False
@@ -14871,6 +15577,9 @@ def _prepare_soft_compaction_prefetch(
     transient_message_patterns: TransientMessagePatterns | None = None,
     token_system_prompt: str | None = None,
     dropped_message_keys: frozenset[str] = frozenset(),
+    ref_mode_active: bool = False,
+    ref_substitution_threshold_tokens: int = 10_000,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> _PreparedSoftPrefetch | None:
     prefetch_source = _soft_prefetch_source_messages(
         body,
@@ -14890,6 +15599,7 @@ def _prepare_soft_compaction_prefetch(
         pipe_function_id=pipe_function_id,
         transient_message_patterns=transient_message_patterns,
         source_messages=source_messages,
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
     if key is None:
         return None
@@ -14924,35 +15634,46 @@ def _prepare_soft_compaction_prefetch(
                 raise
             except Exception:
                 pass
-        return await _prefetch_compaction_checkpoint(
-            request=prefetch_request,
-            user=prefetch_user,
-            user_id=user_id,
-            chat_id=chat_id,
-            metadata=prefetch_metadata,
-            body=prefetch_body,
-            pipe_function_id=pipe_function_id,
-            summary_model_id=summary_model_id,
-            source_messages=source_messages,
-            preserved_system_message=preserved_system_message,
-            summary_tool_policy=summary_tool_policy,
-            historical_message_excerpt_bytes=historical_message_excerpt_bytes,
-            historical_message_excerpt_count=historical_message_excerpt_count,
-            effective_trigger_input_tokens=effective_trigger_input_tokens,
-            effective_soft_trigger_input_tokens=effective_soft_trigger_input_tokens,
-            trigger_observed_tokens=trigger_observed_tokens,
-            trigger_estimated_tokens=trigger_estimated_tokens,
-            trigger_usage_source=trigger_usage_source,
-            token_status_detail=token_status_detail,
-            token_status_show_usage_and_estimate=token_status_show_usage_and_estimate,
-            event_emitter=event_emitter,
-            file_context_enabled=file_context_enabled,
-            task_estimate_body=prefetch_task_estimate_body,
-            summary_prompt=summary_prompt,
-            transient_message_patterns=transient_message_patterns,
-            token_system_prompt=token_system_prompt,
-            dropped_message_keys=dropped_message_keys,
-        )
+        try:
+            return await _prefetch_compaction_checkpoint(
+                request=prefetch_request,
+                user=prefetch_user,
+                user_id=user_id,
+                chat_id=chat_id,
+                metadata=prefetch_metadata,
+                body=prefetch_body,
+                pipe_function_id=pipe_function_id,
+                summary_model_id=summary_model_id,
+                source_messages=source_messages,
+                preserved_system_message=preserved_system_message,
+                summary_tool_policy=summary_tool_policy,
+                historical_message_excerpt_bytes=historical_message_excerpt_bytes,
+                historical_message_excerpt_count=historical_message_excerpt_count,
+                effective_trigger_input_tokens=effective_trigger_input_tokens,
+                effective_soft_trigger_input_tokens=effective_soft_trigger_input_tokens,
+                trigger_observed_tokens=trigger_observed_tokens,
+                trigger_estimated_tokens=trigger_estimated_tokens,
+                trigger_usage_source=trigger_usage_source,
+                token_status_detail=token_status_detail,
+                token_status_show_usage_and_estimate=(
+                    token_status_show_usage_and_estimate
+                ),
+                event_emitter=event_emitter,
+                file_context_enabled=file_context_enabled,
+                task_estimate_body=prefetch_task_estimate_body,
+                summary_prompt=summary_prompt,
+                transient_message_patterns=transient_message_patterns,
+                token_system_prompt=token_system_prompt,
+                dropped_message_keys=dropped_message_keys,
+                ref_mode_active=ref_mode_active,
+                ref_substitution_threshold_tokens=(
+                    ref_substitution_threshold_tokens
+                ),
+                checkpoint_profile_hash=checkpoint_profile_hash,
+            )
+        except RefProjectionError as exc:
+            _log_ref_projection_failure(exc)
+            return False
 
     return _PreparedSoftPrefetch(key=key, run=run_prefetch)
 
@@ -14982,6 +15703,9 @@ def _start_soft_compaction_prefetch(
     transient_message_patterns: TransientMessagePatterns | None = None,
     token_system_prompt: str | None = None,
     dropped_message_keys: frozenset[str] = frozenset(),
+    ref_mode_active: bool = False,
+    ref_substitution_threshold_tokens: int = 10_000,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
     parent_prefetch_task: asyncio.Task[Any] | None = None,
     _prepared: _PreparedSoftPrefetch | None = None,
 ) -> bool:
@@ -15009,6 +15733,9 @@ def _start_soft_compaction_prefetch(
         transient_message_patterns=transient_message_patterns,
         token_system_prompt=token_system_prompt,
         dropped_message_keys=dropped_message_keys,
+        ref_mode_active=ref_mode_active,
+        ref_substitution_threshold_tokens=ref_substitution_threshold_tokens,
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
     if prepared is None:
         return False
@@ -15104,6 +15831,8 @@ async def _body_reusable_checkpoint_match(
     body: dict[str, Any],
     pipe_function_id: str,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    capture_logical_snapshot: bool = False,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> ReusableCheckpointMatch | None:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -15125,7 +15854,7 @@ async def _body_reusable_checkpoint_match(
     if (tool_cut is None or not tool_cut.summarization_prefix) and not cut.summarization_prefix:
         return None
 
-    profile_hash = compute_profile_hash()
+    profile_hash = checkpoint_profile_hash
     await ensure_checkpoint_table_initialized(request=request)
     store = CheckpointStore()
     resolver_source_messages: list[dict[str, Any]] = []
@@ -15164,11 +15893,31 @@ async def _body_reusable_checkpoint_match(
         )
         if tool_match is not None:
             kind, checkpoint = tool_match
+            logical_snapshot = (
+                await get_or_build_logical_history_snapshot(
+                    request,
+                    tool_cut.summarization_prefix,
+                    identity=(
+                        CHECKPOINT_NAMESPACE,
+                        user_id,
+                        chat_id,
+                        pipe_function_id,
+                        profile_hash,
+                    ),
+                    prefix_file_fingerprint_resolver=(
+                        prefix_file_fingerprint_resolver
+                    ),
+                    transient_message_patterns=transient_message_patterns,
+                )
+                if capture_logical_snapshot
+                else None
+            )
             return ReusableCheckpointMatch(
                 kind=kind,
                 source_message_count=int(checkpoint.get("source_message_count") or tool_cut.source_message_count),
                 source_kind="tool",
                 checkpoint=checkpoint,
+                logical_snapshot=logical_snapshot,
             )
 
     if not cut.summarization_prefix:
@@ -15197,11 +15946,29 @@ async def _body_reusable_checkpoint_match(
     )
     if message_match is not None:
         kind, checkpoint = message_match
+        logical_snapshot = (
+            await get_or_build_logical_history_snapshot(
+                request,
+                cut.summarization_prefix,
+                identity=(
+                    CHECKPOINT_NAMESPACE,
+                    user_id,
+                    chat_id,
+                    pipe_function_id,
+                    profile_hash,
+                ),
+                prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
+                transient_message_patterns=transient_message_patterns,
+            )
+            if capture_logical_snapshot
+            else None
+        )
         return ReusableCheckpointMatch(
             kind=kind,
             source_message_count=int(checkpoint.get("source_message_count") or cut.source_message_count),
             source_kind="message",
             checkpoint=checkpoint,
+            logical_snapshot=logical_snapshot,
         )
     return None
 
@@ -15246,6 +16013,7 @@ async def _estimate_checkpoint_applied_body_tokens(
     transient_message_patterns: TransientMessagePatterns | None = None,
     token_system_prompt: str | None = None,
     dropped_message_keys: frozenset[str] = frozenset(),
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> int | None:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -15271,7 +16039,7 @@ async def _estimate_checkpoint_applied_body_tokens(
 
     chat_id = str(metadata.get("chat_id") or "")
     user_id = str((user.get("id") if isinstance(user, dict) else getattr(user, "id", "")) or "")
-    profile_hash = compute_profile_hash()
+    profile_hash = checkpoint_profile_hash
     store = CheckpointStore()
     resolver_source_messages: list[dict[str, Any]] = []
     for _candidate_cut, source_messages in candidates:
@@ -15409,6 +16177,7 @@ async def _compact_body_with_reusable_checkpoint(
     historical_message_excerpt_count: int,
     file_context_enabled: bool = True,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> tuple[dict[str, Any], bool, int]:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -15436,7 +16205,7 @@ async def _compact_body_with_reusable_checkpoint(
 
     await ensure_checkpoint_table_initialized(request=request)
     store = CheckpointStore()
-    profile_hash = compute_profile_hash()
+    profile_hash = checkpoint_profile_hash
     resolver_source_messages: list[dict[str, Any]] = []
     for _kind, _candidate_cut, source_messages in candidates:
         resolver_source_messages.extend(source_messages)
@@ -15528,6 +16297,7 @@ async def _estimate_task_checkpoint_applied_body_tokens(
     transient_message_patterns: TransientMessagePatterns | None = None,
     token_system_prompt: str | None = None,
     dropped_message_keys: frozenset[str] = frozenset(),
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> int | None:
     task_metadata = metadata
     body_metadata = body.get("metadata")
@@ -15546,6 +16316,7 @@ async def _estimate_task_checkpoint_applied_body_tokens(
             historical_message_excerpt_count=historical_message_excerpt_count,
             file_context_enabled=file_context_enabled,
             transient_message_patterns=transient_message_patterns,
+            checkpoint_profile_hash=checkpoint_profile_hash,
         )
     except SummaryFileContextUnavailable:
         return None
@@ -16606,6 +17377,8 @@ async def _compact_body(
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
     ref_projection_plan: RefProjectionPlan | None = None,
+    ref_mode_active: bool | None = None,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> tuple[dict[str, Any], bool, int]:
     messages = body.get("messages")
     if not isinstance(messages, list) or len(messages) < 2:
@@ -16640,6 +17413,8 @@ async def _compact_body(
                 summary_prompt=summary_prompt,
                 transient_message_patterns=transient_message_patterns,
                 ref_projection_plan=ref_projection_plan,
+                ref_mode_active=ref_mode_active,
+                checkpoint_profile_hash=checkpoint_profile_hash,
             )
         except UnsupportedCompactionInput as exc:
             if exc.code != "latest_tool_result_too_large":
@@ -16682,6 +17457,8 @@ async def _compact_body(
                 summary_prompt=summary_prompt,
                 transient_message_patterns=transient_message_patterns,
                 ref_projection_plan=ref_projection_plan,
+                ref_mode_active=ref_mode_active,
+                checkpoint_profile_hash=checkpoint_profile_hash,
             )
             history_prefix_file_fingerprint_resolver = await _build_prefix_file_fingerprint_resolver(
                 request,
@@ -16703,6 +17480,7 @@ async def _compact_body(
                     history_prefix_file_fingerprint_resolver
                 ),
                 transient_message_patterns=transient_message_patterns,
+                checkpoint_profile_hash=checkpoint_profile_hash,
             )
             if history_checkpoint is None:
                 raise RuntimeError("History checkpoint was not available after creation")
@@ -16722,6 +17500,8 @@ async def _compact_body(
                 summary_prompt=summary_prompt,
                 transient_message_patterns=transient_message_patterns,
                 ref_projection_plan=ref_projection_plan,
+                ref_mode_active=ref_mode_active,
+                checkpoint_profile_hash=checkpoint_profile_hash,
             )
         if did_compact_tools:
             compacted = _copy_body_preserving_metadata(body)
@@ -16779,6 +17559,7 @@ async def _compact_body(
         source_messages=cut.summarization_prefix,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
         transient_message_patterns=transient_message_patterns,
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
     if pending_checkpoint is not None and not _checkpoint_matches_exact_source(
         pending_checkpoint,
@@ -16841,6 +17622,8 @@ async def _compact_body(
             summary_prompt=summary_prompt,
             transient_message_patterns=transient_message_patterns,
             ref_projection_plan=ref_projection_plan,
+            ref_mode_active=ref_mode_active,
+            checkpoint_profile_hash=checkpoint_profile_hash,
         )
         compacted["messages"] = replace_prefix_with_summary(
             messages,
@@ -16893,6 +17676,7 @@ async def _compact_task_body_with_reusable_checkpoint(
     historical_message_excerpt_count: int,
     file_context_enabled: bool = True,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> tuple[dict[str, Any], bool, int]:
     source_body = _task_history_source_body_for_compaction(body, metadata)
     if source_body is None:
@@ -16908,6 +17692,7 @@ async def _compact_task_body_with_reusable_checkpoint(
         historical_message_excerpt_count=historical_message_excerpt_count,
         file_context_enabled=file_context_enabled,
         transient_message_patterns=transient_message_patterns,
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
     if not compacted:
         return body, False, 0
@@ -16939,6 +17724,8 @@ async def _compact_task_body(
     summary_prompt: str | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
     ref_projection_plan: RefProjectionPlan | None = None,
+    ref_mode_active: bool | None = None,
+    checkpoint_profile_hash: str = ACTIVE_CHECKPOINT_PROFILE_HASH,
 ) -> tuple[dict[str, Any], bool, int]:
     source_body = _task_history_source_body_for_compaction(body, metadata)
     if source_body is None:
@@ -16958,6 +17745,8 @@ async def _compact_task_body(
         summary_prompt=summary_prompt,
         transient_message_patterns=transient_message_patterns,
         ref_projection_plan=ref_projection_plan,
+        ref_mode_active=ref_mode_active,
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
     if not compacted:
         return body, False, 0
@@ -17459,6 +18248,9 @@ class Pipe:
                 registry_available=registry_available,
             )
         )
+        checkpoint_profile_hash = checkpoint_profile_hash_for_ref_mode(
+            ref_mode_active=effective_ref_mode.active
+        )
         if self.valves.ref_exec_enabled and not effective_ref_mode.active:
             LOG.info(
                 "Auto Compact ref mode inactive: %s",
@@ -17531,6 +18323,8 @@ class Pipe:
                     body=checkpoint_lookup_body,
                     pipe_function_id=identity.pipe_function_id,
                     transient_message_patterns=transient_message_patterns,
+                    capture_logical_snapshot=effective_ref_mode.active,
+                    checkpoint_profile_hash=checkpoint_profile_hash,
                 )
             except Exception:
                 checkpoint_lookup_unavailable = True
@@ -17548,6 +18342,7 @@ class Pipe:
                 request=__request__,
                 metadata=metadata,
                 transient_message_patterns=transient_message_patterns,
+                logical_snapshot=reusable_checkpoint_match.logical_snapshot,
             )
         pre_rag_messages: list[dict[str, Any]] | None = None
         pre_injected_file_context_sources = None
@@ -17658,7 +18453,10 @@ class Pipe:
         prepared_uncompacted_forward_candidate = None
 
         async def apply_target_ref_projection(candidate: dict[str, Any]) -> dict[str, Any]:
-            if not effective_ref_mode.active or ref_projection_plan is None:
+            if not effective_ref_mode.active:
+                return candidate
+            _require_provider_bound_history_ref_manifests(candidate, ref_projection_plan)
+            if ref_projection_plan is None:
                 return candidate
             candidate_messages = candidate.get("messages")
             if not isinstance(candidate_messages, list):
@@ -17717,6 +18515,7 @@ class Pipe:
                         historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                         file_context_enabled=target_file_context_enabled,
                         transient_message_patterns=transient_message_patterns,
+                        checkpoint_profile_hash=checkpoint_profile_hash,
                     )
                 else:
                     candidate, compacted, prefix_count = await _compact_body_with_reusable_checkpoint(
@@ -17730,6 +18529,7 @@ class Pipe:
                         historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                         file_context_enabled=target_file_context_enabled,
                         transient_message_patterns=transient_message_patterns,
+                        checkpoint_profile_hash=checkpoint_profile_hash,
                     )
             except (SummaryFileContextUnavailable, RuntimeError):
                 return None
@@ -17769,6 +18569,11 @@ class Pipe:
             return candidate, forward_candidate, prefix_count, source_events
 
         async def estimate_candidate(candidate: dict[str, Any]) -> int | None:
+            if effective_ref_mode.active:
+                _require_provider_bound_history_ref_manifests(
+                    candidate,
+                    ref_projection_plan,
+                )
             token_candidate = _project_usage_anchor_token_body(
                 candidate,
                 dropped_message_keys=usage_anchor_dropped_message_keys,
@@ -17807,27 +18612,37 @@ class Pipe:
                 return None
             return await estimate_candidate(prepared[1])
 
-        if supported_context:
-            if reusable_checkpoint_match is not None:
-                checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(reusable_checkpoint_match)
-            else:
-                if effective_ref_mode.active:
-                    prepared_uncompacted_candidate = await apply_target_ref_projection(
-                        _copy_body_preserving_metadata(estimate_lookup_body)
+        try:
+            if supported_context:
+                if reusable_checkpoint_match is not None:
+                    checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(
+                        reusable_checkpoint_match
                     )
-                    prepared_uncompacted_forward_candidate = _apply_resolved_model_route_params(
-                        prepared_uncompacted_candidate,
-                        models=models,
-                        route=target_route,
-                    )
-                    estimate_candidate_body = prepared_uncompacted_forward_candidate
                 else:
-                    estimate_candidate_body = _apply_resolved_model_route_params(
-                        estimate_lookup_body,
-                        models=models,
-                        route=target_route,
+                    if effective_ref_mode.active:
+                        prepared_uncompacted_candidate = await apply_target_ref_projection(
+                            _copy_body_preserving_metadata(estimate_lookup_body)
+                        )
+                        prepared_uncompacted_forward_candidate = (
+                            _apply_resolved_model_route_params(
+                                prepared_uncompacted_candidate,
+                                models=models,
+                                route=target_route,
+                            )
+                        )
+                        estimate_candidate_body = prepared_uncompacted_forward_candidate
+                    else:
+                        estimate_candidate_body = _apply_resolved_model_route_params(
+                            estimate_lookup_body,
+                            models=models,
+                            route=target_route,
+                        )
+                    estimated_total_tokens = await estimate_candidate(
+                        estimate_candidate_body
                     )
-                estimated_total_tokens = await estimate_candidate(estimate_candidate_body)
+        except RefProjectionError as exc:
+            _log_ref_projection_failure(exc)
+            return _error_response(str(exc), code="ref_projection_failed")
         # decision_total: checkpoint-applied estimate (the compacted body we
         # would actually forward) takes priority over the usage-anchor / full-body
         # estimate. It NEVER falls back to raw observed total_tokens.
@@ -17900,6 +18715,8 @@ class Pipe:
                     body=checkpoint_lookup_body,
                     pipe_function_id=identity.pipe_function_id,
                     transient_message_patterns=transient_message_patterns,
+                    capture_logical_snapshot=effective_ref_mode.active,
+                    checkpoint_profile_hash=checkpoint_profile_hash,
                 )
             except Exception as exc:
                 if not hard_should_compact and soft_should_prefetch:
@@ -17932,6 +18749,7 @@ class Pipe:
                         request=__request__,
                         metadata=metadata,
                         transient_message_patterns=transient_message_patterns,
+                        logical_snapshot=late_checkpoint_match.logical_snapshot,
                     )
                 prepared_reusable_key = None
                 prepared_reusable_candidate = None
@@ -17940,7 +18758,13 @@ class Pipe:
                 prepared_reusable_source_events = None
                 prepared_uncompacted_candidate = None
                 prepared_uncompacted_forward_candidate = None
-                checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(late_checkpoint_match)
+                try:
+                    checkpoint_applied_estimate = (
+                        await estimate_reusable_checkpoint_match(late_checkpoint_match)
+                    )
+                except RefProjectionError as exc:
+                    _log_ref_projection_failure(exc)
+                    return _error_response(str(exc), code="ref_projection_failed")
                 # Once a checkpoint is reusable, the checkpoint-applied payload is
                 # the only candidate that matters. If that estimate is unavailable,
                 # do not fall back to the raw estimate that caused this late check.
@@ -18005,6 +18829,8 @@ class Pipe:
                         body=checkpoint_lookup_body,
                         pipe_function_id=identity.pipe_function_id,
                         transient_message_patterns=transient_message_patterns,
+                        capture_logical_snapshot=effective_ref_mode.active,
+                        checkpoint_profile_hash=checkpoint_profile_hash,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -18031,6 +18857,7 @@ class Pipe:
                                 request=__request__,
                                 metadata=metadata,
                                 transient_message_patterns=transient_message_patterns,
+                                logical_snapshot=late_checkpoint_match.logical_snapshot,
                             )
                         prepared_reusable_key = None
                         prepared_reusable_candidate = None
@@ -18039,7 +18866,17 @@ class Pipe:
                         prepared_reusable_source_events = None
                         prepared_uncompacted_candidate = None
                         prepared_uncompacted_forward_candidate = None
-                        checkpoint_applied_estimate = await estimate_reusable_checkpoint_match(late_checkpoint_match)
+                        try:
+                            checkpoint_applied_estimate = (
+                                await estimate_reusable_checkpoint_match(
+                                    late_checkpoint_match
+                                )
+                            )
+                        except RefProjectionError as exc:
+                            _log_ref_projection_failure(exc)
+                            return _error_response(
+                                str(exc), code="ref_projection_failed"
+                            )
                         decision_total = checkpoint_applied_estimate
                         hard_should_compact, soft_should_prefetch, should_compact = compute_threshold_decisions()
                         should_compact = hard_should_compact or reusable_checkpoint_match is not None
@@ -18069,6 +18906,11 @@ class Pipe:
                     transient_message_patterns=transient_message_patterns,
                     token_system_prompt=target_route.token_system_prompt,
                     dropped_message_keys=usage_anchor_dropped_message_keys,
+                    ref_mode_active=effective_ref_mode.active,
+                    ref_substitution_threshold_tokens=(
+                        self.valves.ref_substitution_threshold_tokens
+                    ),
+                    checkpoint_profile_hash=checkpoint_profile_hash,
                 )
 
         def schedule_completed_turn_soft_prefetch(completion: dict[str, Any]) -> None:
@@ -18097,7 +18939,7 @@ class Pipe:
                     completed_user_id,
                     completed_chat_id,
                     identity.pipe_function_id,
-                    compute_profile_hash(),
+                    checkpoint_profile_hash,
                     completed_message_id,
                 )
 
@@ -18120,6 +18962,7 @@ class Pipe:
                         body=checkpoint_lookup_body,
                         pipe_function_id=identity.pipe_function_id,
                         transient_message_patterns=transient_message_patterns,
+                        checkpoint_profile_hash=checkpoint_profile_hash,
                     )
                     prepared = _prepare_soft_compaction_prefetch(
                         request=__request__,
@@ -18143,6 +18986,11 @@ class Pipe:
                         transient_message_patterns=transient_message_patterns,
                         token_system_prompt=target_route.token_system_prompt,
                         dropped_message_keys=usage_anchor_dropped_message_keys,
+                        ref_mode_active=effective_ref_mode.active,
+                        ref_substitution_threshold_tokens=(
+                            self.valves.ref_substitution_threshold_tokens
+                        ),
+                        checkpoint_profile_hash=checkpoint_profile_hash,
                     )
                     if prepared is None:
                         return None
@@ -18162,6 +19010,7 @@ class Pipe:
                                 pipe_function_id=identity.pipe_function_id,
                                 transient_message_patterns=transient_message_patterns,
                                 inflight_key=parent_key,
+                                checkpoint_profile_hash=checkpoint_profile_hash,
                             )
                             if parent_key is not None
                             else None
@@ -18189,6 +19038,7 @@ class Pipe:
                             token_system_prompt=target_route.token_system_prompt,
                             dropped_message_keys=usage_anchor_dropped_message_keys,
                             parent_prefetch_task=parent_prefetch_task,
+                            checkpoint_profile_hash=checkpoint_profile_hash,
                             _prepared=prepared,
                         )
                         if started:
@@ -18328,6 +19178,7 @@ class Pipe:
                                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                                 file_context_enabled=target_file_context_enabled,
                                 transient_message_patterns=transient_message_patterns,
+                                checkpoint_profile_hash=checkpoint_profile_hash,
                             )
                         else:
                             candidate, compacted, compaction_prefix_count = await _compact_body_with_reusable_checkpoint(
@@ -18341,6 +19192,7 @@ class Pipe:
                                 historical_message_excerpt_count=self.valves.historical_message_excerpt_count,
                                 file_context_enabled=target_file_context_enabled,
                                 transient_message_patterns=transient_message_patterns,
+                                checkpoint_profile_hash=checkpoint_profile_hash,
                             )
                     else:
                         if task_source_body is not None:
@@ -18359,6 +19211,8 @@ class Pipe:
                                 file_context_enabled=target_file_context_enabled,
                                 transient_message_patterns=transient_message_patterns,
                                 ref_projection_plan=ref_projection_plan,
+                                ref_mode_active=effective_ref_mode.active,
+                                checkpoint_profile_hash=checkpoint_profile_hash,
                             )
                         else:
                             candidate, compacted, compaction_prefix_count = await _compact_body(
@@ -18376,6 +19230,8 @@ class Pipe:
                                 file_context_enabled=target_file_context_enabled,
                                 transient_message_patterns=transient_message_patterns,
                                 ref_projection_plan=ref_projection_plan,
+                                ref_mode_active=effective_ref_mode.active,
+                                checkpoint_profile_hash=checkpoint_profile_hash,
                             )
                     compacted_once = compacted_once or compacted
                     if (
@@ -18510,9 +19366,11 @@ class Pipe:
                                 body=checkpoint_lookup_body,
                                 pipe_function_id=identity.pipe_function_id,
                                 transient_message_patterns=transient_message_patterns,
+                                capture_logical_snapshot=True,
+                                checkpoint_profile_hash=checkpoint_profile_hash,
                             )
-                        except Exception:
-                            selected_history_match = None
+                        except Exception as exc:  # noqa: BLE001  # noqa: BROAD_EXCEPT_OK - failed relookup must block provider forwarding
+                            raise RefProjectionError(stage="checkpoint relookup") from exc
                     selected_history_checkpoint = (
                         selected_history_match.checkpoint
                         if selected_history_match is not None
@@ -18528,6 +19386,11 @@ class Pipe:
                         request=__request__,
                         metadata=metadata,
                         transient_message_patterns=transient_message_patterns,
+                        logical_snapshot=(
+                            selected_history_match.logical_snapshot
+                            if selected_history_match is not None
+                            else None
+                        ),
                     )
                     current_projection_surface = (
                         ref_projection_plan.manifests,
@@ -18537,6 +19400,11 @@ class Pipe:
                     if final_projection_changed:
                         candidate_is_projected = False
                         selected_prepared_forward_candidate = None
+                if effective_ref_mode.active:
+                    _require_provider_bound_history_ref_manifests(
+                        candidate,
+                        ref_projection_plan,
+                    )
                 if effective_ref_mode.active and ref_projection_plan is not None:
                     if not candidate_is_projected:
                         candidate = await apply_target_ref_projection(candidate)

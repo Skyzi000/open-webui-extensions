@@ -74,6 +74,7 @@ async def _run_pipe_boundary(
     | None = None,
     estimated_token_values: tuple[int, ...] | None = None,
     forwarded_capture: list[dict[str, object]] | None = None,
+    use_real_checkpoint_lookup: bool = False,
 ) -> tuple[
     object,
     list[dict[str, object]],
@@ -107,6 +108,7 @@ async def _run_pipe_boundary(
     checkpoint_bodies: list[dict[str, object]] = []
     checkpoint_match_index = 0
     estimate_index = 0
+    real_reusable_checkpoint_match = mod._body_reusable_checkpoint_match
 
     class FakeChats:
         @staticmethod
@@ -165,6 +167,8 @@ async def _run_pipe_boundary(
     ) -> mod.ReusableCheckpointMatch | None:
         nonlocal checkpoint_match_index
         checkpoint_bodies.append(copy.deepcopy(kwargs["body"]))
+        if use_real_checkpoint_lookup:
+            return await real_reusable_checkpoint_match(**kwargs)
         if reusable_checkpoint_matches is None:
             return None
         match = reusable_checkpoint_matches[
@@ -1224,7 +1228,11 @@ async def test_always_strip_summary_keeps_refs_without_reader_schema(
     assert always_body["messages"][1]["content"] == expected_ref
     assert fallback_first["messages"] == always_body["messages"]
     assert any(
-        tool["function"]["name"] == mod.REF_EXEC_TOOL_NAME
+        tool["function"]["name"] == "lookup"
+        for tool in fallback_first["tools"]
+    )
+    assert all(
+        tool["function"]["name"] != mod.REF_EXEC_TOOL_NAME
         for tool in fallback_first["tools"]
     )
     assert fallback_retry == always_body
@@ -1280,6 +1288,8 @@ async def test_always_strip_summary_keeps_refs_without_reader_schema(
             messages=[*source_messages, {"role": "user", "content": "continue"}],
             estimated_tokens=10,
             configure_pipe=configure_pipe,
+            metadata_overrides={"user_message_id": "user-message-1"},
+            use_real_checkpoint_lookup=True,
         )
 
         second_messages = [
@@ -1299,6 +1309,8 @@ async def test_always_strip_summary_keeps_refs_without_reader_schema(
             messages=second_messages,
             estimated_tokens=10,
             configure_pipe=configure_pipe,
+            metadata_overrides={"user_message_id": "user-message-2"},
+            use_real_checkpoint_lookup=True,
         )
         summary_calls_after_child = len(captured["pipe"])
         (
@@ -1312,6 +1324,8 @@ async def test_always_strip_summary_keeps_refs_without_reader_schema(
             messages=second_messages,
             estimated_tokens=10,
             configure_pipe=configure_pipe,
+            metadata_overrides={"user_message_id": "user-message-2"},
+            use_real_checkpoint_lookup=True,
         )
 
         async with sessionmaker() as session:
@@ -1337,10 +1351,10 @@ async def test_always_strip_summary_keeps_refs_without_reader_schema(
         }
         & captured["pipe"][0].keys()
     )
-    assert (
-        pipe_forwards[0]["metadata"]["auto_compact_ref_manifests"]
-        == always_body["metadata"]["auto_compact_ref_manifests"]
-    )
+    pipe_manifests = pipe_forwards[0]["metadata"]["auto_compact_ref_manifests"]
+    always_manifests = always_body["metadata"]["auto_compact_ref_manifests"]
+    assert pipe_manifests[: len(always_manifests)] == always_manifests
+    assert len(pipe_manifests) == len(always_manifests) + 1
     assert any(
         tool["function"]["name"] == mod.REF_EXEC_TOOL_NAME
         for tool in pipe_forwards[0]["tools"]
@@ -1361,6 +1375,7 @@ async def test_always_strip_summary_keeps_refs_without_reader_schema(
     assert len(captured["pipe"]) == summary_calls_after_child
     assert len(checkpoint_rows) == 2
     parent, child = sorted(checkpoint_rows, key=lambda row: row["source_message_count"])
+    assert pipe_manifests[-1]["ref"] == f"history:{parent['id']}"
     assert parent["state"] == child["state"] == "ready"
     assert parent["profile_hash"] == child["profile_hash"] == mod.compute_profile_hash()
     assert parent["source_hash"] == mod.compute_summary_source_hash(source_messages)
@@ -5742,12 +5757,14 @@ def _grouped_tool_image_output() -> list[dict[str, object]]:
             "call_id": "image-call-1",
             "name": "lookup_one",
             "arguments": '{"index":1}',
+            "status": "completed",
         },
         {
             "type": "function_call",
             "call_id": "image-call-2",
             "name": "lookup_two",
             "arguments": '{"index":2}',
+            "status": "completed",
         },
         {
             "type": "function_call_output",
@@ -5837,6 +5854,7 @@ def test_history_jsonl_raw_output_canonical_bytes_remain_stable() -> None:
                     "call_id": "ordinary-call",
                     "name": "lookup",
                     "arguments": "{}",
+                    "status": "completed",
                 },
                 {
                     "type": "function_call_output",
@@ -6236,6 +6254,7 @@ async def test_history_jsonl_maps_expanded_count_only_at_raw_record_end() -> Non
                     "call_id": "call-1",
                     "name": "lookup",
                     "arguments": '{"b":2,"a":1}',
+                    "status": "completed",
                 },
                 {
                     "type": "function_call_output",
@@ -6287,6 +6306,7 @@ async def test_history_jsonl_rejects_inside_record_and_unsaved_sources() -> None
                     "call_id": "call-1",
                     "name": "lookup",
                     "arguments": "{}",
+                    "status": "completed",
                 },
                 {
                     "type": "function_call_output",
@@ -6549,6 +6569,7 @@ async def test_history_jsonl_matches_core_ordered_tool_text() -> None:
             "call_id": "call-1",
             "name": "lookup",
             "arguments": arguments,
+            "status": "completed",
         },
         {
             "type": "function_call_output",
@@ -6833,6 +6854,7 @@ async def test_history_jsonl_omits_known_media_and_rejects_unknown_shapes() -> N
                         "call_id": "call-image",
                         "name": "image_lookup",
                         "arguments": "{}",
+                        "status": "completed",
                     },
                     {
                         "type": "function_call_output",
@@ -6877,6 +6899,29 @@ async def test_history_jsonl_omits_known_media_and_rejects_unknown_shapes() -> N
     ):
         with pytest.raises(error_type, match="unknown message shape"):
             await builder([incomplete], source_message_count=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "forbidden_field",
+    [
+        pytest.param({"name": "legacy"}, id="name"),
+        pytest.param(
+            {"function_call": {"name": "legacy", "arguments": "{}"}},
+            id="function_call",
+        ),
+    ],
+)
+async def test_history_jsonl_rejects_noncanonical_direct_message_fields(
+    forbidden_field: dict[str, str | dict[str, str]],
+) -> None:
+    _, builder, _, error_type = _task3_surface()
+
+    with pytest.raises(error_type, match="unknown message shape"):
+        await builder(
+            [{"role": "assistant", "content": "answer", **forbidden_field}],
+            source_message_count=1,
+        )
 
 
 @pytest.mark.asyncio
@@ -7095,9 +7140,9 @@ async def test_pipe_propagates_canonical_failure_when_legacy_checkpoint_digest_i
 
     forwarded: list[dict[str, object]] = []
     with pytest.raises(
-        mod.CanonicalHistoryError,
-        match="history source is not valid UTF-8",
-    ):
+        mod.RefProjectionError,
+        match="Externalized ref history verification failed before provider forward",
+    ) as failure:
         await _run_pipe_boundary(
             monkeypatch,
             messages=[raw_message],
@@ -7107,6 +7152,8 @@ async def test_pipe_propagates_canonical_failure_when_legacy_checkpoint_digest_i
             reusable_checkpoint_matches=(match,),
             forwarded_capture=forwarded,
         )
+    assert isinstance(failure.value.__cause__, mod.CanonicalHistoryError)
+    assert failure.value.__cause__.reason == "history source is not valid UTF-8"
     assert forwarded == []
 
 
@@ -7344,18 +7391,20 @@ async def test_ref_projection_preserves_complete_parallel_tool_round(
         "id": "parallel-assistant",
         "role": "assistant",
         "output": [
-            {
-                "type": "function_call",
-                "call_id": "call-a",
-                "name": "existing",
-                "arguments": '{"value":1}',
-            },
-            {
-                "type": "function_call",
-                "call_id": "call-b",
-                "name": "existing",
-                "arguments": '{"value":2}',
-            },
+                {
+                    "type": "function_call",
+                    "call_id": "call-a",
+                    "name": "existing",
+                    "arguments": '{"value":1}',
+                    "status": "completed",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-b",
+                    "name": "existing",
+                    "arguments": '{"value":2}',
+                    "status": "completed",
+                },
             {
                 "type": "function_call_output",
                 "call_id": "call-a",
@@ -7613,11 +7662,11 @@ async def test_death_chat_ninth_search_result_survives_real_core_rag_rewrite(
     add_or_update_user_message(rag_content, provider_messages, append=False)
 
     assert len(raw_records) == 2
-    assert len(converted) == 18
+    assert len(converted) == 10
     assert [
         message["tool_call_id"] for message in converted if message["role"] == "tool"
     ] == [f"death-chat-call-{index}" for index in range(1, 10)]
-    assert converted[-2]["tool_calls"][0]["function"]["name"] == "search_web"
+    assert converted[0]["tool_calls"][-1]["function"]["name"] == "search_web"
     assert provider_messages[-1]["content"] == f"{rag_content}\n{tenth_turn}"
     assert not any(
         provider_messages[start : start + len(canonical_visible_branch)]
@@ -7675,6 +7724,7 @@ async def test_real_core_missing_or_empty_function_name_externalizes_as_unknown(
         "type": "function_call",
         "call_id": "empty-name-call",
         "arguments": "{}",
+        "status": "completed",
     }
     if include_empty_name:
         function_call["name"] = ""
@@ -8432,7 +8482,7 @@ async def test_final_checkpoint_lookup_reprojects_selected_candidate_when_plan_e
 
 
 @pytest.mark.asyncio
-async def test_apply_ref_manifests_removes_seeded_block_when_plan_omits_summary_history_ref() -> (
+async def test_apply_ref_manifests_rejects_plan_omitting_summary_history_ref() -> (
     None
 ):
     own_messages = [{"role": "user", "content": "owned history"}]
@@ -8533,24 +8583,19 @@ async def test_apply_ref_manifests_removes_seeded_block_when_plan_omits_summary_
     assert len(reapply_plan.manifests) == 2
     assert own_ref not in {manifest.ref for manifest in reapply_plan.manifests}
 
-    mod._apply_ref_manifests(body, reapply_plan)
+    with pytest.raises(
+        mod.RefProjectionError,
+        match="Externalized ref history manifest proof failed before provider forward",
+    ):
+        mod._apply_ref_manifests(body, reapply_plan)
 
-    tool_hash = hashlib.sha256(tool_output.encode()).hexdigest()
-    content = body["messages"][0]["content"]
-    assert content.count(marker) == 0
-    assert "</auto_compact_ref_manifests>" not in content
-    assert content.endswith("</auto_compaction_context>")
+    assert body["messages"][0]["content"].count(marker) == 1
     assert body["metadata"]["auto_compact_ref_manifests"] == [
         {
-            "ref": other_ref,
-            "sha256": other_source.raw_source_hash,
-            "utf8_bytes": other_source.utf8_bytes,
-        },
-        {
-            "ref": f"tool:{tool_hash}",
-            "sha256": tool_hash,
-            "utf8_bytes": len(tool_output.encode()),
-        },
+            "ref": own_ref,
+            "sha256": own_source.raw_source_hash,
+            "utf8_bytes": own_source.utf8_bytes,
+        }
     ]
 
 
@@ -8651,18 +8696,20 @@ async def test_multimodal_tool_result_stays_raw(
         "id": "multimodal-assistant",
         "role": "assistant",
         "output": [
-            {
-                "type": "function_call",
-                "call_id": "text-call",
-                "name": "existing",
-                "arguments": "{}",
-            },
-            {
-                "type": "function_call",
-                "call_id": "image-call",
-                "name": "existing",
-                "arguments": "{}",
-            },
+                {
+                    "type": "function_call",
+                    "call_id": "text-call",
+                    "name": "existing",
+                    "arguments": "{}",
+                    "status": "completed",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "image-call",
+                    "name": "existing",
+                    "arguments": "{}",
+                    "status": "completed",
+                },
             {
                 "type": "function_call_output",
                 "call_id": "text-call",
@@ -8933,6 +8980,51 @@ async def test_pipe_propagates_canonical_history_failure_without_forwarding_targ
         )
 
     assert forwarded == []
+
+
+@pytest.mark.asyncio
+async def test_selected_v2_history_digest_mismatch_fails_before_projection() -> None:
+    messages = [{"role": "user", "content": "logical history"}]
+    profile_hash = mod.compute_profile_hash()
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=profile_hash,
+        source_hash=mod.compute_summary_source_hash(messages),
+        source_message_count=1,
+        summary_text="verified summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": "0" * 64,
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    snapshot = await mod.build_logical_history_snapshot(
+        messages,
+        identity=(
+            mod.CHECKPOINT_NAMESPACE,
+            "user-1",
+            "chat-1",
+            "auto_compact",
+            profile_hash,
+        ),
+    )
+
+    with pytest.raises(
+        mod.RefProjectionError,
+        match="Externalized ref history verification failed before provider forward",
+    ):
+        await mod.extend_ref_projection_plan_with_checkpoint(
+            None,
+            checkpoint,
+            request=SimpleNamespace(state=SimpleNamespace()),
+            metadata={"chat_id": "chat-1", "user_message_id": "current-user"},
+            logical_snapshot=snapshot,
+        )
 
 
 @pytest.mark.asyncio

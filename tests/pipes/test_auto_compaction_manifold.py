@@ -26,7 +26,7 @@ from functions.pipe import auto_compact as mod
 TRANSIENT_MARKER = r"(?s)<SYSTEM_CONTEXT>.*</SYSTEM_CONTEXT>\s*\Z"
 
 
-def test_auto_compact_release_header_is_083_with_096_floor():
+def test_auto_compact_release_header_is_084_with_096_floor():
     header = {
         key.strip(): value.strip()
         for line in (mod.__doc__ or "").splitlines()
@@ -35,7 +35,7 @@ def test_auto_compact_release_header_is_083_with_096_floor():
     }
     source_after_header = inspect.getsource(mod).split('"""', 2)[2]
 
-    assert header["version"] == "0.8.3"
+    assert header["version"] == "0.8.4"
     assert header["required_open_webui_version"] == "0.9.6"
     assert source_after_header.lstrip().startswith("# fmt: off")
 
@@ -3938,16 +3938,16 @@ def test_classify_target_chat_level_knowledge_retained():
     assert retained == [knowledge]
 
 
-def test_classify_target_with_tool_call_expansion_in_prefix():
+@pytest.mark.asyncio
+async def test_classify_target_with_tool_call_expansion_in_prefix(monkeypatch):
     """DB chain assistant-with-output expands via process_messages_with_output.
     compaction_prefix_count counts expanded messages, so the DB chain must be
     expanded too for positional alignment. A delta user message between the
     expanded assistant block and the current message is the critical test —
     without expansion its file would be silently dropped."""
-    from open_webui.utils.middleware import process_messages_with_output
-
     assistant_with_output = {
         "id": "a1",
+        "parentId": "u1",
         "role": "assistant",
         "content": "",
         "output": [
@@ -3956,6 +3956,7 @@ def test_classify_target_with_tool_call_expansion_in_prefix():
                 "call_id": "c1",
                 "name": "search",
                 "arguments": "{}",
+                "status": "completed",
             },
             {
                 "type": "function_call_output",
@@ -3967,14 +3968,41 @@ def test_classify_target_with_tool_call_expansion_in_prefix():
     }
     # Unexpanded DB chain: 4 messages
     db_chain_raw = [
-        {"id": "u1", "role": "user", "files": [_file("prefix-file")]},
+        {
+            "id": "u1",
+            "parentId": None,
+            "role": "user",
+            "content": "prefix",
+            "files": [_file("prefix-file")],
+        },
         assistant_with_output,
-        {"id": "u2", "role": "user", "files": [_file("delta-file")]},
-        {"id": "u3", "role": "user", "files": [_file("current-file")]},
+        {
+            "id": "u2",
+            "parentId": "a1",
+            "role": "user",
+            "content": "delta",
+            "files": [_file("delta-file")],
+        },
+        {
+            "id": "u3",
+            "parentId": "u2",
+            "role": "user",
+            "content": "current",
+            "files": [_file("current-file")],
+        },
     ]
+
+    from open_webui.models.chats import Chats
+
+    async def get_messages_map_by_chat_id(chat_id):
+        return {message["id"]: message for message in db_chain_raw}
+
+    monkeypatch.setattr(Chats, "get_messages_map_by_chat_id", get_messages_map_by_chat_id)
+
     # Expanded: process_messages_with_output produces 6 messages
     # [u1, assistant(tool_calls), tool(result), assistant(final), u2(delta), u3(current)]
-    expanded = process_messages_with_output(db_chain_raw)
+    expanded = await mod._load_chat_message_chain(None, "chat-1", "u3")
+    assert expanded is not None
     assert len(expanded) == 6, f"Expected 6 expanded messages, got {len(expanded)}"
 
     # compaction_prefix_count=4 (absorb u1 + expanded assistant block)
@@ -4009,6 +4037,7 @@ async def test_load_chat_message_chain_expands_assistant_with_output(monkeypatch
                 "call_id": "c1",
                 "name": "search",
                 "arguments": "{}",
+                "status": "completed",
             },
             {
                 "type": "function_call_output",
@@ -4036,14 +4065,12 @@ async def test_load_chat_message_chain_expands_assistant_with_output(monkeypatch
         },
     }
 
-    class FakeChats:
-        @staticmethod
-        async def get_messages_map_by_chat_id(chat_id):
-            return messages_map
+    from open_webui.models.chats import Chats
 
-    chats_module = types.ModuleType("open_webui.models.chats")
-    chats_module.Chats = FakeChats
-    monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_module)
+    async def get_messages_map_by_chat_id(chat_id):
+        return messages_map
+
+    monkeypatch.setattr(Chats, "get_messages_map_by_chat_id", get_messages_map_by_chat_id)
 
     chain = await mod._load_chat_message_chain(
         request=None,
@@ -17533,7 +17560,7 @@ async def test_pipe_first_compaction_forwards_exact_new_checkpoint_history_manif
     assert result == {"ok": True}
     assert len(store.claimed_rows) == len(store.completed_rows) == 1
     assert new_checkpoint_id == store.completed_rows[0]["id"]
-    assert captured["raw_branch_loads"] == 1
+    assert captured.get("raw_branch_loads", 0) == 0
     assert rendered["content"].count(
         '<auto_compact_ref_manifests version="1">'
     ) == 1
@@ -25263,6 +25290,9 @@ def _install_registry_parent_prefetch(pipe_identity, body, release_parent):
         metadata=pipe_metadata,
         body=body,
         pipe_function_id="auto_compact",
+        checkpoint_profile_hash=mod.checkpoint_profile_hash_for_ref_mode(
+            ref_mode_active=False
+        ),
     )
     assert parent_key is not None
     assert mod._launch_soft_prefetch_task(parent_key, parent_prefetch()) is True
@@ -25280,6 +25310,9 @@ def _completed_turn_registry_key(pipe_user, pipe_metadata, body):
         metadata=pipe_metadata,
         body=completed_body,
         pipe_function_id="auto_compact",
+        checkpoint_profile_hash=mod.checkpoint_profile_hash_for_ref_mode(
+            ref_mode_active=False
+        ),
     )
     assert completed_key is not None
     return completed_key
@@ -26945,6 +26978,211 @@ async def test_checkpoint_reuse_survives_mode_flip(
 
 
 @pytest.mark.asyncio
+async def test_mid_turn_logical_checkpoint_ref_survives_unsaved_then_saved_raw_source(
+    monkeypatch,
+    pipe_user,
+):
+    from open_webui.utils.middleware import process_messages_with_output
+
+    prior_user = {"id": "prior-user", "role": "user", "content": "question"}
+    raw_assistant = {
+        "id": "assistant-turn",
+        "role": "assistant",
+        "content": "stale UI content",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "function-call-1",
+                "call_id": "call-1",
+                "name": "lookup",
+                "arguments": "{}",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "id": "function-output-1",
+                "call_id": "call-1",
+                "output": [{"type": "input_text", "text": "result"}],
+                "status": "completed",
+            },
+        ],
+    }
+    first_current_user = {
+        "id": "unsaved-user",
+        "role": "user",
+        "content": "continue before save",
+    }
+    second_current_user = {
+        "id": "saved-user",
+        "role": "user",
+        "content": "continue after save",
+    }
+    first_messages = process_messages_with_output(
+        copy.deepcopy([prior_user, raw_assistant, first_current_user])
+    )
+    second_messages = process_messages_with_output(
+        copy.deepcopy([prior_user, raw_assistant, second_current_user])
+    )
+    logical_source = first_messages[:2]
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_summary_source_hash(logical_source),
+        source_message_count=2,
+        summary_text="mid-turn logical checkpoint",
+        summary_meta={},
+        parent_checkpoint_id=None,
+    )
+    expected_payload = (
+        '{"content":"question","role":"user"}\n'
+        '{"content":"","role":"assistant","tool_calls":'
+        '[{"arguments":"{}","id":"call-1","name":"lookup"}]}'
+    )
+    expected_digest = hashlib.sha256(expected_payload.encode()).hexdigest()
+    expected_ref = f"history:{checkpoint['id']}"
+    forwarded = []
+    raw_branch_loads = []
+
+    class LogicalCheckpointStore(ClaimCheckpointStore):
+        async def compare_and_swap_history_ref(
+            self,
+            checkpoint_id,
+            *,
+            expected_summary_meta,
+            history_ref,
+        ):
+            row = next(row for row in self.rows if row["id"] == checkpoint_id)
+            current_meta = mod.normalize_summary_meta(row.get("summary_meta"))
+            assert current_meta == expected_summary_meta
+            if mod.SUMMARY_META_HISTORY_REF_KEY in current_meta:
+                return False
+            row["summary_meta"] = {
+                **current_meta,
+                mod.SUMMARY_META_HISTORY_REF_KEY: copy.deepcopy(history_ref),
+            }
+            return True
+
+        async def lookup_ready_by_id(self, checkpoint_id, **_identity):
+            row = next(
+                (row for row in self.rows if row["id"] == checkpoint_id),
+                None,
+            )
+            return copy.deepcopy(row)
+
+        async def lookup_ready_descriptor_by_id(self, checkpoint_id, **identity):
+            return await self.lookup_ready_by_id(checkpoint_id, **identity)
+
+    store = LogicalCheckpointStore([checkpoint])
+
+    async def validate_target_access(**_kwargs):
+        return None
+
+    async def model_dict_from_request(_request):
+        return {
+            "target": {
+                "id": "target",
+                "name": "Target",
+                "info": {"meta": {"capabilities": {"function_calling": True}}},
+            }
+        }
+
+    async def noop_initialize(**_kwargs):
+        return None
+
+    async def generate_summary_text(**_kwargs):
+        raise AssertionError("the selected checkpoint must not be regenerated")
+
+    raw_branches = {
+        "unsaved-user": [prior_user],
+        "saved-user": [prior_user, raw_assistant, second_current_user],
+    }
+
+    async def load_raw_chat_branch(*, chat_id, metadata):
+        assert chat_id == "chat-1"
+        user_message_id = metadata["user_message_id"]
+        raw_branch_loads.append(user_message_id)
+        return copy.deepcopy(raw_branches[user_message_id])
+
+    async def forward_target(**kwargs):
+        forwarded.append(copy.deepcopy(kwargs["body"]))
+        return {"ok": True}
+
+    async def compact_mid_turn_checkpoint(*, body, **_kwargs):
+        return copy.deepcopy(body), True, 0
+
+    monkeypatch.setattr(mod, "_validate_target_access", validate_target_access)
+    monkeypatch.setattr(mod, "_model_dict_from_request", model_dict_from_request)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
+    monkeypatch.setattr(mod, "_forward_streaming_target", forward_target)
+    monkeypatch.setattr(
+        mod,
+        "_compact_body_with_reusable_checkpoint",
+        compact_mid_turn_checkpoint,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_target_model_supports_file_context",
+        lambda *_args: False,
+    )
+    _install_candidate_token_estimate(monkeypatch, 10)
+
+    pipe = mod.Pipe()
+    pipe.valves.ref_exec_enabled = True
+    pipe.valves.trigger_input_tokens = 100_000
+    wrapper_id = mod.build_wrapper_model_id("auto_compact", "target")
+
+    async def run(messages, user_message_id):
+        registry = {"existing": {"spec": {"name": "existing"}}}
+        request = SimpleNamespace(
+            state=SimpleNamespace(),
+            app=SimpleNamespace(state=SimpleNamespace(MODELS={})),
+        )
+        result = await pipe.pipe(
+            {
+                "model": wrapper_id,
+                "stream": True,
+                "messages": copy.deepcopy(messages),
+            },
+            __request__=request,
+            __user__=pipe_user,
+            __metadata__={
+                "chat_id": "chat-1",
+                "message_id": user_message_id,
+                "user_message_id": user_message_id,
+                "session_id": "session-1",
+                "params": {"function_calling": "native"},
+                "tools": registry,
+            },
+            __tools__=registry,
+        )
+        reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
+        return result, await reader(f"cat {expected_ref}")
+
+    first_result, first_read = await run(first_messages, "unsaved-user")
+    second_result, second_read = await run(second_messages, "saved-user")
+
+    assert first_result == second_result == {"ok": True}
+    assert first_read == second_read == expected_payload
+    assert raw_branch_loads == []
+    assert len(forwarded) == 2
+    assert all(
+        body["metadata"]["auto_compact_ref_manifests"]
+        == [{"ref": expected_ref, "sha256": expected_digest}]
+        for body in forwarded
+    )
+    assert store.rows[0]["summary_meta"]["history_ref"] == {
+        "format": "canonical-history-jsonl-v2-logical",
+        "raw_source_hash": expected_digest,
+    }
+
+
+@pytest.mark.asyncio
 async def test_history_ref_cas_enrichment_preserves_single_lineage(
     monkeypatch, tmp_path
 ):
@@ -27508,6 +27746,7 @@ async def _task6_run_checkpoint_handoffs(
             __metadata__={
                 "chat_id": "chat-1",
                 "message_id": message_id,
+                "user_message_id": f"user-{message_id}",
                 "session_id": "session-1",
                 "params": {"function_calling": "native"},
                 "tools": registry,
@@ -27580,7 +27819,11 @@ async def test_summary_ref_projection_matches_target_prefix_and_schema(
     manifests = mod.ref_render_manifest_payloads(plan)
     assert result == "summary"
     assert summary["messages"][:-1] == target["messages"]
-    assert _task6_ref_schema(summary) == _task6_ref_schema(target)
+    assert all(
+        tool.get("function", {}).get("name") != mod.REF_EXEC_TOOL_NAME
+        for tool in summary.get("tools", [])
+    )
+    assert _task6_ref_schema(target)["function"]["name"] == mod.REF_EXEC_TOOL_NAME
     assert (
         summary["metadata"]["auto_compact_ref_manifests"]
         == target["metadata"]["auto_compact_ref_manifests"]
@@ -27611,19 +27854,28 @@ async def test_cross_turn_summary_shared_prefix_matches_prior_target_bytes(
     expected_delta = await mod.apply_ref_projection_plan(persisted_delta, plan)
     assert parent["id"] in handoffs["render_phases"]["prior"]
     assert parent["id"] in handoffs["render_phases"]["current"]
-    assert summary_fingerprint == prior_fingerprint
-    assert _task6_cache_projection(summary_fingerprint, summary_messages).startswith(
-        _task6_cache_projection(prior_fingerprint, prior_messages)
+    assert summary_fingerprint != prior_fingerprint
+    assert all(
+        tool.get("function", {}).get("name") != mod.REF_EXEC_TOOL_NAME
+        for tool in summary.get("tools", [])
+    )
+    assert _task6_ref_schema(prior_target)["function"]["name"] == (
+        mod.REF_EXEC_TOOL_NAME
     )
     assert summary_messages[: len(prior_messages)] == prior_messages
     assert summary_messages[len(prior_messages) :] == [
         *expected_delta,
         mod.build_summary_request_message(),
     ]
-    assert all(
-        '<auto_compact_ref_manifests version="1">' not in message.get("content", "")
+    rendered_prior_manifests = [
+        _task17_render_manifest_payload(message.get("content", ""))
         for message in prior_messages
-    )
+        if '<auto_compact_ref_manifests version="1">' in message.get("content", "")
+    ]
+    assert len(rendered_prior_manifests) == 1
+    assert [manifest["ref"] for manifest in rendered_prior_manifests[0]] == [
+        f"history:{parent['id']}"
+    ]
 
 
 @pytest.mark.asyncio
@@ -27671,8 +27923,11 @@ async def test_projection_setting_transitions_preserve_checkpoint_profile_and_li
     baseline_profile = mod.compute_profile_hash()
     baseline_source_hash = mod.compute_summary_source_hash(source)
     baseline_fingerprint = _task6_render_fingerprint(summary, checkpoint=parent)
-    assert baseline_fingerprint == _task6_render_fingerprint(
+    assert baseline_fingerprint != _task6_render_fingerprint(
         prior_target, checkpoint=parent
+    )
+    assert summary["messages"][: len(prior_target["messages"])] == (
+        prior_target["messages"]
     )
     assert prior_target["stream"] is False
     assert summary["stream"] is False
@@ -27875,8 +28130,9 @@ async def test_summary_error_policy_preserves_schema_and_existing_error_behavior
         )
 
     assert len(captured) == 1
-    assert (
-        _task6_ref_schema(captured[0][1])["function"]["name"] == mod.REF_EXEC_TOOL_NAME
+    assert all(
+        tool.get("function", {}).get("name") != mod.REF_EXEC_TOOL_NAME
+        for tool in captured[0][1].get("tools", [])
     )
 
 
@@ -27914,7 +28170,13 @@ async def test_summary_ref_registry_is_empty_and_reader_is_not_called(
         },
         summary_model_id="target",
         source_messages=source,
-        base_body={"model": "target", "messages": source},
+        base_body={
+            "model": "target",
+            "messages": source,
+            "tools": [
+                {"type": "function", "function": {"name": "lookup"}}
+            ],
+        },
         ref_projection_plan=plan,
     )
 
@@ -27972,7 +28234,13 @@ async def test_summary_ref_tool_call_retries_without_execution(
         metadata={"chat_id": "chat-1"},
         summary_model_id="target",
         source_messages=source,
-        base_body={"model": "target", "messages": source},
+        base_body={
+            "model": "target",
+            "messages": source,
+            "tools": [
+                {"type": "function", "function": {"name": "lookup"}}
+            ],
+        },
         summary_tool_policy="fallback_on_tool_call",
         ref_projection_plan=plan,
     )
@@ -28022,7 +28290,13 @@ async def test_summary_retry_preserves_projected_messages(
         metadata={"chat_id": "chat-1"},
         summary_model_id="target",
         source_messages=source,
-        base_body={"model": "target", "messages": source},
+        base_body={
+            "model": "target",
+            "messages": source,
+            "tools": [
+                {"type": "function", "function": {"name": "lookup"}}
+            ],
+        },
         summary_tool_policy="fallback_on_tool_call",
         ref_projection_plan=plan,
     )
@@ -28071,7 +28345,27 @@ async def test_parent_extension_projects_same_delta_for_target_and_summary(
         source_message_count=len(all_source),
     )
     target_messages = mod.replace_prefix_with_parent_checkpoint_and_delta(cut, parent)
-    plan = await _task6_plan(all_source)
+    tool_plan = await _task6_plan(all_source)
+    parent_history = await mod.build_canonical_history_source(
+        parent_source,
+        source_message_count=len(parent_source),
+    )
+    plan = mod.merge_ref_projection_plans(
+        tool_plan,
+        mod.build_history_ref_projection_plan(
+            (
+                mod.RefCatalogEntry(
+                    manifest=mod.RefManifest(
+                        ref=f"history:{parent['id']}",
+                        utf8_bytes=parent_history.utf8_bytes,
+                        sha256=parent_history.raw_source_hash,
+                    ),
+                    source=parent_history,
+                ),
+            )
+        ),
+    )
+    assert plan is not None
     target = {
         "messages": await mod.apply_ref_projection_plan(target_messages, plan),
         "metadata": {},
@@ -28276,6 +28570,68 @@ def test_rendered_checkpoint_manifest_contains_only_own_history_ref():
         manifest["ref"]
         for manifest in body["metadata"]["auto_compact_ref_manifests"]
     ] == [other_ref, tool_ref, own_ref]
+
+
+@pytest.mark.parametrize(
+    "ref_projection_plan",
+    [
+        pytest.param(None, id="missing-plan"),
+        pytest.param(
+            mod.RefProjectionPlan(catalog=(), manifests=(), reader_schema=None),
+            id="empty-plan",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_summary_rendered_history_ref_requires_plan_before_projection_or_provider(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+    ref_projection_plan,
+):
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash="source-a",
+        source_message_count=1,
+        summary_text="stored summary",
+        summary_meta={},
+        parent_checkpoint_id=None,
+    )
+    source = [mod.render_summary_message_from_checkpoint(checkpoint)]
+    projection_calls = []
+    apply_projection = mod.apply_ref_projection_plan
+
+    async def observe_projection(*args, **kwargs):
+        projection_calls.append((args, kwargs))
+        return await apply_projection(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "apply_ref_projection_plan", observe_projection)
+    provider_calls = _task6_install_summary_capture(
+        monkeypatch,
+        [{"choices": [{"message": {"content": "summary"}}]}],
+    )
+
+    with pytest.raises(
+        mod.RefProjectionError,
+        match="Externalized ref history manifest proof failed before provider forward",
+    ):
+        await mod._generate_summary_text(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={"chat_id": "chat-1"},
+            summary_model_id="target",
+            source_messages=source,
+            base_body={"model": "target", "messages": source},
+            ref_projection_plan=ref_projection_plan,
+            ref_mode_active=True,
+        )
+
+    assert projection_calls == []
+    assert provider_calls == []
 
 
 @pytest.mark.asyncio
@@ -28722,6 +29078,169 @@ async def _task7_pipe_call(
     return result, metadata
 
 
+@pytest.mark.parametrize(
+    "ref_projection_plan",
+    [
+        pytest.param(None, id="missing-plan"),
+        pytest.param(
+            mod.RefProjectionPlan(catalog=(), manifests=(), reader_schema=None),
+            id="empty-plan",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_outer_rendered_history_ref_requires_plan_before_projection_or_estimation(
+    monkeypatch,
+    ref_projection_plan,
+):
+    observed = _task7_install_pipe_runtime(monkeypatch, estimate_tokens=10)
+    checkpoint = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash="source-a",
+        source_message_count=1,
+        summary_text="stored summary",
+        summary_meta={},
+        parent_checkpoint_id=None,
+    )
+    projection_calls = []
+    apply_projection = mod.apply_ref_projection_plan
+
+    async def select_plan(*_args, **_kwargs):
+        return ref_projection_plan
+
+    async def observe_projection(*args, **kwargs):
+        projection_calls.append((args, kwargs))
+        return await apply_projection(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "project_native_tool_texts", select_plan)
+    monkeypatch.setattr(mod, "apply_ref_projection_plan", observe_projection)
+    registry = {}
+    result, _ = await _task7_pipe_call(
+        request=_Task7Request(),
+        registry=registry,
+        text="unused",
+        enabled=True,
+        body={
+            "model": mod.build_wrapper_model_id("auto_compact", "target"),
+            "stream": True,
+            "messages": [
+                mod.render_summary_message_from_checkpoint(checkpoint),
+                {"role": "user", "content": "continue"},
+            ],
+        },
+    )
+
+    assert result == {
+        "error": {
+            "code": "ref_projection_failed",
+            "message": (
+                "Externalized ref history manifest proof failed before provider forward"
+            ),
+        }
+    }
+    assert projection_calls == []
+    assert observed["estimates"] == []
+    assert observed["forwards"] == []
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+
+
+@pytest.mark.asyncio
+async def test_final_checkpoint_relookup_failure_after_compaction_never_forwards(
+    monkeypatch,
+):
+    observed = _task7_install_pipe_runtime(monkeypatch, estimate_tokens=200)
+    lookup_calls = 0
+
+    async def fail_final_relookup(**_kwargs):
+        nonlocal lookup_calls
+        lookup_calls += 1
+        if lookup_calls == 3:
+            raise ConnectionError("final lookup exploded")
+        return None
+
+    monkeypatch.setattr(
+        mod,
+        "_body_reusable_checkpoint_match",
+        fail_final_relookup,
+    )
+    registry = {}
+    result, _ = await _task7_pipe_call(
+        request=_Task7Request(),
+        registry=registry,
+        text="compacted content" * 5_000,
+        enabled=True,
+    )
+
+    assert lookup_calls == 3
+    assert result == {
+        "error": {
+            "code": "ref_projection_failed",
+            "message": (
+                "Externalized ref checkpoint relookup failed before provider forward"
+            ),
+        }
+    }
+    assert observed["forwards"] == []
+    assert mod.REF_EXEC_TOOL_NAME not in registry
+
+
+@pytest.mark.asyncio
+async def test_pipe_propagates_effective_ref_mode_checkpoint_profile(
+    monkeypatch,
+):
+    _task7_install_pipe_runtime(monkeypatch, estimate_tokens=10)
+    captured_profiles = []
+
+    async def capture_checkpoint_profile(**kwargs):
+        captured_profiles.append(kwargs["checkpoint_profile_hash"])
+        return None
+
+    monkeypatch.setattr(
+        mod,
+        "_body_reusable_checkpoint_match",
+        capture_checkpoint_profile,
+    )
+
+    active_registry = {}
+    active_result, _ = await _task7_pipe_call(
+        request=_Task7Request(),
+        registry=active_registry,
+        text="active",
+        enabled=True,
+    )
+    inactive_result, _ = await _task7_pipe_call(
+        request=_Task7Request(),
+        registry={},
+        text="inactive",
+        enabled=False,
+    )
+    task_registry = {}
+    task_result, _ = await _task7_pipe_call(
+        request=_Task7Request(),
+        registry=task_registry,
+        text="task",
+        enabled=True,
+        metadata_override={
+            "chat_id": "chat-1",
+            "message_id": "assistant-task",
+            "task": "title_generation",
+            "params": {"function_calling": "native"},
+            "tools": task_registry,
+        },
+    )
+
+    assert active_result == inactive_result == task_result == {"ok": True}
+    assert captured_profiles == [
+        mod.checkpoint_profile_hash_for_ref_mode(ref_mode_active=True),
+        mod.checkpoint_profile_hash_for_ref_mode(ref_mode_active=False),
+        mod.checkpoint_profile_hash_for_ref_mode(ref_mode_active=False),
+    ]
+
+
 async def _task7_dispatch_with_current_core(monkeypatch, registry, ref, outer_metadata):
     import open_webui.utils.filter as core_filter
     import open_webui.utils.middleware as core_middleware
@@ -28804,7 +29323,7 @@ async def _task7_dispatch_with_current_core(monkeypatch, registry, ref, outer_me
     )
     request = SimpleNamespace(
         state=SimpleNamespace(metadata=outer_metadata),
-        app=SimpleNamespace(state=SimpleNamespace()),
+        app=SimpleNamespace(state=SimpleNamespace(redis=None)),
     )
     await core_middleware.streaming_chat_response_handler(
         initial,
@@ -28975,7 +29494,7 @@ async def _task8_run_current_core_route(
         return True
 
     async def channel_message(message_id):
-        return SimpleNamespace(channel_id="chat")
+        return SimpleNamespace(channel_id="chat", user_id=user_id)
 
     async def no_filters(*args, **kwargs):
         return []
@@ -29333,6 +29852,7 @@ async def _task8_run_current_core_route(
                         "call_id": "call-1",
                         "name": "lookup",
                         "arguments": "{}",
+                        "status": "completed",
                     },
                     {
                         "type": "function_call_output",
@@ -31149,6 +31669,192 @@ async def test_soft_prefetch_never_mutates_ref_request_store_or_registry():
 
 
 @pytest.mark.asyncio
+async def test_summary_projection_only_avoids_ref_attempts_state_and_reader_schema(
+    monkeypatch,
+    pipe_user,
+):
+    raw = "summary projection only\n" * 5_000
+    source_messages = _task7_native_round(raw)
+    plan = _task7_plan(raw)
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    request.state.metadata = {"chat_id": "chat-1", "tools": registry}
+    attempted = []
+
+    def forbid_attempt(*_args, **_kwargs):
+        attempted.append(True)
+        raise AssertionError("projection-only summary must not create a ref attempt")
+
+    provider_calls = _task6_install_summary_capture(
+        monkeypatch,
+        [{"choices": [{"message": {"content": "summary"}}]}],
+    )
+    monkeypatch.setattr(mod, "reserve_ref_binding", forbid_attempt)
+    monkeypatch.setattr(mod, "stage_ref_attempt", forbid_attempt)
+    monkeypatch.setattr(mod, "commit_ref_attempt", forbid_attempt)
+
+    result = await mod._generate_summary_text(
+        request=request,
+        user=pipe_user,
+        metadata={"chat_id": "chat-1", "tools": registry},
+        summary_model_id="target",
+        source_messages=source_messages,
+        base_body={"model": "target", "messages": source_messages},
+        ref_projection_plan=plan,
+        ref_mode_active=True,
+    )
+
+    provider_body = provider_calls[0][1]
+    assert result == "summary"
+    assert attempted == []
+    assert not hasattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert registry == {"unrelated": {}}
+    assert all(
+        tool.get("function", {}).get("name") != mod.REF_EXEC_TOOL_NAME
+        for tool in provider_body.get("tools", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefetch_projection_only_avoids_ref_attempts_state_and_reader_schema(
+    monkeypatch,
+    pipe_user,
+):
+    raw = "prefetch projection only\n" * 5_000
+    source_messages = [
+        *_task7_native_round(raw),
+        {"role": "user", "content": "continue"},
+    ]
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    request.state.metadata = {"chat_id": "chat-1", "tools": registry}
+    attempted = []
+
+    def forbid_attempt(*_args, **_kwargs):
+        attempted.append(True)
+        raise AssertionError("projection-only prefetch must not create a ref attempt")
+
+    async def no_pending(**_kwargs):
+        return None
+
+    async def no_reusable(**_kwargs):
+        return None
+
+    async def create_without_parent(**kwargs):
+        return await kwargs["summary_factory"](None)
+
+    provider_calls = _task6_install_summary_capture(
+        monkeypatch,
+        [{"choices": [{"message": {"content": "prefetched summary"}}]}],
+    )
+    monkeypatch.setattr(mod, "reserve_ref_binding", forbid_attempt)
+    monkeypatch.setattr(mod, "stage_ref_attempt", forbid_attempt)
+    monkeypatch.setattr(mod, "commit_ref_attempt", forbid_attempt)
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        no_pending,
+    )
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", no_reusable)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", create_without_parent)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        metadata={"chat_id": "chat-1", "tools": registry},
+        body={"model": "target", "messages": source_messages},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        ref_mode_active=True,
+        ref_substitution_threshold_tokens=1,
+    )
+
+    provider_body = provider_calls[0][1]
+    assert result is True
+    assert attempted == []
+    assert not hasattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert registry == {"unrelated": {}}
+    assert all(
+        tool.get("function", {}).get("name") != mod.REF_EXEC_TOOL_NAME
+        for tool in provider_body.get("tools", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_parentless_active_prefetch_skips_logical_snapshot_build(
+    monkeypatch,
+    pipe_user,
+):
+    source_messages = [
+        {"role": "user", "content": "first checkpoint request"},
+        {"role": "assistant", "content": "first checkpoint answer"},
+    ]
+    request = _Task7Request()
+    snapshot_calls = []
+    get_or_build_snapshot = mod.get_or_build_logical_history_snapshot
+
+    async def observe_snapshot(*args, **kwargs):
+        snapshot_calls.append((args, kwargs))
+        return await get_or_build_snapshot(*args, **kwargs)
+
+    async def no_pending(**_kwargs):
+        return None
+
+    async def no_reusable(**_kwargs):
+        return None
+
+    async def no_projection(*_args, **_kwargs):
+        return None
+
+    async def create_without_parent(**kwargs):
+        return await kwargs["summary_factory"](None)
+
+    async def generate_summary(**_kwargs):
+        return "prefetched summary"
+
+    monkeypatch.setattr(
+        mod,
+        "get_or_build_logical_history_snapshot",
+        observe_snapshot,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        no_pending,
+    )
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", no_reusable)
+    monkeypatch.setattr(mod, "project_native_tool_texts", no_projection)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", create_without_parent)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        metadata={"chat_id": "chat-1"},
+        body={"model": "target", "messages": source_messages},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        ref_mode_active=True,
+        ref_substitution_threshold_tokens=1,
+    )
+
+    assert result is True
+    assert snapshot_calls == []
+
+
+@pytest.mark.asyncio
 async def test_prefetch_profile_and_projection_match_foreground(monkeypatch):
     body = {
         "messages": [
@@ -31158,6 +31864,9 @@ async def test_prefetch_profile_and_projection_match_foreground(monkeypatch):
         ]
     }
     captured = {}
+    checkpoint_profile_hash = mod.checkpoint_profile_hash_for_ref_mode(
+        ref_mode_active=False
+    )
 
     async def capture_prefetch(**kwargs):
         captured.update(kwargs)
@@ -31174,17 +31883,20 @@ async def test_prefetch_profile_and_projection_match_foreground(monkeypatch):
         summary_tool_policy="fallback_on_tool_call",
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=1,
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
 
     assert prepared is not None
     assert await prepared.run(None) is True
-    assert prepared.key[4] == mod.compute_profile_hash()
+    assert prepared.key[4] == checkpoint_profile_hash
     assert prepared.key == mod._soft_prefetch_inflight_key_for_body(
         user={"id": "user-1"},
         metadata={"chat_id": "chat-1"},
         body=body,
         pipe_function_id="auto_compact",
+        checkpoint_profile_hash=checkpoint_profile_hash,
     )
+    assert captured["checkpoint_profile_hash"] == checkpoint_profile_hash
     source_messages = captured["source_messages"]
     source_hash = mod.compute_summary_source_hash(source_messages)
     checkpoint = {
@@ -31209,14 +31921,811 @@ async def test_prefetch_profile_and_projection_match_foreground(monkeypatch):
     assert selected == ("exact", checkpoint)
     rendered = mod.render_summary_message_from_checkpoint(selected[1])
     projected = {"messages": [rendered], "metadata": {}}
-    plan = _task7_plan("active projection")
+    history_source = await mod.build_canonical_history_source(
+        source_messages,
+        source_message_count=len(source_messages),
+    )
+    plan = mod.merge_ref_projection_plans(
+        _task7_plan("active projection"),
+        mod.build_history_ref_projection_plan(
+            (
+                mod.RefCatalogEntry(
+                    manifest=mod.RefManifest(
+                        ref=f"history:{checkpoint['id']}",
+                        utf8_bytes=history_source.utf8_bytes,
+                        sha256=history_source.raw_source_hash,
+                    ),
+                    source=history_source,
+                ),
+            )
+        ),
+    )
+    assert plan is not None
     mod.apply_ref_projection_surfaces(projected, plan, include_reader_schema=True)
     assert selected[1]["parent_checkpoint_id"] == "checkpoint-parent"
     assert selected[1]["source_hash"] == source_hash
     assert projected["metadata"]["auto_compact_ref_manifests"]
     assert set(rendered) == {"role", "content"}
-    assert '<auto_compact_ref_manifests version="1">' not in rendered["content"]
+    assert [
+        manifest["ref"]
+        for manifest in _task17_render_manifest_payload(rendered["content"])
+    ] == [f"history:{checkpoint['id']}"]
     assert selected[1]["summary_text"] == "stored summary"
+
+
+@pytest.mark.asyncio
+async def test_prefetch_projects_exact_source_with_originating_threshold(
+    monkeypatch,
+):
+    source_messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+    ]
+    projection_plan = _task7_plan("prefetch source")
+    captured = {}
+
+    async def project(messages, *, threshold_tokens, request):
+        captured["project_messages"] = messages
+        captured["threshold_tokens"] = threshold_tokens
+        captured["project_request"] = request
+        return projection_plan
+
+    async def no_pending(**_kwargs):
+        return None
+
+    async def no_reusable(**_kwargs):
+        return None
+
+    async def capture_summary(**kwargs):
+        captured["summary_kwargs"] = kwargs
+        return "summary"
+
+    monkeypatch.setattr(mod, "project_native_tool_texts", project)
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        no_pending,
+    )
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", no_reusable)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", capture_summary)
+    request = _Task7Request()
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=request,
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata={"chat_id": "chat-1"},
+        body={
+            "messages": [
+                *source_messages,
+                {"role": "user", "content": "three"},
+            ]
+        },
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=1,
+        ref_mode_active=True,
+        ref_substitution_threshold_tokens=37,
+    )
+
+    assert result is True
+    assert captured["project_messages"] == source_messages
+    assert captured["project_messages"] is not source_messages
+    assert captured["threshold_tokens"] == 37
+    assert captured["project_request"] is request
+    assert captured["summary_kwargs"]["ref_projection_plan"] is projection_plan
+    assert captured["summary_kwargs"]["ref_mode_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_active_soft_prefetch_proves_parent_and_projects_tool_delta_before_send(
+    monkeypatch,
+    pipe_user,
+):
+    parent_source = [
+        {"role": "user", "content": "parent request"},
+        {"role": "assistant", "content": "parent answer"},
+    ]
+    large_delta = "large private tool result\n" * 5_000
+    source_messages = [
+        *parent_source,
+        {"role": "user", "content": "run lookup"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-prefetch",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-prefetch",
+            "content": large_delta,
+        },
+    ]
+    request = _Task7Request()
+    metadata = {
+        "chat_id": "chat-1",
+        "user_message_id": "current-user-message",
+    }
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        pipe_user["id"],
+        metadata["chat_id"],
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    snapshot = await mod.build_logical_history_snapshot(
+        source_messages,
+        identity=identity,
+    )
+    parent_count = len(parent_source)
+    parent_source_hash = mod._logical_snapshot_source_hash(snapshot, parent_count)
+    parent_handle = mod._logical_history_source_handle(snapshot, parent_count)
+    assert parent_source_hash is not None
+    parent = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id=pipe_user["id"],
+        chat_id=metadata["chat_id"],
+        pipe_function_id="auto_compact",
+        profile_hash=mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+        source_hash=parent_source_hash,
+        source_message_count=parent_count,
+        summary_text="parent summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": parent_handle.raw_source_hash,
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    order = []
+    gated = []
+    provider_calls = _task6_install_summary_capture(
+        monkeypatch,
+        [{"choices": [{"message": {"content": "prefetched summary"}}]}],
+    )
+    chat_module = sys.modules["open_webui.utils.chat"]
+    provider = chat_module.generate_chat_completion
+
+    async def ordered_provider(*args, **kwargs):
+        order.append("provider")
+        return await provider(*args, **kwargs)
+
+    chat_module.generate_chat_completion = ordered_provider
+    require_parent_proof = mod._require_provider_bound_history_ref_manifests
+
+    def record_parent_proof(body, plan):
+        require_parent_proof(body, plan)
+        order.append("gate")
+        gated.append((copy.deepcopy(body), plan))
+
+    async def no_pending(**_kwargs):
+        return None
+
+    async def no_reusable(**_kwargs):
+        return None
+
+    async def select_parent(**kwargs):
+        return await kwargs["summary_factory"](parent)
+
+    monkeypatch.setattr(
+        mod,
+        "_require_provider_bound_history_ref_manifests",
+        record_parent_proof,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        no_pending,
+    )
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", no_reusable)
+    monkeypatch.setattr(mod, "_get_or_create_checkpoint_summary", select_parent)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: SimpleNamespace())
+
+    prefetched = await mod._prefetch_compaction_checkpoint(
+        request=request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id=metadata["chat_id"],
+        metadata=metadata,
+        body={"model": "target", "messages": source_messages},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        ref_mode_active=True,
+        ref_substitution_threshold_tokens=1,
+    )
+
+    parent_ref = f"history:{parent['id']}"
+    tool_ref = f"tool:{hashlib.sha256(large_delta.encode()).hexdigest()}"
+    provider_body = provider_calls[0][1]
+    provider_json = json.dumps(provider_body, ensure_ascii=False)
+    provider_manifests = provider_body["metadata"][
+        "auto_compact_ref_manifests"
+    ]
+    assert prefetched is True
+    assert order[-1] == "provider"
+    assert order[:-1] and set(order[:-1]) == {"gate"}
+    assert gated
+    assert {
+        "ref": parent_ref,
+        "sha256": parent_handle.raw_source_hash,
+    }.items() <= next(
+        manifest for manifest in provider_manifests if manifest["ref"] == parent_ref
+    ).items()
+    assert parent_ref in provider_json
+    assert tool_ref in provider_json
+    assert large_delta not in provider_json
+
+
+@pytest.mark.asyncio
+async def test_soft_prefetch_isolates_own_ref_failure_without_task_warning(
+    monkeypatch,
+    pipe_user,
+):
+    task_errors = []
+
+    async def no_pending(**_kwargs):
+        return None
+
+    async def no_reusable(**_kwargs):
+        return None
+
+    async def fail_summary(**_kwargs):
+        raise mod.RefProjectionError(stage="history verification")
+
+    def capture_error(message, *args, **kwargs):
+        task_errors.append((message, args, kwargs))
+
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        no_pending,
+    )
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", no_reusable)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", fail_summary)
+    monkeypatch.setattr(mod.LOG, "error", capture_error)
+    before = set(mod._SOFT_PREFETCH_TASKS)
+
+    started = mod._start_soft_compaction_prefetch(
+        request=_Task7Request(),
+        user=pipe_user,
+        metadata={"chat_id": "chat-1", "user_message_id": "current-user"},
+        body={
+            "model": "target",
+            "messages": [
+                {"role": "user", "content": "completed request"},
+                {"role": "assistant", "content": "completed answer"},
+                {"role": "user", "content": "active request"},
+            ],
+        },
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        ref_mode_active=True,
+        ref_substitution_threshold_tokens=1,
+    )
+    launched = set(mod._SOFT_PREFETCH_TASKS) - before
+    results = await asyncio.gather(*launched, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert started is True
+    assert len(launched) == 1
+    assert results == [False]
+    assert not any(
+        message.startswith("Soft compaction prefetch task failed")
+        for message, _args, _kwargs in task_errors
+    )
+
+
+@pytest.mark.parametrize("ref_mode_active", [False, True], ids=["inactive", "active"])
+@pytest.mark.asyncio
+async def test_soft_prefetch_propagates_originating_ref_mode_explicitly(
+    monkeypatch,
+    ref_mode_active,
+):
+    source_messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+    ]
+    projection_plan = _task7_plan("projected source")
+    captured = {"project_calls": 0}
+
+    async def project(_messages, **_kwargs):
+        captured["project_calls"] += 1
+        return projection_plan
+
+    async def no_pending(**_kwargs):
+        return None
+
+    async def no_reusable(**_kwargs):
+        return None
+
+    async def capture_summary(**kwargs):
+        captured["summary_kwargs"] = kwargs
+        return "summary"
+
+    monkeypatch.setattr(mod, "project_native_tool_texts", project)
+    monkeypatch.setattr(
+        mod,
+        "_lookup_pending_checkpoint_for_source_prefix",
+        no_pending,
+    )
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", no_reusable)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", capture_summary)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=_Task7Request(),
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata={"chat_id": "chat-1"},
+        body={"model": "target", "messages": source_messages},
+        pipe_function_id="auto_compact",
+        summary_model_id="target",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=1,
+        ref_mode_active=ref_mode_active,
+        ref_substitution_threshold_tokens=1,
+    )
+
+    expected_plan = projection_plan if ref_mode_active else None
+    assert result is True
+    assert captured["project_calls"] == int(ref_mode_active)
+    assert captured["summary_kwargs"]["ref_mode_active"] is ref_mode_active
+    assert captured["summary_kwargs"]["ref_projection_plan"] is expected_plan
+
+
+@pytest.mark.asyncio
+async def test_summary_projection_uses_actual_fallback_parent_without_reader_state(
+    monkeypatch,
+):
+    tool_plan = _task7_plan("summary delta")
+    source_messages = [{"role": "user", "content": "source"}]
+    actual_digest = hashlib.sha256(
+        b'{"content":"source","role":"user"}'
+    ).hexdigest()
+    stale_parent = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash="stale-source",
+        source_message_count=1,
+        summary_text="stale parent",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_FORMAT,
+                "raw_source_hash": "a" * 64,
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    actual_parent = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_summary_source_hash(source_messages),
+        source_message_count=1,
+        summary_text="actual parent",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": actual_digest,
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    stale_history_plan = mod.RefProjectionPlan(
+        catalog=(),
+        manifests=(
+            mod.RefManifest(
+                ref=f"history:{stale_parent['id']}",
+                utf8_bytes=None,
+                sha256="a" * 64,
+            ),
+        ),
+        reader_schema=mod.REF_EXEC_TOOL_SPEC,
+        render_manifests=(
+            mod.RefRenderManifest(
+                ref=f"history:{stale_parent['id']}",
+                utf8_bytes=None,
+                kind="history",
+                line_count=None,
+                tool="history",
+            ),
+        ),
+    )
+    originating_plan = mod.merge_ref_projection_plans(tool_plan, stale_history_plan)
+    captured = {}
+
+    async def select_actual_parent(**kwargs):
+        return await kwargs["summary_factory"](actual_parent)
+
+    async def capture_summary(**kwargs):
+        captured.update(kwargs)
+        return "summary"
+
+    monkeypatch.setattr(
+        mod,
+        "_get_or_create_checkpoint_summary",
+        select_actual_parent,
+    )
+    monkeypatch.setattr(mod, "_generate_summary_text", capture_summary)
+    request = _Task7Request()
+    registry = {"unrelated": {}}
+    request.state.metadata = {"tools": registry}
+
+    result = await mod._get_or_create_compaction_summary(
+        request=request,
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        metadata={
+            "chat_id": "chat-1",
+            "user_message_id": "current-user",
+            "tools": registry,
+        },
+        summary_model_id="target",
+        base_body={"model": "target", "messages": []},
+        source_messages=source_messages,
+        summary_meta={},
+        ref_projection_plan=originating_plan,
+        ref_mode_active=True,
+    )
+
+    summary_plan = captured["ref_projection_plan"]
+    refs = [manifest.ref for manifest in summary_plan.manifests]
+    assert result == "summary"
+    assert summary_plan.reader_schema is None
+    assert f"history:{actual_parent['id']}" in refs
+    assert f"history:{stale_parent['id']}" not in refs
+    assert any(ref.startswith("tool:") for ref in refs)
+    assert not hasattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    assert registry == {"unrelated": {}}
+
+
+@pytest.mark.asyncio
+async def test_summary_provider_proves_only_actual_parent_when_selection_changes(
+    monkeypatch,
+    pipe_user,
+):
+    source_messages = [{"role": "user", "content": "source"}]
+    request = _Task7Request()
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        pipe_user["id"],
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    snapshot = await mod.build_logical_history_snapshot(
+        source_messages,
+        identity=identity,
+    )
+    actual_source_hash = mod._logical_snapshot_source_hash(snapshot, 1)
+    assert actual_source_hash is not None
+    actual_parent = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        source_hash=actual_source_hash,
+        source_message_count=1,
+        summary_text="actual parent",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": snapshot.prefix_raw_source_hashes[0],
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    stale_parent = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        source_hash="stale-source",
+        source_message_count=1,
+        summary_text="stale parent",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_FORMAT,
+                "raw_source_hash": "a" * 64,
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    stale_ref = f"history:{stale_parent['id']}"
+    originating_plan = mod.RefProjectionPlan(
+        catalog=(),
+        manifests=(
+            mod.RefManifest(
+                ref=stale_ref,
+                utf8_bytes=None,
+                sha256="a" * 64,
+            ),
+        ),
+        reader_schema=mod.REF_EXEC_TOOL_SPEC,
+        render_manifests=(
+            mod.RefRenderManifest(
+                ref=stale_ref,
+                utf8_bytes=None,
+                kind="history",
+                line_count=None,
+                tool="history",
+            ),
+        ),
+    )
+    provider_calls = _task6_install_summary_capture(
+        monkeypatch,
+        [{"choices": [{"message": {"content": "summary"}}]}],
+    )
+    gated_plans = []
+    require_parent_proof = mod._require_provider_bound_history_ref_manifests
+
+    async def select_actual_parent(**kwargs):
+        return await kwargs["summary_factory"](actual_parent)
+
+    def record_parent_proof(body, plan):
+        require_parent_proof(body, plan)
+        gated_plans.append(plan)
+
+    monkeypatch.setattr(
+        mod,
+        "_get_or_create_checkpoint_summary",
+        select_actual_parent,
+    )
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        mod,
+        "_require_provider_bound_history_ref_manifests",
+        record_parent_proof,
+    )
+
+    result = await mod._get_or_create_compaction_summary(
+        request=request,
+        user=pipe_user,
+        user_id=pipe_user["id"],
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        metadata={
+            "chat_id": "chat-1",
+            "user_message_id": "current-user-message",
+        },
+        summary_model_id="target",
+        base_body={"model": "target", "messages": source_messages},
+        source_messages=source_messages,
+        summary_meta={},
+        ref_projection_plan=originating_plan,
+        ref_mode_active=True,
+    )
+
+    actual_ref = f"history:{actual_parent['id']}"
+    provider_body = provider_calls[0][1]
+    provider_history_refs = [
+        manifest["ref"]
+        for manifest in provider_body["metadata"]["auto_compact_ref_manifests"]
+        if manifest["ref"].startswith("history:")
+    ]
+    assert result == "summary"
+    assert provider_history_refs == [actual_ref]
+    assert actual_ref in json.dumps(provider_body)
+    assert stale_ref not in json.dumps(provider_body)
+    assert gated_plans
+    assert all(
+        [
+            manifest.ref
+            for manifest in plan.manifests
+            if manifest.ref.startswith("history:")
+        ]
+        == [actual_ref]
+        for plan in gated_plans
+    )
+
+
+@pytest.mark.asyncio
+async def test_summary_ref_projection_error_bypasses_parent_fallback_and_provider(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    source_prefix = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        pipe_user["id"],
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    snapshot = await mod.build_logical_history_snapshot(
+        source_prefix,
+        identity=identity,
+    )
+    parent_source_hash = mod._logical_snapshot_source_hash(snapshot, 1)
+    assert parent_source_hash is not None
+    parent = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        source_hash=parent_source_hash,
+        source_message_count=1,
+        summary_text="parent summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": snapshot.prefix_raw_source_hashes[0],
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    store = ClaimCheckpointStore([parent])
+    provider_calls = _task6_install_summary_capture(
+        monkeypatch,
+        [{"choices": [{"message": {"content": "must not be used"}}]}],
+    )
+
+    async def noop_initialize(**_kwargs):
+        return None
+
+    def fail_parent_proof(_body, _plan):
+        raise mod.RefProjectionError(stage="history manifest proof")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(
+        mod,
+        "_require_provider_bound_history_ref_manifests",
+        fail_parent_proof,
+    )
+
+    with pytest.raises(mod.RefProjectionError) as exc_info:
+        await mod._compact_body(
+            request=pipe_request,
+            user=pipe_user,
+            metadata={
+                "chat_id": "chat-1",
+                "user_message_id": "current-user-message",
+            },
+            body={
+                "model": "target",
+                "messages": [
+                    *source_prefix,
+                    {"role": "user", "content": "active"},
+                ],
+            },
+            pipe_function_id="auto_compact",
+            target_model_id="target",
+            summary_model_id="target",
+            historical_message_excerpt_bytes=64,
+            historical_message_excerpt_count=1,
+            ref_mode_active=True,
+            checkpoint_profile_hash=mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+        )
+
+    assert str(exc_info.value) == (
+        "Externalized ref history manifest proof failed before provider forward"
+    )
+    assert provider_calls == []
+    assert store.rows == [parent]
+
+
+@pytest.mark.asyncio
+async def test_summary_provider_error_after_parent_proof_uses_parent_fallback(
+    monkeypatch,
+    pipe_request,
+    pipe_user,
+):
+    source_prefix = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        pipe_user["id"],
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    snapshot = await mod.build_logical_history_snapshot(
+        source_prefix,
+        identity=identity,
+    )
+    parent_source_hash = mod._logical_snapshot_source_hash(snapshot, 1)
+    assert parent_source_hash is not None
+    parent = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        source_hash=parent_source_hash,
+        source_message_count=1,
+        summary_text="parent summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": snapshot.prefix_raw_source_hashes[0],
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    store = ClaimCheckpointStore([parent])
+    _task6_install_summary_capture(monkeypatch, [])
+    provider_calls = []
+
+    async def noop_initialize(**_kwargs):
+        return None
+
+    async def fail_provider(_request, form_data, **_kwargs):
+        provider_calls.append(copy.deepcopy(form_data))
+        raise ConnectionError("summary provider failed")
+
+    sys.modules["open_webui.utils.chat"].generate_chat_completion = fail_provider
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    compacted, did_compact, prefix_count = await mod._compact_body(
+        request=pipe_request,
+        user=pipe_user,
+        metadata={
+            "chat_id": "chat-1",
+            "user_message_id": "current-user-message",
+        },
+        body={
+            "model": "target",
+            "messages": [
+                *source_prefix,
+                {"role": "user", "content": "active"},
+            ],
+        },
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+        ref_mode_active=True,
+        checkpoint_profile_hash=mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+
+    assert did_compact is True
+    assert prefix_count == 1
+    assert len(provider_calls) == 1
+    assert "parent summary" in compacted["messages"][0]["content"]
+    assert compacted["messages"][1:] == [
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    assert store.rows == [parent]
 
 
 @pytest.mark.asyncio
