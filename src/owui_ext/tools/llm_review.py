@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.8
+version: 0.5.9
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -22,7 +22,11 @@ from pydantic import BaseModel, Field
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
 from owui_ext.shared.completion_response import format_chat_completion_error
-from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
+from owui_ext.shared.inlet_filters import (
+    apply_inlet_filters_if_enabled,
+    finalize_model_request,
+    resolve_model_filter_pipeline,
+)
 from owui_ext.shared.model_features import (
     model_has_note_knowledge,
     model_knowledge_tools_enabled,
@@ -2926,9 +2930,12 @@ async def run_agent_loop(
     else:
         user_obj = user
 
-    # Get model info for filter processing
-    models = request.app.state.MODELS
-    model = models.get(model_id, {})
+    filter_pipeline = await resolve_model_filter_pipeline(
+        apply_inlet_filters,
+        request,
+        model_id,
+        extra_params.get("__metadata__", {}).get("filter_ids", []),
+    )
 
     # Build tools parameter for native function calling
     tools_param = None
@@ -3022,12 +3029,14 @@ async def run_agent_loop(
         if tools_param:
             form_data["tools"] = tools_param
 
-        # Apply inlet filters if enabled, then append tool-server prompts
-        # (core injects terminal/direct prompts AFTER inlet filters)
+        # Match Core's inlet -> tool prompts -> request filter ordering.
         form_data = await apply_inlet_filters_if_enabled(
-            apply_inlet_filters, request, model, form_data, extra_params
+            filter_pipeline, request, form_data, extra_params
         )
         form_data = _append_tool_server_prompts(form_data, extra_params)
+        form_data = await finalize_model_request(
+            filter_pipeline, request, form_data, extra_params
+        )
 
         try:
             response = await generate_chat_completion(
@@ -3347,9 +3356,12 @@ async def run_agent_loop(
         form_data["tools"] = final_tools_param
 
     form_data = await apply_inlet_filters_if_enabled(
-        apply_inlet_filters, request, model, form_data, extra_params
+        filter_pipeline, request, form_data, extra_params
     )
     form_data = _append_tool_server_prompts(form_data, extra_params)
+    form_data = await finalize_model_request(
+        filter_pipeline, request, form_data, extra_params
+    )
 
     try:
         response = await generate_chat_completion(
@@ -3554,7 +3566,7 @@ class Tools:
         )
         APPLY_INLET_FILTERS: bool = Field(
             default=True,
-            description="Apply inlet filters (e.g., user_info_injector) to review agent requests. Outlet filters are never applied to review agent responses.",
+            description="Apply inlet and request filters (e.g., user_info_injector) to review agent model requests. Outlet filters are never applied to review agent responses.",
         )
 
         # Builtin tool category toggles

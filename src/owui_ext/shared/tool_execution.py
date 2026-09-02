@@ -121,6 +121,29 @@ async def process_tool_result(
     )
 
 
+def structure_terminal_file_tool_result(
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool_result: Any,
+    tool: dict,
+    metadata: Optional[dict],
+) -> Any:
+    """Apply Core's structured ``display_file`` result when available."""
+    from open_webui.utils import middleware as middleware_utils
+
+    builder = getattr(middleware_utils, "build_terminal_file_tool_result", None)
+    if not callable(builder):
+        return tool_result
+    structured_result = builder(
+        tool_function_name,
+        tool_function_params,
+        tool_result,
+        tool,
+        metadata,
+    )
+    return tool_result if structured_result is None else structured_result
+
+
 async def execute_direct_tool_call(
     *,
     tool_function_name: str,
@@ -326,6 +349,13 @@ async def execute_tool_call(
                 tool_result = await tool_function(**tool_function_params)
 
             tool_type = tool.get("type", "")
+            tool_result = structure_terminal_file_tool_result(
+                tool_function_name,
+                tool_function_params,
+                tool_result,
+                tool,
+                extra_params.get("__metadata__"),
+            )
             tool_result, tool_result_files, tool_result_embeds = await process_tool_result(
                 tool_function_name=tool_function_name,
                 tool_type=tool_type,

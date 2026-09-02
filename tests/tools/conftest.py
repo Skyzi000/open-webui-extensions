@@ -86,9 +86,36 @@ def install_open_webui_tool_stubs(monkeypatch):
 
         return tool_result, [], []
 
+    def _build_terminal_file_tool_result(
+        tool_function_name,
+        tool_function_params,
+        tool_result,
+        tool,
+        metadata,
+    ):
+        if isinstance(tool_result, (list, tuple)) and tool_result:
+            tool_result = tool_result[0]
+        if tool_function_name != "display_file" or not isinstance(tool_result, dict):
+            return None
+        terminal_id = (tool or {}).get("tool_id", "").removeprefix("terminal:")
+        path = tool_result.get("path") or tool_function_params.get("path")
+        if not terminal_id or not path:
+            return None
+        return {
+            **tool_result,
+            "type": "file",
+            "source": "open_terminal",
+            **({"displayed": True} if tool_function_params.get("inline") is True else {}),
+            "terminal_selector": terminal_id,
+            "terminal_id": terminal_id,
+            "session_id": (metadata or {}).get("chat_id"),
+            "path": path,
+        }
+
     middleware_module = _build_module(
         "open_webui.utils.middleware",
         process_tool_result=_process_tool_result,
+        build_terminal_file_tool_result=_build_terminal_file_tool_result,
         get_citation_source_from_tool_result=lambda *a, **kw: [],
         get_file_url_from_base64=None,
     )

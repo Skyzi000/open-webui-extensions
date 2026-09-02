@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.4
+version: 0.2.5
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -31,6 +31,7 @@ from owui_ext.shared.tool_execution import (
     emit_terminal_tool_event,
     execute_direct_tool_call,
     process_tool_result,
+    structure_terminal_file_tool_result,
 )
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients
 from owui_ext.shared.tool_loader import build_tools_dict
@@ -117,6 +118,13 @@ async def execute_single_tool(
 
         # Handle OpenAPI/external/direct tool results that return (data, headers)
         tool_type = tool.get("type", "")
+        result = structure_terminal_file_tool_result(
+            tool_name,
+            filtered_args,
+            result,
+            tool,
+            extra_params.get("__metadata__"),
+        )
         result, tool_result_files, tool_result_embeds = await process_tool_result(
             tool_function_name=tool_name,
             tool_type=tool_type,

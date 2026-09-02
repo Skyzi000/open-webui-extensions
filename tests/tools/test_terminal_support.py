@@ -139,19 +139,30 @@ def stub_open_webui_config_get(
 
 
 @pytest.mark.asyncio
-async def test_sub_agent_execute_tool_call_terminal_tuple_and_event():
+@pytest.mark.parametrize(
+    ("_module_name", "module"),
+    [
+        (name, module)
+        for name, module, _, _ in TERMINAL_EVENT_MODULE_CASES
+        if name != "parallel_tools"
+    ],
+)
+@pytest.mark.parametrize("inline", [False, True])
+async def test_execute_tool_call_structures_terminal_file_and_keeps_nested_event(
+    _module_name, module, inline
+):
     events = []
 
     async def event_emitter(event: dict):
         events.append(event)
 
-    async def display_file(path: str):
+    async def display_file(path: str, inline: bool = False):
         return ({"exists": True, "path": path}, {"Content-Type": "application/json"})
 
     tools_dict = {
         "display_file": {
             "callable": display_file,
-            "spec": make_spec("path"),
+            "spec": make_spec("path", "inline"),
             "type": "terminal",
             "tool_id": "terminal:test",
         }
@@ -161,24 +172,73 @@ async def test_sub_agent_execute_tool_call_terminal_tuple_and_event():
         "id": "tc-1",
         "function": {
             "name": "display_file",
-            "arguments": json.dumps({"path": "/tmp/test.html"}),
+            "arguments": json.dumps(
+                {"path": "/tmp/test.html", "inline": inline}
+            ),
         },
     }
 
-    result = await sub_agent.execute_tool_call(
+    result = await module.execute_tool_call(
         tool_call=tool_call,
         tools_dict=tools_dict,
-        extra_params={},
+        extra_params={"__metadata__": {"chat_id": "chat-1"}},
         event_emitter=event_emitter,
     )
 
     payload = json.loads(result["content"])
     assert payload["path"] == "/tmp/test.html"
+    assert payload["type"] == "file"
+    assert payload["source"] == "open_terminal"
+    assert payload["terminal_id"] == "test"
+    assert payload["session_id"] == "chat-1"
+    if inline:
+        assert payload.get("displayed") is True
+    else:
+        assert "displayed" not in payload
     assert any(
         e.get("type") == "terminal:display_file"
         and e.get("data", {}).get("path") == "/tmp/test.html"
         for e in events
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inline", [False, True])
+async def test_parallel_tools_structures_terminal_file_on_real_execution_path(inline):
+    events = []
+
+    async def event_emitter(event: dict):
+        events.append(event)
+
+    async def display_file(path: str, inline: bool = False):
+        return ({"exists": True, "path": path}, {"Content-Type": "application/json"})
+
+    result = await parallel_tools.execute_single_tool(
+        tool_name="display_file",
+        tool_args={"path": "/tmp/test.html", "inline": inline},
+        tools_dict={
+            "display_file": {
+                "callable": display_file,
+                "spec": make_spec("path", "inline"),
+                "type": "terminal",
+                "tool_id": "terminal:test",
+            }
+        },
+        extra_params={"__metadata__": {"chat_id": "chat-1"}},
+        event_emitter=event_emitter,
+    )
+
+    payload = result["result"]
+    assert payload["path"] == "/tmp/test.html"
+    assert payload["type"] == "file"
+    assert payload["source"] == "open_terminal"
+    assert payload["terminal_id"] == "test"
+    assert payload["session_id"] == "chat-1"
+    if inline:
+        assert payload.get("displayed") is True
+    else:
+        assert "displayed" not in payload
+    assert any(event.get("type") == "terminal:display_file" for event in events)
 
 
 @pytest.mark.asyncio

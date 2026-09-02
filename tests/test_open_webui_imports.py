@@ -20,6 +20,7 @@ Usage by extensions:
 import ast
 import inspect
 import importlib
+from types import SimpleNamespace
 from typing import get_origin, get_args
 
 import pytest
@@ -608,13 +609,19 @@ class TestUserValvesInjection:
             pytest.fail(import_error_message("open_webui.utils.filter") + f"\n{e}")
 
 
-class TestInletFilterCompatibility:
-    """Test the shared inlet helper against old and current Core signatures."""
+class TestFilterCompatibility:
+    """Test nested model-request filters against old and current Core."""
 
     @pytest.mark.asyncio
-    async def test_current_core_process_filter_functions(self, monkeypatch):
+    async def test_current_core_request_filter_leaves_messages_untouched(
+        self, monkeypatch
+    ):
         from open_webui.utils import filter as filter_utils
-        from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
+        from owui_ext.shared.inlet_filters import (
+            apply_inlet_filters_if_enabled,
+            finalize_model_request,
+            resolve_model_filter_pipeline,
+        )
 
         calls = []
         original_process = filter_utils.process_filter_functions
@@ -630,7 +637,7 @@ class TestInletFilterCompatibility:
             form_data,
             extra_params,
         ):
-            calls.append(filter_context)
+            calls.append((filter_type, filter_context))
             return await original_process(
                 request,
                 filter_context,
@@ -640,24 +647,642 @@ class TestInletFilterCompatibility:
                 extra_params,
             )
 
-        monkeypatch.setattr(filter_utils, "get_sorted_filter_ids", no_filters)
+        monkeypatch.setattr(filter_utils, "get_filter_functions", no_filters)
         monkeypatch.setattr(
             filter_utils, "process_filter_functions", current_process
         )
-        request = object()
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(MODELS={"nested": {}})),
+            state=SimpleNamespace(),
+        )
+        messages = [
+            {"role": "system", "content": "stable prompt"},
+            {"role": "system", "content": "[Iteration 2/5]"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "hello"},
+                ],
+            },
+        ]
+        form_data = {
+            "metadata": {},
+            "messages": messages,
+        }
+
+        pipeline = await resolve_model_filter_pipeline(
+            True, request, "nested", []
+        )
+        result = await apply_inlet_filters_if_enabled(pipeline, request, form_data, {})
+        result = await finalize_model_request(pipeline, request, result, {})
+
+        assert result is form_data
+        assert calls[0][0] == "inlet"
+        assert calls[1][0] == "request"
+        assert calls[0][1] is calls[1][1]
+        assert not hasattr(request.state, "filter_context")
+        assert result["messages"] is messages
+        assert result["messages"][2]["content"][0] == {"type": "text", "text": ""}
+
+    @pytest.mark.asyncio
+    async def test_nested_pipeline_uses_fresh_context_with_saved_admin_valves(
+        self, monkeypatch
+    ):
+        from pydantic import BaseModel
+
+        from open_webui.utils import filter as filter_utils
+        from owui_ext.shared.inlet_filters import (
+            apply_inlet_filters_if_enabled,
+            finalize_model_request,
+            resolve_model_filter_pipeline,
+        )
+
+        class Valves(BaseModel):
+            marker: str = "default"
+
+        ValveModel = Valves
+
+        class FilterModule:
+            Valves = ValveModel
+
+            def __init__(self):
+                self.valves = self.Valves()
+
+            async def inlet(self, body):
+                body["inlet_valve"] = self.valves.marker
+                return body
+
+            async def request(self, body):
+                body["request_valve"] = self.valves.marker
+                return body
+
+        module = FilterModule()
+        function = SimpleNamespace(id="nested-filter")
+        valve_loads = []
+
+        async def get_function_valves_by_ids(filter_ids):
+            valve_loads.append(list(filter_ids))
+            values = {
+                "outer-filter": {"marker": "outer"},
+                "nested-filter": {"marker": "saved"},
+            }
+            return {filter_id: values[filter_id] for filter_id in filter_ids}
+
+        async def get_filter_functions(*args, **kwargs):
+            return [function]
+
+        async def get_function_module(*args, **kwargs):
+            return module
+
+        original_process = filter_utils.process_filter_functions
+        contexts = []
+
+        async def recording_process(
+            request,
+            filter_context,
+            filter_functions,
+            filter_type,
+            form_data,
+            extra_params,
+        ):
+            contexts.append(filter_context)
+            return await original_process(
+                request=request,
+                filter_context=filter_context,
+                filter_functions=filter_functions,
+                filter_type=filter_type,
+                form_data=form_data,
+                extra_params=extra_params,
+            )
+
+        monkeypatch.setattr(
+            filter_utils.Functions,
+            "get_function_valves_by_ids",
+            get_function_valves_by_ids,
+        )
+        monkeypatch.setattr(
+            filter_utils, "get_filter_functions", get_filter_functions
+        )
+        monkeypatch.setattr(filter_utils, "get_function_module", get_function_module)
+        monkeypatch.setattr(
+            filter_utils, "process_filter_functions", recording_process
+        )
+
+        outer_context = filter_utils.FilterContext()
+        await outer_context.get_function_valves(
+            ["outer-filter"], "outer-filter", Valves
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(MODELS={"nested": {}})),
+            state=SimpleNamespace(filter_context=outer_context),
+        )
+        pipeline = await resolve_model_filter_pipeline(
+            True, request, "nested", []
+        )
         form_data = {"metadata": {}}
 
         result = await apply_inlet_filters_if_enabled(
-            True, request, {}, form_data, {}
+            pipeline, request, form_data, {}
+        )
+        result = await finalize_model_request(pipeline, request, result, {})
+
+        assert result["inlet_valve"] == "saved"
+        assert result["request_valve"] == "saved"
+        assert contexts[0] is contexts[1]
+        assert contexts[0] is not outer_context
+        assert request.state.filter_context is outer_context
+        assert valve_loads == [["outer-filter"], ["nested-filter"]]
+
+    @pytest.mark.asyncio
+    async def test_resolved_pipeline_is_reused_across_stages_and_iterations(
+        self, monkeypatch
+    ):
+        from open_webui.utils import filter as filter_utils
+        from owui_ext.shared.inlet_filters import (
+            apply_inlet_filters_if_enabled,
+            finalize_model_request,
+            resolve_model_filter_pipeline,
         )
 
+        functions = [SimpleNamespace(id="stable-filter")]
+        resolve_calls = []
+        process_calls = []
+
+        async def get_filter_functions(request, model, enabled_filter_ids):
+            resolve_calls.append((model, list(enabled_filter_ids)))
+            return functions
+
+        async def process_filter_functions(
+            request,
+            filter_context,
+            filter_functions,
+            filter_type,
+            form_data,
+            extra_params,
+        ):
+            process_calls.append(
+                (
+                    filter_type,
+                    filter_functions,
+                    filter_context,
+                )
+            )
+            if filter_type == "inlet":
+                return {"messages": form_data["messages"]}, {}
+            return form_data, {}
+
+        monkeypatch.setattr(
+            filter_utils, "get_filter_functions", get_filter_functions
+        )
+        monkeypatch.setattr(
+            filter_utils, "process_filter_functions", process_filter_functions
+        )
+        model = {"id": "nested"}
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(MODELS={"nested": model})),
+            state=SimpleNamespace(),
+        )
+        pipeline = await resolve_model_filter_pipeline(
+            True, request, "nested", ["toggle-filter"]
+        )
+
+        for iteration in range(2):
+            form_data = {
+                "messages": [{"role": "user", "content": str(iteration)}],
+                "metadata": {"filter_ids": ["changed-by-caller"]},
+            }
+            result = await apply_inlet_filters_if_enabled(
+                pipeline, request, form_data, {}
+            )
+            assert "metadata" not in result
+            await finalize_model_request(pipeline, request, result, {})
+
+        assert resolve_calls == [(model, ["toggle-filter"])]
+        assert [call[0] for call in process_calls] == [
+            "inlet",
+            "request",
+            "inlet",
+            "request",
+        ]
+        assert all(call[1] is functions for call in process_calls)
+        context = process_calls[0][2]
+        assert context is not None
+        assert all(call[2] is context for call in process_calls)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("arena_meta", "expected_candidates", "selected_model_id"),
+        [
+            (
+                {"model_ids": ["child-a", "child-b"]},
+                ["child-a", "child-b"],
+                "child-b",
+            ),
+            (
+                {
+                    "model_ids": ["excluded", "child-a", "child-b"],
+                    "filter_mode": "exclude",
+                },
+                ["allowed"],
+                "allowed",
+            ),
+        ],
+    )
+    async def test_arena_child_is_fixed_for_filters_and_iterations(
+        self,
+        monkeypatch,
+        arena_meta,
+        expected_candidates,
+        selected_model_id,
+    ):
+        import random
+
+        from open_webui.utils import filter as filter_utils
+        from owui_ext.shared.inlet_filters import (
+            apply_inlet_filters_if_enabled,
+            finalize_model_request,
+            resolve_model_filter_pipeline,
+        )
+
+        arena = {
+            "id": "arena",
+            "owned_by": "arena",
+            "info": {"meta": arena_meta},
+        }
+        models = {
+            "arena": arena,
+            "other-arena": {"id": "other-arena", "owned_by": "arena"},
+            "excluded": {"id": "excluded", "owned_by": "openai"},
+            "child-a": {"id": "child-a", "owned_by": "openai"},
+            "child-b": {"id": "child-b", "owned_by": "openai"},
+            "allowed": {"id": "allowed", "owned_by": "openai"},
+        }
+        child = models[selected_model_id]
+        choice_calls = []
+        resolved_models = []
+        handler_models = []
+
+        def choose(candidates):
+            choice_calls.append(list(candidates))
+            return selected_model_id
+
+        async def get_filter_functions(request, model, enabled_filter_ids):
+            resolved_models.append(model)
+            return []
+
+        async def process_filter_functions(
+            request,
+            filter_context,
+            filter_functions,
+            filter_type,
+            form_data,
+            extra_params,
+        ):
+            handler_models.append(extra_params["__model__"])
+            assert form_data["model"] == selected_model_id
+            return form_data, {}
+
+        monkeypatch.setattr(random, "choice", choose)
+        monkeypatch.setattr(
+            filter_utils, "get_filter_functions", get_filter_functions
+        )
+        monkeypatch.setattr(
+            filter_utils, "process_filter_functions", process_filter_functions
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(MODELS=models)),
+            state=SimpleNamespace(),
+        )
+
+        pipeline = await resolve_model_filter_pipeline(
+            True, request, "arena", ["toggle-filter"]
+        )
+
+        for iteration in range(2):
+            form_data = {
+                "model": "arena",
+                "metadata": {},
+                "messages": [{"role": "user", "content": str(iteration)}],
+            }
+            result = await apply_inlet_filters_if_enabled(
+                pipeline,
+                request,
+                form_data,
+                {"__model__": arena},
+            )
+            assert result["model"] == selected_model_id
+            assert "selected_model_id" not in result["metadata"]
+            result = await finalize_model_request(
+                pipeline,
+                request,
+                result,
+                {"__model__": arena},
+            )
+            assert result["model"] == selected_model_id
+
+        assert choice_calls == [expected_candidates]
+        assert resolved_models == [child]
+        assert pipeline["model"] is child
+        assert pipeline["model_id"] == selected_model_id
+        assert len(handler_models) == 4
+        assert all(model is child for model in handler_models)
+
+    @pytest.mark.asyncio
+    async def test_arena_child_is_fixed_when_filters_are_disabled(
+        self, monkeypatch
+    ):
+        import random
+
+        from owui_ext.shared.inlet_filters import (
+            apply_inlet_filters_if_enabled,
+            resolve_model_filter_pipeline,
+        )
+
+        child = {"id": "child", "owned_by": "openai"}
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    MODELS={
+                        "arena": {
+                            "id": "arena",
+                            "owned_by": "arena",
+                            "info": {"meta": {"model_ids": ["child"]}},
+                        },
+                        "child": child,
+                    }
+                )
+            ),
+            state=SimpleNamespace(),
+        )
+        choice_calls = []
+
+        def choose(candidates):
+            choice_calls.append(list(candidates))
+            return "child"
+
+        monkeypatch.setattr(random, "choice", choose)
+        pipeline = await resolve_model_filter_pipeline(
+            False, request, "arena", []
+        )
+
+        for _ in range(2):
+            result = await apply_inlet_filters_if_enabled(
+                pipeline,
+                request,
+                {"model": "arena", "metadata": {}},
+                {},
+            )
+            assert result["model"] == "child"
+
+        assert choice_calls == [["child"]]
+        assert pipeline["model"] is child
+        assert pipeline["process"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("models", "model_id", "expected_source"),
+        [
+            ({}, "direct", "direct"),
+            (
+                {"direct": {"id": "direct", "source": "server"}},
+                "direct",
+                "direct",
+            ),
+            (
+                {"server": {"id": "server", "source": "server"}},
+                "server",
+                "server",
+            ),
+        ],
+    )
+    async def test_direct_model_precedes_server_model_only_for_matching_id(
+        self, monkeypatch, models, model_id, expected_source
+    ):
+        import random
+
+        from open_webui.utils import filter as filter_utils
+        from owui_ext.shared.inlet_filters import (
+            apply_inlet_filters_if_enabled,
+            finalize_model_request,
+            resolve_model_filter_pipeline,
+        )
+
+        captured_models = []
+        handler_models = []
+
+        async def get_filter_functions(request, model, enabled_filter_ids):
+            captured_models.append(model)
+            return []
+
+        async def process_filter_functions(
+            request,
+            filter_context,
+            filter_functions,
+            filter_type,
+            form_data,
+            extra_params,
+        ):
+            handler_models.append(extra_params["__model__"])
+            return form_data, {}
+
+        def unexpected_choice(candidates):
+            raise AssertionError("Direct and non-Arena models must not use Arena routing")
+
+        monkeypatch.setattr(random, "choice", unexpected_choice)
+        monkeypatch.setattr(
+            filter_utils, "get_filter_functions", get_filter_functions
+        )
+        monkeypatch.setattr(
+            filter_utils, "process_filter_functions", process_filter_functions
+        )
+        direct_model = {
+            "id": "direct",
+            "source": "direct",
+            "owned_by": "arena",
+        }
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(MODELS=models)),
+            state=SimpleNamespace(direct=True, model=direct_model),
+        )
+
+        pipeline = await resolve_model_filter_pipeline(
+            True, request, model_id, []
+        )
+        form_data = {"model": model_id, "metadata": {}}
+        result = await apply_inlet_filters_if_enabled(
+            pipeline, request, form_data, {"__model__": {"id": "wrong"}}
+        )
+        await finalize_model_request(
+            pipeline, request, result, {"__model__": {"id": "wrong"}}
+        )
+
+        expected_model = (
+            direct_model if expected_source == "direct" else models[model_id]
+        )
+
+        assert captured_models == [expected_model]
+        assert pipeline["model"] is expected_model
+        assert pipeline["model_id"] == model_id
+        assert result["model"] == model_id
+        assert handler_models == [expected_model, expected_model]
+
+    @pytest.mark.asyncio
+    async def test_sub_agent_resolves_filter_pipeline_once_per_loop(
+        self, monkeypatch
+    ):
+        from open_webui.utils import chat as chat_utils
+        from owui_ext.tools import sub_agent
+
+        pipeline = object()
+        resolve_calls = []
+        stage_calls = []
+        responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": "noop",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            {"choices": [{"message": {"content": "done", "tool_calls": []}}]},
+        ]
+
+        async def resolve(*args):
+            resolve_calls.append(args)
+            return pipeline
+
+        async def apply(resolved, request, form_data, extra_params):
+            stage_calls.append(("inlet", resolved))
+            return {
+                key: value for key, value in form_data.items() if key != "metadata"
+            }
+
+        async def finalize(resolved, request, form_data, extra_params):
+            stage_calls.append(("request", resolved))
+            assert "metadata" not in form_data
+            return form_data
+
+        async def generate_chat_completion(**kwargs):
+            return responses.pop(0)
+
+        async def execute_tool_call(*args, **kwargs):
+            return {"tool_call_id": "call-1", "content": "ok"}
+
+        monkeypatch.setattr(sub_agent, "resolve_model_filter_pipeline", resolve)
+        monkeypatch.setattr(sub_agent, "apply_inlet_filters_if_enabled", apply)
+        monkeypatch.setattr(sub_agent, "finalize_model_request", finalize)
+        monkeypatch.setattr(sub_agent, "execute_tool_call", execute_tool_call)
+        monkeypatch.setattr(
+            chat_utils, "generate_chat_completion", generate_chat_completion
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(MODELS={"nested": {"id": "nested"}})
+            ),
+            state=SimpleNamespace(),
+        )
+
+        result = await sub_agent.run_sub_agent_loop(
+            request=request,
+            user=SimpleNamespace(),
+            model_id="nested",
+            messages=[{"role": "user", "content": "work"}],
+            tools_dict={"noop": {"spec": {"name": "noop"}}},
+            max_iterations=2,
+            extra_params={"__metadata__": {"filter_ids": ["initial-filter"]}},
+            apply_inlet_filters=True,
+        )
+
+        assert result == "done"
+        assert resolve_calls == [
+            (True, request, "nested", ["initial-filter"])
+        ]
+        assert stage_calls == [
+            ("inlet", pipeline),
+            ("request", pipeline),
+            ("inlet", pipeline),
+            ("request", pipeline),
+        ]
+        assert responses == []
+
+    @pytest.mark.asyncio
+    async def test_pre_request_filter_core_uses_batched_inlet_pipeline(
+        self, monkeypatch
+    ):
+        from open_webui.utils import filter as filter_utils
+        from owui_ext.shared.inlet_filters import (
+            apply_inlet_filters_if_enabled,
+            finalize_model_request,
+            resolve_model_filter_pipeline,
+        )
+
+        functions = [SimpleNamespace(id="legacy-batched-filter")]
+        resolve_calls = []
+        process_calls = []
+
+        async def get_filter_functions(request, model, enabled_filter_ids):
+            resolve_calls.append((model, list(enabled_filter_ids)))
+            return functions
+
+        async def process_filter_functions(
+            request,
+            filter_context,
+            filter_functions,
+            filter_type,
+            form_data,
+            extra_params,
+        ):
+            process_calls.append(
+                (filter_type, filter_context, filter_functions)
+            )
+            return form_data, {}
+
+        monkeypatch.setattr(
+            filter_utils, "get_filter_functions", get_filter_functions
+        )
+        monkeypatch.setattr(
+            filter_utils, "process_filter_functions", process_filter_functions
+        )
+        monkeypatch.delattr(filter_utils, "get_filter_context")
+        model = {"id": "nested"}
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(MODELS={"nested": model})),
+            state=SimpleNamespace(),
+        )
+
+        pipeline = await resolve_model_filter_pipeline(
+            True, request, "nested", ["enabled-filter"]
+        )
+        form_data = {"metadata": {}}
+        result = await apply_inlet_filters_if_enabled(
+            pipeline, request, form_data, {}
+        )
+        result = await finalize_model_request(pipeline, request, result, {})
+
         assert result is form_data
-        assert calls == [None]
+        assert resolve_calls == [(model, ["enabled-filter"])]
+        assert process_calls == [("inlet", None, functions)]
 
     @pytest.mark.asyncio
     async def test_legacy_process_filter_functions(self, monkeypatch):
         from open_webui.utils import filter as filter_utils
-        from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
+        from owui_ext.shared.inlet_filters import (
+            apply_inlet_filters_if_enabled,
+            finalize_model_request,
+            resolve_model_filter_pipeline,
+        )
 
         calls = []
 
@@ -678,14 +1303,50 @@ class TestInletFilterCompatibility:
         monkeypatch.setattr(
             filter_utils, "process_filter_functions", legacy_process
         )
+        monkeypatch.delattr(filter_utils, "get_filter_functions")
+        monkeypatch.delattr(filter_utils, "FilterContext")
         form_data = {"metadata": {}}
-
-        result = await apply_inlet_filters_if_enabled(
-            True, object(), {}, form_data, {}
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(MODELS={"nested": {}})),
+            state=SimpleNamespace(),
         )
+
+        pipeline = await resolve_model_filter_pipeline(
+            True, request, "nested", []
+        )
+        result = await apply_inlet_filters_if_enabled(
+            pipeline, request, form_data, {}
+        )
+        result = await finalize_model_request(pipeline, request, result, {})
 
         assert result is form_data
         assert calls == [[]]
+
+
+class TestTerminalCompatibility:
+    """Test the v0.11.2 terminal file-result contract used by nested tools."""
+
+    @pytest.mark.parametrize("inline", [False, True])
+    def test_build_terminal_file_tool_result(self, inline):
+        from open_webui.utils.middleware import build_terminal_file_tool_result
+
+        result = build_terminal_file_tool_result(
+            "display_file",
+            {"path": "/tmp/test.html", "inline": inline},
+            ({"exists": True, "path": "/tmp/test.html"}, {}),
+            {"tool_id": "terminal:test"},
+            {"chat_id": "chat-1"},
+        )
+
+        assert result is not None
+        assert result["type"] == "file"
+        assert result["source"] == "open_terminal"
+        assert result["terminal_id"] == "test"
+        assert result["session_id"] == "chat-1"
+        if inline:
+            assert result["displayed"] is True
+        else:
+            assert "displayed" not in result
 
 
 # =============================================================================

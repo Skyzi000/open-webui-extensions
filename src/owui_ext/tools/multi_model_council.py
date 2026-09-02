@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.21
+version: 0.1.22
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -17,7 +17,11 @@ from pydantic import BaseModel, Field
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.completion_response import format_chat_completion_error
 from owui_ext.shared.event_emitter import EventEmitter
-from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
+from owui_ext.shared.inlet_filters import (
+    apply_inlet_filters_if_enabled,
+    finalize_model_request,
+    resolve_model_filter_pipeline,
+)
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients
 from owui_ext.shared.models import extract_model_ids, get_available_models
 from owui_ext.shared.parsing import normalize_text, safe_json_loads
@@ -195,8 +199,12 @@ async def run_agent_loop(
     else:
         user_obj = user
 
-    models = request.app.state.MODELS
-    model = models.get(model_id, {})
+    filter_pipeline = await resolve_model_filter_pipeline(
+        apply_inlet_filters,
+        request,
+        model_id,
+        extra_params.get("__metadata__", {}).get("filter_ids", []),
+    )
 
     tools_param = None
     if tools_dict:
@@ -244,9 +252,12 @@ async def run_agent_loop(
             form_data["tools"] = tools_param
 
         form_data = await apply_inlet_filters_if_enabled(
-            apply_inlet_filters, request, model, form_data, extra_params
+            filter_pipeline, request, form_data, extra_params
         )
         form_data = _append_tool_server_prompts(form_data, extra_params)
+        form_data = await finalize_model_request(
+            filter_pipeline, request, form_data, extra_params
+        )
 
         try:
             response = await generate_chat_completion(
@@ -409,9 +420,12 @@ async def run_agent_loop(
     }
 
     form_data = await apply_inlet_filters_if_enabled(
-        apply_inlet_filters, request, model, form_data, extra_params
+        filter_pipeline, request, form_data, extra_params
     )
     form_data = _append_tool_server_prompts(form_data, extra_params)
+    form_data = await finalize_model_request(
+        filter_pipeline, request, form_data, extra_params
+    )
 
     try:
         response = await generate_chat_completion(
@@ -473,7 +487,7 @@ class Tools:
         )
         APPLY_INLET_FILTERS: bool = Field(
             default=True,
-            description="Apply inlet filters (e.g., user_info_injector) to council member requests.",
+            description="Apply inlet and request filters (e.g., user_info_injector) to council member model requests.",
         )
 
         # Builtin tool category toggles

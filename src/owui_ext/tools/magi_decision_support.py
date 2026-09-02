@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.14
+version: 0.2.15
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -26,7 +26,11 @@ from pydantic import BaseModel, Field
 
 from owui_ext.shared.completion_response import format_chat_completion_error
 from owui_ext.shared.event_emitter import EventEmitter
-from owui_ext.shared.inlet_filters import apply_inlet_filters_if_enabled
+from owui_ext.shared.inlet_filters import (
+    apply_inlet_filters_if_enabled,
+    finalize_model_request,
+    resolve_model_filter_pipeline,
+)
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients
 from owui_ext.shared.parsing import normalize_text, safe_json_loads
 from owui_ext.shared.prompt_utils import (
@@ -201,6 +205,8 @@ async def generate_single_completion(
     user: Any,
     model_id: str,
     messages: List[dict],
+    extra_params: dict,
+    apply_inlet_filters: bool,
 ) -> str:
     from open_webui.utils.chat import generate_chat_completion
 
@@ -208,8 +214,23 @@ async def generate_single_completion(
         "model": model_id,
         "messages": messages,
         "stream": False,
-        "metadata": {"task": "magi_arbitrator"},
+        "metadata": {
+            "task": "magi_arbitrator",
+            "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
+        },
     }
+    filter_pipeline = await resolve_model_filter_pipeline(
+        apply_inlet_filters,
+        request,
+        model_id,
+        extra_params.get("__metadata__", {}).get("filter_ids", []),
+    )
+    form_data = await apply_inlet_filters_if_enabled(
+        filter_pipeline, request, form_data, extra_params
+    )
+    form_data = await finalize_model_request(
+        filter_pipeline, request, form_data, extra_params
+    )
 
     response = await generate_chat_completion(
         request=request,
@@ -253,8 +274,12 @@ async def run_agent_loop(
     else:
         user_obj = user
 
-    models = request.app.state.MODELS
-    model = models.get(model_id, {})
+    filter_pipeline = await resolve_model_filter_pipeline(
+        apply_inlet_filters,
+        request,
+        model_id,
+        extra_params.get("__metadata__", {}).get("filter_ids", []),
+    )
 
     tools_param = None
     if tools_dict:
@@ -302,9 +327,12 @@ async def run_agent_loop(
             form_data["tools"] = tools_param
 
         form_data = await apply_inlet_filters_if_enabled(
-            apply_inlet_filters, request, model, form_data, extra_params
+            filter_pipeline, request, form_data, extra_params
         )
         form_data = _append_tool_server_prompts(form_data, extra_params)
+        form_data = await finalize_model_request(
+            filter_pipeline, request, form_data, extra_params
+        )
 
         try:
             response = await generate_chat_completion(
@@ -458,9 +486,12 @@ async def run_agent_loop(
     }
 
     form_data = await apply_inlet_filters_if_enabled(
-        apply_inlet_filters, request, model, form_data, extra_params
+        filter_pipeline, request, form_data, extra_params
     )
     form_data = _append_tool_server_prompts(form_data, extra_params)
+    form_data = await finalize_model_request(
+        filter_pipeline, request, form_data, extra_params
+    )
 
     try:
         response = await generate_chat_completion(
@@ -496,7 +527,7 @@ class Tools:
         )
         APPLY_INLET_FILTERS: bool = Field(
             default=True,
-            description="Apply inlet filters (e.g., user_info_injector) to MAGI agent requests.",
+            description="Apply inlet and request filters (e.g., user_info_injector) to MAGI model requests.",
         )
 
         # Builtin tool category toggles
@@ -864,6 +895,8 @@ class Tools:
                     {"role": "system", "content": summary_prompt},
                     {"role": "user", "content": json.dumps(summary_input, ensure_ascii=False)},
                 ],
+                extra_params=extra_params,
+                apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
             )
         except Exception as exc:
             log.exception(f"Error generating summary: {exc}")
