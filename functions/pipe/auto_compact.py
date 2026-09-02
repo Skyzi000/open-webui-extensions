@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.8.4
+version: 0.8.5
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -140,36 +140,15 @@ REF_EXEC_COMMANDS = ("cat", "grep", "head", "ls", "sed", "stat", "tail", "wc")
 _REF_BINDING_LABEL_HMAC_KEY = secrets.token_bytes(32)
 _REF_SHARED_REGISTRY_WARNED_REQUESTS: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
 _REF_SHARED_REGISTRY_WARNED_LOCK = threading.Lock()
-CANONICAL_HISTORY_IGNORED_MESSAGE_KEYS = frozenset(
+_KNOWN_SEMANTIC_MESSAGE_KEYS = frozenset(
     {
-        "id",
-        "parentId",
-        "childrenIds",
-        "timestamp",
-        "created_at",
-        "updated_at",
-        "models",
-        "model",
-        "done",
-        "usage",
-        "info",
-        "sources",
-        "files",
-        "embeds",
-        "annotation",
-        "annotations",
-        "reasoning",
-        "reasoning_content",
-        "reasoning_details",
-        "status",
-        "statusHistory",
-        "status_history",
-        "contextSummary",
-        "context_summary",
-        "error",
-        "feedback",
-        "meta",
-        "metadata",
+        "role",
+        "content",
+        "name",
+        "tool_call_id",
+        "tool_calls",
+        "function_call",
+        "output",
     }
 )
 BODY_TOKEN_EXTRA_KEYS = (
@@ -1385,6 +1364,102 @@ def _canonicalize_content_value(value: Any) -> Any:
     return _canonicalize_content_part(value)
 
 
+def _canonicalize_content_part_for_source_hash(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return _canonicalize_content_part(value)
+    part_type = value.get("type")
+    if not isinstance(part_type, str):
+        return _canonicalize_content_part(value)
+    # Canonical projection is structure-strict and attribute-tolerant: known nodes
+    # drop provider extras from both the source hash and the served history, while
+    # hash-only semantic identity (media detail, file identity, files, sources)
+    # is kept. The contract is one-way: equal source hashes imply equal served
+    # bytes. Source hashing itself stays total: unknown structures fall back to the
+    # generic canonicalization here and fail loudly only at direct-history admission.
+    if part_type in {"text", "input_text", "output_text"}:
+        keys = ("text", "type")
+    elif part_type == "input_image":
+        keys = ("detail", "image_url", "type")
+    elif part_type == "image_url":
+        keys = ("image_url", "type")
+    elif part_type in _FILE_CONTENT_PART_TYPES:
+        keys = ("file", "file_data", "file_id", "filename", "type")
+    else:
+        return _canonicalize_content_part(value)
+
+    canonical: dict[str, Any] = {}
+    for key in keys:
+        if key not in value:
+            continue
+        item_value = value[key]
+        if part_type == "image_url" and key == "image_url" and isinstance(item_value, dict):
+            image_url: dict[str, Any] = {}
+            for image_key in ("detail", "file", "url"):
+                if image_key not in item_value:
+                    continue
+                image_item = _canonicalize_general_value(item_value[image_key])
+                if not _is_empty_canonical_value(image_item):
+                    image_url[image_key] = image_item
+            item = image_url
+        elif part_type in _FILE_CONTENT_PART_TYPES and key == "file":
+            item = _canonicalize_embedded_file_value(item_value)
+        else:
+            item = _canonicalize_general_value(item_value)
+        if not _is_empty_canonical_value(item):
+            canonical[key] = item
+    return canonical
+
+
+def _canonicalize_content_value_for_source_hash(value: Any) -> Any:
+    if isinstance(value, list):
+        canonical = []
+        for item in value:
+            canonical_item = _canonicalize_content_part_for_source_hash(item)
+            if not _is_empty_canonical_value(canonical_item):
+                canonical.append(canonical_item)
+        if len(canonical) == 1:
+            collapsed = _collapse_text_only_content_part(canonical[0])
+            if collapsed is not None:
+                return collapsed
+        return canonical
+    return _canonicalize_content_part_for_source_hash(value)
+
+
+def _canonicalize_tool_call_for_source_hash(value: Any) -> Any:
+    if not isinstance(value, dict) or value.get("type") != "function":
+        return _canonicalize_general_value(value)
+    canonical: dict[str, Any] = {}
+    for key in ("function", "id", "type"):
+        if key not in value:
+            continue
+        item_value = value[key]
+        if key == "function" and isinstance(item_value, dict):
+            function: dict[str, Any] = {}
+            for function_key in ("arguments", "name"):
+                if function_key not in item_value:
+                    continue
+                function_item = _canonicalize_general_value(item_value[function_key])
+                if not _is_empty_canonical_value(function_item):
+                    function[function_key] = function_item
+            item = function
+        else:
+            item = _canonicalize_general_value(item_value)
+        if not _is_empty_canonical_value(item):
+            canonical[key] = item
+    return canonical
+
+
+def _canonicalize_tool_calls_for_source_hash(value: Any) -> Any:
+    if isinstance(value, list):
+        canonical = []
+        for item in value:
+            canonical_item = _canonicalize_tool_call_for_source_hash(item)
+            if not _is_empty_canonical_value(canonical_item):
+                canonical.append(canonical_item)
+        return canonical
+    return _canonicalize_tool_call_for_source_hash(value)
+
+
 def _canonicalize_files_value(value: Any) -> Any:
     return _canonicalize_file_attachment_value(value)
 
@@ -1449,6 +1524,18 @@ def _canonicalize_message_value(key: str, value: Any) -> Any:
     return _canonicalize_general_value(value)
 
 
+def _canonicalize_message_value_for_source_hash(key: str, value: Any) -> Any:
+    if key == "content":
+        return _canonicalize_content_value_for_source_hash(value)
+    if key == "tool_calls":
+        return _canonicalize_tool_calls_for_source_hash(value)
+    if key == "files":
+        return _canonicalize_files_value(value)
+    if key == "sources":
+        return _canonicalize_sources_value(value)
+    return _canonicalize_general_value(value)
+
+
 def canonicalize_message_for_source_hash(message: dict[str, Any]) -> dict[str, Any]:
     canonical: dict[str, Any] = {}
     for key in sorted(message.keys()):
@@ -1456,7 +1543,7 @@ def canonicalize_message_for_source_hash(message: dict[str, Any]) -> dict[str, A
             continue
         if key not in _STABLE_MESSAGE_KEYS:
             continue
-        value = _canonicalize_message_value(key, message[key])
+        value = _canonicalize_message_value_for_source_hash(key, message[key])
         if _is_empty_canonical_value(value):
             continue
         canonical[key] = value
@@ -1635,21 +1722,19 @@ def _canonical_history_content(content: Any, *, required: bool) -> str | list[di
             raise CanonicalHistoryError(reason="unknown content shape")
         part_type = part.get("type")
         if part_type in {"text", "input_text", "output_text"}:
-            if set(part) != {"type", "text"} or not isinstance(part.get("text"), str):
+            if not isinstance(part.get("text"), str):
                 raise CanonicalHistoryError(reason="unknown content shape")
             canonical.append({"type": "text", "text": part["text"]})
             continue
         if part_type == "input_image":
-            if set(part) != {"type", "image_url"} or not isinstance(part.get("image_url"), str):
+            if not isinstance(part.get("image_url"), str):
                 raise CanonicalHistoryError(reason="unknown content shape")
             canonical.append({"type": "omitted_media", "media": "image"})
             continue
         if part_type == "image_url":
-            if set(part) != {"type", "image_url"}:
-                raise CanonicalHistoryError(reason="unknown content shape")
             image_url = part.get("image_url")
             if isinstance(image_url, dict):
-                if set(image_url) != {"url"} or not isinstance(image_url.get("url"), str):
+                if not isinstance(image_url.get("url"), str):
                     raise CanonicalHistoryError(reason="unknown content shape")
             elif not isinstance(image_url, str):
                 raise CanonicalHistoryError(reason="unknown content shape")
@@ -1664,14 +1749,13 @@ def _canonical_history_tool_calls(tool_calls: Any) -> list[dict[str, str]]:
         raise CanonicalHistoryError(reason="unknown tool call shape")
     canonical: list[dict[str, str]] = []
     for call in tool_calls:
-        if not isinstance(call, dict) or set(call) != {"id", "type", "function"}:
+        if not isinstance(call, dict):
             raise CanonicalHistoryError(reason="unknown tool call shape")
         function = call.get("function")
         if (
             call.get("type") != "function"
             or not isinstance(call.get("id"), str)
             or not isinstance(function, dict)
-            or set(function) != {"name", "arguments"}
             or not isinstance(function.get("name"), str)
             or not isinstance(function.get("arguments"), str)
         ):
@@ -1688,7 +1772,7 @@ def _canonical_history_tool_calls(tool_calls: Any) -> list[dict[str, str]]:
 
 def _canonical_direct_history_message(message: dict[str, Any]) -> dict[str, Any]:
     role = message.get("role")
-    semantic_keys = set(message) - CANONICAL_HISTORY_IGNORED_MESSAGE_KEYS
+    semantic_keys = set(message) & _KNOWN_SEMANTIC_MESSAGE_KEYS
     if role == "user":
         if semantic_keys != {"role", "content"}:
             raise CanonicalHistoryError(reason="unknown message shape")
@@ -1770,7 +1854,6 @@ def _iter_core_output_history_messages(output: list[Any]) -> Iterable[dict[str, 
             for part in parts:
                 if (
                     not isinstance(part, dict)
-                    or set(part) != {"type", "text"}
                     or part.get("type") != "output_text"
                     or not isinstance(part.get("text"), str)
                 ):
@@ -1801,11 +1884,11 @@ def _iter_core_output_history_messages(output: list[Any]) -> Iterable[dict[str, 
                 if not isinstance(part, dict):
                     raise CanonicalHistoryError(reason="unknown content shape")
                 if part.get("type") == "input_text":
-                    if set(part) != {"type", "text"} or not isinstance(part.get("text"), str):
+                    if not isinstance(part.get("text"), str):
                         raise CanonicalHistoryError(reason="unknown content shape")
                     text += part["text"]
                 elif part.get("type") == "input_image":
-                    if set(part) != {"type", "image_url"} or not isinstance(part.get("image_url"), str):
+                    if not isinstance(part.get("image_url"), str):
                         raise CanonicalHistoryError(reason="unknown content shape")
                     images.append({"type": "omitted_media", "media": "image"})
                 else:
@@ -1843,7 +1926,11 @@ def _iter_core_output_history_messages(output: list[Any]) -> Iterable[dict[str, 
                     f"<code_interpreter_output>\n{output_text}\n</code_interpreter_output>"
                 )
             continue
-        if item_type == "reasoning" or item_type.startswith("open_webui:"):
+        if item_type == "reasoning":
+            continue
+        # Open WebUI Core's converter skips extension records it does not own;
+        # mirror that contract while keeping unknown bare output types strict.
+        if item_type.startswith("open_webui:"):
             continue
         raise CanonicalHistoryError(reason="unknown output shape")
     pending = flush_pending()
@@ -1873,7 +1960,7 @@ def _iter_canonical_messages_for_raw(
         return
     output = message.get("output")
     if message.get("role") == "assistant" and output:
-        semantic_keys = set(message) - CANONICAL_HISTORY_IGNORED_MESSAGE_KEYS
+        semantic_keys = set(message) & _KNOWN_SEMANTIC_MESSAGE_KEYS
         if not semantic_keys <= {"role", "content", "tool_calls", "output"}:
             raise CanonicalHistoryError(reason="unknown message shape")
         if not isinstance(output, list):

@@ -20,7 +20,7 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Awaitable, Callable, Final, Protocol
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from sqlalchemy.exc import OperationalError
 
 from functions.pipe import auto_compact as mod
@@ -230,6 +230,108 @@ async def _run_pipe_boundary(
         __tools__=registry,
     )
     return result, forwarded, checkpoint_bodies, registry, request
+
+
+@pytest.fixture
+async def real_checkpoint_store(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path}/ref-exec-checkpoints.db",
+        poolclass=NullPool,
+    )
+    monkeypatch.setattr(mod, "_CHECKPOINT_SCHEMA_READY", False)
+    await mod.ensure_checkpoint_table_initialized(async_engine=engine)
+    sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False)
+    state = SimpleNamespace(
+        sessionmaker=sessionmaker,
+        cas_checkpoint_ids=[],
+        healed_checkpoint_ids=[],
+        force_cas_winner_lookup=False,
+    )
+
+    class EngineCheckpointStore(mod.CheckpointStore):
+        async def _context(self):
+            return sessionmaker()
+
+        async def compare_and_swap_history_ref(
+            self,
+            checkpoint_id: str,
+            *,
+            expected_summary_meta: dict[str, JsonValue],
+            history_ref: dict[str, str],
+        ) -> bool:
+            state.cas_checkpoint_ids.append(checkpoint_id)
+            updated = await super().compare_and_swap_history_ref(
+                checkpoint_id,
+                expected_summary_meta=expected_summary_meta,
+                history_ref=history_ref,
+            )
+            if updated and state.force_cas_winner_lookup:
+                state.force_cas_winner_lookup = False
+                return False
+            return updated
+
+        async def lookup_ready_by_id(
+            self,
+            checkpoint_id: str,
+            *,
+            namespace: str,
+            user_id: str,
+            chat_id: str,
+            pipe_function_id: str,
+            profile_hash: str,
+        ) -> dict[str, JsonValue] | None:
+            state.healed_checkpoint_ids.append(checkpoint_id)
+            return await super().lookup_ready_by_id(
+                checkpoint_id,
+                namespace=namespace,
+                user_id=user_id,
+                chat_id=chat_id,
+                pipe_function_id=pipe_function_id,
+                profile_hash=profile_hash,
+            )
+
+    async def checkpoint_schema_ready(**_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", checkpoint_schema_ready)
+    monkeypatch.setattr(mod, "CheckpointStore", EngineCheckpointStore)
+    try:
+        yield state
+    finally:
+        await engine.dispose()
+
+
+async def _create_real_checkpoint(
+    request: SimpleNamespace,
+    source_messages,
+    summary_text: str,
+) -> dict[str, JsonValue]:
+    async def summary_factory(_parent: dict[str, JsonValue] | None) -> str:
+        return summary_text
+
+    result = await mod._get_or_create_checkpoint_summary(
+        request=request,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        summary_meta=mod.build_checkpoint_summary_meta(
+            source_messages,
+            historical_message_excerpt_bytes=(
+                mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES
+            ),
+            historical_message_excerpt_count=(
+                mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT
+            ),
+        ),
+        summary_factory=summary_factory,
+        use_generation_lease=False,
+    )
+    assert isinstance(result.checkpoint, dict)
+    return result.checkpoint
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -5844,6 +5946,29 @@ def test_history_jsonl_raw_output_canonical_bytes_remain_stable() -> None:
     assert len(records) == 3
 
 
+@pytest.mark.asyncio
+async def test_history_jsonl_core_output_chain_raw_source_hash_remains_stable() -> None:
+    source = await mod.build_canonical_history_source(
+        [
+            {
+                "role": "assistant",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "core answer"}],
+                    }
+                ],
+            }
+        ],
+        source_message_count=1,
+    )
+
+    assert source.raw_source_hash == (
+        "8226f8d35b042a68e54306a588108d84382596e4556a4300b4c08b6910c440d6"
+    )
+
+
 @pytest.mark.parametrize(
     ("output", "expected_roles"),
     (
@@ -6334,7 +6459,10 @@ async def test_history_jsonl_accepts_v011_code_interpreter_bookkeeping() -> None
             "id": "code-interpreter-1",
             "status": "completed",
             "code": "print('café')",
-            "output": {"stdout": "café\n", "result": "42"},
+            "output": {
+                "stdout": "café\n",
+                "result": "42",
+            },
             "start_tag": "<code_interpreter>",
             "end_tag": "</code_interpreter>",
             "attributes": {"data-language": "python"},
@@ -6466,7 +6594,7 @@ async def test_history_jsonl_ignores_code_interpreter_stderr() -> None:
             "id": "code-interpreter-stderr",
             "status": "completed",
             "code": "raise RuntimeError('boom')",
-            "output": {"stderr": "boom"},
+            "output": {"stdout": "ok", "stderr": 123},
         }
     ]
     stripped_output = [
@@ -6475,7 +6603,7 @@ async def test_history_jsonl_ignores_code_interpreter_stderr() -> None:
             "id": "code-interpreter-stderr",
             "status": "completed",
             "code": "raise RuntimeError('boom')",
-            "output": {},
+            "output": {"stdout": "ok"},
         }
     ]
     core_messages = convert_output_to_messages(
@@ -6485,7 +6613,8 @@ async def test_history_jsonl_ignores_code_interpreter_stderr() -> None:
         flatten_tool_images=True,
     )
     expected_content = (
-        "<code_interpreter>\nraise RuntimeError('boom')\n</code_interpreter>"
+        "<code_interpreter>\nraise RuntimeError('boom')\n</code_interpreter>\n"
+        "<code_interpreter_output>\nok\n</code_interpreter_output>"
     )
     raw_message = {"role": "assistant", "output": output}
     stripped_message = {"role": "assistant", "output": stripped_output}
@@ -6499,8 +6628,57 @@ async def test_history_jsonl_ignores_code_interpreter_stderr() -> None:
     assert tuple(actual.iter_records()) == (
         _canonical_json({"role": "assistant", "content": expected_content}),
     )
-    assert "code_interpreter_output" not in next(iter(actual.iter_records()))
+    assert "<code_interpreter_output>\\nok\\n</code_interpreter_output>" in next(
+        iter(actual.iter_records())
+    )
     _assert_canonical_sources_equal(actual, expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ("stdout", "result"))
+async def test_history_jsonl_rejects_non_string_code_interpreter_output_fields(
+    field: str,
+) -> None:
+    _, builder, _, error_type = _task3_surface()
+
+    with pytest.raises(error_type, match="unknown output shape"):
+        await builder(
+            [
+                {
+                    "role": "assistant",
+                    "output": [
+                        {
+                            "type": "open_webui:code_interpreter",
+                            "code": "print('done')",
+                            "output": {field: 7},
+                        }
+                    ],
+                }
+            ],
+            source_message_count=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_history_jsonl_rejects_unknown_code_interpreter_output_fields() -> None:
+    _, builder, _, error_type = _task3_surface()
+
+    with pytest.raises(error_type, match="unknown output shape"):
+        await builder(
+            [
+                {
+                    "role": "assistant",
+                    "output": [
+                        {
+                            "type": "open_webui:code_interpreter",
+                            "code": "print('done')",
+                            "output": {"stdout": "done", "files": []},
+                        }
+                    ],
+                }
+            ],
+            source_message_count=1,
+        )
 
 
 @pytest.mark.asyncio
@@ -6550,6 +6728,67 @@ async def test_history_jsonl_accepts_v011_tagged_message_bookkeeping() -> None:
         _canonical_json({"role": "assistant", "content": "tagged café"}),
     )
     _assert_canonical_sources_equal(actual, expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "role_fields",
+    ({}, {"role": None}, {"role": "user"}),
+    ids=("missing-role", "null-role", "non-assistant-role"),
+)
+async def test_history_jsonl_ignores_core_output_message_role(
+    role_fields: dict[str, str | None],
+) -> None:
+    _, builder, _, _ = _task3_surface()
+
+    source = await builder(
+        [
+            {
+                "role": "assistant",
+                "output": [
+                    {
+                        "type": "message",
+                        **role_fields,
+                        "content": [{"type": "output_text", "text": "roleless"}],
+                    }
+                ],
+            }
+        ],
+        source_message_count=1,
+    )
+
+    assert tuple(source.iter_records()) == (
+        _canonical_json({"role": "assistant", "content": "roleless"}),
+    )
+
+
+@pytest.mark.asyncio
+async def test_history_jsonl_skips_other_open_webui_output_extensions() -> None:
+    _, builder, _, _ = _task3_surface()
+
+    source = await builder(
+        [
+            {
+                "role": "assistant",
+                "output": [
+                    {
+                        "type": "open_webui:unknown_extension",
+                        "content": "private extension state",
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "visible"}],
+                    },
+                ],
+            }
+        ],
+        source_message_count=1,
+    )
+
+    assert tuple(source.iter_records()) == (
+        _canonical_json({"role": "assistant", "content": "visible"}),
+    )
 
 
 @pytest.mark.asyncio
@@ -6638,7 +6877,12 @@ async def test_history_jsonl_matches_core_ordered_tool_text() -> None:
                 "summary": [{"type": "output_text", "text": "private"}],
             }
         ],
-        [{"type": "open_webui:unknown_extension", "content": "private"}],
+        [
+            {
+                "type": "open_webui:unknown_extension",
+                "content": "private extension state",
+            }
+        ],
         [
             {
                 "type": "function_call",
@@ -6877,21 +7121,12 @@ async def test_history_jsonl_omits_known_media_and_rejects_unknown_shapes() -> N
             {"type": "omitted_media", "media": "image"},
         ],
     }
-    rejected_contents = (
-        [{"type": "audio", "audio_url": "private"}],
-        [{"type": "text", "text": "x", "extra": True}],
-        [{"type": "image_url", "image_url": {"url": "x", "detail": "high"}}],
-    )
+    rejected_contents = ([{"type": "audio", "audio_url": "private"}],)
     for content in rejected_contents:
         with pytest.raises(error_type, match="unknown content shape"):
             await builder(
                 [{"role": "user", "content": content}], source_message_count=1
             )
-    with pytest.raises(error_type, match="unknown message shape"):
-        await builder(
-            [{"role": "user", "content": "x", "invented": "private"}],
-            source_message_count=1,
-        )
     for incomplete in (
         {"role": "user"},
         {"role": "tool", "content": "x"},
@@ -6902,26 +7137,241 @@ async def test_history_jsonl_omits_known_media_and_rejects_unknown_shapes() -> N
 
 
 @pytest.mark.asyncio
+async def test_history_jsonl_drops_known_node_decorations_without_identity_drift() -> None:
+    _, builder, _, _ = _task3_surface()
+    clean_direct = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "inspect"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://images.example/a.png"},
+                },
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "done",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+    ]
+    decorated_direct = copy.deepcopy(clean_direct)
+    decorated_direct[0]["provider_message_state"] = {"trace": "volatile"}
+    decorated_direct[0]["content"][0]["provider_annotations"] = {
+        "trace": "volatile"
+    }
+    decorated_direct[0]["content"][1]["provider_part_state"] = True
+    decorated_direct[1]["tool_calls"][0]["provider_call_state"] = {
+        "trace": 7
+    }
+    decorated_direct[1]["tool_calls"][0]["function"][
+        "provider_function_state"
+    ] = "volatile"
+    decorated_direct[2]["provider_tool_state"] = "volatile"
+
+    clean_direct_source = await builder(clean_direct, source_message_count=3)
+    decorated_direct_source = await builder(decorated_direct, source_message_count=3)
+    detail_direct = copy.deepcopy(clean_direct)
+    detail_direct[0]["content"][1]["image_url"]["detail"] = "high"
+    detail_direct_source = await builder(detail_direct, source_message_count=3)
+
+    assert mod.compute_summary_source_hash(
+        clean_direct
+    ) == mod.compute_summary_source_hash(decorated_direct)
+    assert mod.compute_summary_source_hash(
+        clean_direct
+    ) != mod.compute_summary_source_hash(detail_direct)
+    _assert_canonical_sources_equal(decorated_direct_source, clean_direct_source)
+    _assert_canonical_sources_equal(detail_direct_source, clean_direct_source)
+
+    clean_output = [
+        {
+            "role": "assistant",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-2",
+                    "name": "lookup",
+                    "arguments": "{}",
+                    "status": "completed",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-2",
+                    "output": [{"type": "input_text", "text": "tool result"}],
+                },
+            ],
+        }
+    ]
+    decorated_output = copy.deepcopy(clean_output)
+    decorated_output[0]["provider_message_state"] = "volatile"
+    decorated_output[0]["output"][0]["provider_item_state"] = {
+        "trace": "volatile"
+    }
+    decorated_output[0]["output"][0]["content"][0]["provider_part_state"] = 1
+    decorated_output[0]["output"][1]["provider_call_state"] = "volatile"
+    decorated_output[0]["output"][2]["provider_output_state"] = "volatile"
+    decorated_output[0]["output"][2]["output"][0]["provider_part_state"] = 2
+
+    clean_output_source = await builder(clean_output, source_message_count=2)
+    decorated_output_source = await builder(decorated_output, source_message_count=2)
+
+    assert mod.compute_summary_source_hash(
+        clean_output
+    ) == mod.compute_summary_source_hash(decorated_output)
+    _assert_canonical_sources_equal(decorated_output_source, clean_output_source)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "forbidden_field",
+    ("message", "reason"),
     [
-        pytest.param({"name": "legacy"}, id="name"),
         pytest.param(
-            {"function_call": {"name": "legacy", "arguments": "{}"}},
-            id="function_call",
+            {"role": "provider_custom", "content": "unknown"},
+            "unknown message shape",
+            id="unknown-direct-role",
+        ),
+        pytest.param(
+            {"role": "user", "content": [{"type": "text"}]},
+            "unknown content shape",
+            id="missing-text",
+        ),
+        pytest.param(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup"},
+                    }
+                ],
+            },
+            "unknown tool call shape",
+            id="missing-tool-arguments",
+        ),
+        pytest.param(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "provider_custom",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            "unknown tool call shape",
+            id="unknown-tool-call-type",
+        ),
+        pytest.param(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            "unknown tool call shape",
+            id="missing-tool-call-id",
+        ),
+        pytest.param(
+            {"role": "user", "content": [7]},
+            "unknown content shape",
+            id="non-dict-content-part",
+        ),
+        pytest.param(
+            {"role": "user", "content": [{"type": "text", "text": 7}]},
+            "unknown content shape",
+            id="non-string-content-part-text",
+        ),
+        pytest.param(
+            {
+                "role": "assistant",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_audio", "text": "unknown"}],
+                    }
+                ],
+            },
+            "unknown content shape",
+            id="core-output-unknown-part",
         ),
     ],
 )
-async def test_history_jsonl_rejects_noncanonical_direct_message_fields(
-    forbidden_field: dict[str, str | dict[str, str]],
+async def test_history_jsonl_fails_loud_for_unknown_or_incomplete_structures(
+    message: dict[str, object],
+    reason: str,
+) -> None:
+    _, builder, _, error_type = _task3_surface()
+
+    with pytest.raises(error_type, match=reason):
+        await builder([message], source_message_count=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(
+            {"role": "user", "name": "legacy", "content": "question"},
+            id="user-name",
+        ),
+        pytest.param(
+            {
+                "role": "assistant",
+                "content": "answer",
+                "function_call": {"name": "legacy", "arguments": "{}"},
+            },
+            id="assistant-function-call",
+        ),
+        pytest.param(
+            {
+                "role": "user",
+                "content": "question",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            id="user-tool-calls",
+        ),
+        pytest.param(
+            {"role": "assistant", "name": "provider", "content": "answer"},
+            id="assistant-name",
+        ),
+    ],
+)
+async def test_history_jsonl_rejects_unsupported_direct_message_semantic_fields(
+    message: dict[str, object],
 ) -> None:
     _, builder, _, error_type = _task3_surface()
 
     with pytest.raises(error_type, match="unknown message shape"):
-        await builder(
-            [{"role": "assistant", "content": "answer", **forbidden_field}],
-            source_message_count=1,
-        )
+        await builder([message], source_message_count=1)
 
 
 @pytest.mark.asyncio
@@ -7980,6 +8430,224 @@ def test_native_tool_name_classification_tolerates_invalid_candidates(
     ]
 
     assert mod._native_tool_names_by_call_id(messages) == {"candidate-call": expected}
+
+
+@pytest.mark.asyncio
+async def test_current_core_cache_hint_survives_compression_and_history_ref_advertisement(
+    monkeypatch: pytest.MonkeyPatch,
+    real_checkpoint_store: SimpleNamespace,
+) -> None:
+    from open_webui.routers.ollama import OpenAIChatMessage
+
+    clean_history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    core_user = OpenAIChatMessage.model_validate(
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "old",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "provider_message_state": {"trace": "volatile"},
+        }
+    ).model_dump(exclude_none=True)
+    current_messages = [
+        core_user,
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "continue"},
+    ]
+    history_source = await mod.build_canonical_history_source(
+        clean_history,
+        source_message_count=len(clean_history),
+    )
+    checkpoint = await _create_real_checkpoint(
+        SimpleNamespace(state=SimpleNamespace()),
+        clean_history,
+        "cache-hint checkpoint",
+    )
+
+    result, forwarded, _, registry, request = await _run_pipe_boundary(
+        monkeypatch,
+        messages=current_messages,
+        function_calling_capability=True,
+        metadata_overrides={"user_message_id": "current-user"},
+        raw_message_map=_linked_raw_message_map(
+            [
+                {"id": "prior-user", **core_user},
+                {"id": "prior-assistant", **current_messages[1]},
+                {"id": "current-user", **current_messages[2]},
+            ]
+        ),
+        use_real_checkpoint_lookup=True,
+    )
+
+    async with real_checkpoint_store.sessionmaker() as session:
+        persisted = dict(
+            (
+                await session.execute(
+                    mod.CHECKPOINT_TABLE.select().where(
+                        mod.CHECKPOINT_TABLE.c.id == checkpoint["id"]
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+    expected_ref = f"history:{checkpoint['id']}"
+    binding = _committed_ref_binding(request)
+    assert core_user["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert result == {"ok": True}
+    assert len(forwarded) == 1
+    assert mod.extract_compaction_summary_text_from_messages(
+        [forwarded[0]["messages"][0]]
+    ) == "cache-hint checkpoint"
+    assert forwarded[0]["metadata"]["auto_compact_ref_manifests"] == [
+        {
+            "ref": expected_ref,
+            "sha256": history_source.raw_source_hash,
+        }
+    ]
+    assert expected_ref in repr(forwarded[0]["messages"])
+    assert {entry.manifest.ref for entry in binding.catalog} == {expected_ref}
+    assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is binding.reader
+    assert await _read(binding.reader, f"cat {expected_ref}") == "\n".join(
+        history_source.iter_records()
+    )
+    assert real_checkpoint_store.cas_checkpoint_ids == [checkpoint["id"]]
+    assert persisted["summary_meta"][mod.SUMMARY_META_HISTORY_REF_KEY] == {
+        "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+        "raw_source_hash": history_source.raw_source_hash,
+    }
+
+
+@pytest.mark.asyncio
+async def test_same_turn_checkpoint_reselection_ignores_changing_known_node_junk(
+    monkeypatch: pytest.MonkeyPatch,
+    real_checkpoint_store: SimpleNamespace,
+) -> None:
+    from open_webui.routers.ollama import OpenAIChatMessage
+
+    clean_history = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    def decorated_history(tag: str) -> list[dict[str, object]]:
+        return [
+            OpenAIChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "old",
+                            "cache_control": {"type": "ephemeral"},
+                            "provider_annotations": {"trace": tag},
+                        }
+                    ],
+                    "provider_message_state": {"trace": tag},
+                }
+            ).model_dump(exclude_none=True),
+            OpenAIChatMessage.model_validate(
+                {
+                    "role": "assistant",
+                    "content": "old answer",
+                    "provider_message_state": {"trace": tag},
+                }
+            ).model_dump(exclude_none=True),
+        ]
+
+    request_history = decorated_history("request")
+    current_messages = [
+        *request_history,
+        {"role": "user", "content": "continue"},
+    ]
+    history_source = await mod.build_canonical_history_source(
+        clean_history,
+        source_message_count=len(clean_history),
+    )
+    lookup_digests: list[str] = []
+    checkpoint_box: list[dict[str, object]] = []
+    real_lookup = mod._body_reusable_checkpoint_match
+
+    async def changing_lookup(**kwargs) -> mod.ReusableCheckpointMatch | None:
+        lookup_index = len(lookup_digests) + 1
+        body = copy.deepcopy(kwargs["body"])
+        assert isinstance(body, dict)
+        body_messages = body["messages"]
+        assert isinstance(body_messages, list)
+        candidate_history = copy.deepcopy(body_messages[: len(clean_history)])
+        changing = decorated_history(f"lookup-{lookup_index}")
+        candidate_history[0]["provider_message_state"] = changing[0][
+            "provider_message_state"
+        ]
+        candidate_history[0]["content"][0].update(
+            changing[0]["content"][0]
+        )
+        candidate_history[1]["provider_message_state"] = changing[1][
+            "provider_message_state"
+        ]
+        digest = mod.compute_summary_source_hash(candidate_history)
+        lookup_digests.append(digest)
+        body["messages"] = [*candidate_history, *body_messages[len(clean_history) :]]
+        match = await real_lookup(**{**kwargs, "body": body})
+        if lookup_index == 1:
+            assert match is None
+            checkpoint_box.append(
+                await _create_real_checkpoint(
+                    kwargs["request"],
+                    clean_history,
+                    "reselected checkpoint",
+                )
+            )
+            real_checkpoint_store.force_cas_winner_lookup = True
+        return match
+
+    def configure(pipe: mod.Pipe) -> None:
+        pipe.valves.trigger_input_tokens = 100
+        pipe.valves.soft_trigger_ratio = 0.5
+        monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", changing_lookup)
+
+    result, forwarded, _, registry, request = await _run_pipe_boundary(
+        monkeypatch,
+        messages=current_messages,
+        function_calling_capability=True,
+        metadata_overrides={"user_message_id": "current-user"},
+        raw_message_map=_linked_raw_message_map(
+            [
+                {"id": "prior-user", **request_history[0]},
+                {"id": "prior-assistant", **request_history[1]},
+                {"id": "current-user", **current_messages[-1]},
+            ]
+        ),
+        estimated_token_values=(200, 10, 10),
+        configure_pipe=configure,
+    )
+
+    assert len(checkpoint_box) == 1
+    checkpoint = checkpoint_box[0]
+    expected_ref = f"history:{checkpoint['id']}"
+    binding = _committed_ref_binding(request)
+    assert result == {"ok": True}
+    assert mod.extract_compaction_summary_text_from_messages(
+        [forwarded[0]["messages"][0]]
+    ) == "reselected checkpoint"
+    assert len(lookup_digests) == 3
+    assert set(lookup_digests) == {checkpoint["source_hash"]}
+    assert expected_ref in repr(forwarded[0]["messages"])
+    assert {entry.manifest.ref for entry in binding.catalog} == {expected_ref}
+    assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is binding.reader
+    assert real_checkpoint_store.cas_checkpoint_ids == [checkpoint["id"]]
+    assert real_checkpoint_store.healed_checkpoint_ids == [checkpoint["id"]]
+    assert await _read(binding.reader, f"cat {expected_ref}") == "\n".join(
+        history_source.iter_records()
+    )
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,813 @@ def test_source_hash_is_deterministic_for_equivalent_canonical_payloads():
     assert mod.compute_source_hash(left) == mod.compute_source_hash(right)
 
 
+@pytest.mark.parametrize(
+    ("messages", "kwargs", "expected"),
+    [
+        pytest.param(
+            [{"role": "assistant", "content": "answer"}],
+            {},
+            "sha256:26041d0d9b64729a42038d97fa271ffef19c6f8ece24549fc1bfca73392bd879",
+            id="plain-assistant",
+        ),
+        pytest.param(
+            [{"role": "user", "content": "question"}],
+            {},
+            "sha256:1b7f10b4a126472618896f92734890e2edacabe567cb20c311c4881ef9a0671c",
+            id="plain-user",
+        ),
+        pytest.param(
+            [{"role": "tool", "tool_call_id": "call-1", "content": "result"}],
+            {},
+            "sha256:7bdf0bcdd2780650ec7b9bab1647b673cd6d121d9beea981c318627d36365a2e",
+            id="plain-tool",
+        ),
+        pytest.param(
+            [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            {},
+            "sha256:5ed9a648836592ffbb710ea69ef2795cd4b92ee05725bab9e3032ddb2025fee2",
+            id="text-part",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ],
+            {},
+            "sha256:3023290754b37d612764bc3c01668519228fc068e5804985e3e940c675839acf",
+            id="input-text-part",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}],
+                }
+            ],
+            {},
+            "sha256:802d700ebbd1fc0e6d33447872121c527c26b388412fbac0a104eb064b1fb543",
+            id="output-text-part",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,abc",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:e1886fb12c891fa5a0b7aaac6ac550a1fac36ac9d791caea4de3973a4497139d",
+            id="input-image-string",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": "https://images.example/a.png",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:615820f5a3c5ada80522b9924fc529a33b2188aecfad9c6bab578d94fb0c9930",
+            id="image-url-string",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://images.example/a.png"},
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:bd2f1346ec183e920e7e7e67bcab590b35c29b1d6fbd6348e072d340497680a0",
+            id="image-url-object",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,abc"},
+                        },
+                    ],
+                }
+            ],
+            {
+                "file_backed_image_db_chain": [
+                    {
+                        "role": "user",
+                        "content": "describe",
+                        "files": [
+                            {
+                                "id": "image-1",
+                                "type": "image",
+                                "name": "photo.png",
+                                "url": "https://files.example/photo.png",
+                                "file": {"id": "image-1", "hash": "abc"},
+                            }
+                        ],
+                    }
+                ]
+            },
+            "sha256:9d525ba81214d15260aa832110c6fcaeab29fe635e629462ce48cbe6f0d8c1e3",
+            id="stabilized-image-url-file",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"q":"x"}',
+                            },
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:1e1176acc8ff6988c9318f32d18288561183570cd438cb83cc73cdfb02c8ba6f",
+            id="assistant-tool-call",
+        ),
+        pytest.param(
+            [{"role": "user", "name": "alice", "content": "hello"}],
+            {},
+            "sha256:57a7794ebc9fd6d6824e06dc9279bfb7fcb2afdd28ebc3bf5d16baf03ed1ffea",
+            id="message-name",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "function_call": {
+                        "name": "lookup",
+                        "arguments": '{"q":"x"}',
+                    },
+                }
+            ],
+            {},
+            "sha256:4fbe1e6bf270216149dabdcb2a0b803557e37225fe8413198917f874d867f028",
+            id="legacy-function-call",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://images.example/a.png",
+                                "detail": "high",
+                            },
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:10fa4627acb7af1dda22484a649114384488fcd37417ab29b7cde5b6c01ff41e",
+            id="image-url-detail",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "https://images.example/a.png",
+                            "detail": "high",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:86ea1e6ce391353835fae95b2546fbc759d6fd25b4e0cbd8f5a3daa324454e1a",
+            id="input-image-detail",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file_id": "file-1",
+                            "filename": "report.pdf",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:2e8e90f8f3762593e10afeec608f214162037930d336612228e31d4f3d0c5c64",
+            id="flat-input-file-id",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file_data": "data:application/pdf;base64,AA==",
+                            "filename": "report.pdf",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:04794d852ecb7b59b8b0477bf553cd24a1376cfeee61afe7eae1f8978dceb5ae",
+            id="flat-input-file-data",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "file",
+                            "file": {
+                                "id": "file-1",
+                                "hash": "abc123",
+                                "name": "report.pdf",
+                            },
+                            "filename": "report.pdf",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:639a4713595524ce46f3b866fb2dc346849abc4ed495da39d9feb2fd0c3f7d3f",
+            id="explicit-file",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://images.example/a.png"},
+                        },
+                    ],
+                }
+            ],
+            {},
+            "sha256:d76ae9a6767da2c81fe04a3fa1562a3d250b552aad2cf15aa89c8417c98ba83d",
+            id="multipart-text-image",
+        ),
+    ],
+)
+def test_clean_history_source_hashes_remain_byte_identical(
+    messages, kwargs, expected
+):
+    assert mod.compute_summary_source_hash(messages, **kwargs) == expected
+
+
+def test_source_hash_drops_decorations_from_known_message_nodes():
+    clean = [
+        {
+            "role": "user",
+            "name": "provider-user-name",
+            "content": [
+                {"type": "text", "text": "inspect"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://images.example/a.png"},
+                },
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "done",
+            "function_call": {
+                "name": "legacy-provider-decoration",
+                "arguments": "{}",
+            },
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+                }
+            ],
+        },
+    ]
+    decorated = copy.deepcopy(clean)
+    decorated[0]["provider_message_state"] = {"trace": "volatile"}
+    decorated[0]["content"][0]["provider_annotations"] = {"trace": "volatile"}
+    decorated[0]["content"][1]["provider_part_state"] = True
+    decorated[1]["tool_calls"][0]["provider_call_state"] = {"trace": 7}
+    decorated[1]["tool_calls"][0]["function"]["provider_function_state"] = "volatile"
+
+    assert mod.compute_summary_source_hash(clean) == mod.compute_summary_source_hash(
+        decorated
+    )
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected"),
+    [
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "provider_custom",
+                            "payload": {"value": 1},
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+            "sha256:44f219bc2f41f9d385f36af2a461b0b4780e5fb4075ff0427fb3a949ea678c98",
+            id="unknown-part-cache-hint",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "provider_custom",
+                            "content": [{"type": "text", "text": "nested"}],
+                        }
+                    ],
+                }
+            ],
+            "sha256:b3d551d5d4b9127e4b9d2cf901f1c172a29129270e1cfe282b8c36ae8ec7cfe1",
+            id="unknown-part-nested-single-text",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": {"provider": "custom"},
+                            "payload": {"value": 1},
+                        }
+                    ],
+                }
+            ],
+            "sha256:b30122c1f99d0896034a007976a6aef62f188f0b7e35ed908f06d1f61e278b07",
+            id="dict-part-type-remains-total",
+        ),
+    ],
+)
+def test_source_hash_matches_head_projection_for_content_part_edges(
+    messages, expected
+):
+    assert mod.compute_summary_source_hash(messages) == expected
+
+
+# HEAD kept image_url provider junk (95e3ccb6); 0.8.5 drops it to clean-twin 10fa4627.
+def test_source_hash_drops_provider_junk_from_image_url_parts():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://images.example/a.png",
+                        "detail": "high",
+                        "provider_url_state": "volatile",
+                    },
+                    "provider_part_state": {"trace": 1},
+                }
+            ],
+        }
+    ]
+
+    assert mod.compute_summary_source_hash(messages) == (
+        "sha256:10fa4627acb7af1dda22484a649114384488fcd37417ab29b7cde5b6c01ff41e"
+    )
+
+
+def test_source_hash_preserves_generic_tool_result_attributes_from_head():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": [{"type": "text", "text": "result"}],
+                    "is_error": True,
+                    "provider_result": {"trace": "stable"},
+                }
+            ],
+        }
+    ]
+
+    assert mod.compute_summary_source_hash(messages) == (
+        "sha256:74e482d31f5c81a5e6b6b136f17a36855e897fe81684aa098454a5b47bd45374"
+    )
+
+
+def test_source_hash_keeps_known_part_and_tool_call_identity():
+    pairs = [
+        (
+            {"role": "user", "name": "alpha", "content": "hello"},
+            {"role": "user", "name": "beta", "content": "hello"},
+        ),
+        (
+            {
+                "role": "assistant",
+                "content": "",
+                "function_call": {"name": "lookup", "arguments": '{"q":1}'},
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "function_call": {"name": "lookup", "arguments": '{"q":2}'},
+            },
+        ),
+        (
+            {"role": "user", "content": [{"type": "text", "text": "alpha"}]},
+            {"role": "user", "content": [{"type": "text", "text": "beta"}]},
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://images.example/a.png"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://images.example/b.png"},
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://images.example/a.png"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://images.example/a.png",
+                            "detail": "high",
+                        },
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "https://images.example/a.png",
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "https://images.example/a.png",
+                        "detail": "high",
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [{"type": "text", "text": "result"}],
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-2",
+                        "content": [{"type": "text", "text": "result"}],
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "filename": "report.pdf",
+                        "file": {"id": "file-1", "hash": "abc"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "filename": "report.pdf",
+                        "file": {"id": "file-2", "hash": "def"},
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_id": "file-1",
+                        "filename": "report.pdf",
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_id": "file-2",
+                        "filename": "report.pdf",
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": "data:application/pdf;base64,AA==",
+                        "filename": "report.pdf",
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": "data:application/pdf;base64,BB==",
+                        "filename": "report.pdf",
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "filename": "alpha.txt",
+                        "file": {"id": "file-1", "hash": "abc"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "filename": "beta.txt",
+                        "file": {"id": "file-1", "hash": "abc"},
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-2",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"q":1}'},
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"q":2}'},
+                    }
+                ],
+            },
+        ),
+        (
+            {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            {"role": "tool", "tool_call_id": "call-2", "content": "result"},
+        ),
+    ]
+
+    for left, right in pairs:
+        assert mod.compute_summary_source_hash(
+            [left]
+        ) != mod.compute_summary_source_hash([right])
+
+
+def test_source_hash_keeps_unknown_tool_call_types_total_and_generic():
+    first = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "custom-1", "type": "provider_custom", "payload": {"value": 1}}
+            ],
+        }
+    ]
+    second = copy.deepcopy(first)
+    second[0]["tool_calls"][0]["payload"]["value"] = 2
+
+    assert mod.compute_summary_source_hash(first).startswith("sha256:")
+    assert mod.compute_summary_source_hash(first) != mod.compute_summary_source_hash(
+        second
+    )
+
+
+def test_tolerant_source_projection_preserves_token_estimate_bytes():
+    message = {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "text",
+                "text": "answer",
+                "cache_control": {"type": "ephemeral"},
+                "provider_annotations": {"trace": "token-visible"},
+            }
+        ],
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": '{"q":"x"}',
+                    "provider_function_extra": "token-visible",
+                },
+                "provider_call_extra": {"trace": 7},
+            }
+        ],
+        "provider_message_extra": "dropped-top-level",
+    }
+    expected = {
+        "content": [
+            {
+                "provider_annotations": {"trace": "token-visible"},
+                "text": "answer",
+                "type": "text",
+            }
+        ],
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "function": {
+                    "arguments": '{"q":"x"}',
+                    "name": "lookup",
+                    "provider_function_extra": "token-visible",
+                },
+                "id": "call-1",
+                "provider_call_extra": {"trace": 7},
+                "type": "function",
+            }
+        ],
+    }
+
+    class ByteEncoder:
+        name = "order-085-byte"
+
+        def encode(self, value, **_kwargs):
+            return list(value.encode("utf-8"))
+
+    image_count, text = mod._message_token_image_count_and_text(message)
+    mod._MESSAGE_TOKEN_ESTIMATE_CACHE.clear()
+    try:
+        count = mod.estimate_message_tokens(
+            message,
+            encoder=ByteEncoder(),
+            encoding_name="order-085-byte",
+        )
+    finally:
+        mod._MESSAGE_TOKEN_ESTIMATE_CACHE.clear()
+
+    assert mod.canonicalize_message_for_token_estimate(message) == expected
+    assert image_count == 0
+    assert text == (
+        '{"content":[{"provider_annotations":{"trace":"token-visible"},'
+        '"text":"answer","type":"text"}],"role":"assistant","tool_calls":['
+        '{"function":{"arguments":"{\\"q\\":\\"x\\"}","name":"lookup",'
+        '"provider_function_extra":"token-visible"},"id":"call-1",'
+        '"provider_call_extra":{"trace":7},"type":"function"}]}'
+    )
+    assert count == 299
+
+
 def test_source_hash_ignores_provider_prompt_cache_hints():
     stable = [
         {"role": "system", "content": [{"type": "text", "text": "system"}]},
@@ -86,7 +893,7 @@ def test_source_hash_collapses_single_text_part_to_plain_string():
     assert mod.compute_source_hash(plain) == mod.compute_source_hash(wrapped)
 
 
-def test_source_hash_does_not_collapse_multimodal_or_annotated_parts():
+def test_source_hash_keeps_multimodal_identity_and_drops_text_annotations():
     plain = [{"role": "user", "content": "hello"}]
     with_image = [
         {
@@ -97,7 +904,7 @@ def test_source_hash_does_not_collapse_multimodal_or_annotated_parts():
             ],
         }
     ]
-    with_extra_key = [
+    with_annotations = [
         {
             "role": "user",
             "content": [{"type": "text", "text": "hello", "annotations": ["note"]}],
@@ -105,7 +912,7 @@ def test_source_hash_does_not_collapse_multimodal_or_annotated_parts():
     ]
 
     assert mod.compute_source_hash(plain) != mod.compute_source_hash(with_image)
-    assert mod.compute_source_hash(plain) != mod.compute_source_hash(with_extra_key)
+    assert mod.compute_source_hash(plain) == mod.compute_source_hash(with_annotations)
 
 
 def test_source_hash_ignores_core_file_upload_transients():
