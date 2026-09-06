@@ -816,7 +816,7 @@ async def test_tool_preview_marker_recovers_omitted_middle_across_reader_pages(
 
 
 @pytest.mark.asyncio
-async def test_tool_preview_counter_failure_keeps_raw_and_does_not_cache_failure(
+async def test_tool_preview_counter_failure_falls_back_to_byte_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RecoveringEncoder(PreviewByteEncoder):
@@ -839,21 +839,11 @@ async def test_tool_preview_counter_failure_keeps_raw_and_does_not_cache_failure
         plan = await mod.project_native_tool_texts(
             messages, threshold_tokens=1_000, encoder=encoder, request=request
         )
-        assert plan.catalog == ()
-        assert await mod.apply_ref_projection_plan(messages, plan) == messages
-
-    recovering_encoder.fail = False
-    recovered = await mod.project_native_tool_texts(
-        messages,
-        threshold_tokens=1_000,
-        encoder=recovering_encoder,
-        request=request,
-    )
-    assert len(recovered.catalog) == 1
-    assert (
-        _preview_ref(recovered.catalog[0].preview_text)
-        == recovered.catalog[0].manifest.ref
-    )
+        assert len(plan.catalog) == 1
+        projected = await mod.apply_ref_projection_plan(messages, plan)
+        preview = projected[0]["content"]
+        assert _preview_ref(preview) == plan.catalog[0].manifest.ref
+        assert len(preview.encode("utf-8")) < 1_000
 
 
 @pytest.mark.asyncio
@@ -1157,10 +1147,16 @@ def test_ref_threshold_valve_rejects_values_below_1000() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tokenizer_available", [True, False])
 async def test_oversized_tool_text_externalizes_with_bounded_preview(
     monkeypatch: pytest.MonkeyPatch,
+    tokenizer_available: bool,
 ) -> None:
     _task1_surface()
+    if not tokenizer_available:
+        monkeypatch.setattr(
+            mod, "_get_tiktoken_encoder", lambda _request=None: (None, None)
+        )
     raw = "z" * (30 * 1024 * 1024)
     projector_calls = 0
     original_projector = mod.project_native_tool_texts
@@ -1209,6 +1205,41 @@ async def test_oversized_tool_text_externalizes_with_bounded_preview(
     binding = next(iter(store.bindings.values()))
     assert binding.catalog[0].source.text is raw
     assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is binding.reader
+
+
+@pytest.mark.asyncio
+async def test_tool_preview_rendering_failure_never_forwards_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _task1_surface()
+    raw = "eligible" * 10_000
+
+    monkeypatch.setattr(
+        mod, "_cached_tool_ref_preview_sync", lambda *_args, **_kwargs: None
+    )
+    result, forwarded, _, registry, _ = await _run_pipe_boundary(
+        monkeypatch,
+        messages=[
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "preview-call",
+                        "type": "function",
+                        "function": {"name": "existing", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "preview-call", "content": raw},
+            {"role": "user", "content": "continue"},
+        ],
+    )
+
+    assert result["error"]["code"] == "ref_projection_failed"
+    assert "before provider forward" in result["error"]["message"]
+    assert forwarded == []
+    assert mod.REF_EXEC_TOOL_NAME not in registry
 
 
 @pytest.mark.asyncio

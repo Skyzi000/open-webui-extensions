@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.8.7
+version: 0.8.8
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -768,6 +768,7 @@ _REF_PROJECTION_DIAGNOSTIC_STAGES = MappingProxyType(
         "reader schema registration": "reader_schema",
         "registration": "registration",
         "generation CAS": "generation_cas",
+        "tool preview rendering": "tool_preview_rendering",
     }
 )
 
@@ -4078,11 +4079,13 @@ def _render_tool_ref_preview_sync(
     """Keep a near-limit head/tail preview with byte-exact middle recovery.
 
     Match Core's d40225da3b03 contract: the marker counts against both caps,
-    and an uncountable preview is not adopted. Only bounded edge fragments
-    are copied or tokenized, even when the source is a single huge line.
+    and a preview the token counter cannot measure is judged by the same
+    byte upper bound the reader uses. Only bounded edge fragments are
+    copied or tokenized, even when the source is a single huge line.
     """
-    if encoder is None or utf8_bytes < 2:
+    if utf8_bytes < 2:
         return None
+    cancelled = threading.Event()
     marker_overhead = len(
         _ref_exec_truncated_marker(
             f"tail -c +{utf8_bytes + 1} {ref} | head -c {utf8_bytes}"
@@ -4109,10 +4112,14 @@ def _render_tool_ref_preview_sync(
         return prefix + _ref_exec_truncated_marker(command) + "\n" + suffix
 
     def fits(candidate: str | None) -> bool:
-        if candidate is None or len(candidate.encode("utf-8")) > REF_EXEC_RESPONSE_MAX_BYTES:
+        if candidate is None:
             return False
-        tokens = _encode_text_token_count(encoder, candidate)
-        return tokens is not None and tokens < threshold_tokens
+        return _ref_exec_response_fits(
+            candidate,
+            threshold_tokens=threshold_tokens,
+            encoder=encoder,
+            cancelled=cancelled,
+        )
 
     best = None
     prefix_end, suffix_start = 0, len(text)
@@ -4157,8 +4164,6 @@ def _cached_tool_ref_preview_sync(
 ) -> str | None:
     if encoder is None:
         encoder, _ = _get_tiktoken_encoder(request)
-    if encoder is None:
-        return None
     key = (ref, threshold_tokens, id(encoder))
     cached = cache.get(key)
     if cached is not None:
@@ -4233,7 +4238,8 @@ async def project_native_tool_texts(
             cache=preview_cache,
         )
         if preview is None:
-            continue
+            # Fail closed: eligible text must never reach the provider raw.
+            raise RefProjectionError(stage="tool preview rendering")
         manifest = RefManifest(
             ref=ref,
             utf8_bytes=utf8_bytes,
