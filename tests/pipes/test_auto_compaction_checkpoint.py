@@ -5,6 +5,8 @@ import copy
 import dataclasses
 import hashlib
 import inspect
+import random
+import re
 import time
 from types import SimpleNamespace
 
@@ -1704,6 +1706,78 @@ async def test_logical_history_snapshot_is_built_once_per_request_history(
     assert first.prefix_raw_source_hashes[-1] == canonical.raw_source_hash
 
 
+@pytest.mark.asyncio
+async def test_get_or_build_snapshot_accepts_precomputed_source_hash(monkeypatch):
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [
+        {"role": "user", "content": "with files"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    metadata = {
+        "chat_id": "chat-1",
+        "user_message_id": "msg-1",
+        "files": [{"id": "file-1", "type": "file", "name": "a.txt"}],
+    }
+    db_chain = [
+        {
+            "role": "user",
+            "content": "with files",
+            "files": [{"id": "file-1", "type": "file"}],
+        },
+        {"role": "assistant", "content": "answer"},
+    ]
+
+    async def load_chain(request, chat_id, current_message_id):
+        return copy.deepcopy(db_chain)
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+    request = SimpleNamespace(state=SimpleNamespace())
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        request, metadata, messages
+    )
+    assert resolver is not None
+
+    first = await mod.get_or_build_logical_history_snapshot(
+        request,
+        messages,
+        identity=identity,
+        prefix_file_fingerprint_resolver=resolver,
+    )
+    source_hash = mod.compute_summary_source_hash(
+        messages,
+        resolver(len(messages)),
+        mod._prefix_file_fingerprint_resolver_db_chain(resolver),
+    )
+    second = await mod.get_or_build_logical_history_snapshot(
+        request,
+        messages,
+        identity=identity,
+        prefix_file_fingerprint_resolver=resolver,
+        source_hash=source_hash,
+    )
+    assert first is second
+
+    plain_request = SimpleNamespace(state=SimpleNamespace())
+    third = await mod.get_or_build_logical_history_snapshot(
+        plain_request,
+        messages,
+        identity=identity,
+    )
+    fourth = await mod.get_or_build_logical_history_snapshot(
+        plain_request,
+        messages,
+        identity=identity,
+        source_hash=mod.compute_summary_source_hash(messages),
+    )
+    assert third is fourth
+
+
 def _v2_history_catalog_entry(
     checkpoint,
     snapshot,
@@ -1978,6 +2052,165 @@ async def test_v2_readvertisement_rejects_changed_manifest_digest():
 
 
 @pytest.mark.asyncio
+async def test_v2_history_ref_verification_hash_computes_once_per_snapshot(monkeypatch):
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [{"role": "user", "content": "one"}]
+    snapshot = await mod.build_logical_history_snapshot(messages, identity=identity)
+    checkpoint = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        # Built from the equivalent summary hash on purpose: computing the
+        # snapshot's own verification hash here would warm its memo.
+        source_hash=mod.compute_summary_source_hash(messages),
+        source_message_count=1,
+        summary_text="summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": snapshot.prefix_raw_source_hashes[0],
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(state=SimpleNamespace()),
+    )
+    key = mod.RefBindingKey(
+        user_id="user-1",
+        chat_id="chat-1",
+        user_message_id="message-1",
+        assistant_message_id="assistant-1",
+        incoming_model_id="wrapper-1",
+        base_pipe_id="auto_compact",
+        profile_hash=mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+        branch_anchor="branch-1",
+    )
+    registry = {}
+    source_hash_json_hashes = 0
+    in_source_hash = False
+    real_json_hash = mod._json_hash
+    real_source_hash = mod._logical_snapshot_source_hash
+
+    def counting_json_hash(payload):
+        nonlocal source_hash_json_hashes
+        if in_source_hash:
+            source_hash_json_hashes += 1
+        return real_json_hash(payload)
+
+    def counting_source_hash(snapshot_arg, count):
+        nonlocal in_source_hash
+        in_source_hash = True
+        try:
+            return real_source_hash(snapshot_arg, count)
+        finally:
+            in_source_hash = False
+
+    monkeypatch.setattr(mod, "_json_hash", counting_json_hash)
+    monkeypatch.setattr(mod, "_logical_snapshot_source_hash", counting_source_hash)
+
+    entry = _v2_history_catalog_entry(checkpoint, snapshot)
+    reservation = await mod.reserve_ref_binding(request, key, registry)
+    assert reservation is not None
+    attempt = mod.stage_ref_attempt(
+        request,
+        reservation,
+        mod.build_history_ref_projection_plan((entry,)),
+    )
+    await mod.commit_ref_attempt(request, attempt)
+    reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
+
+    for _ in range(5):
+        assert await reader(f"cat {entry.manifest.ref}")
+
+    assert source_hash_json_hashes == 1
+
+
+@pytest.mark.asyncio
+async def test_unresolved_v2_history_entry_source_hash_computes_once_in_worker(
+    monkeypatch,
+):
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [{"role": "user", "content": "one"}]
+    snapshot = await mod.build_logical_history_snapshot(messages, identity=identity)
+    checkpoint = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        source_hash=mod.compute_summary_source_hash(messages),
+        source_message_count=1,
+        summary_text="summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": snapshot.prefix_raw_source_hashes[0],
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    # The unresolved entry skips verification on purpose so the snapshot's
+    # verification-hash memo stays cold for the handoff measurement.
+    source = mod._history_ref_source_handle(
+        checkpoint,
+        user_message_id="message-1",
+        logical_snapshot=snapshot,
+        require_logical_snapshot_match=False,
+    )
+    assert isinstance(source, mod.HistoryRefSourceHandle)
+    entry = mod.RefCatalogEntry(
+        manifest=mod.RefManifest(
+            ref=f"history:{source.checkpoint_id}",
+            utf8_bytes=None,
+            sha256=source.raw_source_hash,
+        ),
+        source=source,
+    )
+    handoffs = []
+    real_source_hash_function = mod._logical_snapshot_source_hash
+
+    async def capture_to_thread(function, *args):
+        if function is real_source_hash_function:
+            handoffs.append(args)
+        return function(*args)
+
+    monkeypatch.setattr(mod.asyncio, "to_thread", capture_to_thread)
+    request = SimpleNamespace(state=SimpleNamespace())
+    metadata = {"chat_id": "chat-1", "user_message_id": "message-1"}
+
+    resolved = await mod.resolve_history_ref_catalog_entry(
+        entry,
+        request=request,
+        metadata=metadata,
+    )
+    assert isinstance(resolved.source, mod.LogicalHistorySourceHandle)
+    assert len(handoffs) == 1
+    again = await mod.resolve_history_ref_catalog_entry(
+        entry,
+        request=request,
+        metadata=metadata,
+    )
+    assert isinstance(again.source, mod.LogicalHistorySourceHandle)
+    assert len(handoffs) == 1
+
+
+@pytest.mark.asyncio
 async def test_logical_history_snapshot_freezes_canonical_prefixes_in_one_thread_handoff(
     monkeypatch,
 ):
@@ -2022,10 +2255,9 @@ async def test_logical_history_snapshot_freezes_canonical_prefixes_in_one_thread
     assert thread_handoffs[0][0] is mod._build_logical_history_snapshot_sync
     assert thread_handoffs[0][1][0] == tuple(original_messages)
     assert thread_handoffs[0][1][0][0] is not messages[0]
-    assert fingerprint_counts == [1, 2]
+    assert fingerprint_counts == []
     assert snapshot.identity == identity
     assert snapshot.records == expected_records
-    assert snapshot.prefix_file_fingerprints == ("files-1", "files-2")
     for count in (1, 2):
         payload = "\n".join(expected_records[:count])
         assert snapshot.prefix_raw_source_hashes[count - 1] == hashlib.sha256(
@@ -2038,10 +2270,252 @@ async def test_logical_history_snapshot_freezes_canonical_prefixes_in_one_thread
                 f"files-{count}",
             )
         )
+    assert fingerprint_counts == [1, 2]
 
     messages[1]["content"] = "mutated after build"
     assert snapshot.records == expected_records
     assert tuple(snapshot.source_hash_messages) == expected_records
+
+
+@pytest.mark.asyncio
+async def test_logical_history_snapshot_build_does_not_precompute_prefix_fingerprints():
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"m{index}"}
+        for index in range(200)
+    ]
+    fingerprint_counts = []
+
+    def prefix_file_fingerprint(count):
+        fingerprint_counts.append(count)
+        return f"files-{count}"
+
+    snapshot = await mod.build_logical_history_snapshot(
+        messages,
+        identity=identity,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint,
+    )
+
+    assert fingerprint_counts == []
+    source_hash = mod._logical_snapshot_source_hash(snapshot, 7)
+    assert fingerprint_counts == [7]
+    assert source_hash == mod.compute_summary_source_hash(
+        messages[:7],
+        "files-7",
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_fingerprint_freezes_metadata_files_before_worker_handoff(
+    monkeypatch,
+):
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+    ]
+    metadata = {
+        "chat_id": "chat-1",
+        "user_message_id": "msg-1",
+        "files": [
+            {
+                "id": "file-1",
+                "type": "file",
+                "name": "original.txt",
+                "docs": ["ignored body"],
+            },
+        ],
+    }
+    db_chain = [
+        {
+            "role": "user",
+            "content": "one",
+            "files": [{"id": "file-1", "type": "file"}],
+        },
+        {
+            "role": "assistant",
+            "content": "two",
+            "files": [{"id": "file-2", "type": "file"}],
+        },
+        {"role": "user", "content": "three"},
+    ]
+    expected_files = copy.deepcopy(metadata["files"])
+
+    async def load_chain(request, chat_id, current_message_id):
+        return copy.deepcopy(db_chain)
+
+    async def capture_to_thread(function, *args):
+        if function is mod._make_prefix_file_fingerprint_resolver:
+            # Mutate during the loop -> worker handoff window: the freeze
+            # must have happened on the event loop, before this point.
+            metadata["files"].append(
+                {"id": "file-2", "type": "file", "name": "appended.txt"}
+            )
+            metadata["files"][0]["name"] = "rewritten.txt"
+        return function(*args)
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+    monkeypatch.setattr(mod.asyncio, "to_thread", capture_to_thread)
+    request = SimpleNamespace(state=SimpleNamespace())
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        request, metadata, messages
+    )
+    assert resolver is not None
+    snapshot = await mod.get_or_build_logical_history_snapshot(
+        request,
+        messages,
+        identity=identity,
+        prefix_file_fingerprint_resolver=resolver,
+    )
+    metadata["files"][0]["name"] = "rewritten-again.txt"
+
+    expected_fingerprint = reference_prefix_file_fingerprint(
+        db_chain,
+        expected_files,
+        None,
+        2,
+    )
+    assert expected_fingerprint is not None
+    assert mod._logical_snapshot_source_hash(snapshot, 2) == (
+        mod.compute_summary_source_hash(
+            messages[:2],
+            expected_fingerprint,
+            db_chain,
+        )
+    )
+    assert not hasattr(
+        snapshot.prefix_file_fingerprint,
+        mod.PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR,
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_fingerprint_deepcopy_excludes_file_bodies(monkeypatch):
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+    ]
+    metadata = {
+        "chat_id": "chat-1",
+        "user_message_id": "msg-1",
+        "files": [
+            {
+                "id": "file-1",
+                "type": "file",
+                "name": "a.txt",
+                "docs": ["d" * 4096],
+                "content": {"body": "c" * 4096},
+            },
+            {
+                "id": "image-1",
+                "type": "image",
+                "name": "i.png",
+                "docs": ["d" * 4096],
+            },
+        ],
+    }
+    db_chain = [
+        {
+            "role": "user",
+            "content": "one",
+            "files": [{"id": "file-1", "type": "file"}],
+        },
+        {"role": "assistant", "content": "two"},
+    ]
+
+    async def load_chain(request, chat_id, current_message_id):
+        return [
+            {
+                "role": "user",
+                "content": "one",
+                "files": [{"id": "file-1", "type": "file"}],
+            },
+            {"role": "assistant", "content": "two"},
+        ]
+
+    deepcopied_inputs = []
+    real_deepcopy = copy.deepcopy
+
+    def observing_deepcopy(value):
+        deepcopied_inputs.append(value)
+        return real_deepcopy(value)
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+    monkeypatch.setattr(mod.copy, "deepcopy", observing_deepcopy)
+    request = SimpleNamespace(state=SimpleNamespace())
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        request,
+        metadata,
+        messages,
+    )
+
+    assert resolver is not None
+    assert len(deepcopied_inputs) == 1
+    frozen_input = deepcopied_inputs[0]
+    assert len(frozen_input) == 1
+    frozen_item = frozen_input[0]
+    assert frozen_item["id"] == "file-1"
+    assert frozen_item["name"] == "a.txt"
+    assert "docs" not in frozen_item
+    assert "content" not in frozen_item
+    assert resolver(1) == reference_prefix_file_fingerprint(
+        db_chain,
+        metadata["files"],
+        None,
+        1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_logical_snapshot_source_hash_is_stable_across_memo_warming():
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+    ]
+    fresh = await mod.build_logical_history_snapshot(messages, identity=identity)
+    warmed = await mod.build_logical_history_snapshot(
+        copy.deepcopy(messages),
+        identity=identity,
+    )
+    for count in range(1, len(messages) + 1):
+        mod._logical_snapshot_source_hash(warmed, count)
+
+    for count in range(0, len(messages) + 2):
+        expected = mod._logical_snapshot_source_hash(fresh, count)
+        assert mod._logical_snapshot_source_hash(warmed, count) == expected
+        assert mod._logical_snapshot_source_hash(warmed, count) == expected
+
+    other = await mod.build_logical_history_snapshot(
+        [
+            {"role": "user", "content": "different"},
+            {"role": "assistant", "content": "history"},
+        ],
+        identity=identity,
+    )
+    assert mod._logical_snapshot_source_hash(other, 1) != (
+        mod._logical_snapshot_source_hash(fresh, 1)
+    )
 
 
 def test_logical_history_handle_iterates_prefix_without_slicing_snapshot_records():
@@ -2062,7 +2536,6 @@ def test_logical_history_handle_iterates_prefix_without_slicing_snapshot_records
         ),
         records=records,
         source_hash_messages=("one", "two", "three"),
-        prefix_file_fingerprints=(None, None, None),
         prefix_raw_source_hashes=("a" * 64, "b" * 64, "c" * 64),
         prefix_utf8_bytes=(3, 7, 13),
     )
@@ -4483,6 +4956,70 @@ async def test_reusable_checkpoint_paths_skip_db_chain_for_tail_only_images_with
     assert calls == []
 
 
+@pytest.mark.asyncio
+async def test_reusable_checkpoint_match_computes_summary_source_hash_once(monkeypatch):
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "active"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,active"},
+                },
+            ],
+        },
+    ]
+    prefix = messages[:2]
+    checkpoint = make_checkpoint_row(
+        prefix,
+        state="ready",
+        summary_text="old summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([checkpoint])
+    hash_calls = 0
+    real_hash = mod.compute_summary_source_hash
+
+    def counting_hash(
+        source_messages,
+        prefix_file_fingerprint=None,
+        file_backed_image_db_chain=None,
+        *,
+        transient_message_patterns=None,
+    ):
+        nonlocal hash_calls
+        hash_calls += 1
+        return real_hash(
+            source_messages,
+            prefix_file_fingerprint,
+            file_backed_image_db_chain,
+            transient_message_patterns=transient_message_patterns,
+        )
+
+    async def load_chain(request, chat_id, current_message_id):
+        return [{"role": "user", "content": "active"}]
+
+    monkeypatch.setattr(mod, "compute_summary_source_hash", counting_hash)
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    match = await mod._body_reusable_checkpoint_match(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1", "user_message_id": "msg-1"},
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+        capture_logical_snapshot=True,
+    )
+    assert match is not None
+    assert hash_calls == 1
+
+
 def test_replace_prefix_accepts_parent_checkpoint_with_prefix_file_fingerprint():
     messages = [
         {"role": "user", "content": "old with file"},
@@ -4952,6 +5489,160 @@ def test_prefix_file_fingerprint_resolver_covers_only_absorbed_prefix_range():
     metadata_files_without_current = [metadata_files[0]]
     resolver_without_current = mod._make_prefix_file_fingerprint_resolver(db_chain, metadata_files_without_current)
     assert resolver_without_current(2) == fp_prefix
+
+
+def reference_prefix_file_fingerprint(
+    db_chain,
+    metadata_files,
+    transient_message_patterns,
+    count,
+):
+    prefix_ids = mod._classify_files_for_summary(
+        db_chain,
+        count,
+        0,
+        transient_message_patterns=transient_message_patterns,
+    )
+    if not prefix_ids:
+        return None
+    items = [
+        item
+        for item in metadata_files
+        if isinstance(item, dict)
+        and not mod._is_image_file_item(item)
+        and item.get("id") in prefix_ids
+    ]
+    return mod._stable_file_fingerprint(items) or None
+
+
+def _random_fingerprint_chain(rng):
+    db_chain = []
+    metadata_files = []
+    file_seq = 0
+    for _ in range(rng.randint(1, 60)):
+        roll = rng.random()
+        if roll < 0.08:
+            db_chain.append("non-dict-row")
+            continue
+        message = {"role": "user", "content": f"m{len(db_chain)}"}
+        if roll < 0.2:
+            message["role"] = "system"
+        elif roll < 0.34:
+            message["content"] = f"<CTX>transient {len(db_chain)}</CTX>"
+        if roll > 0.5:
+            files = []
+            for _ in range(rng.randint(1, 2)):
+                file_seq += 1
+                style = rng.random()
+                if style < 0.15:
+                    files.append({"id": f"img-{file_seq}", "type": "image"})
+                elif style < 0.35:
+                    files.append({"id": "shared-file", "type": "file"})
+                else:
+                    files.append({"id": f"file-{file_seq}", "type": "file"})
+            message["files"] = files
+            if rng.random() < 0.7:
+                for file_entry in files:
+                    if rng.random() < 0.5:
+                        metadata_files.append(
+                            {
+                                "id": file_entry["id"],
+                                "type": file_entry.get("type", "file"),
+                                "name": f"{file_entry['id']}.txt",
+                                "docs": ["dropped body"],
+                            }
+                        )
+        db_chain.append(message)
+    if rng.random() < 0.35:
+        db_chain.append(
+            {
+                "role": "system",
+                "content": "trailing system row",
+                "files": [{"id": "trailing-file", "type": "file"}],
+            }
+        )
+        if rng.random() < 0.5:
+            metadata_files.append(
+                {"id": "trailing-file", "type": "file", "name": "t.txt"}
+            )
+    metadata_files.append({"id": "image-only", "type": "image", "name": "i.png"})
+    metadata_files.append({"id": "ghost-file", "type": "file", "name": "g.txt"})
+    return db_chain, metadata_files
+
+
+def test_prefix_file_fingerprint_resolver_matches_classify_reference():
+    transient_message_patterns = (re.compile(r"<CTX>.*</CTX>"),)
+    rng = random.Random(20260906)
+
+    for case_index in range(36):
+        db_chain, metadata_files = _random_fingerprint_chain(rng)
+        for patterns in (None, transient_message_patterns):
+            resolver = mod._make_prefix_file_fingerprint_resolver(
+                db_chain,
+                metadata_files,
+                transient_message_patterns=patterns,
+            )
+            for count in range(-1, len(db_chain) + 3):
+                assert resolver(count) == reference_prefix_file_fingerprint(
+                    db_chain,
+                    metadata_files,
+                    patterns,
+                    count,
+                ), (case_index, patterns is None, count)
+
+
+def test_prefix_file_fingerprint_resolver_cost_is_bounded_per_unique_count(monkeypatch):
+    total = 200
+    db_chain = [
+        {
+            "role": "user",
+            "content": f"m{index}",
+            "files": [{"id": f"file-{index}", "type": "file"}],
+        }
+        for index in range(total)
+    ]
+    metadata_files = [
+        {"id": f"file-{index}", "type": "file", "name": f"f{index}.txt"}
+        for index in range(total)
+    ]
+    counts = {"identity": 0, "fingerprint": 0, "classify": 0, "boundary": 0}
+    real_identity = mod._is_source_identity_message
+    real_fingerprint = mod._stable_file_fingerprint
+    real_classify = mod._classify_files_for_summary
+    real_boundary = mod._raw_chain_boundary
+
+    def counting_identity(message, **kwargs):
+        counts["identity"] += 1
+        return real_identity(message, **kwargs)
+
+    def counting_fingerprint(items):
+        counts["fingerprint"] += 1
+        return real_fingerprint(items)
+
+    def counting_classify(*args, **kwargs):
+        counts["classify"] += 1
+        return real_classify(*args, **kwargs)
+
+    def counting_boundary(*args, **kwargs):
+        counts["boundary"] += 1
+        return real_boundary(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "_is_source_identity_message", counting_identity)
+    monkeypatch.setattr(mod, "_stable_file_fingerprint", counting_fingerprint)
+    monkeypatch.setattr(mod, "_classify_files_for_summary", counting_classify)
+    monkeypatch.setattr(mod, "_raw_chain_boundary", counting_boundary)
+
+    resolver = mod._make_prefix_file_fingerprint_resolver(db_chain, metadata_files)
+
+    assert resolver(1) is not None
+    assert resolver(100) is not None
+    assert resolver(200) is not None
+    assert resolver(100) is not None
+
+    assert counts["identity"] <= 3 * total
+    assert counts["fingerprint"] == 3
+    assert counts["classify"] == 0
+    assert counts["boundary"] == 0
 
 
 @pytest.mark.asyncio

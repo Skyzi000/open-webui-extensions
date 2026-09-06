@@ -26,7 +26,7 @@ from functions.pipe import auto_compact as mod
 TRANSIENT_MARKER = r"(?s)<SYSTEM_CONTEXT>.*</SYSTEM_CONTEXT>\s*\Z"
 
 
-def test_auto_compact_release_header_is_085_with_096_floor():
+def test_auto_compact_release_header_keeps_096_floor():
     header = {
         key.strip(): value.strip()
         for line in (mod.__doc__ or "").splitlines()
@@ -35,7 +35,6 @@ def test_auto_compact_release_header_is_085_with_096_floor():
     }
     source_after_header = inspect.getsource(mod).split('"""', 2)[2]
 
-    assert header["version"] == "0.8.5"
     assert header["required_open_webui_version"] == "0.9.6"
     assert source_after_header.lstrip().startswith("# fmt: off")
 

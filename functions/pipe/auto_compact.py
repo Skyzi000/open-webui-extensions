@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.8.5
+version: 0.8.6
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -234,6 +234,7 @@ AUTO_COMPACT_TIKTOKEN_ENCODING_LOADED_STATE_KEY = "_auto_compact_tiktoken_encodi
 PREFIX_FILE_FINGERPRINT_RESOLVER_STATE_KEY = "_auto_compact_prefix_file_fingerprint_resolver_cache"
 PREFIX_FILE_FINGERPRINT_FAMILY = "prefix-file-fingerprint-v1"
 PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR = "_auto_compact_db_chain"
+PREFIX_FILE_FINGERPRINT_RESOLVER_FROZEN_ATTR = "_auto_compact_frozen_fingerprint"
 LOG = logging.getLogger(__name__)
 REF_EXEC_TOOL_SPEC = MappingProxyType(
     {
@@ -508,9 +509,21 @@ class LogicalHistorySnapshot:
     identity: tuple[str, str, str, str, str]
     records: tuple[str, ...]
     source_hash_messages: tuple[str, ...]
-    prefix_file_fingerprints: tuple[str | None, ...]
     prefix_raw_source_hashes: tuple[str, ...]
     prefix_utf8_bytes: tuple[int, ...]
+    # Frozen-table callable from a production resolver; snapshots must not
+    # retain the raw DB chain or metadata files, so uncomputed fingerprints
+    # are derived lazily from the frozen table instead of being stored.
+    prefix_file_fingerprint: Callable[[int], str | None] | None = dataclass_field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    source_hash_by_count: dict[int, str] = dataclass_field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2111,7 +2124,6 @@ def _build_logical_history_snapshot_sync(
     mask = _transient_message_mask(logical_messages, transient_message_patterns)
     records: list[str] = []
     canonical_source_messages: list[str] = []
-    prefix_file_fingerprints: list[str | None] = []
     prefix_raw_source_hashes: list[str] = []
     prefix_utf8_bytes: list[int] = []
     digest = hashlib.sha256()
@@ -2142,19 +2154,13 @@ def _build_logical_history_snapshot_sync(
                 canonicalize_message_for_source_hash(source_hash_messages[index])
             )
         )
-        count = len(records)
-        prefix_file_fingerprints.append(
-            prefix_file_fingerprint_resolver(count)
-            if prefix_file_fingerprint_resolver is not None
-            else None
-        )
     return LogicalHistorySnapshot(
         identity=identity,
         records=tuple(records),
         source_hash_messages=tuple(canonical_source_messages),
-        prefix_file_fingerprints=tuple(prefix_file_fingerprints),
         prefix_raw_source_hashes=tuple(prefix_raw_source_hashes),
         prefix_utf8_bytes=tuple(prefix_utf8_bytes),
+        prefix_file_fingerprint=prefix_file_fingerprint_resolver,
     )
 
 
@@ -2176,7 +2182,11 @@ async def build_logical_history_snapshot(
                 or []
             )
         ),
-        prefix_file_fingerprint_resolver,
+        getattr(
+            prefix_file_fingerprint_resolver,
+            PREFIX_FILE_FINGERPRINT_RESOLVER_FROZEN_ATTR,
+            prefix_file_fingerprint_resolver,
+        ),
         transient_message_patterns,
         identity,
     )
@@ -2194,6 +2204,7 @@ async def get_or_build_logical_history_snapshot(
     identity: tuple[str, str, str, str, str],
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    source_hash: str | None = None,
 ) -> LogicalHistorySnapshot:
     state = getattr(request, "state", None)
     if state is None:
@@ -2207,22 +2218,24 @@ async def get_or_build_logical_history_snapshot(
         messages,
         transient_message_patterns=transient_message_patterns,
     )
-    source_fingerprint = (
-        prefix_file_fingerprint_resolver(source_message_count)
-        if prefix_file_fingerprint_resolver is not None
-        and source_message_count > 0
-        else None
-    )
-    cache_key = (
-        identity,
-        compute_summary_source_hash(
+    if source_hash is None:
+        source_fingerprint = (
+            prefix_file_fingerprint_resolver(source_message_count)
+            if prefix_file_fingerprint_resolver is not None
+            and source_message_count > 0
+            else None
+        )
+        source_hash = compute_summary_source_hash(
             messages,
             source_fingerprint,
             _prefix_file_fingerprint_resolver_db_chain(
                 prefix_file_fingerprint_resolver
             ),
             transient_message_patterns=transient_message_patterns,
-        ),
+        )
+    cache_key = (
+        identity,
+        source_hash,
         source_message_count,
     )
     cache = getattr(
@@ -2281,6 +2294,8 @@ def _logical_snapshot_source_hash(
 ) -> str | None:
     if source_message_count <= 0 or source_message_count > len(snapshot.records):
         return None
+    if source_message_count in snapshot.source_hash_by_count:
+        return snapshot.source_hash_by_count[source_message_count]
     payload: dict[str, Any] = {
         "family": SOURCE_HASH_FAMILY,
         "messages": [
@@ -2288,12 +2303,31 @@ def _logical_snapshot_source_hash(
             for message in snapshot.source_hash_messages[:source_message_count]
         ],
     }
-    prefix_file_fingerprint = snapshot.prefix_file_fingerprints[
-        source_message_count - 1
-    ]
+    prefix_file_fingerprint = (
+        snapshot.prefix_file_fingerprint(source_message_count)
+        if snapshot.prefix_file_fingerprint is not None
+        else None
+    )
     if prefix_file_fingerprint:
         payload["prefix_file_fingerprint"] = prefix_file_fingerprint
-    return _json_hash(payload)
+    result = _json_hash(payload)
+    snapshot.source_hash_by_count[source_message_count] = result
+    return result
+
+
+async def _logical_snapshot_source_hash_async(
+    snapshot: LogicalHistorySnapshot,
+    source_message_count: int,
+) -> str | None:
+    if source_message_count <= 0 or source_message_count > len(snapshot.records):
+        return None
+    if source_message_count in snapshot.source_hash_by_count:
+        return snapshot.source_hash_by_count[source_message_count]
+    return await asyncio.to_thread(
+        _logical_snapshot_source_hash,
+        snapshot,
+        source_message_count,
+    )
 
 
 def _logical_snapshot_matches_checkpoint(
@@ -2472,6 +2506,8 @@ async def build_history_ref_catalog(
         visited.add(checkpoint_id)
         previous_count = count
 
+        if is_selected_checkpoint and logical_snapshot is not None:
+            await _logical_snapshot_source_hash_async(logical_snapshot, count)
         source = _history_ref_source_handle(
             current,
             user_message_id=user_message_id,
@@ -2535,7 +2571,10 @@ async def resolve_history_ref_catalog_entry(
         ):
             raise CanonicalHistoryError(reason="checkpoint source identity verification failed")
         if (
-            _logical_snapshot_source_hash(snapshot, source.source_message_count)
+            await _logical_snapshot_source_hash_async(
+                snapshot,
+                source.source_message_count,
+            )
             != source.source_hash
         ):
             raise CanonicalHistoryError(reason="checkpoint source integrity verification failed")
@@ -2828,6 +2867,13 @@ async def enrich_checkpoint_history_ref(
     if parsed_existing.state == "invalid":
         return None
     existing = parsed_existing.value
+    if logical_snapshot is not None:
+        try:
+            warm_count = int(checkpoint.get("source_message_count") or 0)
+        except (TypeError, ValueError):
+            warm_count = 0
+        if warm_count > 0:
+            await _logical_snapshot_source_hash_async(logical_snapshot, warm_count)
     use_logical_snapshot = (
         logical_snapshot is not None
         and _logical_snapshot_matches_checkpoint(logical_snapshot, checkpoint)
@@ -3459,41 +3505,81 @@ def _make_prefix_file_fingerprint_resolver(
     # filter-injected system messages exist only in the request body and
     # churn between turns, while imported or API-created histories can store
     # their own system rows in the chain, so neither side is safe to index
-    # raw; _classify_files_for_summary converts via _raw_chain_boundary.
-    # Using the full prefix range (rather than the delta
+    # raw. The frozen table below derives that boundary and the file
+    # identities once, at construction; each count then resolves from the
+    # table without touching the chain or metadata files again. Using the
+    # full prefix range (rather than the delta
     # [parent_count, compaction_prefix_count)) keeps the hash basis identical
     # for a checkpoint and any of its potential children, so parent matching
     # and parent validation use the same fingerprint the stored row was built
-    # with. The set is order-independent because _classify_files_for_summary
-    # returns a set and the summary file context only depends on which files
-    # are present in the prefix, not their positional order.
-    cache: dict[int, str | None] = {}
+    # with. The set is order-independent because the prefix ids form a set
+    # and the summary file context only depends on which files are present
+    # in the prefix, not their positional order.
+    chain_length = len(db_chain) if db_chain else 0
+    mask = (
+        _transient_message_mask(db_chain, transient_message_patterns)
+        if db_chain
+        else None
+    )
+    seen_positions: list[int] = []
+    first_index_by_id: dict[str, int] = {}
+    if db_chain:
+        for index, message in enumerate(db_chain):
+            if not isinstance(message, dict):
+                seen_positions.append(index)
+            elif _is_source_identity_message(
+                message,
+                transient_message_patterns=transient_message_patterns,
+                transient_message_mask=mask,
+                index=index,
+            ):
+                seen_positions.append(index)
+            if _is_source_identity_message(
+                message,
+                transient_message_patterns=transient_message_patterns,
+            ):
+                for file_id in _extract_non_image_file_ids(message.get("files")):
+                    first_index_by_id.setdefault(file_id, index)
+    # Attachment identities only: docs/content/file bodies never enter the
+    # fingerprint, so the frozen table must not retain them.
+    frozen_files = tuple(
+        _canonicalize_prefix_file_attachment_identity(item)
+        for item in metadata_files
+        if isinstance(item, dict) and not _is_image_file_item(item)
+    )
+    seen_position_index = tuple(seen_positions)
+    fingerprint_cache: dict[int, str | None] = {}
 
-    def resolve(count: int) -> str | None:
-        cached = cache.get(count, False)
-        if cached is not False:
-            return cached
-        prefix_ids = _classify_files_for_summary(
-            db_chain,
-            count,
-            0,
-            transient_message_patterns=transient_message_patterns,
-        )
-        if not prefix_ids:
-            result: str | None = None
+    def table_fingerprint(count: int) -> str | None:
+        if count in fingerprint_cache:
+            return fingerprint_cache[count]
+        if count <= 0:
+            boundary = 0
+        elif count < len(seen_position_index):
+            boundary = seen_position_index[count]
         else:
-            items = [
-                item
-                for item in metadata_files
-                if isinstance(item, dict)
-                and not _is_image_file_item(item)
-                and item.get("id") in prefix_ids
-            ]
-            result = _stable_file_fingerprint(items) or None
-        cache[count] = result
+            boundary = chain_length
+        prefix_ids = {
+            file_id
+            for file_id, index in first_index_by_id.items()
+            if index < boundary
+        }
+        result: str | None = None
+        if prefix_ids:
+            result = (
+                _stable_file_fingerprint(
+                    [item for item in frozen_files if item.get("id") in prefix_ids]
+                )
+                or None
+            )
+        fingerprint_cache[count] = result
         return result
 
+    def resolve(count: int) -> str | None:
+        return table_fingerprint(count)
+
     setattr(resolve, PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR, db_chain)
+    setattr(resolve, PREFIX_FILE_FINGERPRINT_RESOLVER_FROZEN_ATTR, table_fingerprint)
     return resolve
 
 
@@ -3539,10 +3625,22 @@ async def _build_prefix_file_fingerprint_resolver(
         if require_file_context_chain and required_file_ids:
             raise SummaryFileContextUnavailable()
         return None
-    resolver = _make_prefix_file_fingerprint_resolver(
+    # Freeze the attachment identities on the event loop, before the worker
+    # handoff, so later mutations of metadata.files cannot leak into
+    # fingerprints computed in the worker. Canonicalizing first also keeps
+    # file bodies (docs/content) out of the deep-copied payload.
+    frozen_files = copy.deepcopy(
+        [
+            _canonicalize_prefix_file_attachment_identity(item)
+            for item in metadata_files
+            if isinstance(item, dict) and not _is_image_file_item(item)
+        ]
+    )
+    resolver = await asyncio.to_thread(
+        _make_prefix_file_fingerprint_resolver,
         db_chain,
-        metadata_files,
-        transient_message_patterns=transient_message_patterns,
+        frozen_files,
+        transient_message_patterns,
     )
     if cache is not None:
         with suppress(Exception):
@@ -15876,14 +15974,17 @@ async def _find_reusable_checkpoint_for_source(
     prefix_file_fingerprint: str | None = None,
     prefix_file_fingerprint_resolver: Callable[[int], str | None] | None = None,
     transient_message_patterns: TransientMessagePatterns | None = None,
+    source_hash: str | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
-    file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(prefix_file_fingerprint_resolver)
-    source_hash = compute_summary_source_hash(
-        source_messages,
-        prefix_file_fingerprint,
-        file_backed_image_db_chain,
-        transient_message_patterns=transient_message_patterns,
-    )
+    if source_hash is None:
+        source_hash = compute_summary_source_hash(
+            source_messages,
+            prefix_file_fingerprint,
+            _prefix_file_fingerprint_resolver_db_chain(
+                prefix_file_fingerprint_resolver
+            ),
+            transient_message_patterns=transient_message_patterns,
+        )
     existing = await store.lookup_ready(
         namespace=CHECKPOINT_NAMESPACE,
         user_id=user_id,
@@ -15955,6 +16056,9 @@ async def _body_reusable_checkpoint_match(
         resolver_source_messages,
         transient_message_patterns=transient_message_patterns,
     )
+    file_backed_image_db_chain = _prefix_file_fingerprint_resolver_db_chain(
+        prefix_file_fingerprint_resolver
+    )
 
     if tool_cut is not None and tool_cut.summarization_prefix:
         tool_identity_fingerprint = (
@@ -15967,6 +16071,12 @@ async def _body_reusable_checkpoint_match(
             if prefix_file_fingerprint_resolver is not None
             else None
         )
+        tool_source_hash = compute_summary_source_hash(
+            tool_cut.summarization_prefix,
+            tool_identity_fingerprint,
+            file_backed_image_db_chain,
+            transient_message_patterns=transient_message_patterns,
+        )
         tool_match = await _find_reusable_checkpoint_for_source(
             store=store,
             user_id=user_id,
@@ -15977,6 +16087,7 @@ async def _body_reusable_checkpoint_match(
             prefix_file_fingerprint=tool_identity_fingerprint,
             prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
             transient_message_patterns=transient_message_patterns,
+            source_hash=tool_source_hash,
         )
         if tool_match is not None:
             kind, checkpoint = tool_match
@@ -15995,6 +16106,7 @@ async def _body_reusable_checkpoint_match(
                         prefix_file_fingerprint_resolver
                     ),
                     transient_message_patterns=transient_message_patterns,
+                    source_hash=tool_source_hash,
                 )
                 if capture_logical_snapshot
                 else None
@@ -16020,6 +16132,12 @@ async def _body_reusable_checkpoint_match(
         if prefix_file_fingerprint_resolver is not None
         else None
     )
+    message_source_hash = compute_summary_source_hash(
+        cut.summarization_prefix,
+        message_identity_fingerprint,
+        file_backed_image_db_chain,
+        transient_message_patterns=transient_message_patterns,
+    )
     message_match = await _find_reusable_checkpoint_for_source(
         store=store,
         user_id=user_id,
@@ -16030,6 +16148,7 @@ async def _body_reusable_checkpoint_match(
         prefix_file_fingerprint=message_identity_fingerprint,
         prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
         transient_message_patterns=transient_message_patterns,
+        source_hash=message_source_hash,
     )
     if message_match is not None:
         kind, checkpoint = message_match
@@ -16046,6 +16165,7 @@ async def _body_reusable_checkpoint_match(
                 ),
                 prefix_file_fingerprint_resolver=prefix_file_fingerprint_resolver,
                 transient_message_patterns=transient_message_patterns,
+                source_hash=message_source_hash,
             )
             if capture_logical_snapshot
             else None
