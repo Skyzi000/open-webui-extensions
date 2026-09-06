@@ -29370,6 +29370,8 @@ async def _task8_run_current_core_route(
     dispatch_exact_ref_command=False,
     observe_hard_compaction=False,
     target_model=None,
+    append_live_user=False,
+    request_filter_module=None,
 ):
     import open_webui.functions as core_functions
     import open_webui.main as core_main
@@ -29747,18 +29749,56 @@ async def _task8_run_current_core_route(
     )
     monkeypatch.setattr(core_middleware, "load_messages_from_db", no_messages)
     monkeypatch.setattr(core_middleware.Chats, "get_chat_folder_id", no_messages)
-    monkeypatch.setattr(core_filter, "get_sorted_filter_ids", no_filters)
-    if hasattr(core_middleware, "get_sorted_filter_ids"):
-        monkeypatch.setattr(core_middleware, "get_sorted_filter_ids", no_filters)
-    monkeypatch.setattr(core_filter.Functions, "get_functions_by_ids", no_filters)
-    if hasattr(core_middleware, "Functions"):
+    if request_filter_module is None:
+        monkeypatch.setattr(core_filter, "get_sorted_filter_ids", no_filters)
+        if hasattr(core_middleware, "get_sorted_filter_ids"):
+            monkeypatch.setattr(core_middleware, "get_sorted_filter_ids", no_filters)
+        monkeypatch.setattr(core_filter.Functions, "get_functions_by_ids", no_filters)
+        if hasattr(core_middleware, "Functions"):
+            monkeypatch.setattr(
+                core_middleware.Functions, "get_functions_by_ids", no_filters
+            )
+    else:
+
+        async def active_filter_ids(*args, **kwargs):
+            return [("cache-hint-filter", True)]
+
+        async def filter_functions_by_ids(ids, *args, **kwargs):
+            return [
+                SimpleNamespace(id=function_id)
+                for function_id in ids
+                if function_id == "cache-hint-filter"
+            ]
+
+        async def no_filter_valves(ids, *args, **kwargs):
+            return {}
+
+        async def request_filter_by_id(
+            request, function_id, load_from_db=True, function=None
+        ):
+            if function_id == "cache-hint-filter":
+                return request_filter_module
+            raise AssertionError(f"unexpected request filter: {function_id}")
+
         monkeypatch.setattr(
-            core_middleware.Functions, "get_functions_by_ids", no_filters
+            core_filter.Functions, "get_active_filter_ids", active_filter_ids
         )
+        monkeypatch.setattr(
+            core_filter.Functions, "get_functions_by_ids", filter_functions_by_ids
+        )
+        monkeypatch.setattr(
+            core_filter.Functions,
+            "get_function_valves_by_ids",
+            no_filter_valves,
+        )
+        monkeypatch.setattr(core_filter, "get_function_module", request_filter_by_id)
     monkeypatch.setattr(
         core_middleware, "process_pipeline_inlet_filter", identity_pipeline
     )
-    monkeypatch.setattr(core_middleware, "process_filter_functions", identity_filters)
+    if request_filter_module is None:
+        monkeypatch.setattr(
+            core_middleware, "process_filter_functions", identity_filters
+        )
     monkeypatch.setattr(
         core_middleware, "chat_completion_files_handler", no_file_context
     )
@@ -29810,7 +29850,7 @@ async def _task8_run_current_core_route(
                 entry["message_id"]
             ]
     input_messages = _task7_native_round(persisted_tool_text)
-    if observe_hard_compaction:
+    if observe_hard_compaction or append_live_user:
         input_messages.append({"role": "user", "content": "answer after compaction"})
     body = {
         "model": wrapper_id,
@@ -33002,6 +33042,175 @@ async def test_real_core_native_reader_dispatches_and_reenters_pipe(
     assert not store.reservations
     assert not store.registry_reservations
     assert not store.registry_owners
+
+
+class _CacheHintRequestFilter:
+    def __init__(self):
+        self.calls = 0
+
+    async def request(self, body):
+        self.calls += 1
+        trace = f"call-{self.calls}"
+        messages = body["messages"]
+        first_user = next(message for message in messages if message.get("role") == "user")
+        last_user = next(
+            message
+            for message in reversed(messages)
+            if message.get("role") == "user"
+        )
+        for message in (first_user, last_user):
+            content = message["content"]
+            text = content if isinstance(content, str) else content[0]["text"]
+            message["content"] = [
+                {
+                    "type": "text",
+                    "text": text,
+                    "cache_control": {"type": "ephemeral"},
+                    "provider_annotations": {"trace": trace},
+                }
+            ]
+            message["provider_message_state"] = {"trace": trace}
+        return body
+
+
+@pytest.mark.asyncio
+async def test_real_core_request_filter_reapplication_keeps_checkpoint_identity(
+    monkeypatch,
+    real_checkpoint_store,
+    create_real_checkpoint,
+):
+    request = _Task7Request()
+    text = "persisted tool text"
+    checkpoint = await create_real_checkpoint(
+        request,
+        _task7_native_round(text),
+        "task-7b checkpoint",
+    )
+    filter_module = _CacheHintRequestFilter()
+    checkpoint_lookups = []
+    real_checkpoint_lookup = mod._body_reusable_checkpoint_match
+
+    async def observe_checkpoint_lookup(**kwargs):
+        match = await real_checkpoint_lookup(**kwargs)
+        checkpoint_lookups.append(
+            (
+                mod.compute_summary_source_hash(
+                    copy.deepcopy(kwargs["body"]["messages"][:3])
+                ),
+                match.checkpoint["id"] if match is not None else None,
+            )
+        )
+        return match
+
+    monkeypatch.setattr(
+        mod,
+        "_body_reusable_checkpoint_match",
+        observe_checkpoint_lookup,
+    )
+    registry = {
+        "unrelated": {
+            "spec": {"name": "unrelated", "parameters": {"type": "object"}},
+            "callable": lambda: None,
+        }
+    }
+
+    observed = await _task8_run_current_core_route(
+        monkeypatch,
+        registry=registry,
+        text=text,
+        request=request,
+        dispatch_reader=True,
+        ref_substitution_threshold_tokens=1_000,
+        append_live_user=True,
+        request_filter_module=filter_module,
+    )
+
+    assert filter_module.calls == len(observed["injected"]) == 3
+
+    for index, injected in enumerate(observed["injected"]):
+        messages = injected["body"]["messages"]
+        first_user = next(
+            message for message in messages if message.get("role") == "user"
+        )
+        last_user = next(
+            message
+            for message in reversed(messages)
+            if message.get("role") == "user"
+        )
+        trace = f"call-{index + 1}"
+        for message in (first_user, last_user):
+            assert message["content"][0]["cache_control"] == {"type": "ephemeral"}
+            assert message["content"][0]["provider_annotations"]["trace"] == trace
+        if index >= 1:
+            assert messages[-1]["role"] == "tool"
+        assert "<auto_compaction_context" not in json.dumps(messages)
+        assert "metadata" not in injected["body"]
+
+    assert len(checkpoint_lookups) >= 3
+    assert {digest for digest, _checkpoint_id in checkpoint_lookups} == {
+        checkpoint["source_hash"]
+    }
+    assert {checkpoint_id for _digest, checkpoint_id in checkpoint_lookups} == {
+        checkpoint["id"]
+    }
+
+    async with real_checkpoint_store.sessionmaker() as session:
+        rows = list((await session.execute(mod.CHECKPOINT_TABLE.select())).mappings())
+        persisted = dict(
+            (
+                await session.execute(
+                    mod.CHECKPOINT_TABLE.select().where(
+                        mod.CHECKPOINT_TABLE.c.id == checkpoint["id"]
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+    assert [row["id"] for row in rows] == [checkpoint["id"]]
+    assert real_checkpoint_store.cas_checkpoint_ids == [checkpoint["id"]]
+    assert real_checkpoint_store.healed_checkpoint_ids == []
+
+    provider_calls = observed["provider"]
+    assert len(provider_calls) == 3
+    summary_prefixes = [
+        json.dumps(call["messages"][0], sort_keys=True) for call in provider_calls
+    ]
+    assert len(set(summary_prefixes)) == 1
+    assert [
+        mod.extract_compaction_summary_text_from_messages([call["messages"][0]])
+        for call in provider_calls
+    ] == ["task-7b checkpoint"] * 3
+
+    for index, call in enumerate(provider_calls):
+        last_user = next(
+            message
+            for message in reversed(call["messages"])
+            if message.get("role") == "user"
+        )
+        assert last_user["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert last_user["content"][0]["provider_annotations"]["trace"] == (
+            f"call-{index + 1}"
+        )
+
+    history_ref = persisted["summary_meta"][mod.SUMMARY_META_HISTORY_REF_KEY]
+    expected_manifests = [
+        {
+            "ref": f"history:{checkpoint['id']}",
+            "sha256": history_ref["raw_source_hash"],
+        }
+    ]
+    assert all(
+        call["metadata"]["auto_compact_ref_manifests"] == expected_manifests
+        for call in provider_calls
+    )
+
+    assert len(observed["active_readers"]) == 1
+    assert {
+        (entry.manifest.ref, entry.manifest.sha256)
+        for entry in observed["active_readers"][0]["catalog"]
+    } == {(expected_manifests[0]["ref"], expected_manifests[0]["sha256"])}
 
 
 @pytest.mark.asyncio
