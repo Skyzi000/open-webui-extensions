@@ -27413,11 +27413,6 @@ async def test_history_ref_cas_enrichment_preserves_single_lineage(
     }
 
 
-class _Task6Encoder:
-    def encode(self, _text, **_kwargs):
-        return list(range(1_000))
-
-
 def _task6_projection_surface():
     surface = getattr(mod, "apply_ref_projection_surfaces", None)
     assert callable(surface), "Task 6 shared projection surface is not implemented"
@@ -27445,7 +27440,6 @@ async def _task6_plan(messages):
     return await mod.project_native_tool_texts(
         messages,
         threshold_tokens=1_000,
-        encoder=_Task6Encoder(),
     )
 
 
@@ -27785,7 +27779,11 @@ async def test_summary_ref_projection_matches_target_prefix_and_schema(
     monkeypatch, pipe_request, pipe_user
 ):
     apply_surfaces = _task6_projection_surface()
-    raw = "shared projection" * 5_000
+    raw = (
+        "Result columns: name, status\n"
+        + "shared projection" * 5_000
+        + "\nResult complete"
+    )
     source = [*_task6_native_round(raw), {"role": "user", "content": "continue"}]
     plan = await _task6_plan(source)
     target = {
@@ -27818,6 +27816,12 @@ async def test_summary_ref_projection_matches_target_prefix_and_schema(
     manifests = mod.ref_render_manifest_payloads(plan)
     assert result == "summary"
     assert summary["messages"][:-1] == target["messages"]
+    preview = target["messages"][1]["content"]
+    assert preview.startswith("Result columns: name, status\n")
+    assert preview.endswith("\nResult complete")
+    assert "<auto_compact_ref_truncated>" in preview
+    assert plan.catalog[0].manifest.ref in preview
+    assert source[1]["content"] == raw
     assert all(
         tool.get("function", {}).get("name") != mod.REF_EXEC_TOOL_NAME
         for tool in summary.get("tools", [])
@@ -28675,8 +28679,8 @@ async def test_rendered_checkpoint_manifest_bytes_stay_stable_after_post_boundar
     turn_n_plus_one_source = [*historical_prefix, *post_boundary_round]
 
     class AboveThresholdEncoder:
-        def encode(self, _text, **_kwargs):
-            return list(range(1_001))
+        def encode(self, text, **_kwargs):
+            return list(text.encode("utf-8"))
 
     threshold_tokens = 1_000
     encoder = AboveThresholdEncoder()
@@ -28733,7 +28737,10 @@ async def test_rendered_checkpoint_manifest_bytes_stay_stable_after_post_boundar
     assert tool_plan.render_manifests[0].ref == expected_tool_ref
     assert tool_plan.render_manifests[0].kind == "tool"
     assert tool_plan.render_manifests[0].tool == "lookup"
-    assert turn_n_plus_one["messages"][-1]["content"] == expected_tool_ref
+    preview = turn_n_plus_one["messages"][-1]["content"]
+    assert expected_tool_ref in preview
+    assert "<auto_compact_ref_truncated>" in preview
+    assert len(encoder.encode(preview)) < threshold_tokens
     assert set(turn_n_summary) == set(turn_n_plus_one_summary) == {"role", "content"}
     assert json.dumps(turn_n_plus_one_summary).encode("utf-8") == json.dumps(
         turn_n_summary
@@ -29365,7 +29372,7 @@ async def _task8_run_current_core_route(
     chat_id="chat-1",
     previous_response_id=None,
     trigger_input_tokens=100_000_000,
-    ref_substitution_threshold_tokens=1,
+    ref_substitution_threshold_tokens=1_000,
     dispatch_exact_ref_command=False,
     observe_hard_compaction=False,
     target_model=None,
@@ -30025,7 +30032,9 @@ async def test_provider_visible_tokens_alone_drive_compaction_across_ref_counts(
     assert result == {"ok": True}
     assert observed["summaries"] == 0
     assert observed["estimates"][-1] is observed["forwards"][0]
-    assert observed["estimates"][-1]["messages"][-1]["content"].startswith("tool:")
+    preview = observed["estimates"][-1]["messages"][-1]["content"]
+    assert "<auto_compact_ref_truncated>" in preview
+    assert re.search(r"tool:[0-9a-f]{64}", preview)
     assert any(
         tool.get("function", {}).get("name") == mod.REF_EXEC_TOOL_NAME
         for tool in observed["estimates"][-1]["tools"]
@@ -31611,11 +31620,14 @@ async def test_selected_attempt_commits_only_readable_projected_refs_immediately
     observed = {}
 
     async def forward(**kwargs):
-        refs = [
+        previews = [
             message["content"]
             for message in kwargs["body"]["messages"]
             if message.get("role") == "tool"
         ]
+        assert previews
+        assert all("<auto_compact_ref_truncated>" in text for text in previews)
+        refs = [re.search(r"tool:[0-9a-f]{64}", text).group(0) for text in previews]
         observed["refs"] = refs
         observed["results"] = [
             await registry[mod.REF_EXEC_TOOL_NAME]["callable"](f"cat {ref}")
@@ -31714,7 +31726,7 @@ async def test_summary_projection_only_avoids_ref_attempts_state_and_reader_sche
 ):
     raw = "summary projection only\n" * 5_000
     source_messages = _task7_native_round(raw)
-    plan = _task7_plan(raw)
+    plan = await _task6_plan(source_messages)
     request = _Task7Request()
     registry = {"unrelated": {}}
     request.state.metadata = {"chat_id": "chat-1", "tools": registry}
@@ -31746,6 +31758,8 @@ async def test_summary_projection_only_avoids_ref_attempts_state_and_reader_sche
     provider_body = provider_calls[0][1]
     assert result == "summary"
     assert attempted == []
+    assert "<auto_compact_ref_truncated>" in provider_body["messages"][2]["content"]
+    assert raw not in provider_body["messages"][2]["content"]
     assert not hasattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
     assert registry == {"unrelated": {}}
     assert all(
@@ -31811,12 +31825,15 @@ async def test_prefetch_projection_only_avoids_ref_attempts_state_and_reader_sch
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
         ref_mode_active=True,
-        ref_substitution_threshold_tokens=1,
+        ref_substitution_threshold_tokens=1_000,
     )
 
     provider_body = provider_calls[0][1]
     assert result is True
     assert attempted == []
+    preview = provider_body["messages"][2]["content"]
+    assert "<auto_compact_ref_truncated>" in preview
+    assert raw not in preview
     assert not hasattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
     assert registry == {"unrelated": {}}
     assert all(
@@ -32185,7 +32202,7 @@ async def test_active_soft_prefetch_proves_parent_and_projects_tool_delta_before
         historical_message_excerpt_bytes=1024,
         historical_message_excerpt_count=3,
         ref_mode_active=True,
-        ref_substitution_threshold_tokens=1,
+        ref_substitution_threshold_tokens=1_000,
     )
 
     parent_ref = f"history:{parent['id']}"
@@ -32912,7 +32929,7 @@ async def test_real_core_native_reader_dispatches_and_reenters_pipe(
             "callable": lambda: None,
         }
     }
-    source_text = "λ" * 40_000
+    source_text = "Result columns: name, status\n" + "λ" * 40_000 + "\nResult complete"
     source_utf8 = source_text.encode("utf-8")
     expected_byte_count = str(len(source_utf8))
     assert len(source_utf8) > 65_536
@@ -32970,6 +32987,20 @@ async def test_real_core_native_reader_dispatches_and_reenters_pipe(
     assert projected_ref in {
         entry.manifest.ref for entry in active_reader["catalog"]
     }
+    previews = [
+        next(
+            message["content"]
+            for message in call["messages"]
+            if message.get("role") == "tool" and message.get("tool_call_id") == "call-1"
+        )
+        for call in observed["provider"]
+    ]
+    assert previews[0] == previews[1]
+    assert previews[0].startswith("Result columns: name, status\n")
+    assert previews[0].endswith("\nResult complete")
+    assert "<auto_compact_ref_truncated>" in previews[0]
+    assert projected_ref in previews[0]
+    assert source_text not in previews[0]
     expected_command = f"wc -c {projected_ref}"
     second_provider_messages = observed["provider"][1]["messages"]
     reader_tool_calls = [

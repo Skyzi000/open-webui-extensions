@@ -55,6 +55,26 @@ class CountingEncoder:
         return list(range(self.count))
 
 
+class PreviewByteEncoder:
+    def encode(self, text: str, **_kwargs: object) -> range:
+        return range((len(text.encode("utf-8")) + 3) // 4)
+
+
+def _preview_parts(content: str) -> tuple[str, str, str]:
+    head, opening, rest = content.partition("\n<auto_compact_ref_truncated>")
+    assert opening, content
+    encoded, closing, tail = rest.partition("</auto_compact_ref_truncated>\n")
+    assert closing, content
+    return head, json.loads(encoded)["next"], tail
+
+
+def _preview_ref(content: str) -> str:
+    _head, command, _tail = _preview_parts(content)
+    match = re.fullmatch(r"tail -c \+\d+ (tool:[0-9a-f]{64}) \| head -c \d+", command)
+    assert match is not None, command
+    return match[1]
+
+
 async def _run_pipe_boundary(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -667,6 +687,221 @@ async def test_ref_threshold_encoder_failure_keeps_only_that_text_raw() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "size, externalized", [(3_996, False), (4_000, True), (4_004, True)]
+)
+async def test_tool_preview_threshold_includes_marker_budget(
+    size: int, externalized: bool
+) -> None:
+    encoder = PreviewByteEncoder()
+    source = "x" * size
+    messages = [{"role": "tool", "tool_call_id": "call", "content": source}]
+    plan = await mod.project_native_tool_texts(
+        messages, threshold_tokens=1_000, encoder=encoder
+    )
+    projected = await mod.apply_ref_projection_plan(messages, plan)
+
+    assert messages[0]["content"] == source
+    assert bool(plan.catalog) is externalized
+    if not externalized:
+        assert projected == messages
+        return
+    preview = projected[0]["content"]
+    ref = _preview_ref(preview)
+    assert ref == f"tool:{hashlib.sha256(source.encode()).hexdigest()}"
+    assert len(encoder.encode(preview)) < 1_000
+    assert len(preview.encode()) <= mod.REF_EXEC_RESPONSE_MAX_BYTES
+    assert plan.catalog[0].source.text is source
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source",
+    [
+        "head of the result\n" + "middle line\n" * 900 + "tail of the result\n",
+        "日本語の長い結果。\n" * 1_200,
+        "🙂🚀漢字αβγ" * 3_000,
+        "single giant line " + "z" * 100_000,
+    ],
+    ids=("lines", "japanese", "emoji", "giant-line"),
+)
+async def test_tool_preview_preserves_utf8_head_tail_and_full_source_identity(
+    source: str,
+) -> None:
+    encoder = PreviewByteEncoder()
+    plan = await mod.project_native_tool_texts(
+        [{"role": "tool", "tool_call_id": "call", "content": source}],
+        threshold_tokens=1_000,
+        encoder=encoder,
+    )
+    entry = plan.catalog[0]
+    head, command, tail = _preview_parts(entry.preview_text)
+    retained_head = len(head.encode())
+    omitted = len(source.encode()) - retained_head - len(tail.encode())
+
+    assert head and tail
+    assert source.startswith(head) and source.endswith(tail)
+    assert abs(retained_head - len(tail.encode())) <= 4
+    assert (
+        command
+        == f"tail -c +{retained_head + 1} {entry.manifest.ref} | head -c {omitted}"
+    )
+    assert entry.manifest.sha256 == hashlib.sha256(source.encode()).hexdigest()
+    assert entry.source.text is source
+    assert len(encoder.encode(entry.preview_text)) < 1_000
+    assert len(entry.preview_text.encode()) <= mod.REF_EXEC_RESPONSE_MAX_BYTES
+
+
+@pytest.mark.asyncio
+async def test_tool_preview_fills_token_and_byte_budgets_without_exceeding_them() -> (
+    None
+):
+    import tiktoken
+
+    encoder = tiktoken.get_encoding("cl100k_base")
+    source = "Realistic english sentences with several words each.\n" * 700
+    plan = await mod.project_native_tool_texts(
+        [{"role": "tool", "tool_call_id": "call", "content": source}],
+        threshold_tokens=1_000,
+        encoder=encoder,
+    )
+    assert 950 <= len(encoder.encode(plan.catalog[0].preview_text)) < 1_000
+
+    byte_plan = await mod.project_native_tool_texts(
+        [{"role": "tool", "tool_call_id": "call", "content": "a" * 200_000}],
+        threshold_tokens=1_000_000,
+        encoder=CountingEncoder(count=1),
+    )
+    assert (
+        len(byte_plan.catalog[0].preview_text.encode())
+        == mod.REF_EXEC_RESPONSE_MAX_BYTES
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_preview_marker_recovers_omitted_middle_across_reader_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "format=record key=visible_head\n" + ("α界" + "x" * 70 + "\n") * 1_200
+    encoder = PreviewByteEncoder()
+    plan = await mod.project_native_tool_texts(
+        [{"role": "tool", "tool_call_id": "call", "content": source}],
+        threshold_tokens=1_000,
+        encoder=encoder,
+    )
+    head, command, tail = _preview_parts(plan.catalog[0].preview_text)
+    reader, refs, _, _ = await _reader_fixture(
+        monkeypatch, (source,), threshold_tokens=1_000, encoder=encoder
+    )
+    assert head.startswith("format=record key=visible_head\n")
+    assert (
+        await _read(reader, f"grep -c -- {json.dumps(head.splitlines()[0])} {refs[0]}")
+        == "1"
+    )
+    middle = []
+    for _ in range(100):
+        response = await _read(reader, command)
+        visible, next_command = _item7_visible_and_next(response)
+        middle.append(visible)
+        if next_command is None:
+            break
+        assert next_command.startswith("tail -c +"), response
+        assert refs[0] in next_command
+        command = next_command
+    else:
+        pytest.fail("preview recovery did not finish")
+
+    assert len(middle) > 1
+    assert (head + "".join(middle) + tail).encode() == source.encode()
+
+
+@pytest.mark.asyncio
+async def test_tool_preview_counter_failure_keeps_raw_and_does_not_cache_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecoveringEncoder(PreviewByteEncoder):
+        fail = True
+
+        def encode(self, text: str, **kwargs: object) -> range:
+            if self.fail:
+                raise RuntimeError("counter unavailable")
+            return super().encode(text, **kwargs)
+
+    source = "oversized result\n" * 10_000
+    messages = [{"role": "tool", "tool_call_id": "call", "content": source}]
+    request = SimpleNamespace(state=SimpleNamespace())
+    monkeypatch.setattr(
+        mod, "_get_tiktoken_encoder", lambda _request=None: (None, None)
+    )
+
+    recovering_encoder = RecoveringEncoder()
+    for encoder in (None, recovering_encoder):
+        plan = await mod.project_native_tool_texts(
+            messages, threshold_tokens=1_000, encoder=encoder, request=request
+        )
+        assert plan.catalog == ()
+        assert await mod.apply_ref_projection_plan(messages, plan) == messages
+
+    recovering_encoder.fail = False
+    recovered = await mod.project_native_tool_texts(
+        messages,
+        threshold_tokens=1_000,
+        encoder=recovering_encoder,
+        request=request,
+    )
+    assert len(recovered.catalog) == 1
+    assert (
+        _preview_ref(recovered.catalog[0].preview_text)
+        == recovered.catalog[0].manifest.ref
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_preview_rendering_is_worker_bound_and_request_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = SimpleNamespace(state=SimpleNamespace())
+    other_request = SimpleNamespace(state=SimpleNamespace())
+    source = "preview cache result\n" * 1_000
+    messages = [{"role": "tool", "tool_call_id": "call", "content": source}]
+    encoder = PreviewByteEncoder()
+    render = mod._render_tool_ref_preview_sync
+    threads = []
+
+    def tracked(*args: object, **kwargs: object) -> str | None:
+        threads.append(threading.get_ident())
+        return render(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "_render_tool_ref_preview_sync", tracked)
+    first = await mod.project_native_tool_texts(
+        messages, threshold_tokens=1_000, encoder=encoder, request=request
+    )
+    second = await mod.project_native_tool_texts(
+        messages, threshold_tokens=1_000, encoder=encoder, request=request
+    )
+    projected = await mod.apply_ref_projection_plan(messages, first)
+    assert await mod.apply_ref_projection_plan(messages, second) == projected
+    assert await mod.apply_ref_projection_plan(projected, second) == projected
+    assert len(threads) == 1
+    assert threads[0] != threading.get_ident()
+
+    smaller = await mod.project_native_tool_texts(
+        messages, threshold_tokens=500, encoder=encoder, request=request
+    )
+    assert len(threads) == 2
+    assert len(encoder.encode(smaller.catalog[0].preview_text)) < 500
+    assert smaller.catalog[0].preview_text != first.catalog[0].preview_text
+    await mod.project_native_tool_texts(
+        messages, threshold_tokens=1_000, encoder=encoder, request=other_request
+    )
+    assert len(threads) == 3
+    await mod.project_native_tool_texts(
+        messages, threshold_tokens=1_000, encoder=PreviewByteEncoder(), request=request
+    )
+    assert len(threads) == 4
+
+
+@pytest.mark.asyncio
 async def test_invalid_eligible_ref_classification_is_rejected_before_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -754,14 +989,8 @@ async def test_valid_utf8_measurement_classification_and_projection_remain_exact
         token_count=1_000,
         encoder_failed=False,
     )
-    assert projected == [
-        {"role": "tool", "tool_call_id": "call-1", "content": expected_ref},
-        {
-            "role": "tool",
-            "tool_call_id": "call-2",
-            "content": below_threshold,
-        },
-    ]
+    assert _preview_ref(projected[0]["content"]) == expected_ref
+    assert projected[1] == messages[1]
     assert measured_texts == [text]
     assert plan.manifests == (
         mod.RefManifest(ref=expected_ref, utf8_bytes=len(encoded), sha256=digest),
@@ -772,7 +1001,7 @@ async def test_valid_utf8_measurement_classification_and_projection_remain_exact
 async def test_projection_binds_classified_text_when_message_mutates_across_await(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    classified_text = "classified-A"
+    classified_text = "classified-A" * 400
     mutated_text = "mutated-B"
     digest = hashlib.sha256(classified_text.encode()).hexdigest()
     messages = [
@@ -793,7 +1022,7 @@ async def test_projection_binds_classified_text_when_message_mutates_across_awai
     plan = await mod.project_native_tool_texts(
         messages,
         threshold_tokens=1_000,
-        encoder=CountingEncoder(count=1_000),
+        encoder=PreviewByteEncoder(),
     )
     projected = await mod.apply_ref_projection_plan(messages, plan)
 
@@ -867,7 +1096,7 @@ async def test_pipe_keeps_only_unencodable_tool_text_raw_while_valid_text_extern
     forwarded_messages = forwarded[0]["messages"]
     assert result == {"ok": True}
     assert forwarded_messages[1]["content"] == bad
-    assert forwarded_messages[2]["content"] == valid_ref
+    assert _preview_ref(forwarded_messages[2]["content"]) == valid_ref
     assert valid not in repr(forwarded[0])
     assert forwarded[0]["metadata"]["auto_compact_ref_manifests"] == [
         {
@@ -877,16 +1106,13 @@ async def test_pipe_keeps_only_unencodable_tool_text_raw_while_valid_text_extern
         }
     ]
     binding = _committed_ref_binding(request)
-    assert binding.catalog == (
-        mod.RefCatalogEntry(
-            manifest=mod.RefManifest(
-                ref=valid_ref,
-                utf8_bytes=len(valid.encode("utf-8")),
-                sha256=valid_digest,
-            ),
-            source=mod.ZeroCopySourceHandle(text=valid),
-        ),
+    assert len(binding.catalog) == 1
+    assert binding.catalog[0].manifest == mod.RefManifest(
+        ref=valid_ref,
+        utf8_bytes=len(valid.encode("utf-8")),
+        sha256=valid_digest,
     )
+    assert binding.catalog[0].source == mod.ZeroCopySourceHandle(text=valid)
     assert registry[mod.REF_EXEC_TOOL_NAME]["callable"] is binding.reader
     assert await _read(binding.reader, f"head -1 {valid_ref}") == "valid-line\n"
 
@@ -931,7 +1157,7 @@ def test_ref_threshold_valve_rejects_values_below_1000() -> None:
 
 
 @pytest.mark.asyncio
-async def test_oversized_tool_text_externalizes_without_tokenizer_or_raw_fallback(
+async def test_oversized_tool_text_externalizes_with_bounded_preview(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _task1_surface()
@@ -966,7 +1192,7 @@ async def test_oversized_tool_text_externalizes_without_tokenizer_or_raw_fallbac
 
     expected_ref = f"tool:{hashlib.sha256(raw.encode()).hexdigest()}"
     assert result == {"ok": True}
-    assert forwarded[0]["messages"][1]["content"] == expected_ref
+    assert _preview_ref(forwarded[0]["messages"][1]["content"]) == expected_ref
     assert raw not in repr(forwarded[0])
     assert projector_calls == 1
     assert forwarded[0]["metadata"]["auto_compact_ref_manifests"] == [
@@ -1132,7 +1358,7 @@ async def test_always_strip_summary_keeps_refs_without_reader_schema(
     projection_plan = await mod.project_native_tool_texts(
         source_messages,
         threshold_tokens=1_000,
-        encoder=CountingEncoder(count=1_000),
+        encoder=PreviewByteEncoder(),
     )
     captured: dict[str, list[dict[str, object]]] = {
         "always": [],
@@ -1225,7 +1451,7 @@ async def test_always_strip_summary_keeps_refs_without_reader_schema(
     expected_ref = f"tool:{hashlib.sha256(raw.encode()).hexdigest()}"
     always_body = captured["always"][0]
     fallback_first, fallback_retry = captured["fallback"]
-    assert always_body["messages"][1]["content"] == expected_ref
+    assert _preview_ref(always_body["messages"][1]["content"]) == expected_ref
     assert fallback_first["messages"] == always_body["messages"]
     assert any(
         tool["function"]["name"] == "lookup"
@@ -1340,7 +1566,7 @@ async def test_always_strip_summary_keeps_refs_without_reader_schema(
         *source_messages,
         {"role": "user", "content": "continue"},
     ]
-    assert captured["pipe"][0]["messages"][1]["content"] == expected_ref
+    assert _preview_ref(captured["pipe"][0]["messages"][1]["content"]) == expected_ref
     assert (
         not {
             "tools",
@@ -1572,7 +1798,7 @@ def _item7_visible_and_next(result: str) -> tuple[str, str | None]:
         if opening in result:
             visible, encoded_marker = result.split(opening, 1)
             marker = json.loads(encoded_marker.removesuffix(f"</{tag}>"))
-            return visible, marker["next"]
+            return visible, marker.get("next")
     return result, None
 
 
@@ -1739,13 +1965,9 @@ async def test_ref_exec_supports_bounded_commands(
     assert "utf8_bytes=" in await _read(reader, f"stat {ref}")
     spec = mod.ref_exec_tool_spec_payload()["function"]
     assert spec["name"] == "auto_compact_ref_exec"
-    assert spec["description"] == (
-        "Read externalized content in this chat. Oversized tool results and compacted history are replaced by ref tokens: tool:<64 hex> or history:accp_<64 hex>. "
-        "When a tool message's content is such a token, the original text is retrievable only through this tool. Commands: ls [tool|history]; stat REF; "
-        "wc -l|-w|-c REF; cat REF; head [-n N|-N|-c N] REF; tail [-n N|-N|-c N|-c +N] REF; sed -n 'M,Np' REF; grep [-E] [-i] [-n] [-c] [-o] [--] PATTERN REF "
-        "(patterns match literally unless regex syntax is auto-detected; -E forces regex). REF is the complete token including its tool:/history: prefix, exactly as written. Pipelines are supported; "
-        "only grep/head/tail/sed/wc consume piped input, e.g. grep -n PATTERN tool:<hash> | head -20. Start with stat, then prefer grep/sed/head over cat for large refs."
-    )
+    assert "preview" in spec["description"]
+    assert "<auto_compact_ref_truncated>" in spec["description"]
+    assert "next command" in spec["description"]
     assert spec["parameters"] == {
         "type": "object",
         "properties": {
@@ -7562,7 +7784,9 @@ async def test_over_128_tool_refs_remain_readable_with_hash_dedup_and_no_evictio
     assert len(binding.catalog) == 129
     assert len(listed) == 129
     assert len(set(listed)) == 129
-    assert forwarded_tool_contents.count(first_ref) == 2
+    assert [_preview_ref(content) for content in forwarded_tool_contents].count(
+        first_ref
+    ) == 2
     assert all(
         isinstance(entry.source, mod.ZeroCopySourceHandle)
         for entry in binding.catalog
@@ -7666,7 +7890,7 @@ async def test_tool_text_uses_ordered_input_parts_and_exact_hash(
         binding = _committed_ref_binding(request)
         reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
         assert result == {"ok": True}
-        assert forwarded[0]["messages"][2]["content"] == expected_ref
+        assert _preview_ref(forwarded[0]["messages"][2]["content"]) == expected_ref
         assert binding.catalog[0].manifest == mod.RefManifest(
             ref=expected_ref,
             utf8_bytes=expected_utf8_bytes,
@@ -7723,7 +7947,7 @@ async def test_same_request_30mb_text_uses_source_reference_without_copy(
     binding = _committed_ref_binding(request)
     source = binding.catalog[0].source
     assert result == {"ok": True}
-    assert forwarded[0]["messages"][2]["content"] == expected_ref
+    assert _preview_ref(forwarded[0]["messages"][2]["content"]) == expected_ref
     assert raw not in repr(forwarded[0])
     assert isinstance(source, mod.ZeroCopySourceHandle)
     assert source.text is raw
@@ -7787,7 +8011,10 @@ async def test_ref_projection_preserves_complete_parallel_tool_round(
     reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
     assert result == {"ok": True}
     assert projected[1] == expected_assistant
-    assert [projected[2]["content"], projected[3]["content"]] == [first_ref, second_ref]
+    assert [_preview_ref(projected[index]["content"]) for index in (2, 3)] == [
+        first_ref,
+        second_ref,
+    ]
     assert projected[4]["content"] == "continue"
     assert all(
         isinstance(entry.source, mod.ZeroCopySourceHandle)
@@ -7906,7 +8133,7 @@ async def test_real_core_unrelated_message_rewrites_do_not_break_tool_binding(
     assert "data:image/png;base64,Y29yZS1yZXdyaXRl" in rewritten_surface
     assert "<$skill-1|Research>" not in rewritten_surface
     assert result == {"ok": True}
-    assert projected_tool["content"] == expected_ref
+    assert _preview_ref(projected_tool["content"]) == expected_ref
     assert raw not in repr(forwarded[0])
     assert (
         isinstance(
@@ -8039,7 +8266,7 @@ async def test_death_chat_ninth_search_result_survives_real_core_rag_rewrite(
     reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
     assert result == {"ok": True}, (result, forwarded)
     assert len(forwarded) == 1
-    assert ninth_tool["content"] == expected_ref
+    assert _preview_ref(ninth_tool["content"]) == expected_ref
     assert ninth_result not in repr(forwarded[0])
     assert len(binding.catalog) == 1
     assert isinstance(binding.catalog[0].source, mod.ZeroCopySourceHandle)
@@ -8122,7 +8349,7 @@ async def test_real_core_missing_or_empty_function_name_externalizes_as_unknown(
         )
         rendered_context = forwarded[0]["messages"][0]
         assert result == {"ok": True}
-        assert forwarded_tool["content"] == expected_ref
+        assert _preview_ref(forwarded_tool["content"]) == expected_ref
         assert set(rendered_context) == {"role", "content"}
         assert "<auto_compact_ref_manifests" not in rendered_context["content"]
         assert text not in repr(forwarded[0])
@@ -8182,7 +8409,7 @@ async def test_incomplete_tool_round_externalizes_eligible_result_independently(
     monkeypatch.setattr(
         mod,
         "_get_tiktoken_encoder",
-        lambda _request=None: (CountingEncoder(count=12_000), "test"),
+        lambda _request=None: (PreviewByteEncoder(), "test"),
     )
     eligible, eligible_forwards, _, eligible_registry, _ = await _run_pipe_boundary(
         monkeypatch,
@@ -8192,7 +8419,7 @@ async def test_incomplete_tool_round_externalizes_eligible_result_independently(
         f"tool:{hashlib.sha256(malformed[1]['content'].encode()).hexdigest()}"
     )
     assert eligible == {"ok": True}
-    assert eligible_forwards[0]["messages"][1]["content"] == expected_ref
+    assert _preview_ref(eligible_forwards[0]["messages"][1]["content"]) == expected_ref
     assert malformed[1]["content"] not in repr(eligible_forwards[0])
     assert mod.REF_EXEC_TOOL_NAME in eligible_registry
 
@@ -8268,7 +8495,7 @@ async def test_projection_warning_uses_only_fixed_privacy_safe_diagnostics(
     monkeypatch.setattr(
         mod,
         "_get_tiktoken_encoder",
-        lambda _request=None: (CountingEncoder(count=12_000), "test"),
+        lambda _request=None: (PreviewByteEncoder(), "test"),
     )
 
     def fail_registration(_attempt: mod.RefAttempt) -> mod.RefStateDelta:
@@ -8614,7 +8841,9 @@ async def test_malformed_orphan_and_duplicate_call_ids_externalize_per_call_meta
         if message.get("role") == "tool"
     }
     labels = {manifest.ref: manifest.tool for manifest in plan.render_manifests}
-    assert forwarded_tools == {
+    assert {
+        call_id: _preview_ref(content) for call_id, content in forwarded_tools.items()
+    } == {
         "empty": refs["empty"],
         "missing": refs["missing"],
         "valid": refs["valid"],
@@ -9144,7 +9373,7 @@ async def test_apply_ref_manifests_rejects_plan_omitting_summary_history_ref() -
     tool_plan = await mod.project_native_tool_texts(
         tool_messages,
         threshold_tokens=1_000,
-        encoder=CountingEncoder(count=1_001),
+        encoder=PreviewByteEncoder(),
     )
     reapply_plan = mod.merge_ref_projection_plans(other_plan, tool_plan)
     assert reapply_plan is not None
@@ -9204,7 +9433,7 @@ async def test_valid_eligible_round_externalizes_when_separate_malformed_round_i
     projected = await mod.apply_ref_projection_plan(messages, plan)
 
     expected_ref = f"tool:{hashlib.sha256(eligible.encode()).hexdigest()}"
-    assert projected[1]["content"] == expected_ref
+    assert _preview_ref(projected[1]["content"]) == expected_ref
     assert projected[3]["content"] == below_threshold
 
 
@@ -9336,11 +9565,11 @@ async def test_multimodal_tool_result_stays_raw(
     binding = _committed_ref_binding(request)
     assert result == {"ok": True}
     assert (
-        projected_tools["text-call"]
+        _preview_ref(projected_tools["text-call"])
         == f"tool:{hashlib.sha256(text.encode()).hexdigest()}"
     )
     assert (
-        projected_tools["image-call"]
+        _preview_ref(projected_tools["image-call"])
         == f"tool:{hashlib.sha256(caption.encode()).hexdigest()}"
     )
     assert projected_synthetic_user == synthetic_user
@@ -9702,7 +9931,7 @@ async def test_pipe_projects_persisted_tool_refs_as_zero_copy_without_branch_loa
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tool_text, records = _task25_persisted_tool_records("task25-projection")
-    encoder = CountingEncoder(count=1_001)
+    encoder = PreviewByteEncoder()
     original_branch_loader = mod.load_raw_chat_branch
     branch_load_calls = 0
 
@@ -9755,7 +9984,7 @@ async def test_pipe_registered_tool_reader_avoids_branch_loading_for_source_acce
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tool_text, records = _task25_persisted_tool_records("task25-reader")
-    encoder = CountingEncoder(count=1_001)
+    encoder = PreviewByteEncoder()
     original_branch_loader = mod.load_raw_chat_branch
     branch_load_calls = 0
 

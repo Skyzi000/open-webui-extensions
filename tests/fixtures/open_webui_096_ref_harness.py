@@ -118,11 +118,12 @@ def _registry(harness, label: str = "unrelated") -> dict:  # noqa: DICT_OK - Ope
 
 async def _single_route_assertions(harness, observations: dict) -> dict[str, bool]:
     registry = _registry(harness)
+    source_text = "task3 raw recursive tool output\n" * 5_000
     observed = await _run_route(
         harness,
         registry=registry,
         inject_hidden_args=True,
-        text="task3 raw recursive tool output",
+        text=source_text,
     )
     assert observed["active_readers"]
     reader_entry = observed["active_readers"][0]["entry"]
@@ -142,6 +143,19 @@ async def _single_route_assertions(harness, observations: dict) -> dict[str, boo
         "result": observed["result"],
     }
     assert len(observed["injected"]) == 3
+    previews = [
+        next(
+            message["content"]
+            for message in call["messages"]
+            if message.get("role") == "tool" and message.get("tool_call_id") == "call-1"
+        )
+        for call in observed["provider"]
+    ]
+    assert len(set(previews)) == 1
+    assert previews[0].startswith("task3 raw recursive tool output\n")
+    assert previews[0].endswith("task3 raw recursive tool output\n")
+    assert "<auto_compact_ref_truncated>" in previews[0]
+    assert f"tool:{hashlib.sha256(source_text.encode()).hexdigest()}" in previews[0]
     assert all(
         call["__request__"] is observed["request"] for call in observed["injected"]
     )

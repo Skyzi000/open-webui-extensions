@@ -3,7 +3,7 @@ title: Auto Compact
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Manifold Pipe that wraps Open WebUI models, compacts long chats, and persists durable checkpoint summaries.
-version: 0.8.6
+version: 0.8.7
 license: MIT
 required_open_webui_version: 0.9.6
 """
@@ -104,6 +104,7 @@ CHECKPOINT_PREFIX_IDX = "skyzi000_owui_ext_accp_v1_prefix_idx"
 CHECKPOINT_RECENT_IDX = "skyzi000_owui_ext_accp_v1_recent_idx"
 REQUEST_STATE_SCHEMA_READY_KEY = "_auto_compact_checkpoint_schema_ready_v1"
 REQUEST_STATE_REF_STORE_KEY = "_skyzi000_auto_compact_ref_exec_v1"
+REQUEST_STATE_REF_PREVIEW_CACHE_KEY = "_auto_compact_ref_preview_cache"
 CHECKPOINT_CLAIM_LEASE_SECONDS = 90
 CHECKPOINT_CLAIM_HEARTBEAT_SECONDS = 30
 CHECKPOINT_PENDING_POLL_SECONDS = 0.25
@@ -243,8 +244,8 @@ REF_EXEC_TOOL_SPEC = MappingProxyType(
             {
                 "name": REF_EXEC_TOOL_NAME,
                 "description": (
-                    "Read externalized content in this chat. Oversized tool results and compacted history are replaced by ref tokens: tool:<64 hex> or history:accp_<64 hex>. "
-                    "When a tool message's content is such a token, the original text is retrievable only through this tool. Commands: ls [tool|history]; stat REF; "
+                    "Read externalized content in this chat. Oversized tool results include a bounded head/tail preview and a tool:<64 hex> ref; compacted history uses history:accp_<64 hex>. "
+                    "A <auto_compact_ref_truncated> marker embeds a next command to read the omitted span; follow continuation commands across pages when needed. Commands: ls [tool|history]; stat REF; "
                     "wc -l|-w|-c REF; cat REF; head [-n N|-N|-c N] REF; tail [-n N|-N|-c N|-c +N] REF; sed -n 'M,Np' REF; grep [-E] [-i] [-n] [-c] [-o] [--] PATTERN REF "
                     "(patterns match literally unless regex syntax is auto-detected; -E forces regex). REF is the complete token including its tool:/history: prefix, exactly as written. Pipelines are supported; "
                     "only grep/head/tail/sed/wc consume piped input, e.g. grep -n PATTERN tool:<hash> | head -20. Start with stat, then prefer grep/sed/head over cat for large refs."
@@ -580,6 +581,7 @@ RefSourceHandle = (
 class RefCatalogEntry:
     manifest: RefManifest
     source: RefSourceHandle
+    preview_text: str | None = dataclass_field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -4065,6 +4067,112 @@ def _native_tool_names_by_call_id(messages: list[dict[str, Any]]) -> dict[str, s
     return names_by_call_id
 
 
+def _render_tool_ref_preview_sync(
+    text: str,
+    ref: str,
+    utf8_bytes: int,
+    *,
+    threshold_tokens: int,
+    encoder: Any,
+) -> str | None:
+    """Keep a near-limit head/tail preview with byte-exact middle recovery.
+
+    Match Core's d40225da3b03 contract: the marker counts against both caps,
+    and an uncountable preview is not adopted. Only bounded edge fragments
+    are copied or tokenized, even when the source is a single huge line.
+    """
+    if encoder is None or utf8_bytes < 2:
+        return None
+    marker_overhead = len(
+        _ref_exec_truncated_marker(
+            f"tail -c +{utf8_bytes + 1} {ref} | head -c {utf8_bytes}"
+        )
+    ) + 1
+    maximum = min(utf8_bytes - 1, REF_EXEC_RESPONSE_MAX_BYTES - marker_overhead)
+    if maximum < 0:
+        return None
+    # UTF-8 uses at least one byte per character. These edge windows suffice
+    # for every candidate without encoding or indexing the complete source.
+    head_bytes = text[:maximum].encode("utf-8")
+    tail_bytes = text[-maximum:].encode("utf-8") if maximum else b""
+
+    def preview_at(prefix_end: int, suffix_start: int) -> str | None:
+        if not 0 <= prefix_end <= suffix_start <= len(text):
+            return None
+        prefix = text[:prefix_end]
+        suffix = text[suffix_start:]
+        prefix_size = len(prefix.encode("utf-8"))
+        omitted = utf8_bytes - prefix_size - len(suffix.encode("utf-8"))
+        if omitted <= 0:
+            return None
+        command = f"tail -c +{prefix_size + 1} {ref} | head -c {omitted}"
+        return prefix + _ref_exec_truncated_marker(command) + "\n" + suffix
+
+    def fits(candidate: str | None) -> bool:
+        if candidate is None or len(candidate.encode("utf-8")) > REF_EXEC_RESPONSE_MAX_BYTES:
+            return False
+        tokens = _encode_text_token_count(encoder, candidate)
+        return tokens is not None and tokens < threshold_tokens
+
+    best = None
+    prefix_end, suffix_start = 0, len(text)
+    low, high = 0, maximum
+    while low <= high:
+        retained = (low + high) // 2
+        prefix = head_bytes[: retained // 2].decode("utf-8", errors="ignore")
+        suffix_size = retained - len(prefix.encode("utf-8"))
+        suffix = tail_bytes[-suffix_size:].decode("utf-8", errors="ignore") if suffix_size else ""
+        ends = (len(prefix), len(text) - len(suffix))
+        candidate = preview_at(*ends)
+        if fits(candidate):
+            best, (prefix_end, suffix_start) = candidate, ends
+            low = retained + 1
+        else:
+            high = retained - 1
+    if best is None:
+        return None
+    # As in Core, polish each edge after the byte search. The cap bounds
+    # work for token counters whose result is not monotone in text length.
+    for _ in range(8):
+        grew = False
+        for ends in ((prefix_end + 1, suffix_start), (prefix_end, suffix_start - 1)):
+            candidate = preview_at(*ends)
+            if fits(candidate):
+                best, (prefix_end, suffix_start) = candidate, ends
+                grew = True
+        if not grew:
+            break
+    return best
+
+
+def _cached_tool_ref_preview_sync(
+    text: str,
+    ref: str,
+    utf8_bytes: int,
+    *,
+    threshold_tokens: int,
+    encoder: Any,
+    request: Any,
+    cache: dict[tuple[str, int, int], tuple[Any, str]],
+) -> str | None:
+    if encoder is None:
+        encoder, _ = _get_tiktoken_encoder(request)
+    if encoder is None:
+        return None
+    key = (ref, threshold_tokens, id(encoder))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached[1]
+    preview = _render_tool_ref_preview_sync(
+        text, ref, utf8_bytes, threshold_tokens=threshold_tokens, encoder=encoder
+    )
+    if preview is not None:
+        # Retain the encoder to prevent ID reuse within this request. The
+        # cache holds bounded renders, not raw sources or reader bindings.
+        cache[key] = (encoder, preview)
+    return preview
+
+
 async def project_native_tool_texts(
     messages: list[dict[str, Any]],
     *,
@@ -4075,6 +4183,12 @@ async def project_native_tool_texts(
     catalog_by_hash: dict[str, RefCatalogEntry] = {}
     render_manifest_by_hash: dict[str, RefRenderManifest] = {}
     names_by_call_id = _native_tool_names_by_call_id(messages)
+    state = getattr(request, "state", None)
+    preview_cache = getattr(state, REQUEST_STATE_REF_PREVIEW_CACHE_KEY, None)
+    if preview_cache is None:
+        preview_cache = {}
+        if state is not None:
+            setattr(state, REQUEST_STATE_REF_PREVIEW_CACHE_KEY, preview_cache)
 
     eligible_results: list[tuple[str, str, RefTextMeasurement]] = []
     for message in messages:
@@ -4108,6 +4222,18 @@ async def project_native_tool_texts(
     for content, paired_name, measurement in eligible_results:
         utf8_bytes, line_count, text_hash = measurement
         ref = f"tool:{text_hash}"
+        preview = await asyncio.to_thread(
+            _cached_tool_ref_preview_sync,
+            content,
+            ref,
+            utf8_bytes,
+            threshold_tokens=threshold_tokens,
+            encoder=encoder,
+            request=request,
+            cache=preview_cache,
+        )
+        if preview is None:
+            continue
         manifest = RefManifest(
             ref=ref,
             utf8_bytes=utf8_bytes,
@@ -4119,6 +4245,7 @@ async def project_native_tool_texts(
             RefCatalogEntry(
                 manifest=manifest,
                 source=source,
+                preview_text=preview,
             ),
         )
         render_manifest_by_hash.setdefault(
@@ -4145,25 +4272,26 @@ def _apply_ref_projection_plan_sync(
     plan: RefProjectionPlan,
 ) -> list[dict[str, Any]]:
     projected = copy.deepcopy(messages)
-    source_refs: dict[str, str] = {}
+    source_previews: dict[str, str] = {}
     for entry in plan.catalog:
         parsed = parse_ref(entry.manifest.ref)
         if (
             parsed is not None
             and parsed.kind == "tool"
             and isinstance(entry.source, ZeroCopySourceHandle)
+            and entry.preview_text is not None
         ):
-            source_refs.setdefault(entry.source.text, entry.manifest.ref)
-    for message_index, message in enumerate(projected):
+            source_previews.setdefault(entry.source.text, entry.preview_text)
+    for message in projected:
         if message.get("role") != "tool":
             continue
         content = message.get("content")
         if not isinstance(content, str):
             continue
-        ref = source_refs.get(content)
-        if ref is None:
+        preview = source_previews.get(content)
+        if preview is None:
             continue
-        message["content"] = ref
+        message["content"] = preview
     return projected
 
 
@@ -7186,14 +7314,16 @@ def _ref_exec_truncated_byte_response(
             marked=True,
             actual_empty=prefix_bytes == 0,
         )
+        next_command = None
+        if continuation_ref is not None:
+            next_command = f"tail -c +{actual_end + 1} {continuation_ref}"
+            if byte_range.requested_end is not None:
+                remaining = max(0, byte_range.requested_end - actual_end)
+                next_command += f" | head -c {remaining}"
         candidate = prefix + _ref_exec_byte_range_marker(
             marker_range,
             continuation=True,
-            next_command=(
-                f"tail -c +{actual_end + 1} {continuation_ref}"
-                if continuation_ref is not None
-                else None
-            ),
+            next_command=next_command,
         )
         if _ref_exec_response_fits(
             candidate,
@@ -7475,9 +7605,39 @@ def _execute_ref_reader_sync(
         elif stage.command == "wc":
             lines = _ref_exec_wc(lines, next(iter(stage.flags)), cancelled)
     final = stages[-1]
+    bounded_source_range = (
+        len(stages) == 2
+        and first.command == "tail"
+        and first.byte_start is not None
+        and final.command == "head"
+        and final.byte_count is not None
+    )
+    if bounded_source_range:
+        # The preview's recovery command is tail -c +N REF | head -c M.
+        # head's input-relative range must retain the original source window
+        # so every subsequent page stops before the already-visible tail.
+        def source_ranges(selected: Iterable[RefExecLine]) -> Iterable[RefExecLine]:
+            source_start = None
+            for line in selected:
+                byte_range = line.byte_range
+                if byte_range is not None:
+                    if source_start is None and not byte_range.actual_empty:
+                        source_start = byte_range.actual_start
+                    line = replace(
+                        line,
+                        byte_range=replace(
+                            byte_range,
+                            requested_start=first.byte_start,
+                            requested_end=(source_start or first.byte_start) + final.byte_count - 1,
+                        ),
+                    )
+                yield line
+
+        lines = source_ranges(lines)
     continuation_ref = (
         first.ref
-        if len(stages) == 1
+        if bounded_source_range
+        or len(stages) == 1
         and (first.command == "cat" or first.command == "tail" and first.byte_start is not None)
         else None
     )
@@ -7517,6 +7677,8 @@ def _new_ref_reader(
 
     async def reader(command: str = "") -> str:
         """Inspect one binding-local externalized ref with bounded virtual reader commands.
+
+        Follow the next command in truncation markers to read omitted spans across pages.
 
         :param command: Use ls, stat, wc, head, tail, sed -n, grep, or cat and optional bounded pipelines.
         """
@@ -18035,7 +18197,7 @@ class Pipe:
         ref_substitution_threshold_tokens: int = Field(
             default=10_000,
             ge=1_000,
-            description="Exact token threshold for externalizing native-tool text at or below 65,536 UTF-8 bytes.",
+            description="Externalize native-tool text at this exact token threshold or above 65,536 UTF-8 bytes. Head/tail previews, including their recovery marker, stay below this token threshold and within 65,536 UTF-8 bytes.",
         )
         trigger_input_tokens: int = Field(
             default=DEFAULT_TRIGGER_INPUT_TOKENS,
