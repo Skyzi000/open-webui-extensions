@@ -1768,7 +1768,9 @@ class Tools:
             default="",
             description=(
                 "Model ID used for compaction summaries. Leave empty (recommended) to "
-                "use the sub-agent's model, which helps preserve prompt caching where possible."
+                "use the sub-agent's model, which helps preserve prompt caching where possible. "
+                "Summary requests include tool definitions and tool-call history; "
+                "the selected model must accept both."
             ),
         )
         LARGE_TOOL_RESULT_MODE: Literal["ref_exec", "truncate", "raw"] = Field(
