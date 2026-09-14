@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -191,5 +193,48 @@ def test_system_prompt_rule5_is_note_conditional() -> None:
 def test_header_version_and_core_floor() -> None:
     header = (tools_dir / "sub_agent.py").read_text()[:2000]
 
-    assert "version: 0.6.0" in header
+    assert "version: 0.6.1" in header
     assert "required_open_webui_version: 0.9.6" in header
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("emit_fails", [False, True])
+async def test_cancel_reports_status_and_propagates(monkeypatch, parallel, emit_fails):
+    started = asyncio.Event()
+    statuses = []
+
+    async def run_loop(**kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    async def emit(event):
+        statuses.append(event["data"])
+        if event["data"]["done"] and emit_fails:
+            raise RuntimeError("Notification failed")
+
+    monkeypatch.setattr(sub_agent, "run_sub_agent_loop", run_loop)
+    monkeypatch.setattr(sub_agent, "load_sub_agent_tools", AsyncMock(return_value=({}, {})))
+    tool = sub_agent.Tools()
+    kwargs = {
+        "__request__": _FakeRequest(),
+        "__user__": {"id": "u1"},
+        "__model__": {"id": "m"},
+        "__event_emitter__": emit,
+    }
+    work = {"description": "Task", "prompt": "Work"}
+    run = (
+        tool.run_parallel_sub_agents(tasks=[work, work], **kwargs)
+        if parallel else tool.run_sub_agent(**work, **kwargs)
+    )
+    task = asyncio.create_task(run)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert statuses[-1]["done"] is True
+        assert "cancelled" in statuses[-1]["description"]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

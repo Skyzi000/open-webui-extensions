@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.6.0
+version: 0.6.1
 license: MIT
 required_open_webui_version: 0.9.6
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -123,6 +123,20 @@ class SubAgentTaskItem(BaseModel):
 # ============================================================================
 # Helper functions (outside class - AI cannot invoke these)
 # ============================================================================
+
+
+async def _emit_sub_agent_cancellation(
+    event_emitter: Optional[Callable], description: str
+) -> None:
+    if not event_emitter:
+        return
+
+    try:
+        await event_emitter(
+            {"type": "status", "data": {"description": description, "done": True}}
+        )
+    except (asyncio.CancelledError, Exception) as exc:
+        log.warning("Failed to emit sub-agent cancellation status: %s", exc)
 
 
 def normalize_parallel_sub_agent_tasks(tasks: Any) -> tuple[Optional[list[dict[str, str]]], Optional[str]]:
@@ -1892,17 +1906,6 @@ RESPONSE REQUIREMENTS:
         skill_manifest = extract_skill_manifest(__messages__)
         user_skill_tags = extract_user_skill_tags(__messages__)
 
-        if __event_emitter__:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Starting sub-agent: {description}",
-                        "done": False,
-                    },
-                }
-            )
-
         # Determine model ID
         # Priority: DEFAULT_MODEL (valve) > chat model (metadata) > task model (__model__)
         model_id = self.valves.DEFAULT_MODEL
@@ -1944,17 +1947,29 @@ RESPONSE REQUIREMENTS:
             "__files__": __metadata__.get("files", []) if __metadata__ else [],
         }
 
-        tools_dict, mcp_clients = await load_sub_agent_tools(
-            request=__request__,
-            user=user,
-            valves=self.valves,
-            metadata=__metadata__ or {},
-            model=resolved_model,
-            extra_params=common_extra_params,
-            self_tool_id=__id__,
-        )
-
+        mcp_clients = {}
         try:
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Starting sub-agent: {description}",
+                            "done": False,
+                        },
+                    }
+                )
+
+            tools_dict, mcp_clients = await load_sub_agent_tools(
+                request=__request__,
+                user=user,
+                valves=self.valves,
+                metadata=__metadata__ or {},
+                model=resolved_model,
+                extra_params=common_extra_params,
+                self_tool_id=__id__,
+            )
+
             # Register view_skill if model-attached skills manifest is available
             if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
                 await register_view_skill(tools_dict, __request__, common_extra_params)
@@ -2032,6 +2047,11 @@ RESPONSE REQUIREMENTS:
                 },
                 ensure_ascii=False,
             )
+        except asyncio.CancelledError:
+            await _emit_sub_agent_cancellation(
+                __event_emitter__, f"Sub-agent cancelled: {description}"
+            )
+            raise
         finally:
             await cleanup_mcp_clients(mcp_clients)
 
@@ -2163,17 +2183,21 @@ RESPONSE REQUIREMENTS:
         # __event_emitter__ per invocation via get_updated_tool_function.
         # Caveat: tools that store __event_emitter__ on `self` (non-standard
         # pattern) could see cross-task interference.
-        tools_dict, mcp_clients = await load_sub_agent_tools(
-            request=__request__,
-            user=user,
-            valves=self.valves,
-            metadata=__metadata__ or {},
-            model=resolved_model,
-            extra_params=common_extra_params,
-            self_tool_id=__id__,
+        task_mapping = ", ".join(
+            f"[{i + 1}] {task['description']}" for i, task in enumerate(validated_tasks)
         )
-
+        mcp_clients = {}
         try:
+            tools_dict, mcp_clients = await load_sub_agent_tools(
+                request=__request__,
+                user=user,
+                valves=self.valves,
+                metadata=__metadata__ or {},
+                model=resolved_model,
+                extra_params=common_extra_params,
+                self_tool_id=__id__,
+            )
+
             # Register view_skill if model-attached skills manifest is available
             if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
                 await register_view_skill(tools_dict, __request__, common_extra_params)
@@ -2186,10 +2210,6 @@ RESPONSE REQUIREMENTS:
                 if skill_manifest:
                     parallel_prompt_sections.append(skill_manifest)
             parallel_system_content = merge_prompt_sections(*parallel_prompt_sections)
-            task_mapping = ", ".join(
-                f"[{i + 1}] {task['description']}" for i, task in enumerate(validated_tasks)
-            )
-
             if __event_emitter__:
                 await __event_emitter__(
                     {
@@ -2300,5 +2320,10 @@ RESPONSE REQUIREMENTS:
                 },
                 ensure_ascii=False,
             )
+        except asyncio.CancelledError:
+            await _emit_sub_agent_cancellation(
+                __event_emitter__, f"Parallel sub-agent run cancelled: {task_mapping}"
+            )
+            raise
         finally:
             await cleanup_mcp_clients(mcp_clients)
