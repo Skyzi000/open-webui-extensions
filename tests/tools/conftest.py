@@ -145,6 +145,18 @@ def install_open_webui_tool_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "open_webui.models.functions", functions_module)
     monkeypatch.setattr(models_package, "functions", functions_module, raising=False)
 
+    class _Models:
+        @staticmethod
+        async def get_model_by_id(_model_id):
+            return None
+
+    models_db_module = _build_module(
+        "open_webui.models.models",
+        Models=_Models,
+    )
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", models_db_module)
+    monkeypatch.setattr(models_package, "models", models_db_module, raising=False)
+
     class _Config:
         @staticmethod
         async def get(key, default=None):

@@ -10,6 +10,7 @@
 
 ### What's New
 
+- **v0.6** — サブエージェント内の自動コンテキスト圧縮と、大きなツール結果のプレビュー・読み戻しに対応。最低対応版を Open WebUI 0.9.6 へ引き上げました（従来 0.7.0）。[詳細](#サブエージェントのコンテキスト圧縮)
 - **v0.5** — Open WebUI に設定済みの MCP サーバーがサブエージェントでも直接利用可能になりました（mcpo 経由不要）（[#6](https://github.com/Skyzi000/open-webui-extensions/issues/6)）
 - **v0.4.5** — Open Terminal のツール（Open WebUI v0.8.6+）が自動的にサブエージェントに転送されます
 - **v0.4** — Open WebUI v0.8 で導入されたスキルが自動的にサブエージェントへ伝播されます（実験的機能）
@@ -19,6 +20,24 @@
 
 > [!TIP]
 > 並列実行で問題が発生する場合（検索APIのレートリミット等）は、Valvesの `MAX_PARALLEL_AGENTS` を下げるか、`run_parallel_sub_agents` メソッドをコメントアウトして無効化してください。
+
+### サブエージェントのコンテキスト圧縮
+
+ツール呼び出しを重ねると、サブエージェント自身のコンテキストにも履歴や結果が蓄積されます。v0.6 では、次の 2 つの仕組みでモデルへ送るコンテキストを抑え、長い調査や作業を続けやすくします。どちらもデフォルトで有効で、Valves から個別に設定できます。
+
+- **履歴の自動圧縮** — 推定入力トークン数が閾値（既定: 80,000）に達すると、古いラウンドを要約し、依頼内容と直近のラウンドは残します。要約時も、既定では同じモデルを使い、送信済みの冒頭部分やツール定義を再利用することで、プロンプトキャッシュをできるだけ維持しやすいよう配慮しています。
+- **大きなツール結果のプレビュー** — 大きな結果（既定では 10,000 トークン以上、または 64 KiB 超）は、全文の代わりに先頭と末尾の短いプレビューを送ります。元の全文は同じタスクの実行中に保持され、サブエージェントは `agent_ref_exec` ツールで必要な行や範囲を読み戻せます（`head`、`tail`、`sed -n`、`grep` などのコマンド形式）。
+
+Open WebUI 標準のチャット履歴圧縮は、このツールが内部で回すサブエージェントのループには適用されません。この機能は、その内部履歴を対象としています。
+
+| Valve | 役割 |
+| ----- | ---- |
+| `ENABLE_CONTEXT_COMPACTION` | 履歴の自動圧縮の有効／無効（既定: 有効） |
+| `CONTEXT_COMPACTION_TOKEN_THRESHOLD` | 圧縮を始める推定入力トークン数（既定: 80,000） |
+| `COMPACTION_SUMMARY_MODEL` | 要約に使うモデル。空ならサブエージェントと同じモデル（推奨） |
+| `LARGE_TOOL_RESULT_MODE` | `ref_exec`（プレビュー＋読み戻し、既定）/ `truncate`（中間を省略、読み戻しなし）/ `raw`（そのまま送る） |
+| `LARGE_TOOL_RESULT_THRESHOLD_TOKENS` | 大きな結果とみなすトークン数の閾値（既定: 10,000） |
+| `MAX_ITERATIONS` | 反復上限（既定: 50、従来: 10。0 で無制限） |
 
 **[Parallel Tools](tools/parallel_tools.py)** ([openwebui.com](https://openwebui.com/posts/parallel_tools_1d44cfce)) - Open WebUI 公式の [Community Newsletter, March 17th 2026](https://openwebui.com/blog/community-newsletter-march-17th-2026) で "Editor's Picks" ツールの1つとして紹介されました。
 

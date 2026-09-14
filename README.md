@@ -12,6 +12,7 @@ Delegate tool-heavy tasks to sub-agents running in isolated contexts, keeping yo
 
 ### What's New
 
+- **v0.6** — Automatic context compaction and large-result previews with selective read-back for sub-agents. Requires Open WebUI 0.9.6+ (previously 0.7.0+). [Details](#sub-agent-context-compaction)
 - **v0.5** — MCP servers configured in Open WebUI are directly available to sub-agents — no mcpo proxy needed ([#6](https://github.com/Skyzi000/open-webui-extensions/issues/6))
 - **v0.4.5** — Open Terminal tools (Open WebUI v0.8.6+) are automatically forwarded to sub-agents
 - **v0.4** — Skills introduced in Open WebUI v0.8 are automatically propagated to sub-agents (experimental)
@@ -21,6 +22,24 @@ Full changelog: [commits on sub_agent.py](https://github.com/Skyzi000/open-webui
 
 > [!TIP]
 > If parallel execution causes issues (e.g., search API rate limits), reduce `MAX_PARALLEL_AGENTS` in Valves, or comment out the `run_parallel_sub_agents` method to disable it entirely.
+
+### Sub-agent context compaction
+
+Tool-heavy tasks can fill the sub-agent's own context with history and results. Starting in v0.6, two mechanisms reduce the context sent to the model to help long-running tasks keep going. Both are enabled by default and can be configured independently in Valves.
+
+- **Automatic history compaction** — When estimated input tokens reach the threshold (default: 80,000), older rounds are summarized while the task and the most recent rounds are kept. By default, summaries use the same model and reuse the previously sent prefix and tool definitions, with care taken to preserve prompt caching where possible.
+- **Large tool result previews** — Large results (by default, 10,000 tokens or more, or over 64 KiB) are sent as a short head/tail preview instead of the full text. The original text is retained during the same task, and the sub-agent can read back the lines or ranges it needs through `agent_ref_exec`, using commands such as `head`, `tail`, `sed -n`, and `grep`.
+
+Open WebUI's built-in chat-history compaction does not apply to this tool's internal sub-agent loop. This feature covers that internal history.
+
+| Valve | Purpose |
+| ----- | ------- |
+| `ENABLE_CONTEXT_COMPACTION` | Enable or disable automatic history compaction (default: on) |
+| `CONTEXT_COMPACTION_TOKEN_THRESHOLD` | Estimated input tokens at which compaction starts (default: 80,000) |
+| `COMPACTION_SUMMARY_MODEL` | Model used for summaries; leave empty to use the sub-agent's model (recommended) |
+| `LARGE_TOOL_RESULT_MODE` | `ref_exec` (preview + read-back, default) / `truncate` (omit the middle, no read-back) / `raw` (send as is) |
+| `LARGE_TOOL_RESULT_THRESHOLD_TOKENS` | Token threshold for large results (default: 10,000) |
+| `MAX_ITERATIONS` | Iteration cap (default: 50, previously 10; 0 means unlimited) |
 
 **[Parallel Tools](tools/parallel_tools.py)** ([openwebui.com](https://openwebui.com/posts/parallel_tools_1d44cfce)) - Featured in Open WebUI's official [Community Newsletter, March 17th 2026](https://openwebui.com/blog/community-newsletter-march-17th-2026) as one of the "Editor's Picks".
 
