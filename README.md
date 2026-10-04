@@ -60,8 +60,8 @@ Execute multiple independent tool calls in parallel for faster execution.
 
 | Filter | Description |
 | ------ | ----------- |
-| [**Current DateTime Injector**](functions/filter/current_datetime_injector.py) | Inject current datetime into system prompt (implemented as a filter to leverage OpenAI prompt caching) |
-| [**User Info Injector**](functions/filter/user_info_injector.py) | Inject user info into system prompt (same reason as above) |
+| [**Current DateTime Injector**](functions/filter/current_datetime_injector.py) | Append the current datetime to the latest user message. Unlike a built-in system prompt variable such as `{{CURRENT_DATETIME}}`, this does not change the system prompt on every request; the aim is to avoid breaking prompt caching (a system role is available in Valves) |
+| [**User Info Injector**](functions/filter/user_info_injector.py) | Append user info to the latest user message (same reason as above) |
 | [**Full Context Mode Toggle**](functions/filter/full_context_mode_toggle.py) | Batch toggle full context mode per chat (the built-in feature only supports per-file toggling) |
 
 ## Graphiti Memory (Submodule)

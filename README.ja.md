@@ -58,8 +58,8 @@ Open WebUI 標準のチャット履歴圧縮は、このツールが内部で回
 
 | フィルター | 説明 |
 | ---------- | ---- |
-| [**Current DateTime Injector**](functions/filter/current_datetime_injector.py) | 現在日時をシステムプロンプトに注入（OpenAIプロンプトキャッシュ活用のためFilter化） |
-| [**User Info Injector**](functions/filter/user_info_injector.py) | ユーザー情報をシステムプロンプトに注入（同上） |
+| [**Current DateTime Injector**](functions/filter/current_datetime_injector.py) | 現在日時を、最新のユーザーメッセージの末尾に追記。標準の `{{CURRENT_DATETIME}}` などのテンプレート変数と違ってシステムプロンプトを毎回書き換えないので、プロンプトキャッシュを壊さないことを狙っている（Valves で system ロールにも変更可） |
+| [**User Info Injector**](functions/filter/user_info_injector.py) | ユーザー情報を、最新のユーザーメッセージの末尾に追記（同上） |
 | [**Full Context Mode Toggle**](functions/filter/full_context_mode_toggle.py) | チャット単位でフルコンテキストモードを一括切り替え |
 
 ## Graphiti Memory（サブモジュール）

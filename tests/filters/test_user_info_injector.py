@@ -1,5 +1,6 @@
 """Tests for functions/filter/user_info_injector.py extension."""
 
+import copy
 import sys
 from pathlib import Path
 
@@ -78,11 +79,12 @@ class TestUserInfoInjectorBehavior:
         # Should return unchanged
         assert len(result["messages"]) == 1
 
-    async def test_inlet_injects_user_info(self):
-        """Verify inlet injects user info system message."""
+    async def test_inlet_appends_tagged_context_to_latest_user_message(self):
+        """Verify the default adds no message and tags the text appended to the latest user message."""
         from user_info_injector import Filter
 
         f = Filter()
+        f.valves.include_groups = False
         body = {
             "messages": [
                 {"role": "user", "content": "Hello"},
@@ -95,13 +97,135 @@ class TestUserInfoInjectorBehavior:
             "valves": {},
         }
         result = await f.inlet(body, __user__=user)
-        messages = result.get("messages", [])
 
-        # Should have 2 messages now (system + user)
-        assert len(messages) == 2
-        assert messages[0]["role"] == "system"
-        assert "Test User" in messages[0]["content"]
-        assert "Current User" in messages[0]["content"]
+        assert result["messages"] == [
+            {
+                "role": "user",
+                "content": "Hello\n\n<SYSTEM_CONTEXT>\n# Current User\nName: Test User\nRole: user\n</SYSTEM_CONTEXT>",
+            },
+        ]
+
+    async def test_inlet_appends_to_first_text_part_without_mutating_the_original(self):
+        """Verify list content gets the text in its first text part, which is the one Open WebUI reads as the prompt."""
+        from user_info_injector import Filter
+
+        f = Filter()
+        f.valves.include_groups = False
+        f.valves.include_role = False
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        latest = {"role": "user", "content": [{"type": "text", "text": "look"}, image]}
+        original = copy.deepcopy(latest)
+
+        result = await f.inlet({"messages": [latest]}, __user__={"id": "u1", "name": "Test User"})
+
+        assert result["messages"] == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "look\n\n<SYSTEM_CONTEXT>\n# Current User\nName: Test User\n</SYSTEM_CONTEXT>",
+                    },
+                    image,
+                ],
+            }
+        ]
+        assert latest == original
+
+    @pytest.mark.parametrize(
+        "text",
+        ["/skills:create", "  /Skills:Create summarize\nthis chat  ", "/skills:createx", "please /skills:create"],
+    )
+    async def test_inlet_skips_exactly_what_core_handles_as_skills_create(self, text):
+        """Verify injection is skipped for, and only for, text that Open WebUI rewrites as a /skills:create command."""
+        from open_webui.utils.skills import apply_skills_create_prompt
+        from user_info_injector import Filter
+
+        f = Filter()
+        f.valves.include_groups = False
+        result = await f.inlet(
+            {"messages": [{"role": "user", "content": text}]},
+            __user__={"id": "u1", "name": "Test User"},
+        )
+
+        skipped = result["messages"] == [{"role": "user", "content": text}]
+        is_command = apply_skills_create_prompt([{"role": "user", "content": text}], allowed=True)
+        assert skipped == is_command
+
+    async def test_inlet_injects_into_message_without_text(self):
+        """Verify an image-only message still gets the context, as its only text."""
+        from user_info_injector import Filter
+
+        f = Filter()
+        f.valves.include_groups = False
+        f.valves.include_role = False
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        result = await f.inlet(
+            {"messages": [{"role": "user", "content": [{"type": "text", "text": ""}, image]}]},
+            __user__={"id": "u1", "name": "Test User"},
+        )
+
+        assert result["messages"] == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<SYSTEM_CONTEXT>\n# Current User\nName: Test User\n</SYSTEM_CONTEXT>"},
+                    image,
+                ],
+            }
+        ]
+
+    async def test_inlet_system_role_injects_untagged_message_before_latest_user(self):
+        """Verify system role keeps the latest user message last."""
+        from user_info_injector import Filter
+
+        f = Filter()
+        f.valves.include_groups = False
+        f.valves.message_role = "system"
+        body = {
+            "messages": [
+                {"role": "user", "content": "Hello"},
+            ]
+        }
+        user = {
+            "id": "test-user-id",
+            "name": "Test User",
+            "role": "user",
+            "valves": {},
+        }
+        result = await f.inlet(body, __user__=user)
+
+        assert result["messages"] == [
+            {"role": "system", "content": "# Current User\nName: Test User\nRole: user"},
+            {"role": "user", "content": "Hello"},
+        ]
+
+    async def test_inlet_system_after_injects_untagged_message_after_latest_user(self):
+        """Verify system_after lands right after the latest user message, before a trailing assistant turn."""
+        from user_info_injector import Filter
+
+        f = Filter()
+        f.valves.include_groups = False
+        f.valves.message_role = "system_after"
+        body = {
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "partial answer"},
+            ]
+        }
+        user = {
+            "id": "test-user-id",
+            "name": "Test User",
+            "role": "user",
+            "valves": {},
+        }
+        result = await f.inlet(body, __user__=user)
+
+        assert result["messages"] == [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "# Current User\nName: Test User\nRole: user"},
+            {"role": "assistant", "content": "partial answer"},
+        ]
 
 
 class TestGroupsInjection:
@@ -148,8 +272,7 @@ class TestGroupsInjection:
         result = await f.inlet(base_body, __user__=base_user)
         messages = result.get("messages", [])
 
-        # Should have 2 messages (system + user)
-        assert len(messages) == 2
+        assert len(messages) == 1
         system_content = messages[0]["content"]
 
         # Verify group names are in the message
