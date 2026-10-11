@@ -11,6 +11,7 @@ import pytest
 
 IMAGE = "data:image/png;base64,aGVsbG8="
 STORED_IMAGE = "/api/v1/files/image/content"
+FETCHED_IMAGE = "data:image/png;base64,c3RvcmVk"
 
 
 def make_user():
@@ -216,10 +217,16 @@ async def test_parallel_keeps_json_image_text_out_of_outer_core_extraction(monke
 @pytest.mark.asyncio
 @pytest.mark.parametrize("executor", ["shared", "parallel_single", "parallel_batch"])
 @pytest.mark.parametrize("with_emitter", [True, False])
-async def test_mcp_saved_images_and_audio_remain_display_only(monkeypatch, executor, with_emitter):
+@pytest.mark.parametrize("core_version, model_sees_saved_image", [("0.11.4", False), ("0.12.0", True)])
+async def test_mcp_saved_images_reach_the_model_from_core_0_12(
+    monkeypatch, executor, with_emitter, core_version, model_sees_saved_image,
+):
+    import open_webui.env
     import sub_agent
     import parallel_tools
-    from open_webui.utils import middleware
+    from open_webui.utils import files as core_files, middleware
+
+    monkeypatch.setattr(open_webui.env, "VERSION", core_version)
 
     user = make_user()
     events = []
@@ -244,8 +251,8 @@ async def test_mcp_saved_images_and_audio_remain_display_only(monkeypatch, execu
     tools = image_tools()
     tools["screenshot"].update(callable=mixed_result, type="mcp")
     monkeypatch.setattr(middleware, "get_file_url_from_base64", store)
-    read_image = AsyncMock(side_effect=AssertionError("Display-only images must not be fetched for the model"))
-    monkeypatch.setattr(middleware, "get_image_base64_from_url", read_image)
+    read_image = AsyncMock(return_value=FETCHED_IMAGE)
+    monkeypatch.setattr(core_files, "get_image_base64_from_url", read_image)
     monkeypatch.setattr(sub_agent, "_core_process_tool_result", middleware.process_tool_result)
     monkeypatch.setattr(parallel_tools, "_core_process_tool_result", middleware.process_tool_result)
     extra = {"__request__": SimpleNamespace(), "__user__": user.model_dump(), "__metadata__": {}}
@@ -262,9 +269,9 @@ async def test_mcp_saved_images_and_audio_remain_display_only(monkeypatch, execu
             [parallel_tools.ToolCallItem(name="screenshot")], __request__=extra["__request__"], __user__=extra["__user__"], __metadata__={}, __event_emitter__=emitter,
         )
         result = payload["results"][0]
-    assert result["images"] == [IMAGE]
+    assert result["images"] == ([FETCHED_IMAGE, IMAGE] if model_sees_saved_image else [IMAGE])
     assert len(uploads) == 2
-    read_image.assert_not_awaited()
+    assert [call.args for call in read_image.await_args_list] == [(STORED_IMAGE,)] * model_sees_saved_image
     file_events = [event for event in events if event["type"] == "files"]
     assert [event["data"]["files"] for event in file_events] == ([display_files] if with_emitter else [])
     if executor != "shared" and not with_emitter:

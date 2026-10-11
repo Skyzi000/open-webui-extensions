@@ -29,7 +29,13 @@ typeCheckingMode = "basic"
 url = "https://pypi.flatt.tech/simple/"
 default = true
 
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple/"
+explicit = true
+
 [tool.uv.sources]
+rapidocr = { index = "pypi" }
 open-webui = { path = "references/open-webui", editable = true }
 open-webui-plugins-builder = { path = "open_webui_plugins_builder", editable = true }
 
@@ -37,4 +43,6 @@ open-webui-plugins-builder = { path = "open_webui_plugins_builder", editable = t
 dev = [
     "open-webui",
     "open-webui-plugins-builder",
+    # Listed directly so its index pin applies; the default index lacks the version Open WebUI requires.
+    "rapidocr",
 ]

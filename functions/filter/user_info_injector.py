@@ -3,7 +3,7 @@ title: User Info Injector
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Appends user name and group information to the user's latest message instead of using the built-in system prompt variables. The aim is to avoid breaking prompt caching. A system role is available in Valves.
-version: 1.1.0
+version: 1.1.1
 license: MIT
 """
 
@@ -128,7 +128,13 @@ class Filter:
                         g.strip() for g in user_valves.excluded_groups.split(",") if g.strip()
                     }
 
-                user_groups = await maybe_await(Groups.get_groups_by_member_id(user_id))
+                try:
+                    user_groups = await maybe_await(
+                        Groups.get_groups_by_member_id(user_id, include_inherited=True)
+                    )
+                except TypeError:
+                    # Core before 0.12.0 has no inherited groups.
+                    user_groups = await maybe_await(Groups.get_groups_by_member_id(user_id))
                 if user_groups:
                     # Filter out excluded groups
                     group_names = [

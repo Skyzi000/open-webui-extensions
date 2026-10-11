@@ -3,7 +3,7 @@ title: Inlet Title Generator
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
 description: Starts Open WebUI-compatible chat title generation from inlet using the current user-message history when the chat title is still New Chat.
-version: 0.1.1
+version: 0.1.2
 license: MIT
 """
 
@@ -97,7 +97,7 @@ def normalize_messages_for_title(message_list: list[dict[str, Any]]) -> list[dic
 
         if isinstance(content, str):
             content = re.sub(
-                r"<details\b[^>]*>.*?<\/details>|!\[.*?\]\(.*?\)",
+                r"<details\b[^<>]*>(?:(?!<details\b).)*?<\/details>|!\[[^\[\]]*\]\([^()]*\)",
                 "",
                 content,
                 flags=re.S | re.I,
@@ -145,6 +145,13 @@ def extract_title_from_response(
 
     if not title:
         title = messages[0].get("content", user_message)
+        try:
+            from open_webui.utils.skills import replace_skill_mentions_with_labels
+        except ImportError:
+            # Core before 0.12.0 keeps raw skill mentions in fallback titles.
+            pass
+        else:
+            title = replace_skill_mentions_with_labels(title)
 
     return title
 
@@ -387,6 +394,11 @@ class Filter:
             from open_webui.models.chats import Chats
             from open_webui.routers.tasks import generate_title
             from open_webui.utils.misc import get_message_list
+
+            # Shared-chat replies run this inlet for users who do not own the chat.
+            if not await Chats.is_chat_owner(chat_id, user.get("id")):
+                await self._emit_status(event_emitter, user_valves, "Skipped title generation; the chat belongs to another user.", True)
+                return
 
             title = await Chats.get_chat_title_by_id(chat_id)
             if title != PLACEHOLDER_TITLE:

@@ -74,14 +74,16 @@ async def test_actual_core_consumed_servers_reach_nested_loader(core_direct_cata
         "session_id": "browser", "chat_id": "chat",
     }
     approved = await core_direct_catalogue(metadata, AsyncMock(return_value={"connected": connected}))
-    assert "specs" not in server and "system_prompt" not in server
+    # Core before 0.12.0 consumes these from metadata; later versions keep them.
+    consumed = "specs" not in server
+    assert ("system_prompt" not in server) is consumed
     snapshot = copy.deepcopy(metadata)
 
     resolved = await sub_agent.resolve_direct_tool_servers_from_request_and_metadata(
         request=request, metadata=metadata,
     )
     assert metadata == snapshot
-    request.body.assert_awaited_once()
+    assert request.body.await_count == consumed
     extra = {"__metadata__": metadata}
     loaded, clients = await sub_agent.build_tools_dict(
         request=request, model={}, metadata=metadata,
@@ -100,7 +102,7 @@ async def test_actual_core_consumed_servers_reach_nested_loader(core_direct_cata
         request=request, metadata=metadata,
     )
     assert again == resolved
-    request.body.assert_awaited_once()
+    assert request.body.await_count == consumed
 
 
 @pytest.mark.parametrize("servers", [None, []])

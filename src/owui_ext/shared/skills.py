@@ -6,19 +6,19 @@ selected:
 
 - **Available skills** are listed in a single ``<available_skills>``
   manifest block; their content is loaded lazily by ``view_skill``.
-  Core v0.11.4 can include accessible workspace and terminal skills,
+  Core v0.11.4+ can include accessible workspace and terminal skills,
   in addition to model-attached skills.
-- **Inline skills** use full ``<skill name="...">...</skill>`` blocks;
+- **Inline skills** use full ``<skill ... name="...">...</skill>`` blocks
+  (Core v0.12.0 adds ``id`` and ``version_id`` attributes);
   ``view_skill`` is unnecessary for their already-expanded content.
-  Older Core versions inline user-selected skills. Core v0.11.4 inlines
+  Older Core versions inline user-selected skills. Core v0.11.4+ inlines
   mentioned skills, or selected skills when builtin tools are unavailable.
 
 The plugins that spawn agent loops
 need to read both shapes out of ``__messages__`` so the spawned agent
-inherits the parent's skill context. They also need to register
-``view_skill`` manually in their own ``tools_dict`` because their
-agent loop bypasses the core middleware that would normally bind
-builtin tools.
+inherits the parent's skill context. Before Core v0.12.0 they also need
+to register ``view_skill`` manually in their own ``tools_dict`` because
+``get_builtin_tools`` only returns it to the core middleware.
 
 Lives in its own shared dep (rather than ``shared.tool_servers`` or a
 larger generic module) so plugins that don't use skills don't include
@@ -29,6 +29,7 @@ the tiny ``maybe_await`` helper is inlined privately rather than
 imported from ``shared.async_utils``.
 """
 
+import copy
 import logging
 import re
 from typing import Any, Optional
@@ -40,7 +41,7 @@ _skills_log = logging.getLogger("owui_ext.shared.skills")
 _SKILLS_MANIFEST_START = "<available_skills>"
 _SKILLS_MANIFEST_END = "</available_skills>"
 _SKILL_TAG_PATTERN = re.compile(
-    r"<skill name=.*?>\n.*?\n</skill>", re.DOTALL
+    r"<skill [^\n]*?name=.*?>\n.*?\n</skill>", re.DOTALL
 )
 
 
@@ -62,7 +63,7 @@ def _find_manifest_in_text(text: str) -> str:
 
 
 def _find_skill_tags_in_text(text: str) -> list[str]:
-    """Return all ``<skill name="...">…</skill>`` blocks found in *text*."""
+    """Return all ``<skill ... name="...">…</skill>`` blocks found in *text*."""
     return _SKILL_TAG_PATTERN.findall(text)
 
 
@@ -135,6 +136,33 @@ def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
     return _extract_from_system_messages(messages, _find_skill_tags_in_text)
 
 
+def drop_unloadable_skill_manifest(messages: list, tools_dict: Optional[dict]) -> list:
+    """Remove the ``<available_skills>`` manifest when no ``view_skill`` tool can load it."""
+    if "view_skill" in (tools_dict or {}):
+        return messages
+
+    def without_manifest(message: dict) -> dict:
+        content = message.get("content")
+        if message.get("role") != "system" or not isinstance(content, str):
+            return message
+        manifest = _find_manifest_in_text(content)
+        if not manifest:
+            return message
+        parts = (part.strip() for part in content.split(manifest, 1))
+        return {**message, "content": "\n\n".join(part for part in parts if part)}
+
+    return [without_manifest(message) for message in messages]
+
+
+def isolate_chat_context(metadata: Optional[dict]) -> dict:
+    """Copy *metadata* with its own ``chat_context``, as Core does for sub-agent runs."""
+    metadata = metadata or {}
+    return {
+        **metadata,
+        "chat_context": copy.deepcopy(metadata.get("chat_context") or {}),
+    }
+
+
 async def register_view_skill(
     tools_dict: dict,
     request: Request,
@@ -158,7 +186,12 @@ async def register_view_skill(
         return
 
     try:
-        from open_webui.tools.builtin import view_skill
+        from open_webui.tools import builtin
+
+        # Core 0.12.0+ registers skill tools in get_builtin_tools per model.
+        if hasattr(builtin, "read_skill_file"):
+            return
+        view_skill = builtin.view_skill
         from open_webui.utils.tools import (
             get_async_tool_function_and_apply_extra_params,
             convert_function_to_pydantic_model,

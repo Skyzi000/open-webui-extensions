@@ -374,6 +374,22 @@ class TestGroupsInjection:
         assert api_called["count"] == 0, \
             "Groups API should not be called when include_groups=False"
 
+    async def test_groups_include_inherited_parents(self, monkeypatch, base_user, base_body):
+        """Open WebUI 0.12.0+ returns parent groups only when asked for inherited ones."""
+        from user_info_injector import Filter
+
+        def get_groups(member_id, *, include_inherited=False):
+            return [MockGroup("Team"), *([MockGroup("Company")] if include_inherited else [])]
+
+        from open_webui.models import groups as groups_module
+        monkeypatch.setattr(groups_module.Groups, "get_groups_by_member_id", get_groups)
+
+        f = Filter()
+        f.valves.include_groups = True
+        result = await f.inlet(base_body, __user__=base_user)
+
+        assert "Groups: Team, Company" in result["messages"][0]["content"]
+
     async def test_groups_empty_shows_none(self, monkeypatch, base_user, base_body):
         """Verify 'Groups: None' is shown when user has no groups."""
         from user_info_injector import Filter

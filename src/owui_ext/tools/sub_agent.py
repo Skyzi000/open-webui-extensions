@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.6.2
+version: 0.6.3
 license: MIT
 required_open_webui_version: 0.9.6
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -42,6 +42,7 @@ from owui_ext.shared.completion_response import format_chat_completion_error
 from owui_ext.shared.inlet_filters import (
     apply_inlet_filters_if_enabled,
     finalize_model_request,
+    isolate_request_state,
     resolve_model_filter_pipeline,
 )
 from owui_ext.shared.loop_compaction import (
@@ -71,6 +72,7 @@ from owui_ext.shared.model_features import (
 from owui_ext.shared.notifications import emit_notification
 from owui_ext.shared.prompt_utils import (
     _append_tool_server_prompts,
+    apply_agent_tool_search,
     merge_prompt_sections,
 )
 from owui_ext.shared.ref_exec import (
@@ -94,8 +96,10 @@ from owui_ext.shared.tool_execution import (
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients, resolve_mcp_tools
 from owui_ext.shared.tool_loader import build_tools_dict
 from owui_ext.shared.skills import (
+    drop_unloadable_skill_manifest,
     extract_skill_manifest,
     extract_user_skill_tags,
+    isolate_chat_context,
     register_view_skill,
 )
 from owui_ext.shared.tool_servers import (
@@ -334,7 +338,33 @@ def _neutralize_forced_tool_choice(body: dict) -> None:
 
 
 def _strip_tool_request_keys(body: dict) -> dict:
-    return {key: value for key, value in body.items() if key not in _TOOL_REQUEST_STRIP_KEYS}
+    body = {key: value for key, value in body.items() if key not in _TOOL_REQUEST_STRIP_KEYS}
+    try:
+        from open_webui.utils.tool_search import strip_deferred_tools_manifest
+    except ImportError:
+        return body
+
+    def without_manifest(message: Any) -> Any:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            return message
+        content = message.get("content")
+        if isinstance(content, str):
+            return {**message, "content": strip_deferred_tools_manifest(content)}
+        if isinstance(content, list):
+            return {
+                **message,
+                "content": [
+                    {**part, "text": strip_deferred_tools_manifest(part["text"])}
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    else part
+                    for part in content
+                ],
+            }
+        return message
+
+    if isinstance(body.get("messages"), list):
+        body["messages"] = [without_manifest(message) for message in body["messages"]]
+    return body
 
 
 def _payload_for_send(form_data: dict) -> dict:
@@ -664,7 +694,7 @@ async def _request_loop_summary(
         attempts += 1
         try:
             response = await generate_chat_completion(
-                request=request,
+                request=isolate_request_state(request),
                 form_data=_payload_for_send(body),
                 user=user_obj,
                 bypass_filter=True,
@@ -990,7 +1020,7 @@ async def _send_loop_request(
     try:
         run.last_sent_form_data = form_data
         response = await generate_chat_completion(
-            request=request,
+            request=isolate_request_state(request),
             form_data=_payload_for_send(form_data),
             user=user_obj,
             bypass_filter=True,  # We handle filters manually above
@@ -1059,6 +1089,9 @@ async def run_sub_agent_loop(
             extra_params.get("__metadata__", {}).get("filter_ids", []),
         )
 
+    tools_dict, extra_params, deferred_tools = await apply_agent_tool_search(
+        tools_dict, extra_params
+    )
     compaction_options = compaction or LoopCompactionOptions()
     large_result_options = large_results or LargeToolResultOptions()
     encoder: Any = None
@@ -1144,10 +1177,11 @@ async def run_sub_agent_loop(
     if loop_tools_dict:
         tools_param = [
             {"type": "function", "function": tool.get("spec", {})}
-            for tool in loop_tools_dict.values()
+            for name, tool in loop_tools_dict.items()
+            if name not in deferred_tools
         ]
 
-    current_messages = list(messages)
+    current_messages = drop_unloadable_skill_manifest(list(messages), tools_dict)
     iteration = 0
 
     while max_iterations == 0 or iteration < max_iterations:
@@ -1522,7 +1556,7 @@ async def run_sub_agent_loop(
         retry_body = _strip_tool_request_keys(form_data)
         try:
             response = await generate_chat_completion(
-                request=request,
+                request=isolate_request_state(request),
                 form_data=_payload_for_send(retry_body),
                 user=user_obj,
                 bypass_filter=True,
@@ -1744,7 +1778,14 @@ class Tools:
         )
         ENABLE_SKILLS_TOOLS: bool = Field(
             default=True,
-            description="Enable skills tools (view_skill). When enabled and the parent conversation has skills, the sub-agent can view skill contents.",
+            description="Enable skill reading tools (view_skill, read_skill_file). When enabled and the parent conversation has skills, the sub-agent can view skill contents.",
+        )
+        ENABLE_SKILLS_WRITE_TOOLS: bool = Field(
+            default=False,
+            description=(
+                "Enable skill writing tools (update_skill_files, create_skill; Open WebUI 0.12.0+). "
+                "Off by default because they change saved skills. Requires ENABLE_SKILLS_TOOLS."
+            ),
         )
         ENABLE_SUBAGENT_TOOLS: bool = Field(
             default=False,
@@ -1945,7 +1986,7 @@ RESPONSE REQUIREMENTS:
             "__event_emitter__": __event_emitter__,
             "__event_call__": __event_call__,
             "__request__": __request__,
-            "__metadata__": dict(__metadata__ or {}),
+            "__metadata__": isolate_chat_context(__metadata__),
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
@@ -2277,7 +2318,9 @@ RESPONSE REQUIREMENTS:
                     extra_params = {
                         **loaded_extra_params,
                         "__model__": filter_pipeline["model"],
-                        "__metadata__": dict(loaded_extra_params["__metadata__"]),
+                        "__metadata__": isolate_chat_context(
+                            loaded_extra_params["__metadata__"]
+                        ),
                         "__event_emitter__": indexed_event_emitter
                         if __event_emitter__
                         else None,

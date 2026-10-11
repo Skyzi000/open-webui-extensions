@@ -193,7 +193,7 @@ def test_system_prompt_rule5_is_note_conditional() -> None:
 def test_header_version_and_core_floor() -> None:
     header = (tools_dir / "sub_agent.py").read_text()[:2000]
 
-    assert "version: 0.6.2" in header
+    assert "version: 0.6.3" in header
     assert "required_open_webui_version: 0.9.6" in header
 
 

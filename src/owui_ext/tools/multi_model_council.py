@@ -2,11 +2,12 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.23
+version: 0.1.24
 license: MIT
 required_open_webui_version: 0.7.0
 """
 
+import copy
 import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -20,6 +21,7 @@ from owui_ext.shared.event_emitter import EventEmitter
 from owui_ext.shared.inlet_filters import (
     apply_inlet_filters_if_enabled,
     finalize_model_request,
+    isolate_request_state,
     resolve_model_filter_pipeline,
 )
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients
@@ -27,12 +29,15 @@ from owui_ext.shared.models import extract_model_ids, get_available_models
 from owui_ext.shared.parsing import normalize_text, safe_json_loads
 from owui_ext.shared.prompt_utils import (
     _append_tool_server_prompts,
+    apply_agent_tool_search,
     merge_prompt_sections,
     truncate_text,
 )
 from owui_ext.shared.skills import (
+    drop_unloadable_skill_manifest,
     extract_skill_manifest,
     extract_user_skill_tags,
+    isolate_chat_context,
     register_view_skill,
 )
 from owui_ext.shared.tool_execution import (
@@ -209,14 +214,19 @@ async def run_agent_loop(
             extra_params.get("__metadata__", {}).get("filter_ids", []),
         )
 
+    final_extra_params = extra_params
+    tools_dict, extra_params, deferred_tools = await apply_agent_tool_search(
+        tools_dict or {}, extra_params
+    )
     tools_param = None
     if tools_dict:
         tools_param = [
             {"type": "function", "function": tool.get("spec", {})}
-            for tool in tools_dict.values()
+            for name, tool in tools_dict.items()
+            if name not in deferred_tools
         ]
 
-    current_messages = list(messages)
+    current_messages = drop_unloadable_skill_manifest(list(messages), tools_dict)
     iteration = 0
 
     while iteration < max_iterations:
@@ -243,7 +253,7 @@ async def run_agent_loop(
 
         form_data = {
             "model": model_id,
-            "messages": messages_with_context,
+            "messages": copy.deepcopy(messages_with_context),
             "stream": False,
             "metadata": {
                 "task": "multi_model_council",
@@ -264,7 +274,7 @@ async def run_agent_loop(
 
         try:
             response = await generate_chat_completion(
-                request=request,
+                request=isolate_request_state(request),
                 form_data=form_data,
                 user=user_obj,
                 bypass_filter=True,
@@ -412,7 +422,7 @@ async def run_agent_loop(
 
     form_data = {
         "model": model_id,
-        "messages": current_messages
+        "messages": copy.deepcopy(current_messages)
         + [
             {
                 "role": "user",
@@ -427,16 +437,16 @@ async def run_agent_loop(
     }
 
     form_data = await apply_inlet_filters_if_enabled(
-        filter_pipeline, request, form_data, extra_params
+        filter_pipeline, request, form_data, final_extra_params
     )
-    form_data = _append_tool_server_prompts(form_data, extra_params)
+    form_data = _append_tool_server_prompts(form_data, final_extra_params)
     form_data = await finalize_model_request(
-        filter_pipeline, request, form_data, extra_params
+        filter_pipeline, request, form_data, final_extra_params
     )
 
     try:
         response = await generate_chat_completion(
-            request=request,
+            request=isolate_request_state(request),
             form_data=form_data,
             user=user_obj,
             bypass_filter=True,
@@ -554,9 +564,17 @@ class Tools:
             description=(
                 "Enable skill context for council members. When the parent "
                 "conversation has a <available_skills> manifest, the manifest "
-                "is appended to each member's system prompt and view_skill is "
-                "registered as a tool so members can lazy-load skill contents. "
+                "is appended to each member's system prompt and the skill reading "
+                "tools (view_skill, read_skill_file) are registered so members can "
+                "lazy-load skill contents. "
                 "User-selected <skill> tags are also inlined when present."
+            ),
+        )
+        ENABLE_SKILLS_WRITE_TOOLS: bool = Field(
+            default=False,
+            description=(
+                "Enable skill writing tools (update_skill_files, create_skill; Open WebUI 0.12.0+). "
+                "Off by default because they change saved skills. Requires ENABLE_SKILLS_TOOLS."
             ),
         )
         ENABLE_SUBAGENT_TOOLS: bool = Field(
@@ -889,9 +907,6 @@ CRITICAL RULES:
         )
         user_prompt = build_council_user_prompt(prop, prereq, opt_a, opt_b)
 
-        # Skill context from the parent conversation. The agent loop bypasses
-        # the core middleware that would normally bind view_skill, so it has
-        # to be registered manually after build_tools_dict returns.
         skills_enabled = bool(getattr(self.valves, "ENABLE_SKILLS_TOOLS", True))
         skill_manifest = extract_skill_manifest(__messages__) if skills_enabled else ""
         user_skill_tags = extract_user_skill_tags(__messages__) if skills_enabled else []
@@ -920,15 +935,17 @@ CRITICAL RULES:
             )
             member_model = filter_pipeline["model"]
 
+            member_metadata = isolate_chat_context(metadata)
             member_extra_params = {
                 **extra_params,
                 "__model__": member_model,
+                "__metadata__": member_metadata,
             }
 
             tools_dict, mcp_clients = await build_tools_dict(
                 request=request,
                 model=member_model,
-                metadata=metadata,
+                metadata=member_metadata,
                 user=user,
                 valves=self.valves,
                 extra_params=member_extra_params,

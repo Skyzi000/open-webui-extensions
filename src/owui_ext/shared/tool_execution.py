@@ -15,8 +15,9 @@ with its sub-helpers:
   builtin tool result into the matching ``terminal:*`` UI event.
 - ``execute_tool_call`` orchestrates the above and only injects the
   per-call dynamic context (``__messages__`` / ``__files__`` /
-  ``__event_emitter__`` / ``__event_call__``) — never ``__user__`` /
-  ``__request__`` / ``__model__`` / ``__metadata__`` / ``__chat_id__`` /
+  ``__event_emitter__`` / ``__event_call__``, plus the calling agent's
+  ``__metadata__`` for builtin tools) — never ``__user__`` /
+  ``__request__`` / ``__model__`` / ``__chat_id__`` /
   ``__message_id__``, because ``get_tools()`` already attached tool-specific
   ``UserValves`` to ``__user__["valves"]`` and overriding it would
   silently overwrite per-tool valves.
@@ -37,6 +38,7 @@ does not depend on another shared module while being inlined.
 import ast
 import json
 import logging
+import re
 import uuid
 from typing import Any, Callable, Optional
 
@@ -120,20 +122,26 @@ async def process_tool_result(
     )
 
 
-def split_tool_result_files(files: list) -> tuple[list[str], list]:
-    """Match native Core: data images go to the model, other files to display."""
+async def split_tool_result_files(files: list, user: Any = None) -> tuple[list[str], list]:
+    """Match native Core: data images go to the model, URL images to both, other files to display."""
     images = []
     display_files = []
     for file in files:
-        if (
-            isinstance(file, dict)
-            and file.get("type") == "image"
-            and isinstance(file.get("url"), str)
-            and file["url"].startswith("data:")
-        ):
-            images.append(file["url"])
-        else:
-            display_files.append(file)
+        url = file.get("url") if isinstance(file, dict) and file.get("type") == "image" else None
+        if isinstance(url, str) and url.startswith("data:"):
+            images.append(url)
+            continue
+        display_files.append(file)
+        if isinstance(url, str) and url:
+            from open_webui.env import VERSION
+
+            # Core before 0.12.0 keeps URL images display-only.
+            if tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2]) >= (0, 12):
+                from open_webui.utils.files import get_image_base64_from_url
+
+                image = await get_image_base64_from_url(url, user=_normalize_user(user))
+                if image:
+                    images.append(image)
     return images, display_files
 
 
@@ -372,14 +380,21 @@ async def execute_tool_call(
                 # so tool-specific UserValves injected by get_tools() survive.
                 from open_webui.utils.tools import get_updated_tool_function
 
+                call_params = {
+                    "__messages__": extra_params.get("__messages__", []),
+                    "__files__": extra_params.get("__files__", []),
+                    "__event_emitter__": extra_params.get("__event_emitter__"),
+                    "__event_call__": extra_params.get("__event_call__"),
+                }
+                # Core builtins keep per-agent state (skill revisions, Tool
+                # Search) in metadata, while loaded tools are shared by agents.
+                if tool.get("type") == "builtin" and isinstance(
+                    extra_params.get("__metadata__"), dict
+                ):
+                    call_params["__metadata__"] = extra_params["__metadata__"]
                 tool_function = await _maybe_await(get_updated_tool_function(
                     function=tool_function,
-                    extra_params={
-                        "__messages__": extra_params.get("__messages__", []),
-                        "__files__": extra_params.get("__files__", []),
-                        "__event_emitter__": extra_params.get("__event_emitter__"),
-                        "__event_call__": extra_params.get("__event_call__"),
-                    },
+                    extra_params=call_params,
                 ))
 
                 tool_result = await tool_function(**tool_function_params)
@@ -401,7 +416,9 @@ async def execute_tool_call(
                 metadata=extra_params.get("__metadata__"),
                 user=extra_params.get("__user__"),
             )
-            tool_result_images, tool_result_files = split_tool_result_files(tool_result_files)
+            tool_result_images, tool_result_files = await split_tool_result_files(
+                tool_result_files, extra_params.get("__user__")
+            )
             emit_terminal_event = True
 
         except Exception as exc:

@@ -323,8 +323,11 @@ class TestGraphitiMemoryInjectionPlacement:
         ],
         ids=["plain", "pasted block", "pasted block first", "skill mention"],
     )
+    @pytest.mark.parametrize("prompt_key", ["base_user_prompt", "user_prompt"])
     @pytest.mark.asyncio
-    async def test_outlet_saves_what_open_webui_would_build_from_the_prompt_without_memory(self, template, own_text):
+    async def test_outlet_saves_what_open_webui_would_build_from_the_prompt_without_memory(
+        self, template, own_text, prompt_key
+    ):
         """After inlet, Open WebUI puts skill labels in place of mentions, then a RAG template before the prompt."""
         f = filter_with_one_fact()
         block = (await run_inlet(f))[2]["content"].removeprefix(f"{QUESTION}\n\n")
@@ -338,17 +341,18 @@ class TestGraphitiMemoryInjectionPlacement:
         ]
 
         assert sent[2]["content"].count(block) > without_memory.count(block)
-        assert await saved_episode_body(f, sent, request, user_prompt=prompt) == (
+        assert await saved_episode_body(f, sent, request, **{prompt_key: prompt}) == (
             f"Assistant: Hello\n\n---\n\nU: {without_memory}"
         )
 
     def test_open_webui_records_the_prompt_between_skill_labels_and_the_rag_template(self):
-        """outlet reads __metadata__["user_prompt"] as the prompt Open WebUI hands to the RAG template."""
+        """outlet reads the prompt Open WebUI hands to the RAG template: "base_user_prompt", or "user_prompt" before 0.12.0."""
         from open_webui.utils import middleware
 
         source = inspect.getsource(middleware.process_chat_payload)
         labels = source.index("strip_skill_mentions(")
-        record = source.index("metadata['user_prompt'] = get_last_user_message(form_data['messages'])")
+        key = "base_user_prompt" if "metadata['base_user_prompt']" in source else "user_prompt"
+        record = source.index(f"metadata['{key}'] = get_last_user_message(form_data['messages'])")
         rag = source.index("apply_source_context_to_messages(request, form_data['messages'], sources, prompt)")
         assert labels < record < rag
 

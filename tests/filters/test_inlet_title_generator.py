@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
 import types
 import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -80,6 +82,7 @@ def install_open_webui_stubs(
     generated_response=None,
     title_before_update=None,
     generate_title_hook=None,
+    owner_id="user-1",
 ):
     messages_map = messages_map or {}
     generated_response = generated_response or {
@@ -96,6 +99,9 @@ def install_open_webui_stubs(
         if state["title_reads"] >= 2 and title_before_update is not None:
             return title_before_update
         return title
+
+    async def is_chat_owner(chat_id, user_id):
+        return user_id == owner_id
 
     async def get_messages_map_by_chat_id(chat_id):
         return messages_map
@@ -127,6 +133,7 @@ def install_open_webui_stubs(
 
     chats_module = types.ModuleType("open_webui.models.chats")
     chats_module.Chats = SimpleNamespace(
+        is_chat_owner=is_chat_owner,
         get_chat_title_by_id=get_chat_title_by_id,
         get_messages_map_by_chat_id=get_messages_map_by_chat_id,
         update_chat_title_by_id=update_chat_title_by_id,
@@ -627,6 +634,67 @@ async def test_background_emits_title_and_optional_status(monkeypatch, dummy_req
 
     assert {"type": "chat:title", "data": "Generated Title"} in events
     assert any(event.get("type") == "status" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_background_leaves_the_title_of_another_users_chat(monkeypatch, dummy_request, emitter, user):
+    state = install_open_webui_stubs(
+        monkeypatch,
+        owner_id="chat-owner",
+        messages_map={
+            "u0": {"id": "u0", "role": "user", "content": "First", "parentId": None},
+            "a0": {"id": "a0", "role": "assistant", "content": "Answer", "parentId": "u0"},
+            "u1": {"id": "u1", "role": "user", "content": "Shared reply", "parentId": "a0"},
+        },
+    )
+    f = Filter()
+    f.valves.use_redis = False
+
+    await f._run_title_generation(
+        request=dummy_request,
+        event_emitter=emitter,
+        user=user,
+        chat_id="chat-1",
+        user_message_id="u1",
+        model_id="gpt-test",
+        filter_id="filter-1",
+        user_valves=f.UserValves(),
+    )
+
+    assert state["generate_calls"] == []
+    assert state["update_calls"] == []
+
+
+def test_title_cleanup_removes_only_closed_blocks():
+    def clean(text):
+        return mod.normalize_messages_for_title([{"role": "user", "content": text}])[0]["content"]
+
+    assert clean('A <details type="reasoning">x</details> B ![alt](url) C') == "A  B  C"
+    assert clean("<details><details>inner</details> tail") == "<details> tail"
+    assert clean("<details>" * 3 + "![" * 3 + "text") == "<details>" * 3 + "![" * 3 + "text"
+
+
+def test_title_cleanup_uses_the_bounded_core_pattern():
+    core = Path(__file__).parents[2] / "references/open-webui/backend/open_webui/utils/middleware.py"
+    pattern = r"<details\b[^<>]*>(?:(?!<details\b).)*?<\/details>|!\[[^\[\]]*\]\([^()]*\)"
+    if pattern not in core.read_text():
+        pytest.skip("Core before 0.12.0 has the unbounded pattern")
+    assert pattern in inspect.getsource(mod.normalize_messages_for_title)
+
+
+def test_fallback_title_shows_skill_labels_where_core_does():
+    try:
+        from open_webui.utils.skills import replace_skill_mentions_with_labels  # noqa: F401
+    except ImportError:
+        expected = "Use <$tea|Tea skill> now"
+    else:
+        expected = "Use Tea skill now"
+
+    assert mod.extract_title_from_response(
+        {"choices": [{"message": {"content": "not json"}}]},
+        [{"role": "user", "content": "Use <$tea|Tea skill> now"}],
+        {"content": "User fallback"},
+    ) == expected
 
 
 def test_core_title_extraction_variants():

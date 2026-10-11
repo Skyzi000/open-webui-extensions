@@ -4,7 +4,7 @@ Focused on the interaction with Open WebUI's current embed handling:
 
 - Backend (``references/open-webui`` ``socket/main.py``) only persists events
   whose ``type == "embeds"``, and it extends the new payload with whatever is
-  already in the message's ``embeds`` column.
+  already in the message's ``embeds`` column unless ``data.replace`` is set.
 - Frontend (``Chat.svelte``) replaces ``message.embeds`` with ``data.embeds``
   for *both* ``embeds`` and ``chat:message:embeds`` events.
 
@@ -203,6 +203,25 @@ async def test_wrap_emitter_does_not_preserve_from_live_correction() -> None:
     )
 
     assert ee._preserved_embeds == []
+
+
+@pytest.mark.asyncio
+async def test_wrap_emitter_keeps_replace_and_forgets_replaced_embeds() -> None:
+    ee, raw = await _make_initialized_emitter()
+    assert ee.event_emitter is not None
+
+    await ee.event_emitter(
+        {"type": "embeds", "data": {"embeds": ["<div>old</div>"]}}
+    )
+    await ee.event_emitter(
+        {"type": "embeds", "data": {"embeds": ["<div>new</div>"], "replace": True}}
+    )
+
+    assert raw.events[-1] == {
+        "type": "embeds",
+        "data": {"embeds": [ee._shell_html, "<div>new</div>"], "replace": True},
+    }
+    assert ee._preserved_embeds == ["<div>new</div>"]
 
 
 @pytest.mark.asyncio

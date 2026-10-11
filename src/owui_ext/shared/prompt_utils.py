@@ -1,6 +1,6 @@
 """Prompt-assembly helpers shared across owui_ext tool plugins."""
 
-from typing import Optional
+from typing import Iterable, Optional
 
 
 def merge_prompt_sections(*sections: Optional[str]) -> str:
@@ -75,3 +75,42 @@ def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
             messages = add_terminal_agents_md(messages, agents_md)
     form_data["messages"] = messages
     return form_data
+
+
+async def apply_agent_tool_search(
+    tools_dict: dict, extra_params: dict, always_loaded: Iterable[str] = ()
+) -> tuple[dict, dict, set]:
+    """Apply Core's Tool Search to one agent loop.
+
+    Returns the loop's tools (with ``search_tools``), extra_params carrying the
+    manifest, and the names to leave out of the request's ``tools``. The search
+    state lives in ``extra_params["__metadata__"]``, which must belong to this agent.
+    """
+    try:
+        from open_webui.utils.tool_search import apply_tool_search
+    except ImportError:
+        return tools_dict, extra_params, set()
+
+    kept = {name: tools_dict[name] for name in always_loaded if name in tools_dict}
+    loop_tools = {name: tool for name, tool in tools_dict.items() if name not in kept}
+    metadata = extra_params.get("__metadata__")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    form_data: dict = {"messages": []}
+    deferred = await apply_tool_search(form_data, metadata, loop_tools)
+    if not deferred:
+        return tools_dict, extra_params, set()
+    metadata["tools"] = loop_tools
+    prompts = extra_params.get("__direct_tool_server_system_prompts__") or []
+    return (
+        {**loop_tools, **kept},
+        {
+            **extra_params,
+            "__metadata__": metadata,
+            "__direct_tool_server_system_prompts__": [
+                *prompts,
+                form_data["messages"][0]["content"],
+            ],
+        },
+        deferred,
+    )

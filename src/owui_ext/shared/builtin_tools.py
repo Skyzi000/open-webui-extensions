@@ -61,7 +61,8 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "view_channel_message",
     },
     "code_interpreter": {"execute_code"},
-    "skills": {"view_skill"},
+    "skills": {"view_skill", "read_skill_file"},
+    "skills_write": {"update_skill_files", "create_skill"},
     "subagents": {"delegate_task", "timer"},
     "tasks": {"create_tasks", "update_task"},
     "automations": {
@@ -93,6 +94,7 @@ VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_CHANNELS_TOOLS": "channels",
     "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
     "ENABLE_SKILLS_TOOLS": "skills",
+    "ENABLE_SKILLS_WRITE_TOOLS": "skills_write",
     "ENABLE_SUBAGENT_TOOLS": "subagents",
     "ENABLE_TASK_TOOLS": "tasks",
     "ENABLE_AUTOMATION_TOOLS": "automations",

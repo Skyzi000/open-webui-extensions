@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.6
+version: 0.2.7
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -141,7 +141,9 @@ async def execute_single_tool(
 
             # Only Parallel needs Core to extract images from its return container.
             if callable(getattr(middleware, "extract_base64_images", None)):
-                tool_result_images, tool_result_files = split_tool_result_files(tool_result_files)
+                tool_result_images, tool_result_files = await split_tool_result_files(
+                    tool_result_files, extra_params.get("__user__")
+                )
 
         # Emit terminal:* events for display/refresh behavior in UI
         await emit_terminal_tool_event(
@@ -441,15 +443,16 @@ class Tools:
             return json.dumps({"error": f"Failed to load tools: {e}"})
 
         try:
-            # Core's resolved skills are not part of metadata.skill_ids on
-            # newer versions. Reuse the builtin already allowed in this chat.
-            parent_view_skill = (__metadata__.get("tools") or {}).get("view_skill")
-            if (
-                isinstance(parent_view_skill, dict)
-                and parent_view_skill.get("type") == "builtin"
-                and parent_view_skill.get("tool_id") == "builtin:view_skill"
-            ):
-                tools_dict.setdefault("view_skill", parent_view_skill)
+            # Core binds these builtins to chat state the loader cannot rebuild.
+            parent_tools = __metadata__.get("tools") or {}
+            for name in ("view_skill", "search_tools"):
+                parent_tool = parent_tools.get(name)
+                if (
+                    isinstance(parent_tool, dict)
+                    and parent_tool.get("type") == "builtin"
+                    and parent_tool.get("tool_id") == f"builtin:{name}"
+                ):
+                    tools_dict.setdefault(name, parent_tool)
 
             if self.valves.DEBUG:
                 log.info(f"[ParallelTools] Total tools available: {len(tools_dict)}")

@@ -88,11 +88,14 @@ async def build_tools_dict(
     for callers that construct an internal model conversation.
     """
     import inspect
+    import json
     import logging
+    import re
 
     log = logging.getLogger("owui_ext.shared.tool_loader")
     debug = bool(getattr(valves, "DEBUG", False))
 
+    from open_webui.env import VERSION
     from open_webui.utils.tools import get_builtin_tools, get_tools
 
     try:
@@ -325,13 +328,22 @@ async def build_tools_dict(
         else:
             extra_params.pop("__direct_tool_server_system_prompts__", None)
 
+        mcp_instructions = [
+            f"MCP server {json.dumps(server_id, ensure_ascii=False)} instructions:\n{client.instructions}"
+            for server_id, client in mcp_clients.items()
+            if getattr(client, "instructions", None)
+        ]
+        if mcp_instructions:
+            extra_params["__direct_tool_server_system_prompts__"] = [
+                *extra_params.get("__direct_tool_server_system_prompts__", []),
+                *mcp_instructions,
+            ]
+
         try:
             features = metadata.get("features", {})
 
-            # NOTE: view_skill is NOT registered here; the plugin registers it
-            # manually via shared.skills.register_view_skill() when the parent
-            # conversation's <available_skills> manifest is detected
-            # (model-attached skills).
+            # Core before 0.12.0 omits view_skill here; callers add it with
+            # shared.skills.register_view_skill().
             builtin_extra_params = {
                 "__user__": extra_params.get("__user__"),
                 "__event_emitter__": extra_params.get("__event_emitter__"),
@@ -372,18 +384,16 @@ async def build_tools_dict(
 
             all_builtin_tools = await maybe_await(get_builtin_tools(**builtin_kwargs))
 
-            # NOTE: ask_user is excluded from nested loops. The callable itself
-            # would work over __event_call__, but the frontend keeps a single
-            # event callback, so concurrent request:user_input calls from
-            # parallel branches clobber each other and the losing call waits
-            # forever (Core overrides sio.call's 60s default timeout with
-            # WEBSOCKET_EVENT_CALLER_TIMEOUT, which defaults to None).
-            disabled_builtin_tools: set = set(
-                BUILTIN_TOOL_CATEGORIES.get("user_input", set())
-            )
+            disabled_builtin_tools: set = set()
+            # Core before 0.12.0 keeps a single browser event callback and no
+            # call timeout, so concurrent ask_user prompts can wait forever.
+            if tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2]) < (0, 12):
+                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES["user_input"])
             for valve_field, category in VALVE_TO_CATEGORY.items():
                 if not getattr(valves, valve_field, True):
                     disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
+            if not getattr(valves, "ENABLE_SKILLS_TOOLS", True):
+                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES["skills_write"])
 
             knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
             file_tools_enabled = bool(getattr(valves, "ENABLE_FILE_TOOLS", True))

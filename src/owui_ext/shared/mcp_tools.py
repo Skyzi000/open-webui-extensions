@@ -25,6 +25,7 @@ below.
 """
 
 import asyncio
+import hashlib
 import logging
 import re
 from typing import Any, Callable, Optional
@@ -225,6 +226,11 @@ async def resolve_mcp_tools(
             has_tool_server_access as has_connection_access,
         )
 
+    try:
+        from open_webui.utils.tools import connect_mcp_server
+    except ImportError:
+        connect_mcp_server = None
+
     event_emitter = (extra_params or {}).get("__event_emitter__")
 
     async def emit_warning(description: str) -> None:
@@ -234,7 +240,9 @@ async def resolve_mcp_tools(
     extra_params = extra_params or {}
     mcp_tools_dict: dict[str, dict] = {}
     mcp_clients: dict[str, Any] = {}
-    server_connections = await _get_tool_server_connections(request)
+    server_connections = (
+        [] if connect_mcp_server else await _get_tool_server_connections(request)
+    )
 
     ordered_server_ids: list[str] = []
     seen_server_ids: set[str] = set()
@@ -252,55 +260,60 @@ async def resolve_mcp_tools(
         for server_id in ordered_server_ids:
             client = None
             try:
-                mcp_server_connection = next(
-                    (
-                        server_connection
-                        for server_connection in server_connections
-                        if server_connection.get("type", "") == "mcp"
-                        and server_connection.get("info", {}).get("id") == server_id
-                    ),
-                    None,
-                )
+                function_name_filter_list = None
+                if connect_mcp_server is not None:
+                    connected = await connect_mcp_server(
+                        request,
+                        server_id,
+                        user,
+                        {**extra_params, "__metadata__": metadata},
+                    )
+                    if connected is None:
+                        await emit_warning(f"MCP server '{server_id}' is not available")
+                        continue
+                    client, tool_specs = connected
+                    mcp_clients[server_id] = client
+                else:
+                    mcp_server_connection = next(
+                        (
+                            server_connection
+                            for server_connection in server_connections
+                            if server_connection.get("type", "") == "mcp"
+                            and server_connection.get("info", {}).get("id") == server_id
+                        ),
+                        None,
+                    )
 
-                if not mcp_server_connection:
-                    _mcp_tools_log.warning(f"MCP server with id {server_id} not found")
-                    await emit_warning(f"MCP server '{server_id}' was not found")
-                    continue
+                    if not mcp_server_connection:
+                        _mcp_tools_log.warning(f"MCP server with id {server_id} not found")
+                        await emit_warning(f"MCP server '{server_id}' was not found")
+                        continue
 
-                if not mcp_server_connection.get("config", {}).get("enable", True):
-                    if debug:
-                        _mcp_tools_log.info(
-                            f"MCP server {server_id} is disabled; skipping"
+                    if not mcp_server_connection.get("config", {}).get("enable", True):
+                        if debug:
+                            _mcp_tools_log.info(
+                                f"MCP server {server_id} is disabled; skipping"
+                            )
+                        await emit_warning(f"MCP server '{server_id}' is disabled")
+                        continue
+
+                    try:
+                        has_access = await _mcp_maybe_await(
+                            has_connection_access(user, mcp_server_connection)
                         )
-                    await emit_warning(f"MCP server '{server_id}' is disabled")
-                    continue
+                    except TypeError:
+                        has_access = await _mcp_maybe_await(
+                            has_connection_access(user, mcp_server_connection, None)
+                        )
 
-                try:
-                    has_access = await _mcp_maybe_await(
-                        has_connection_access(user, mcp_server_connection)
-                    )
-                except TypeError:
-                    has_access = await _mcp_maybe_await(
-                        has_connection_access(user, mcp_server_connection, None)
-                    )
+                    if not has_access:
+                        _mcp_tools_log.warning(
+                            f"Access denied to MCP server {server_id} for user {user.id}"
+                        )
+                        await emit_warning(f"Access denied to MCP server '{server_id}'")
+                        continue
 
-                if not has_access:
-                    _mcp_tools_log.warning(
-                        f"Access denied to MCP server {server_id} for user {user.id}"
-                    )
-                    await emit_warning(f"Access denied to MCP server '{server_id}'")
-                    continue
-
-                headers = await _build_mcp_headers_with_core(
-                    connection=mcp_server_connection,
-                    request=request,
-                    user=user,
-                    server_id=server_id,
-                    metadata=metadata,
-                    extra_params=extra_params,
-                )
-                if headers is None:
-                    headers = await _build_mcp_headers_legacy(
+                    headers = await _build_mcp_headers_with_core(
                         connection=mcp_server_connection,
                         request=request,
                         user=user,
@@ -308,29 +321,38 @@ async def resolve_mcp_tools(
                         metadata=metadata,
                         extra_params=extra_params,
                     )
+                    if headers is None:
+                        headers = await _build_mcp_headers_legacy(
+                            connection=mcp_server_connection,
+                            request=request,
+                            user=user,
+                            server_id=server_id,
+                            metadata=metadata,
+                            extra_params=extra_params,
+                        )
 
-                function_name_filter_list = mcp_server_connection.get("config", {}).get(
-                    "function_name_filter_list", ""
-                )
-                if isinstance(function_name_filter_list, str):
-                    function_name_filter_list = [
-                        item.strip()
-                        for item in function_name_filter_list.split(",")
-                        if item.strip()
-                    ]
+                    function_name_filter_list = mcp_server_connection.get("config", {}).get(
+                        "function_name_filter_list", ""
+                    )
+                    if isinstance(function_name_filter_list, str):
+                        function_name_filter_list = [
+                            item.strip()
+                            for item in function_name_filter_list.split(",")
+                            if item.strip()
+                        ]
 
-                client = MCPClient()
-                # Own the client before connect/listing can be cancelled.
-                mcp_clients[server_id] = client
+                    client = MCPClient()
+                    # Own the client before connect/listing can be cancelled.
+                    mcp_clients[server_id] = client
+
+                    await client.connect(
+                        url=mcp_server_connection.get("url", ""),
+                        headers=headers if headers else None,
+                    )
+
+                    tool_specs = await client.list_tool_specs() or []
+
                 client_lock = asyncio.Lock()
-                setattr(client, "_sub_agent_lock", client_lock)
-
-                await client.connect(
-                    url=mcp_server_connection.get("url", ""),
-                    headers=headers if headers else None,
-                )
-
-                tool_specs = await client.list_tool_specs() or []
 
                 def make_tool_function(
                     mcp_client: Any,
@@ -362,6 +384,12 @@ async def resolve_mcp_tools(
 
                     safe_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", server_id)
                     prefixed_name = f"{safe_prefix}_{tool_name}"
+                    # Providers reject tool names over 64 characters.
+                    if len(prefixed_name) > 64:
+                        prefixed_name = (
+                            f"{prefixed_name[:55]}_"
+                            f"{hashlib.sha256(prefixed_name.encode()).hexdigest()[:8]}"
+                        )
                     mcp_tools_dict[prefixed_name] = {
                         "spec": {
                             **tool_spec,

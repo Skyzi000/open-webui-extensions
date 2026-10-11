@@ -27,6 +27,8 @@ os.environ.setdefault("WEBUI_SECRET_KEY", "test-secret-key")
 os.environ.setdefault("DATABASE_URL", f"sqlite:///{_temp_db_path}")
 os.environ.setdefault("ENABLE_OLLAMA_API", "false")
 os.environ.setdefault("ENABLE_OPENAI_API", "false")
+# Core 0.12.0 reads ENABLE_TOOL_SEARCH, which Claude Code also exports for itself.
+os.environ.pop("ENABLE_TOOL_SEARCH", None)
 
 
 def pytest_configure(config):

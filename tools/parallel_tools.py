@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.6
+version: 0.2.7
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -40,6 +40,7 @@ async def maybe_await(value):
 import ast
 import json
 import logging
+import re
 import uuid
 from typing import Any, Callable, Optional
 from fastapi import Request
@@ -121,20 +122,26 @@ async def process_tool_result(
     )
 
 
-def split_tool_result_files(files: list) -> tuple[list[str], list]:
-    """Match native Core: data images go to the model, other files to display."""
+async def split_tool_result_files(files: list, user: Any = None) -> tuple[list[str], list]:
+    """Match native Core: data images go to the model, URL images to both, other files to display."""
     images = []
     display_files = []
     for file in files:
-        if (
-            isinstance(file, dict)
-            and file.get("type") == "image"
-            and isinstance(file.get("url"), str)
-            and file["url"].startswith("data:")
-        ):
-            images.append(file["url"])
-        else:
-            display_files.append(file)
+        url = file.get("url") if isinstance(file, dict) and file.get("type") == "image" else None
+        if isinstance(url, str) and url.startswith("data:"):
+            images.append(url)
+            continue
+        display_files.append(file)
+        if isinstance(url, str) and url:
+            from open_webui.env import VERSION
+
+            # Core before 0.12.0 keeps URL images display-only.
+            if tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2]) >= (0, 12):
+                from open_webui.utils.files import get_image_base64_from_url
+
+                image = await get_image_base64_from_url(url, user=_normalize_user(user))
+                if image:
+                    images.append(image)
     return images, display_files
 
 
@@ -373,14 +380,21 @@ async def execute_tool_call(
                 # so tool-specific UserValves injected by get_tools() survive.
                 from open_webui.utils.tools import get_updated_tool_function
 
+                call_params = {
+                    "__messages__": extra_params.get("__messages__", []),
+                    "__files__": extra_params.get("__files__", []),
+                    "__event_emitter__": extra_params.get("__event_emitter__"),
+                    "__event_call__": extra_params.get("__event_call__"),
+                }
+                # Core builtins keep per-agent state (skill revisions, Tool
+                # Search) in metadata, while loaded tools are shared by agents.
+                if tool.get("type") == "builtin" and isinstance(
+                    extra_params.get("__metadata__"), dict
+                ):
+                    call_params["__metadata__"] = extra_params["__metadata__"]
                 tool_function = await _maybe_await(get_updated_tool_function(
                     function=tool_function,
-                    extra_params={
-                        "__messages__": extra_params.get("__messages__", []),
-                        "__files__": extra_params.get("__files__", []),
-                        "__event_emitter__": extra_params.get("__event_emitter__"),
-                        "__event_call__": extra_params.get("__event_call__"),
-                    },
+                    extra_params=call_params,
                 ))
 
                 tool_result = await tool_function(**tool_function_params)
@@ -402,7 +416,9 @@ async def execute_tool_call(
                 metadata=extra_params.get("__metadata__"),
                 user=extra_params.get("__user__"),
             )
-            tool_result_images, tool_result_files = split_tool_result_files(tool_result_files)
+            tool_result_images, tool_result_files = await split_tool_result_files(
+                tool_result_files, extra_params.get("__user__")
+            )
             emit_terminal_event = True
 
         except Exception as exc:
@@ -459,6 +475,7 @@ async def execute_tool_call(
 
 # --- inlined from src/owui_ext/shared/mcp_tools.py (owui_ext.shared.mcp_tools) ---
 import asyncio
+import hashlib
 import logging
 import re
 from typing import Any, Callable, Optional
@@ -657,6 +674,11 @@ async def resolve_mcp_tools(
             has_tool_server_access as has_connection_access,
         )
 
+    try:
+        from open_webui.utils.tools import connect_mcp_server
+    except ImportError:
+        connect_mcp_server = None
+
     event_emitter = (extra_params or {}).get("__event_emitter__")
 
     async def emit_warning(description: str) -> None:
@@ -666,7 +688,9 @@ async def resolve_mcp_tools(
     extra_params = extra_params or {}
     mcp_tools_dict: dict[str, dict] = {}
     mcp_clients: dict[str, Any] = {}
-    server_connections = await _get_tool_server_connections(request)
+    server_connections = (
+        [] if connect_mcp_server else await _get_tool_server_connections(request)
+    )
 
     ordered_server_ids: list[str] = []
     seen_server_ids: set[str] = set()
@@ -684,55 +708,60 @@ async def resolve_mcp_tools(
         for server_id in ordered_server_ids:
             client = None
             try:
-                mcp_server_connection = next(
-                    (
-                        server_connection
-                        for server_connection in server_connections
-                        if server_connection.get("type", "") == "mcp"
-                        and server_connection.get("info", {}).get("id") == server_id
-                    ),
-                    None,
-                )
+                function_name_filter_list = None
+                if connect_mcp_server is not None:
+                    connected = await connect_mcp_server(
+                        request,
+                        server_id,
+                        user,
+                        {**extra_params, "__metadata__": metadata},
+                    )
+                    if connected is None:
+                        await emit_warning(f"MCP server '{server_id}' is not available")
+                        continue
+                    client, tool_specs = connected
+                    mcp_clients[server_id] = client
+                else:
+                    mcp_server_connection = next(
+                        (
+                            server_connection
+                            for server_connection in server_connections
+                            if server_connection.get("type", "") == "mcp"
+                            and server_connection.get("info", {}).get("id") == server_id
+                        ),
+                        None,
+                    )
 
-                if not mcp_server_connection:
-                    _mcp_tools_log.warning(f"MCP server with id {server_id} not found")
-                    await emit_warning(f"MCP server '{server_id}' was not found")
-                    continue
+                    if not mcp_server_connection:
+                        _mcp_tools_log.warning(f"MCP server with id {server_id} not found")
+                        await emit_warning(f"MCP server '{server_id}' was not found")
+                        continue
 
-                if not mcp_server_connection.get("config", {}).get("enable", True):
-                    if debug:
-                        _mcp_tools_log.info(
-                            f"MCP server {server_id} is disabled; skipping"
+                    if not mcp_server_connection.get("config", {}).get("enable", True):
+                        if debug:
+                            _mcp_tools_log.info(
+                                f"MCP server {server_id} is disabled; skipping"
+                            )
+                        await emit_warning(f"MCP server '{server_id}' is disabled")
+                        continue
+
+                    try:
+                        has_access = await _mcp_maybe_await(
+                            has_connection_access(user, mcp_server_connection)
                         )
-                    await emit_warning(f"MCP server '{server_id}' is disabled")
-                    continue
+                    except TypeError:
+                        has_access = await _mcp_maybe_await(
+                            has_connection_access(user, mcp_server_connection, None)
+                        )
 
-                try:
-                    has_access = await _mcp_maybe_await(
-                        has_connection_access(user, mcp_server_connection)
-                    )
-                except TypeError:
-                    has_access = await _mcp_maybe_await(
-                        has_connection_access(user, mcp_server_connection, None)
-                    )
+                    if not has_access:
+                        _mcp_tools_log.warning(
+                            f"Access denied to MCP server {server_id} for user {user.id}"
+                        )
+                        await emit_warning(f"Access denied to MCP server '{server_id}'")
+                        continue
 
-                if not has_access:
-                    _mcp_tools_log.warning(
-                        f"Access denied to MCP server {server_id} for user {user.id}"
-                    )
-                    await emit_warning(f"Access denied to MCP server '{server_id}'")
-                    continue
-
-                headers = await _build_mcp_headers_with_core(
-                    connection=mcp_server_connection,
-                    request=request,
-                    user=user,
-                    server_id=server_id,
-                    metadata=metadata,
-                    extra_params=extra_params,
-                )
-                if headers is None:
-                    headers = await _build_mcp_headers_legacy(
+                    headers = await _build_mcp_headers_with_core(
                         connection=mcp_server_connection,
                         request=request,
                         user=user,
@@ -740,29 +769,38 @@ async def resolve_mcp_tools(
                         metadata=metadata,
                         extra_params=extra_params,
                     )
+                    if headers is None:
+                        headers = await _build_mcp_headers_legacy(
+                            connection=mcp_server_connection,
+                            request=request,
+                            user=user,
+                            server_id=server_id,
+                            metadata=metadata,
+                            extra_params=extra_params,
+                        )
 
-                function_name_filter_list = mcp_server_connection.get("config", {}).get(
-                    "function_name_filter_list", ""
-                )
-                if isinstance(function_name_filter_list, str):
-                    function_name_filter_list = [
-                        item.strip()
-                        for item in function_name_filter_list.split(",")
-                        if item.strip()
-                    ]
+                    function_name_filter_list = mcp_server_connection.get("config", {}).get(
+                        "function_name_filter_list", ""
+                    )
+                    if isinstance(function_name_filter_list, str):
+                        function_name_filter_list = [
+                            item.strip()
+                            for item in function_name_filter_list.split(",")
+                            if item.strip()
+                        ]
 
-                client = MCPClient()
-                # Own the client before connect/listing can be cancelled.
-                mcp_clients[server_id] = client
+                    client = MCPClient()
+                    # Own the client before connect/listing can be cancelled.
+                    mcp_clients[server_id] = client
+
+                    await client.connect(
+                        url=mcp_server_connection.get("url", ""),
+                        headers=headers if headers else None,
+                    )
+
+                    tool_specs = await client.list_tool_specs() or []
+
                 client_lock = asyncio.Lock()
-                setattr(client, "_sub_agent_lock", client_lock)
-
-                await client.connect(
-                    url=mcp_server_connection.get("url", ""),
-                    headers=headers if headers else None,
-                )
-
-                tool_specs = await client.list_tool_specs() or []
 
                 def make_tool_function(
                     mcp_client: Any,
@@ -794,6 +832,12 @@ async def resolve_mcp_tools(
 
                     safe_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", server_id)
                     prefixed_name = f"{safe_prefix}_{tool_name}"
+                    # Providers reject tool names over 64 characters.
+                    if len(prefixed_name) > 64:
+                        prefixed_name = (
+                            f"{prefixed_name[:55]}_"
+                            f"{hashlib.sha256(prefixed_name.encode()).hexdigest()[:8]}"
+                        )
                     mcp_tools_dict[prefixed_name] = {
                         "spec": {
                             **tool_spec,
@@ -895,7 +939,8 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "view_channel_message",
     },
     "code_interpreter": {"execute_code"},
-    "skills": {"view_skill"},
+    "skills": {"view_skill", "read_skill_file"},
+    "skills_write": {"update_skill_files", "create_skill"},
     "subagents": {"delegate_task", "timer"},
     "tasks": {"create_tasks", "update_task"},
     "automations": {
@@ -927,6 +972,7 @@ VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_CHANNELS_TOOLS": "channels",
     "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
     "ENABLE_SKILLS_TOOLS": "skills",
+    "ENABLE_SKILLS_WRITE_TOOLS": "skills_write",
     "ENABLE_SUBAGENT_TOOLS": "subagents",
     "ENABLE_TASK_TOOLS": "tasks",
     "ENABLE_AUTOMATION_TOOLS": "automations",
@@ -1254,11 +1300,14 @@ async def build_tools_dict(
     for callers that construct an internal model conversation.
     """
     import inspect
+    import json
     import logging
+    import re
 
     log = logging.getLogger("owui_ext.shared.tool_loader")
     debug = bool(getattr(valves, "DEBUG", False))
 
+    from open_webui.env import VERSION
     from open_webui.utils.tools import get_builtin_tools, get_tools
 
     try:
@@ -1491,13 +1540,22 @@ async def build_tools_dict(
         else:
             extra_params.pop("__direct_tool_server_system_prompts__", None)
 
+        mcp_instructions = [
+            f"MCP server {json.dumps(server_id, ensure_ascii=False)} instructions:\n{client.instructions}"
+            for server_id, client in mcp_clients.items()
+            if getattr(client, "instructions", None)
+        ]
+        if mcp_instructions:
+            extra_params["__direct_tool_server_system_prompts__"] = [
+                *extra_params.get("__direct_tool_server_system_prompts__", []),
+                *mcp_instructions,
+            ]
+
         try:
             features = metadata.get("features", {})
 
-            # NOTE: view_skill is NOT registered here; the plugin registers it
-            # manually via shared.skills.register_view_skill() when the parent
-            # conversation's <available_skills> manifest is detected
-            # (model-attached skills).
+            # Core before 0.12.0 omits view_skill here; callers add it with
+            # shared.skills.register_view_skill().
             builtin_extra_params = {
                 "__user__": extra_params.get("__user__"),
                 "__event_emitter__": extra_params.get("__event_emitter__"),
@@ -1538,18 +1596,16 @@ async def build_tools_dict(
 
             all_builtin_tools = await maybe_await(get_builtin_tools(**builtin_kwargs))
 
-            # NOTE: ask_user is excluded from nested loops. The callable itself
-            # would work over __event_call__, but the frontend keeps a single
-            # event callback, so concurrent request:user_input calls from
-            # parallel branches clobber each other and the losing call waits
-            # forever (Core overrides sio.call's 60s default timeout with
-            # WEBSOCKET_EVENT_CALLER_TIMEOUT, which defaults to None).
-            disabled_builtin_tools: set = set(
-                BUILTIN_TOOL_CATEGORIES.get("user_input", set())
-            )
+            disabled_builtin_tools: set = set()
+            # Core before 0.12.0 keeps a single browser event callback and no
+            # call timeout, so concurrent ask_user prompts can wait forever.
+            if tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2]) < (0, 12):
+                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES["user_input"])
             for valve_field, category in VALVE_TO_CATEGORY.items():
                 if not getattr(valves, valve_field, True):
                     disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
+            if not getattr(valves, "ENABLE_SKILLS_TOOLS", True):
+                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES["skills_write"])
 
             knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
             file_tools_enabled = bool(getattr(valves, "ENABLE_FILE_TOOLS", True))
@@ -1748,7 +1804,9 @@ async def execute_single_tool(
 
             # Only Parallel needs Core to extract images from its return container.
             if callable(getattr(middleware, "extract_base64_images", None)):
-                tool_result_images, tool_result_files = split_tool_result_files(tool_result_files)
+                tool_result_images, tool_result_files = await split_tool_result_files(
+                    tool_result_files, extra_params.get("__user__")
+                )
 
         # Emit terminal:* events for display/refresh behavior in UI
         await emit_terminal_tool_event(
@@ -2048,15 +2106,16 @@ class Tools:
             return json.dumps({"error": f"Failed to load tools: {e}"})
 
         try:
-            # Core's resolved skills are not part of metadata.skill_ids on
-            # newer versions. Reuse the builtin already allowed in this chat.
-            parent_view_skill = (__metadata__.get("tools") or {}).get("view_skill")
-            if (
-                isinstance(parent_view_skill, dict)
-                and parent_view_skill.get("type") == "builtin"
-                and parent_view_skill.get("tool_id") == "builtin:view_skill"
-            ):
-                tools_dict.setdefault("view_skill", parent_view_skill)
+            # Core binds these builtins to chat state the loader cannot rebuild.
+            parent_tools = __metadata__.get("tools") or {}
+            for name in ("view_skill", "search_tools"):
+                parent_tool = parent_tools.get(name)
+                if (
+                    isinstance(parent_tool, dict)
+                    and parent_tool.get("type") == "builtin"
+                    and parent_tool.get("tool_id") == f"builtin:{name}"
+                ):
+                    tools_dict.setdefault(name, parent_tool)
 
             if self.valves.DEBUG:
                 log.info(f"[ParallelTools] Total tools available: {len(tools_dict)}")

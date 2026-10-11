@@ -5,8 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from open_webui.tools import builtin
 
 import parallel_tools
+
+# Core 0.12.0+ registers skill tools for every model that keeps its skills switch on.
+CORE_REGISTERS_SKILL_TOOLS = hasattr(builtin, "read_skill_file")
 
 
 @pytest.fixture
@@ -15,7 +19,9 @@ def skill_context(monkeypatch):
     from open_webui.models.users import UserModel
 
     monkeypatch.setattr(Config, "get_many", AsyncMock(return_value={}))
-    monkeypatch.setattr(Config, "get", AsyncMock(side_effect=lambda key, default=None: default))
+    monkeypatch.setattr(Config, "get", AsyncMock(
+        side_effect=lambda key, default=None: {} if key == "user.permissions" else default
+    ))
     user = UserModel(
         id="skill-user", email="skill@example.com", name="Skill User", role="user",
         last_active_at=0, updated_at=0, created_at=0,
@@ -41,7 +47,8 @@ async def parent_skill_tools(context, skill_id):
         {"__user__": context.user, "__metadata__": context.metadata, "__skill_ids__": [skill_id]},
         model=context.model,
     )
-    assert set(tools) == {"view_skill"}
+    # Core 0.12.0+ also returns read_skill_file and update_skill_files.
+    assert "view_skill" in tools
     bound = tools["view_skill"]["callable"].__extra_params__
     assert bound["__user__"] is context.user
     assert bound["__metadata__"] is context.metadata
@@ -68,6 +75,8 @@ async def test_parallel_reaches_real_core_workspace_and_terminal_skill(monkeypat
     workspace_lookup = AsyncMock(return_value=SimpleNamespace(
         id=skill_id, user_id=context.user["id"], is_active=True,
         name="Workspace skill", content="Workspace instructions",
+        description=None, meta={}, version_id="version-1",
+        data={"files": [{"path": "SKILL.md", "content": "Workspace instructions"}]},
     ))
     terminal_lookup = AsyncMock(return_value={"name": "Terminal skill", "content": "Terminal instructions"})
     monkeypatch.setattr(Skills, "get_skill_by_id", workspace_lookup)
@@ -80,13 +89,18 @@ async def test_parallel_reaches_real_core_workspace_and_terminal_skill(monkeypat
 
     assert result["content"] == ("Workspace instructions" if kind == "workspace" else "Terminal instructions")
     if kind == "workspace":
-        workspace_lookup.assert_awaited_once_with(skill_id)
+        workspace_lookup.assert_awaited_once()
+        assert workspace_lookup.await_args.args == (skill_id,)
         terminal_lookup.assert_not_awaited()
     else:
-        terminal_lookup.assert_awaited_once_with(context.request, context.user, context.metadata, "terminal skill")
+        terminal_lookup.assert_awaited_once()
+        assert terminal_lookup.await_args.args[:4] == (
+            context.request, context.user, context.metadata, "terminal skill",
+        )
         workspace_lookup.assert_not_awaited()
 
 
+@pytest.mark.skipif(CORE_REGISTERS_SKILL_TOOLS, reason="Core 0.12.0+ needs no parent entry")
 @pytest.mark.parametrize("parent_entry", ["missing", "wrong_type", "wrong_id"])
 async def test_parallel_does_not_add_skill_without_core_builtin_entry(skill_context, parent_entry):
     context = skill_context
@@ -102,6 +116,14 @@ async def test_parallel_does_not_add_skill_without_core_builtin_entry(skill_cont
     result = await run_skill(context, "workspace-skill")
 
     assert "Tool 'view_skill' not found" in result
+
+
+@pytest.mark.skipif(not CORE_REGISTERS_SKILL_TOOLS, reason="Core before 0.12.0 has no skills switch")
+async def test_parallel_follows_the_model_skills_switch(skill_context):
+    context = skill_context
+    context.model["info"]["meta"]["builtinTools"]["skills"] = False
+
+    assert "Tool 'view_skill' not found" in await run_skill(context, "workspace-skill")
 
 
 async def test_parallel_keeps_regular_tool_with_same_name(monkeypatch, skill_context):

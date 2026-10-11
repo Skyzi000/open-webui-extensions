@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.10
+version: 0.5.11
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -14,6 +14,7 @@ required_open_webui_version: 0.7.0
 # See release.toml for target definitions.
 
 import asyncio
+import copy
 import json
 import logging
 import re
@@ -78,7 +79,8 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "view_channel_message",
     },
     "code_interpreter": {"execute_code"},
-    "skills": {"view_skill"},
+    "skills": {"view_skill", "read_skill_file"},
+    "skills_write": {"update_skill_files", "create_skill"},
     "subagents": {"delegate_task", "timer"},
     "tasks": {"create_tasks", "update_task"},
     "automations": {
@@ -110,6 +112,7 @@ VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_CHANNELS_TOOLS": "channels",
     "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
     "ENABLE_SKILLS_TOOLS": "skills",
+    "ENABLE_SKILLS_WRITE_TOOLS": "skills_write",
     "ENABLE_SUBAGENT_TOOLS": "subagents",
     "ENABLE_TASK_TOOLS": "tasks",
     "ENABLE_AUTOMATION_TOOLS": "automations",
@@ -195,11 +198,13 @@ def format_chat_completion_error(response: Any) -> Optional[str]:
     return f"Unexpected response type: {type(response).__name__}"
 
 # --- inlined from src/owui_ext/shared/inlet_filters.py (owui_ext.shared.inlet_filters) ---
+import copy
 import inspect
 import logging
 import random
 from typing import Any
 from fastapi import Request
+from starlette.datastructures import State
 _inlet_filters_log = logging.getLogger("owui_ext.shared.inlet_filters")
 
 
@@ -396,6 +401,21 @@ async def finalize_model_request(
         filter_pipeline, request, form_data, extra_params, "request"
     )
 
+
+def isolate_request_state(request: Request) -> Request:
+    """Copy *request* with its own ``state``.
+
+    Core's ``generate_chat_completion`` writes per-call flags there, so
+    concurrent nested completions sharing one request would race on them.
+    """
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, dict):
+        return request
+    isolated = copy.copy(request)
+    isolated.scope = {**scope, "state": dict(scope.get("state") or {})}
+    isolated._state = State(isolated.scope["state"])
+    return isolated
+
 # --- inlined from src/owui_ext/shared/model_features.py (owui_ext.shared.model_features) ---
 from typing import Optional
 def _attached_knowledge_types(
@@ -481,7 +501,7 @@ async def emit_notification(
         )
 
 # --- inlined from src/owui_ext/shared/prompt_utils.py (owui_ext.shared.prompt_utils) ---
-from typing import Optional
+from typing import Iterable, Optional
 def merge_prompt_sections(*sections: Optional[str]) -> str:
     """Join non-empty prompt sections with blank lines."""
     merged_sections = []
@@ -555,10 +575,50 @@ def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
     form_data["messages"] = messages
     return form_data
 
+
+async def apply_agent_tool_search(
+    tools_dict: dict, extra_params: dict, always_loaded: Iterable[str] = ()
+) -> tuple[dict, dict, set]:
+    """Apply Core's Tool Search to one agent loop.
+
+    Returns the loop's tools (with ``search_tools``), extra_params carrying the
+    manifest, and the names to leave out of the request's ``tools``. The search
+    state lives in ``extra_params["__metadata__"]``, which must belong to this agent.
+    """
+    try:
+        from open_webui.utils.tool_search import apply_tool_search
+    except ImportError:
+        return tools_dict, extra_params, set()
+
+    kept = {name: tools_dict[name] for name in always_loaded if name in tools_dict}
+    loop_tools = {name: tool for name, tool in tools_dict.items() if name not in kept}
+    metadata = extra_params.get("__metadata__")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    form_data: dict = {"messages": []}
+    deferred = await apply_tool_search(form_data, metadata, loop_tools)
+    if not deferred:
+        return tools_dict, extra_params, set()
+    metadata["tools"] = loop_tools
+    prompts = extra_params.get("__direct_tool_server_system_prompts__") or []
+    return (
+        {**loop_tools, **kept},
+        {
+            **extra_params,
+            "__metadata__": metadata,
+            "__direct_tool_server_system_prompts__": [
+                *prompts,
+                form_data["messages"][0]["content"],
+            ],
+        },
+        deferred,
+    )
+
 # --- inlined from src/owui_ext/shared/tool_execution.py (owui_ext.shared.tool_execution) ---
 import ast
 import json
 import logging
+import re
 import uuid
 from typing import Any, Callable, Optional
 from fastapi import Request
@@ -640,20 +700,26 @@ async def process_tool_result(
     )
 
 
-def split_tool_result_files(files: list) -> tuple[list[str], list]:
-    """Match native Core: data images go to the model, other files to display."""
+async def split_tool_result_files(files: list, user: Any = None) -> tuple[list[str], list]:
+    """Match native Core: data images go to the model, URL images to both, other files to display."""
     images = []
     display_files = []
     for file in files:
-        if (
-            isinstance(file, dict)
-            and file.get("type") == "image"
-            and isinstance(file.get("url"), str)
-            and file["url"].startswith("data:")
-        ):
-            images.append(file["url"])
-        else:
-            display_files.append(file)
+        url = file.get("url") if isinstance(file, dict) and file.get("type") == "image" else None
+        if isinstance(url, str) and url.startswith("data:"):
+            images.append(url)
+            continue
+        display_files.append(file)
+        if isinstance(url, str) and url:
+            from open_webui.env import VERSION
+
+            # Core before 0.12.0 keeps URL images display-only.
+            if tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2]) >= (0, 12):
+                from open_webui.utils.files import get_image_base64_from_url
+
+                image = await get_image_base64_from_url(url, user=_normalize_user(user))
+                if image:
+                    images.append(image)
     return images, display_files
 
 
@@ -892,14 +958,21 @@ async def execute_tool_call(
                 # so tool-specific UserValves injected by get_tools() survive.
                 from open_webui.utils.tools import get_updated_tool_function
 
+                call_params = {
+                    "__messages__": extra_params.get("__messages__", []),
+                    "__files__": extra_params.get("__files__", []),
+                    "__event_emitter__": extra_params.get("__event_emitter__"),
+                    "__event_call__": extra_params.get("__event_call__"),
+                }
+                # Core builtins keep per-agent state (skill revisions, Tool
+                # Search) in metadata, while loaded tools are shared by agents.
+                if tool.get("type") == "builtin" and isinstance(
+                    extra_params.get("__metadata__"), dict
+                ):
+                    call_params["__metadata__"] = extra_params["__metadata__"]
                 tool_function = await _maybe_await(get_updated_tool_function(
                     function=tool_function,
-                    extra_params={
-                        "__messages__": extra_params.get("__messages__", []),
-                        "__files__": extra_params.get("__files__", []),
-                        "__event_emitter__": extra_params.get("__event_emitter__"),
-                        "__event_call__": extra_params.get("__event_call__"),
-                    },
+                    extra_params=call_params,
                 ))
 
                 tool_result = await tool_function(**tool_function_params)
@@ -921,7 +994,9 @@ async def execute_tool_call(
                 metadata=extra_params.get("__metadata__"),
                 user=extra_params.get("__user__"),
             )
-            tool_result_images, tool_result_files = split_tool_result_files(tool_result_files)
+            tool_result_images, tool_result_files = await split_tool_result_files(
+                tool_result_files, extra_params.get("__user__")
+            )
             emit_terminal_event = True
 
         except Exception as exc:
@@ -978,6 +1053,7 @@ async def execute_tool_call(
 
 # --- inlined from src/owui_ext/shared/mcp_tools.py (owui_ext.shared.mcp_tools) ---
 import asyncio
+import hashlib
 import logging
 import re
 from typing import Any, Callable, Optional
@@ -1176,6 +1252,11 @@ async def resolve_mcp_tools(
             has_tool_server_access as has_connection_access,
         )
 
+    try:
+        from open_webui.utils.tools import connect_mcp_server
+    except ImportError:
+        connect_mcp_server = None
+
     event_emitter = (extra_params or {}).get("__event_emitter__")
 
     async def emit_warning(description: str) -> None:
@@ -1185,7 +1266,9 @@ async def resolve_mcp_tools(
     extra_params = extra_params or {}
     mcp_tools_dict: dict[str, dict] = {}
     mcp_clients: dict[str, Any] = {}
-    server_connections = await _get_tool_server_connections(request)
+    server_connections = (
+        [] if connect_mcp_server else await _get_tool_server_connections(request)
+    )
 
     ordered_server_ids: list[str] = []
     seen_server_ids: set[str] = set()
@@ -1203,55 +1286,60 @@ async def resolve_mcp_tools(
         for server_id in ordered_server_ids:
             client = None
             try:
-                mcp_server_connection = next(
-                    (
-                        server_connection
-                        for server_connection in server_connections
-                        if server_connection.get("type", "") == "mcp"
-                        and server_connection.get("info", {}).get("id") == server_id
-                    ),
-                    None,
-                )
+                function_name_filter_list = None
+                if connect_mcp_server is not None:
+                    connected = await connect_mcp_server(
+                        request,
+                        server_id,
+                        user,
+                        {**extra_params, "__metadata__": metadata},
+                    )
+                    if connected is None:
+                        await emit_warning(f"MCP server '{server_id}' is not available")
+                        continue
+                    client, tool_specs = connected
+                    mcp_clients[server_id] = client
+                else:
+                    mcp_server_connection = next(
+                        (
+                            server_connection
+                            for server_connection in server_connections
+                            if server_connection.get("type", "") == "mcp"
+                            and server_connection.get("info", {}).get("id") == server_id
+                        ),
+                        None,
+                    )
 
-                if not mcp_server_connection:
-                    _mcp_tools_log.warning(f"MCP server with id {server_id} not found")
-                    await emit_warning(f"MCP server '{server_id}' was not found")
-                    continue
+                    if not mcp_server_connection:
+                        _mcp_tools_log.warning(f"MCP server with id {server_id} not found")
+                        await emit_warning(f"MCP server '{server_id}' was not found")
+                        continue
 
-                if not mcp_server_connection.get("config", {}).get("enable", True):
-                    if debug:
-                        _mcp_tools_log.info(
-                            f"MCP server {server_id} is disabled; skipping"
+                    if not mcp_server_connection.get("config", {}).get("enable", True):
+                        if debug:
+                            _mcp_tools_log.info(
+                                f"MCP server {server_id} is disabled; skipping"
+                            )
+                        await emit_warning(f"MCP server '{server_id}' is disabled")
+                        continue
+
+                    try:
+                        has_access = await _mcp_maybe_await(
+                            has_connection_access(user, mcp_server_connection)
                         )
-                    await emit_warning(f"MCP server '{server_id}' is disabled")
-                    continue
+                    except TypeError:
+                        has_access = await _mcp_maybe_await(
+                            has_connection_access(user, mcp_server_connection, None)
+                        )
 
-                try:
-                    has_access = await _mcp_maybe_await(
-                        has_connection_access(user, mcp_server_connection)
-                    )
-                except TypeError:
-                    has_access = await _mcp_maybe_await(
-                        has_connection_access(user, mcp_server_connection, None)
-                    )
+                    if not has_access:
+                        _mcp_tools_log.warning(
+                            f"Access denied to MCP server {server_id} for user {user.id}"
+                        )
+                        await emit_warning(f"Access denied to MCP server '{server_id}'")
+                        continue
 
-                if not has_access:
-                    _mcp_tools_log.warning(
-                        f"Access denied to MCP server {server_id} for user {user.id}"
-                    )
-                    await emit_warning(f"Access denied to MCP server '{server_id}'")
-                    continue
-
-                headers = await _build_mcp_headers_with_core(
-                    connection=mcp_server_connection,
-                    request=request,
-                    user=user,
-                    server_id=server_id,
-                    metadata=metadata,
-                    extra_params=extra_params,
-                )
-                if headers is None:
-                    headers = await _build_mcp_headers_legacy(
+                    headers = await _build_mcp_headers_with_core(
                         connection=mcp_server_connection,
                         request=request,
                         user=user,
@@ -1259,29 +1347,38 @@ async def resolve_mcp_tools(
                         metadata=metadata,
                         extra_params=extra_params,
                     )
+                    if headers is None:
+                        headers = await _build_mcp_headers_legacy(
+                            connection=mcp_server_connection,
+                            request=request,
+                            user=user,
+                            server_id=server_id,
+                            metadata=metadata,
+                            extra_params=extra_params,
+                        )
 
-                function_name_filter_list = mcp_server_connection.get("config", {}).get(
-                    "function_name_filter_list", ""
-                )
-                if isinstance(function_name_filter_list, str):
-                    function_name_filter_list = [
-                        item.strip()
-                        for item in function_name_filter_list.split(",")
-                        if item.strip()
-                    ]
+                    function_name_filter_list = mcp_server_connection.get("config", {}).get(
+                        "function_name_filter_list", ""
+                    )
+                    if isinstance(function_name_filter_list, str):
+                        function_name_filter_list = [
+                            item.strip()
+                            for item in function_name_filter_list.split(",")
+                            if item.strip()
+                        ]
 
-                client = MCPClient()
-                # Own the client before connect/listing can be cancelled.
-                mcp_clients[server_id] = client
+                    client = MCPClient()
+                    # Own the client before connect/listing can be cancelled.
+                    mcp_clients[server_id] = client
+
+                    await client.connect(
+                        url=mcp_server_connection.get("url", ""),
+                        headers=headers if headers else None,
+                    )
+
+                    tool_specs = await client.list_tool_specs() or []
+
                 client_lock = asyncio.Lock()
-                setattr(client, "_sub_agent_lock", client_lock)
-
-                await client.connect(
-                    url=mcp_server_connection.get("url", ""),
-                    headers=headers if headers else None,
-                )
-
-                tool_specs = await client.list_tool_specs() or []
 
                 def make_tool_function(
                     mcp_client: Any,
@@ -1313,6 +1410,12 @@ async def resolve_mcp_tools(
 
                     safe_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", server_id)
                     prefixed_name = f"{safe_prefix}_{tool_name}"
+                    # Providers reject tool names over 64 characters.
+                    if len(prefixed_name) > 64:
+                        prefixed_name = (
+                            f"{prefixed_name[:55]}_"
+                            f"{hashlib.sha256(prefixed_name.encode()).hexdigest()[:8]}"
+                        )
                     mcp_tools_dict[prefixed_name] = {
                         "spec": {
                             **tool_spec,
@@ -1412,6 +1515,7 @@ def extract_model_ids(models: list[dict]) -> list[str]:
     return ids
 
 # --- inlined from src/owui_ext/shared/skills.py (owui_ext.shared.skills) ---
+import copy
 import logging
 import re
 from typing import Any, Optional
@@ -1421,7 +1525,7 @@ _skills_log = logging.getLogger("owui_ext.shared.skills")
 _SKILLS_MANIFEST_START = "<available_skills>"
 _SKILLS_MANIFEST_END = "</available_skills>"
 _SKILL_TAG_PATTERN = re.compile(
-    r"<skill name=.*?>\n.*?\n</skill>", re.DOTALL
+    r"<skill [^\n]*?name=.*?>\n.*?\n</skill>", re.DOTALL
 )
 
 
@@ -1443,7 +1547,7 @@ def _find_manifest_in_text(text: str) -> str:
 
 
 def _find_skill_tags_in_text(text: str) -> list[str]:
-    """Return all ``<skill name="...">…</skill>`` blocks found in *text*."""
+    """Return all ``<skill ... name="...">…</skill>`` blocks found in *text*."""
     return _SKILL_TAG_PATTERN.findall(text)
 
 
@@ -1516,6 +1620,33 @@ def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
     return _extract_from_system_messages(messages, _find_skill_tags_in_text)
 
 
+def drop_unloadable_skill_manifest(messages: list, tools_dict: Optional[dict]) -> list:
+    """Remove the ``<available_skills>`` manifest when no ``view_skill`` tool can load it."""
+    if "view_skill" in (tools_dict or {}):
+        return messages
+
+    def without_manifest(message: dict) -> dict:
+        content = message.get("content")
+        if message.get("role") != "system" or not isinstance(content, str):
+            return message
+        manifest = _find_manifest_in_text(content)
+        if not manifest:
+            return message
+        parts = (part.strip() for part in content.split(manifest, 1))
+        return {**message, "content": "\n\n".join(part for part in parts if part)}
+
+    return [without_manifest(message) for message in messages]
+
+
+def isolate_chat_context(metadata: Optional[dict]) -> dict:
+    """Copy *metadata* with its own ``chat_context``, as Core does for sub-agent runs."""
+    metadata = metadata or {}
+    return {
+        **metadata,
+        "chat_context": copy.deepcopy(metadata.get("chat_context") or {}),
+    }
+
+
 async def register_view_skill(
     tools_dict: dict,
     request: Request,
@@ -1539,7 +1670,12 @@ async def register_view_skill(
         return
 
     try:
-        from open_webui.tools.builtin import view_skill
+        from open_webui.tools import builtin
+
+        # Core 0.12.0+ registers skill tools in get_builtin_tools per model.
+        if hasattr(builtin, "read_skill_file"):
+            return
+        view_skill = builtin.view_skill
         from open_webui.utils.tools import (
             get_async_tool_function_and_apply_extra_params,
             convert_function_to_pydantic_model,
@@ -1807,11 +1943,14 @@ async def build_tools_dict(
     for callers that construct an internal model conversation.
     """
     import inspect
+    import json
     import logging
+    import re
 
     log = logging.getLogger("owui_ext.shared.tool_loader")
     debug = bool(getattr(valves, "DEBUG", False))
 
+    from open_webui.env import VERSION
     from open_webui.utils.tools import get_builtin_tools, get_tools
 
     try:
@@ -2044,13 +2183,22 @@ async def build_tools_dict(
         else:
             extra_params.pop("__direct_tool_server_system_prompts__", None)
 
+        mcp_instructions = [
+            f"MCP server {json.dumps(server_id, ensure_ascii=False)} instructions:\n{client.instructions}"
+            for server_id, client in mcp_clients.items()
+            if getattr(client, "instructions", None)
+        ]
+        if mcp_instructions:
+            extra_params["__direct_tool_server_system_prompts__"] = [
+                *extra_params.get("__direct_tool_server_system_prompts__", []),
+                *mcp_instructions,
+            ]
+
         try:
             features = metadata.get("features", {})
 
-            # NOTE: view_skill is NOT registered here; the plugin registers it
-            # manually via shared.skills.register_view_skill() when the parent
-            # conversation's <available_skills> manifest is detected
-            # (model-attached skills).
+            # Core before 0.12.0 omits view_skill here; callers add it with
+            # shared.skills.register_view_skill().
             builtin_extra_params = {
                 "__user__": extra_params.get("__user__"),
                 "__event_emitter__": extra_params.get("__event_emitter__"),
@@ -2091,18 +2239,16 @@ async def build_tools_dict(
 
             all_builtin_tools = await maybe_await(get_builtin_tools(**builtin_kwargs))
 
-            # NOTE: ask_user is excluded from nested loops. The callable itself
-            # would work over __event_call__, but the frontend keeps a single
-            # event callback, so concurrent request:user_input calls from
-            # parallel branches clobber each other and the losing call waits
-            # forever (Core overrides sio.call's 60s default timeout with
-            # WEBSOCKET_EVENT_CALLER_TIMEOUT, which defaults to None).
-            disabled_builtin_tools: set = set(
-                BUILTIN_TOOL_CATEGORIES.get("user_input", set())
-            )
+            disabled_builtin_tools: set = set()
+            # Core before 0.12.0 keeps a single browser event callback and no
+            # call timeout, so concurrent ask_user prompts can wait forever.
+            if tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2]) < (0, 12):
+                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES["user_input"])
             for valve_field, category in VALVE_TO_CATEGORY.items():
                 if not getattr(valves, valve_field, True):
                     disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
+            if not getattr(valves, "ENABLE_SKILLS_TOOLS", True):
+                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES["skills_write"])
 
             knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
             file_tools_enabled = bool(getattr(valves, "ENABLE_FILE_TOOLS", True))
@@ -3797,6 +3943,9 @@ class EventEmitter:
                 # that decision and could show content that the tool
                 # never intended to persist past its own next update.
                 if event_type == "embeds":
+                    if data.get("replace"):
+                        self._preserved_embeds = []
+                        self._preserved_embed_keys = set()
                     for e in embeds:
                         if _is_rich_shell_embed(e, self._shell_marker):
                             continue
@@ -3816,8 +3965,8 @@ class EventEmitter:
                     _is_rich_shell_embed(e, self._shell_marker) for e in embeds
                 ):
                     event = {
-                        "type": event_type,
-                        "data": {"embeds": [self._shell_html] + embeds},
+                        **event,
+                        "data": {**data, "embeds": [self._shell_html] + embeds},
                     }
             await raw(event)
 
@@ -5100,15 +5249,20 @@ async def run_agent_loop(
             extra_params.get("__metadata__", {}).get("filter_ids", []),
         )
 
+    tools_dict, loop_extra_params, deferred_tools = await apply_agent_tool_search(
+        tools_dict or {}, extra_params, submission_tool_names or ()
+    )
+
     # Build tools parameter for native function calling
     tools_param = None
     if tools_dict:
         tools_param = [
             {"type": "function", "function": tool.get("spec", {})}
-            for tool in tools_dict.values()
+            for name, tool in tools_dict.items()
+            if name not in deferred_tools
         ]
 
-    current_messages = list(messages)
+    current_messages = drop_unloadable_skill_manifest(list(messages), tools_dict)
     iteration = 0
 
     while iteration < max_iterations:
@@ -5180,7 +5334,7 @@ async def run_agent_loop(
 
         form_data = {
             "model": model_id,
-            "messages": messages_with_context,
+            "messages": copy.deepcopy(messages_with_context),
             "stream": False,
             "metadata": {
                 "task": "llm_review",
@@ -5196,14 +5350,14 @@ async def run_agent_loop(
         form_data = await apply_inlet_filters_if_enabled(
             filter_pipeline, request, form_data, extra_params
         )
-        form_data = _append_tool_server_prompts(form_data, extra_params)
+        form_data = _append_tool_server_prompts(form_data, loop_extra_params)
         form_data = await finalize_model_request(
             filter_pipeline, request, form_data, extra_params
         )
 
         try:
             response = await generate_chat_completion(
-                request=request,
+                request=isolate_request_state(request),
                 form_data=form_data,
                 user=user_obj,
                 bypass_filter=True,  # We handle filters manually above
@@ -5512,7 +5666,7 @@ async def run_agent_loop(
 
     form_data = {
         "model": model_id,
-        "messages": final_messages,
+        "messages": copy.deepcopy(final_messages),
         "stream": False,
         "metadata": {
             "task": "llm_review",
@@ -5533,7 +5687,7 @@ async def run_agent_loop(
 
     try:
         response = await generate_chat_completion(
-            request=request,
+            request=isolate_request_state(request),
             form_data=form_data,
             user=user_obj,
             bypass_filter=True,  # We handle filters manually above
@@ -5814,7 +5968,14 @@ class Tools:
         )
         ENABLE_SKILLS_TOOLS: bool = Field(
             default=True,
-            description="Enable skills tools (view_skill). When enabled and the parent conversation has skills, review agents can view skill contents.",
+            description="Enable skill reading tools (view_skill, read_skill_file). When enabled and the parent conversation has skills, review agents can view skill contents.",
+        )
+        ENABLE_SKILLS_WRITE_TOOLS: bool = Field(
+            default=False,
+            description=(
+                "Enable skill writing tools (update_skill_files, create_skill; Open WebUI 0.12.0+). "
+                "Off by default because they change saved skills. Requires ENABLE_SKILLS_TOOLS."
+            ),
         )
         ENABLE_SUBAGENT_TOOLS: bool = Field(
             default=False,
@@ -6547,6 +6708,7 @@ CRITICAL RULES:
             params = {
                 **extra_params,
                 "__model__": member_model,
+                "__metadata__": isolate_chat_context(metadata),
             }
             if terminal_prompt:
                 params["__terminal_system_prompt__"] = terminal_prompt

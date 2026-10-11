@@ -2727,14 +2727,20 @@ async def test_build_tools_dict_filters_disabled_v011_builtin_categories(
 
 
 @pytest.mark.asyncio
-async def test_build_tools_dict_excludes_ask_user_from_nested_loops(
-    monkeypatch, dummy_request
+@pytest.mark.parametrize(
+    "core_version, offered",
+    [("0.9.6", False), ("0.11.4", False), ("0.12.0", True), ("0.13.1", True), ("1.0.0", True)],
+)
+async def test_build_tools_dict_offers_ask_user_from_core_0_12(
+    monkeypatch, dummy_request, core_version, offered
 ):
+    import open_webui.env as ow_env
     import open_webui.utils.tools as ow_tools
 
     def fake_get_builtin_tools(request, extra_params, features=None, model=None):
         return {"ask_user": {"type": "builtin"}}
 
+    monkeypatch.setattr(ow_env, "VERSION", core_version)
     monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
 
     tools_dict, _ = await sub_agent.build_tools_dict(
@@ -2750,7 +2756,7 @@ async def test_build_tools_dict_excludes_ask_user_from_nested_loops(
         resolved_direct_tool_servers=[],
     )
 
-    assert "ask_user" not in tools_dict
+    assert ("ask_user" in tools_dict) is offered
 
 
 @pytest.mark.asyncio

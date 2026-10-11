@@ -25,12 +25,14 @@ a shared dep module from mixing external imports (``fastapi.Request``)
 with imports from other ``owui_ext.shared.*`` modules.
 """
 
+import copy
 import inspect
 import logging
 import random
 from typing import Any
 
 from fastapi import Request
+from starlette.datastructures import State
 
 _inlet_filters_log = logging.getLogger("owui_ext.shared.inlet_filters")
 
@@ -227,3 +229,18 @@ async def finalize_model_request(
     return await _apply_filter_pipeline(
         filter_pipeline, request, form_data, extra_params, "request"
     )
+
+
+def isolate_request_state(request: Request) -> Request:
+    """Copy *request* with its own ``state``.
+
+    Core's ``generate_chat_completion`` writes per-call flags there, so
+    concurrent nested completions sharing one request would race on them.
+    """
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, dict):
+        return request
+    isolated = copy.copy(request)
+    isolated.scope = {**scope, "state": dict(scope.get("state") or {})}
+    isolated._state = State(isolated.scope["state"])
+    return isolated

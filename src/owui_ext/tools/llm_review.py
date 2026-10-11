@@ -2,12 +2,13 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.10
+version: 0.5.11
 license: MIT
 required_open_webui_version: 0.7.0
 """
 
 import asyncio
+import copy
 import json
 import logging
 import re
@@ -25,6 +26,7 @@ from owui_ext.shared.completion_response import format_chat_completion_error
 from owui_ext.shared.inlet_filters import (
     apply_inlet_filters_if_enabled,
     finalize_model_request,
+    isolate_request_state,
     resolve_model_filter_pipeline,
 )
 from owui_ext.shared.model_features import (
@@ -34,6 +36,7 @@ from owui_ext.shared.model_features import (
 from owui_ext.shared.notifications import emit_notification
 from owui_ext.shared.prompt_utils import (
     _append_tool_server_prompts,
+    apply_agent_tool_search,
     merge_prompt_sections,
     truncate_text,
 )
@@ -47,8 +50,10 @@ from owui_ext.shared.tool_execution import (
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients, resolve_mcp_tools
 from owui_ext.shared.models import extract_model_ids, get_available_models
 from owui_ext.shared.skills import (
+    drop_unloadable_skill_manifest,
     extract_skill_manifest,
     extract_user_skill_tags,
+    isolate_chat_context,
     register_view_skill,
 )
 from owui_ext.shared.tool_loader import build_tools_dict
@@ -1637,6 +1642,9 @@ class EventEmitter:
                 # that decision and could show content that the tool
                 # never intended to persist past its own next update.
                 if event_type == "embeds":
+                    if data.get("replace"):
+                        self._preserved_embeds = []
+                        self._preserved_embed_keys = set()
                     for e in embeds:
                         if _is_rich_shell_embed(e, self._shell_marker):
                             continue
@@ -1656,8 +1664,8 @@ class EventEmitter:
                     _is_rich_shell_embed(e, self._shell_marker) for e in embeds
                 ):
                     event = {
-                        "type": event_type,
-                        "data": {"embeds": [self._shell_html] + embeds},
+                        **event,
+                        "data": {**data, "embeds": [self._shell_html] + embeds},
                     }
             await raw(event)
 
@@ -2940,15 +2948,20 @@ async def run_agent_loop(
             extra_params.get("__metadata__", {}).get("filter_ids", []),
         )
 
+    tools_dict, loop_extra_params, deferred_tools = await apply_agent_tool_search(
+        tools_dict or {}, extra_params, submission_tool_names or ()
+    )
+
     # Build tools parameter for native function calling
     tools_param = None
     if tools_dict:
         tools_param = [
             {"type": "function", "function": tool.get("spec", {})}
-            for tool in tools_dict.values()
+            for name, tool in tools_dict.items()
+            if name not in deferred_tools
         ]
 
-    current_messages = list(messages)
+    current_messages = drop_unloadable_skill_manifest(list(messages), tools_dict)
     iteration = 0
 
     while iteration < max_iterations:
@@ -3020,7 +3033,7 @@ async def run_agent_loop(
 
         form_data = {
             "model": model_id,
-            "messages": messages_with_context,
+            "messages": copy.deepcopy(messages_with_context),
             "stream": False,
             "metadata": {
                 "task": "llm_review",
@@ -3036,14 +3049,14 @@ async def run_agent_loop(
         form_data = await apply_inlet_filters_if_enabled(
             filter_pipeline, request, form_data, extra_params
         )
-        form_data = _append_tool_server_prompts(form_data, extra_params)
+        form_data = _append_tool_server_prompts(form_data, loop_extra_params)
         form_data = await finalize_model_request(
             filter_pipeline, request, form_data, extra_params
         )
 
         try:
             response = await generate_chat_completion(
-                request=request,
+                request=isolate_request_state(request),
                 form_data=form_data,
                 user=user_obj,
                 bypass_filter=True,  # We handle filters manually above
@@ -3352,7 +3365,7 @@ async def run_agent_loop(
 
     form_data = {
         "model": model_id,
-        "messages": final_messages,
+        "messages": copy.deepcopy(final_messages),
         "stream": False,
         "metadata": {
             "task": "llm_review",
@@ -3373,7 +3386,7 @@ async def run_agent_loop(
 
     try:
         response = await generate_chat_completion(
-            request=request,
+            request=isolate_request_state(request),
             form_data=form_data,
             user=user_obj,
             bypass_filter=True,  # We handle filters manually above
@@ -3654,7 +3667,14 @@ class Tools:
         )
         ENABLE_SKILLS_TOOLS: bool = Field(
             default=True,
-            description="Enable skills tools (view_skill). When enabled and the parent conversation has skills, review agents can view skill contents.",
+            description="Enable skill reading tools (view_skill, read_skill_file). When enabled and the parent conversation has skills, review agents can view skill contents.",
+        )
+        ENABLE_SKILLS_WRITE_TOOLS: bool = Field(
+            default=False,
+            description=(
+                "Enable skill writing tools (update_skill_files, create_skill; Open WebUI 0.12.0+). "
+                "Off by default because they change saved skills. Requires ENABLE_SKILLS_TOOLS."
+            ),
         )
         ENABLE_SUBAGENT_TOOLS: bool = Field(
             default=False,
@@ -4387,6 +4407,7 @@ CRITICAL RULES:
             params = {
                 **extra_params,
                 "__model__": member_model,
+                "__metadata__": isolate_chat_context(metadata),
             }
             if terminal_prompt:
                 params["__terminal_system_prompt__"] = terminal_prompt
