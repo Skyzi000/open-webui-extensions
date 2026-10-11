@@ -65,7 +65,7 @@
 ### CRITICAL: No Instance Variables for Cross-Worker State
 
 - Instance variables (`self._cache`, `self._lock`, etc.) are per-worker only and NOT shared across workers or instances; never use them for state that must be consistent in multi-worker deployments.
-- For cross-worker coordination (dedup, locking, caching), use Redis via Open WebUI's `REDIS_URL` / `WEBSOCKET_REDIS_URL` with `redis.asyncio`; follow the established pattern in `functions/filter/inlet_title_generator.py` and `graphiti/functions/filter/graphiti_memory.py` (SETNX with TTL, in-memory fallback for single-instance).
+- For cross-worker coordination (dedup, locking, caching), use Redis via Open WebUI's `REDIS_URL` / `WEBSOCKET_REDIS_URL` with `redis.asyncio`; follow the established pattern in `graphiti/functions/filter/graphiti_memory.py` (SETNX with TTL, in-memory fallback for single-instance).
 - Never block the event loop with synchronous I/O or CPU-heavy work; at thousands-of-users scale one blocking call degrades everyone. Use async APIs for I/O, executors for CPU-bound work, and background tasks for long-running operations.
 - `asyncio.Lock()` only synchronizes within a single worker process; use Redis SETNX with TTL for distributed dedup/locking.
 
