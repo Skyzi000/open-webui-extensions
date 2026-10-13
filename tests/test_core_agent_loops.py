@@ -142,6 +142,30 @@ async def test_nested_completions_do_not_share_request_state():
     assert await isolated.body() == b"{}"
 
 
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_sub_agent_tool_runs_with_the_null_filter_ids_of_a_tool_approval_resume(monkeypatch, parallel):
+    from open_webui.utils import chat
+
+    monkeypatch.setattr(chat, "generate_chat_completion", AsyncMock(
+        return_value={"choices": [{"message": {"content": "done"}}]}
+    ))
+    model = {"id": "model"}
+    kwargs = {
+        "__request__": make_request(model), "__user__": make_user().model_dump(), "__model__": model,
+        "__metadata__": {
+            "filter_ids": None, "chat_id": "local:resume", "session_id": "browser", "tool_servers": [],
+        },
+    }
+    work = {"description": "Task", "prompt": "Work"}
+    tool = sub_agent.Tools()
+
+    if parallel:
+        results = json.loads(await tool.run_parallel_sub_agents(tasks=[work], **kwargs))["results"]
+        assert [item["result"] for item in results] == ["done"]
+    else:
+        assert json.loads(await tool.run_sub_agent(**work, **kwargs))["result"] == "done"
+
+
 @pytest.mark.parametrize("module_name", AGENT_MODULES)
 @pytest.mark.parametrize("server_prompts", [[], ["Server prompt."]])
 async def test_system_prompts_do_not_accumulate_across_iterations(monkeypatch, module_name, server_prompts):

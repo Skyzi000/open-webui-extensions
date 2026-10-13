@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.6.3
+version: 0.6.4
 license: MIT
 required_open_webui_version: 0.9.6
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -1118,7 +1118,7 @@ async def run_sub_agent_loop(
             "Sub-agent context compaction could not resolve a tiktoken encoder; "
             "compaction will not trigger for this loop"
         )
-    filter_identity = list(extra_params.get("__metadata__", {}).get("filter_ids", []))
+    filter_identity = list(extra_params.get("__metadata__", {}).get("filter_ids") or [])
     terminal_agents_md = extra_params.get("__terminal_agents_md__")
     if not isinstance(terminal_agents_md, str):
         terminal_agents_md = ""
