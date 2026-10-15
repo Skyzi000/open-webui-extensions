@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.6.4
+version: 0.6.5
 license: MIT
 required_open_webui_version: 0.9.6
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -97,6 +97,7 @@ from owui_ext.shared.mcp_tools import cleanup_mcp_clients, resolve_mcp_tools
 from owui_ext.shared.tool_loader import build_tools_dict
 from owui_ext.shared.skills import (
     drop_unloadable_skill_manifest,
+    extract_skill_ids,
     extract_skill_manifest,
     extract_user_skill_tags,
     isolate_chat_context,
@@ -694,7 +695,7 @@ async def _request_loop_summary(
         attempts += 1
         try:
             response = await generate_chat_completion(
-                request=isolate_request_state(request),
+                request=isolate_request_state(request, body["model"]),
                 form_data=_payload_for_send(body),
                 user=user_obj,
                 bypass_filter=True,
@@ -1020,7 +1021,7 @@ async def _send_loop_request(
     try:
         run.last_sent_form_data = form_data
         response = await generate_chat_completion(
-            request=isolate_request_state(request),
+            request=isolate_request_state(request, form_data["model"]),
             form_data=_payload_for_send(form_data),
             user=user_obj,
             bypass_filter=True,  # We handle filters manually above
@@ -1556,7 +1557,7 @@ async def run_sub_agent_loop(
         retry_body = _strip_tool_request_keys(form_data)
         try:
             response = await generate_chat_completion(
-                request=isolate_request_state(request),
+                request=isolate_request_state(request, retry_body["model"]),
                 form_data=_payload_for_send(retry_body),
                 user=user_obj,
                 bypass_filter=True,
@@ -1990,7 +1991,8 @@ RESPONSE REQUIREMENTS:
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
-            "__files__": __metadata__.get("files", []) if __metadata__ else [],
+            "__files__": (__metadata__ or {}).get("files") or [],
+            "__skill_ids__": extract_skill_ids(__messages__),
         }
 
         mcp_clients = {}
@@ -2014,6 +2016,7 @@ RESPONSE REQUIREMENTS:
             )
             resolved_model = filter_pipeline["model"]
             common_extra_params["__model__"] = resolved_model
+            common_extra_params["__metadata__"]["model_id"] = filter_pipeline["model_id"]
             tools_dict, mcp_clients = await load_sub_agent_tools(
                 request=__request__,
                 user=user,
@@ -2219,7 +2222,8 @@ RESPONSE REQUIREMENTS:
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
-            "__files__": __metadata__.get("files", []) if __metadata__ else [],
+            "__files__": (__metadata__ or {}).get("files") or [],
+            "__skill_ids__": extract_skill_ids(__messages__),
         }
 
         task_mapping = ", ".join(
@@ -2238,7 +2242,10 @@ RESPONSE REQUIREMENTS:
             loader_extra_params = {
                 **common_extra_params,
                 "__model__": filter_pipeline["model"],
-                "__metadata__": dict(common_extra_params["__metadata__"]),
+                "__metadata__": {
+                    **common_extra_params["__metadata__"],
+                    "model_id": effective_model_id,
+                },
             }
             tools_dict, mcp_clients = await load_sub_agent_tools(
                 request=__request__,

@@ -142,3 +142,21 @@ async def test_parallel_keeps_regular_tool_with_same_name(monkeypatch, skill_con
 
     assert result == "Custom skill result"
     regular.assert_awaited_once_with(id="workspace-skill")
+
+
+@pytest.mark.parametrize("name", ["read_skill_file", "grep_skill_files", "update_skill_files"])
+async def test_parallel_reuses_the_parent_skill_tools_core_bound_to_this_chat(skill_context, name):
+    context = skill_context
+    tools = await parent_skill_tools(context, "workspace-skill")
+    if name not in tools:
+        pytest.skip(f"This Core has no {name}")
+    context.metadata["tools"] = {name: tools[name]}
+    context.model["info"]["meta"]["builtinTools"]["skills"] = False
+
+    result = await parallel_tools.Tools().run_tools_parallel(
+        tool_calls=[{"name": name, "arguments": {}}],
+        __request__=context.request, __user__=context.user,
+        __model__=context.model, __metadata__=context.metadata,
+    )
+
+    assert "not found" not in json.dumps(json.loads(result)["results"][0])

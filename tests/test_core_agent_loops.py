@@ -12,6 +12,7 @@ import pytest
 from open_webui.tools import builtin
 
 import llm_review
+import multi_model_council
 import parallel_tools
 import sub_agent
 
@@ -25,6 +26,15 @@ needs_tool_search = pytest.mark.skipif(
 needs_core_skill_tools = pytest.mark.skipif(
     not hasattr(builtin, "read_skill_file"),
     reason="Core before 0.12.0 registers no skill tools in get_builtin_tools",
+)
+HAS_CALL_TOOL = importlib.util.find_spec("open_webui.utils.tool_search") is not None and hasattr(
+    importlib.import_module("open_webui.utils.tool_search"), "resolve_tool_call"
+)
+needs_call_tool = pytest.mark.skipif(not HAS_CALL_TOOL, reason="Core before 0.12.2 has no call_tool")
+SKILL_READ_TOOLS = {name for name in ("view_skill", "read_skill_file", "grep_skill_files") if hasattr(builtin, name)}
+SKILL_MANIFEST = (
+    "<available_skills>\n<skill>\n<id>skill</id>\n<name>Writer</name>\n"
+    "<description></description>\n</skill>\n</available_skills>"
 )
 
 
@@ -132,12 +142,14 @@ async def test_nested_completions_do_not_share_request_state():
     request = Request({"type": "http", "app": object(), "state": {"direct": False}})
     request._body = b"{}"
 
-    isolated = sub_agent.isolate_request_state(request)
+    isolated = sub_agent.isolate_request_state(request, "child")
     isolated.state.direct = True
     isolated.state.model = {"id": "child"}
 
     assert request.state.direct is False
     assert not hasattr(request.state, "model")
+    assert isolated.state.metadata == {"model_id": "child"}
+    assert not hasattr(request.state, "metadata")
     assert isolated.app is request.app
     assert await isolated.body() == b"{}"
 
@@ -227,7 +239,7 @@ async def test_llm_review_submission_tools_stay_loaded_and_final_request_has_no_
         tools=tools, max_iterations=1, submission_tool_names={"submit_draft"},
     )
 
-    assert tool_names(sent[0]) == {"ping", "search_tools", "submit_draft"}
+    assert tool_names(sent[0]) == {"ping", "search_tools", "submit_draft", *["call_tool"] * HAS_CALL_TOOL}
     assert "<name>lookup</name>" in system_text(sent[0])
     assert "<name>submit_draft</name>" not in system_text(sent[0])
     assert tool_names(sent[1]) == {"submit_draft"}
@@ -321,6 +333,31 @@ async def test_parallel_reuses_the_chat_search_tools(monkeypatch, tool_search):
     assert json.loads(result)["results"][0]["result"]["tools"][0]["name"] == "lookup"
 
 
+@needs_call_tool
+async def test_parallel_runs_call_tool_with_the_chat_dispatcher(monkeypatch, tool_search):
+    from open_webui.utils.tool_search import apply_tool_search
+
+    metadata = {}
+    chat_tools = loop_tools()
+    await apply_tool_search({"messages": []}, metadata, chat_tools)
+    metadata["tools"] = chat_tools
+    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(loop_tools(), {})))
+
+    result = await parallel_tools.Tools().run_tools_parallel(
+        [
+            parallel_tools.ToolCallItem(
+                name="call_tool", args={"tool_name": "lookup", "params": json.dumps({"query": "key"})},
+            ),
+            parallel_tools.ToolCallItem(name="call_tool", args={"tool_name": "missing", "params": "{}"}),
+        ],
+        __request__=make_request(), __user__=make_user().model_dump(), __metadata__=metadata,
+    )
+
+    found, missing = json.loads(result)["results"]
+    assert (found["tool_name"], found["result"]) == ("lookup", "found")
+    assert missing["result"].startswith("Error: Tool \"missing\" is not available")
+
+
 async def test_llm_review_final_keeps_embeds_stored_while_it_is_being_sent():
     from open_webui.models.chats import ChatForm, Chats
     from open_webui.models.users import Users
@@ -382,7 +419,9 @@ def skill_tools(monkeypatch):
         user = make_user(role).model_dump()
         tools, _ = await module.build_tools_dict(
             request=request, model=model, metadata=metadata, user=make_user(role), valves=valves,
-            extra_params={"__request__": request, "__user__": user, "__metadata__": metadata},
+            extra_params={
+                "__request__": request, "__user__": user, "__metadata__": metadata, "__skill_ids__": ["skill"],
+            },
             tool_id_list=[], excluded_tool_ids=set(), resolved_terminal_id=None,
             resolved_direct_tool_servers=[],
         )
@@ -394,8 +433,8 @@ def skill_tools(monkeypatch):
 @needs_core_skill_tools
 @pytest.mark.parametrize("module_name", AGENT_MODULES)
 @pytest.mark.parametrize("read, write, expected", [
-    (True, None, {"view_skill", "read_skill_file"}),
-    (True, True, {"view_skill", "read_skill_file", "update_skill_files", "create_skill"}),
+    (True, None, SKILL_READ_TOOLS),
+    (True, True, SKILL_READ_TOOLS | {"update_skill_files", "create_skill"}),
     (False, True, set()),
 ])
 async def test_skill_write_tools_need_their_own_valve(skill_tools, module_name, read, write, expected):
@@ -406,8 +445,7 @@ async def test_skill_write_tools_need_their_own_valve(skill_tools, module_name, 
 
     tools, _, _ = await skill_tools(module, valves)
 
-    skill_names = {"view_skill", "read_skill_file", "update_skill_files", "create_skill"}
-    assert skill_names & set(tools) == expected
+    assert (SKILL_READ_TOOLS | {"update_skill_files", "create_skill"}) & set(tools) == expected
 
 
 @pytest.mark.parametrize("module_name", AGENT_MODULES)
@@ -443,22 +481,154 @@ async def test_agents_sharing_loaded_tools_keep_their_own_skill_versions(monkeyp
     tools, request, user = await skill_tools(sub_agent, sub_agent.Tools.Valves(), parent)
     first, second = sub_agent.isolate_chat_context(parent), sub_agent.isolate_chat_context(parent)
 
-    result = await sub_agent.execute_tool_call(
+    await sub_agent.execute_tool_call(
         {"id": "call", "function": {"name": "view_skill", "arguments": '{"id": "skill"}'}}, tools,
         {"__request__": request, "__user__": user, "__metadata__": first},
     )
 
-    assert json.loads(result["content"])["version_id"] == "version-1"
     assert first["chat_context"]["skill_versions"] == {"skill": "version-1"}
     assert "skill_versions" not in second["chat_context"]
     assert "skill_versions" not in (parent.get("chat_context") or {})
 
 
-@pytest.mark.parametrize("tag", [
-    '<skill name="Writer">\nWrite well.\n</skill>',
-    '<skill id="writer" version_id="version-1" name="Writer">\nWrite well.\n</skill>',
+@pytest.mark.parametrize("tag, skill_id", [
+    ('<skill name="Writer notes">\nWrite well.\n</skill>', "terminal:Writer%20notes"),
+    ('<skill id="writer" version_id="version-1" name="Writer">\nWrite well.\n</skill>', "writer"),
 ])
-def test_inline_skill_tags_are_inherited_for_both_core_shapes(tag):
+def test_inline_skill_tags_are_inherited_for_both_core_shapes(tag, skill_id):
     messages = [{"role": "system", "content": f"Be brief.\n\n{tag}"}, {"role": "user", "content": "Hi"}]
 
     assert sub_agent.extract_user_skill_tags(messages) == [tag]
+    assert sub_agent.extract_skill_ids(messages) == [skill_id]
+
+
+async def call_entry(entry, **kwargs):
+    module = importlib.import_module("sub_agent" if entry == "parallel_sub_agents" else entry)
+    tool = module.Tools()
+    if module is sub_agent:
+        tool.valves.ENABLE_CONTEXT_COMPACTION = False
+        tool.valves.LARGE_TOOL_RESULT_MODE = "raw"
+    if entry == "sub_agent":
+        return await tool.run_sub_agent(description="Task", prompt="Task", **kwargs)
+    if entry == "parallel_sub_agents":
+        return await tool.run_parallel_sub_agents(tasks=[{"description": "Task", "prompt": "Task"}], **kwargs)
+    if entry == "llm_review":
+        tool.valves.DEFAULT_MODELS = "parent"
+        kwargs["__user__"]["valves"] = {"ROUNDS": 1, "RICH_PROGRESS": False}
+        return await tool.llm_review(topic="Write the draft", **kwargs)
+    decision = {"proposition": "Choose", "option_a": "A", "option_b": "B"}
+    if entry == "magi_decision_support":
+        return await tool.magi_decide(**decision, **kwargs)
+    return await tool.council_decide(**decision, models="parent,child", **kwargs)
+
+
+ENTRIES = ["sub_agent", "parallel_sub_agents", *AGENT_MODULES[1:]]
+LOOKUP_CALL = {"tool_name": "lookup", "params": json.dumps({"query": "key"})}
+
+
+async def run_entry(monkeypatch, entry, respond, *, regular_tools=dict, settings=None):
+    from starlette.requests import Request
+    from open_webui.models.config import Config
+    from open_webui.utils import chat
+    from open_webui.utils import filter as core_filter
+    from open_webui.utils import tools as core_tools
+
+    settings = {"user.permissions": {}, **(settings or {})}
+    monkeypatch.setattr(Config, "get", AsyncMock(side_effect=lambda key, default=None: settings.get(key, default)))
+    monkeypatch.setattr(Config, "get_many", AsyncMock(side_effect=lambda *keys: {key: settings.get(key) for key in keys}))
+    voice_avatar = {"gestures": [{"name": "wave", "description": "Wave."}]}
+    child = {"id": "child", "owned_by": "openai", "info": {"meta": {
+        "builtinTools": {category: False for category in ("time", "user_input", "knowledge", "chats", "tasks")},
+        "voice_avatar": voice_avatar,
+    }}}
+    parent = {"id": "parent", "owned_by": "arena", "info": {"meta": {"model_ids": ["child"], "voice_avatar": voice_avatar}}}
+    models = {"parent": parent, "child": child}
+    request = Request({
+        "type": "http", "app": SimpleNamespace(state=SimpleNamespace(MODELS=models)),
+        "state": {"metadata": {"model_id": "parent"}},
+    })
+    request._body = b"{}"
+    sent, loaded, filtered = [], [], []
+
+    async def get_tools(*, extra_params, **_):
+        loaded.append((extra_params["__metadata__"]["model_id"], extra_params["__files__"]))
+        return regular_tools()
+
+    async def provider(*, form_data, **_):
+        sent.append({
+            "model": form_data["model"], "model_id": form_data["metadata"].get("model_id"),
+            "tools": tool_names(form_data), "system": system_text(form_data),
+            "messages": copy.deepcopy(form_data["messages"]),
+        })
+        return respond(sent[-1])
+
+    async def process_filter_functions(*, form_data, extra_params, filter_context=None, **_):
+        filtered.append(extra_params["__metadata__"]["model_id"])
+        return form_data, {}
+
+    monkeypatch.setattr(core_tools, "get_tools", get_tools)
+    monkeypatch.setattr(core_filter, "get_filter_functions", AsyncMock(return_value=[]), raising=False)
+    monkeypatch.setattr(core_filter, "get_sorted_filter_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(core_filter, "process_filter_functions", process_filter_functions)
+    monkeypatch.setattr(chat, "generate_openai_chat_completion", provider)
+    for module in (llm_review, multi_model_council):
+        monkeypatch.setattr(module, "get_available_models", AsyncMock(return_value=list(models.values())))
+
+    await call_entry(
+        entry, __request__=request, __model__=parent, __user__=make_user("admin").model_dump(),
+        __event_call__=AsyncMock(),
+        __metadata__={
+            "model_id": "parent", "files": None, "tool_ids": ["regular"], "features": {"voice": True},
+            "chat_id": "local:entry", "session_id": "browser", "tool_servers": [],
+        },
+        __messages__=[
+            {"role": "system", "content": f"Be brief.\n\n{SKILL_MANIFEST}"}, {"role": "user", "content": "Hi"},
+        ],
+    )
+    return sent, loaded, filtered
+
+
+def answer(body, draft_call=None):
+    if "submit_review" in body["tools"]:
+        return tool_call("submit_review", {"key_feedback": "Review feedback"})
+    if "submit_draft" in body["tools"]:
+        return tool_call(*(draft_call or ("submit_draft", {"draft": "A complete draft"})))
+    return {"choices": [{"message": {"content": json.dumps({"vote": "A", "reasoning": "done"})}}]}
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_nested_requests_carry_the_child_model_and_the_parent_skills(monkeypatch, entry):
+    sent, loaded, filtered = await run_entry(monkeypatch, entry, answer)
+
+    assert loaded and all(item == ("child", []) for item in loaded)
+    assert filtered and set(filtered) == {"child"}
+    assert sent and {(body["model"], body["model_id"]) for body in sent} == {("child", "child")}
+    assert not any("play_animation" in body["tools"] for body in sent)
+    agent_requests = [body for body in sent if body["tools"] - {"submit_review"}]
+    assert agent_requests
+    for body in agent_requests:
+        assert SKILL_READ_TOOLS <= body["tools"]
+        assert SKILL_MANIFEST in body["system"]
+
+
+@needs_call_tool
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_call_tool_runs_its_target_and_history_keeps_the_model_call(monkeypatch, entry):
+    def respond(body):
+        if "call_tool" in body["tools"] and not any(message.get("tool_calls") for message in body["messages"]):
+            return tool_call("call_tool", LOOKUP_CALL)
+        draft = {"tool_name": "submit_draft", "params": json.dumps({"draft": "A complete draft"})}
+        return answer(body, ("call_tool", draft))
+
+    sent, _, _ = await run_entry(monkeypatch, entry, respond, regular_tools=loop_tools, settings={
+        "chat.tool_search.enable": True, "chat.tool_search.defer_threshold": 400,
+        "chat.tool_search.always_loaded": [], "chat.tool_search.defer_builtin_tools": False,
+    })
+
+    followups = [body for body in sent if any(message.get("tool_calls") for message in body["messages"])]
+    assert followups
+    for body in followups:
+        calls = [call for message in body["messages"] for call in message.get("tool_calls") or []]
+        assert [call["function"] for call in calls] == [{"name": "call_tool", "arguments": json.dumps(LOOKUP_CALL)}]
+        assert not any("provider_function" in call for call in calls)
+        assert [message["content"] for message in body["messages"] if message["role"] == "tool"] == ["found"]

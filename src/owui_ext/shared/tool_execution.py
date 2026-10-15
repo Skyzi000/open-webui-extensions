@@ -307,6 +307,16 @@ async def emit_terminal_tool_event(
         )
 
 
+def resolve_call_tool(tool_call: dict, tools_dict: dict) -> tuple[dict, Optional[str]]:
+    """Return a copy of *tool_call* targeting the tool a Tool Search ``call_tool`` names, or an error."""
+    try:
+        from open_webui.utils.tool_search import resolve_tool_call
+    except ImportError:
+        return tool_call, None
+    resolved = dict(tool_call)
+    return resolved, resolve_tool_call(resolved, tools_dict)
+
+
 async def execute_tool_call(
     tool_call: dict,
     tools_dict: dict,
@@ -320,12 +330,15 @@ async def execute_tool_call(
             "content": f"Malformed tool_call: expected dict, got {type(tool_call).__name__}",
         }
     tool_call_id = tool_call.get("id", str(uuid.uuid4()))
-    func = tool_call.get("function")
-    if not isinstance(func, dict):
+    if not isinstance(tool_call.get("function"), dict):
         return {
             "tool_call_id": tool_call_id,
-            "content": f"Malformed tool_call: 'function' is {type(func).__name__}, not dict",
+            "content": f"Malformed tool_call: 'function' is {type(tool_call.get('function')).__name__}, not dict",
         }
+    tool_call, error = resolve_call_tool(tool_call, tools_dict)
+    if error:
+        return {"tool_call_id": tool_call_id, "content": error}
+    func = tool_call["function"]
     tool_function_name = func.get("name", "")
     tool_args_raw = func.get("arguments", "{}")
 

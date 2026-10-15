@@ -61,7 +61,7 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "view_channel_message",
     },
     "code_interpreter": {"execute_code"},
-    "skills": {"view_skill", "read_skill_file"},
+    "skills": {"view_skill", "read_skill_file", "grep_skill_files"},
     "skills_write": {"update_skill_files", "create_skill"},
     "subagents": {"delegate_task", "timer"},
     "tasks": {"create_tasks", "update_task"},

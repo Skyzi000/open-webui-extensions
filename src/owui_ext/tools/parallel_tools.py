@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.7
+version: 0.2.8
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -31,6 +31,7 @@ from owui_ext.shared.tool_execution import (
     emit_terminal_tool_event,
     execute_direct_tool_call,
     process_tool_result,
+    resolve_call_tool,
     split_tool_result_files,
     structure_terminal_file_tool_result,
 )
@@ -74,6 +75,15 @@ async def execute_single_tool(
     # Strip "functions." prefix if present (OpenAI models sometimes add this)
     if tool_name.startswith("functions."):
         tool_name = tool_name[len("functions.") :]
+
+    resolved, error = resolve_call_tool(
+        {"function": {"name": tool_name, "arguments": json.dumps(tool_args)}}, tools_dict
+    )
+    if error:
+        return {"tool_name": tool_name, "result": error}
+    if "provider_function" in resolved:
+        tool_name = resolved["function"]["name"]
+        tool_args = json.loads(resolved["function"]["arguments"])
 
     if tool_name not in tools_dict:
         return {
@@ -392,7 +402,7 @@ class Tools:
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
-            "__files__": __metadata__.get("files", []) if __metadata__ else [],
+            "__files__": __metadata__.get("files") or [],
         }
 
         # Determine which tools to use
@@ -445,7 +455,14 @@ class Tools:
         try:
             # Core binds these builtins to chat state the loader cannot rebuild.
             parent_tools = __metadata__.get("tools") or {}
-            for name in ("view_skill", "search_tools"):
+            for name in (
+                "view_skill",
+                "read_skill_file",
+                "grep_skill_files",
+                "update_skill_files",
+                "search_tools",
+                "call_tool",
+            ):
                 parent_tool = parent_tools.get(name)
                 if (
                     isinstance(parent_tool, dict)

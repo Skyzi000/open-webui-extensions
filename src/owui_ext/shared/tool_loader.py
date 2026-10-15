@@ -84,8 +84,9 @@ async def build_tools_dict(
     avoids re-reading ``request.body()`` when the caller already did
     so for its own bookkeeping.
 
-    ``include_terminal_agents_md`` loads Core's terminal instructions once
-    for callers that construct an internal model conversation.
+    ``include_terminal_agents_md`` marks callers that construct an internal
+    model conversation: it loads Core's terminal instructions once and
+    omits ``play_animation``, which Core withholds from internal requests.
     """
     import inspect
     import json
@@ -352,6 +353,7 @@ async def build_tools_dict(
                 "__chat_id__": extra_params.get("__chat_id__"),
                 "__message_id__": extra_params.get("__message_id__"),
                 "__oauth_token__": extra_params.get("__oauth_token__"),
+                "__skill_ids__": extra_params.get("__skill_ids__"),
             }
 
             builtin_kwargs = {
@@ -394,6 +396,8 @@ async def build_tools_dict(
                     disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
             if not getattr(valves, "ENABLE_SKILLS_TOOLS", True):
                 disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES["skills_write"])
+            if include_terminal_agents_md:
+                disabled_builtin_tools.add("play_animation")
 
             knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
             file_tools_enabled = bool(getattr(valves, "ENABLE_FILE_TOOLS", True))

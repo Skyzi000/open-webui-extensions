@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.7
+version: 0.2.8
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -307,6 +307,16 @@ async def emit_terminal_tool_event(
         )
 
 
+def resolve_call_tool(tool_call: dict, tools_dict: dict) -> tuple[dict, Optional[str]]:
+    """Return a copy of *tool_call* targeting the tool a Tool Search ``call_tool`` names, or an error."""
+    try:
+        from open_webui.utils.tool_search import resolve_tool_call
+    except ImportError:
+        return tool_call, None
+    resolved = dict(tool_call)
+    return resolved, resolve_tool_call(resolved, tools_dict)
+
+
 async def execute_tool_call(
     tool_call: dict,
     tools_dict: dict,
@@ -320,12 +330,15 @@ async def execute_tool_call(
             "content": f"Malformed tool_call: expected dict, got {type(tool_call).__name__}",
         }
     tool_call_id = tool_call.get("id", str(uuid.uuid4()))
-    func = tool_call.get("function")
-    if not isinstance(func, dict):
+    if not isinstance(tool_call.get("function"), dict):
         return {
             "tool_call_id": tool_call_id,
-            "content": f"Malformed tool_call: 'function' is {type(func).__name__}, not dict",
+            "content": f"Malformed tool_call: 'function' is {type(tool_call.get('function')).__name__}, not dict",
         }
+    tool_call, error = resolve_call_tool(tool_call, tools_dict)
+    if error:
+        return {"tool_call_id": tool_call_id, "content": error}
+    func = tool_call["function"]
     tool_function_name = func.get("name", "")
     tool_args_raw = func.get("arguments", "{}")
 
@@ -939,7 +952,7 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "view_channel_message",
     },
     "code_interpreter": {"execute_code"},
-    "skills": {"view_skill", "read_skill_file"},
+    "skills": {"view_skill", "read_skill_file", "grep_skill_files"},
     "skills_write": {"update_skill_files", "create_skill"},
     "subagents": {"delegate_task", "timer"},
     "tasks": {"create_tasks", "update_task"},
@@ -1296,8 +1309,9 @@ async def build_tools_dict(
     avoids re-reading ``request.body()`` when the caller already did
     so for its own bookkeeping.
 
-    ``include_terminal_agents_md`` loads Core's terminal instructions once
-    for callers that construct an internal model conversation.
+    ``include_terminal_agents_md`` marks callers that construct an internal
+    model conversation: it loads Core's terminal instructions once and
+    omits ``play_animation``, which Core withholds from internal requests.
     """
     import inspect
     import json
@@ -1564,6 +1578,7 @@ async def build_tools_dict(
                 "__chat_id__": extra_params.get("__chat_id__"),
                 "__message_id__": extra_params.get("__message_id__"),
                 "__oauth_token__": extra_params.get("__oauth_token__"),
+                "__skill_ids__": extra_params.get("__skill_ids__"),
             }
 
             builtin_kwargs = {
@@ -1606,6 +1621,8 @@ async def build_tools_dict(
                     disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
             if not getattr(valves, "ENABLE_SKILLS_TOOLS", True):
                 disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES["skills_write"])
+            if include_terminal_agents_md:
+                disabled_builtin_tools.add("play_animation")
 
             knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
             file_tools_enabled = bool(getattr(valves, "ENABLE_FILE_TOOLS", True))
@@ -1737,6 +1754,15 @@ async def execute_single_tool(
     # Strip "functions." prefix if present (OpenAI models sometimes add this)
     if tool_name.startswith("functions."):
         tool_name = tool_name[len("functions.") :]
+
+    resolved, error = resolve_call_tool(
+        {"function": {"name": tool_name, "arguments": json.dumps(tool_args)}}, tools_dict
+    )
+    if error:
+        return {"tool_name": tool_name, "result": error}
+    if "provider_function" in resolved:
+        tool_name = resolved["function"]["name"]
+        tool_args = json.loads(resolved["function"]["arguments"])
 
     if tool_name not in tools_dict:
         return {
@@ -2055,7 +2081,7 @@ class Tools:
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
-            "__files__": __metadata__.get("files", []) if __metadata__ else [],
+            "__files__": __metadata__.get("files") or [],
         }
 
         # Determine which tools to use
@@ -2108,7 +2134,14 @@ class Tools:
         try:
             # Core binds these builtins to chat state the loader cannot rebuild.
             parent_tools = __metadata__.get("tools") or {}
-            for name in ("view_skill", "search_tools"):
+            for name in (
+                "view_skill",
+                "read_skill_file",
+                "grep_skill_files",
+                "update_skill_files",
+                "search_tools",
+                "call_tool",
+            ):
                 parent_tool = parent_tools.get(name)
                 if (
                     isinstance(parent_tool, dict)

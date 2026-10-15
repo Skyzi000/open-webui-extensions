@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.17
+version: 0.2.18
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -42,6 +42,7 @@ from owui_ext.shared.prompt_utils import (
 )
 from owui_ext.shared.skills import (
     drop_unloadable_skill_manifest,
+    extract_skill_ids,
     extract_skill_manifest,
     extract_user_skill_tags,
     isolate_chat_context,
@@ -231,6 +232,13 @@ async def generate_single_completion(
         model_id,
         extra_params.get("__metadata__", {}).get("filter_ids", []),
     )
+    extra_params = {
+        **extra_params,
+        "__metadata__": {
+            **extra_params.get("__metadata__", {}),
+            "model_id": filter_pipeline["model_id"],
+        },
+    }
     form_data = await apply_inlet_filters_if_enabled(
         filter_pipeline, request, form_data, extra_params
     )
@@ -239,7 +247,7 @@ async def generate_single_completion(
     )
 
     response = await generate_chat_completion(
-        request=isolate_request_state(request),
+        request=isolate_request_state(request, form_data["model"]),
         form_data=form_data,
         user=user,
         bypass_filter=True,
@@ -349,7 +357,7 @@ async def run_agent_loop(
 
         try:
             response = await generate_chat_completion(
-                request=isolate_request_state(request),
+                request=isolate_request_state(request, form_data["model"]),
                 form_data=form_data,
                 user=user_obj,
                 bypass_filter=True,
@@ -512,7 +520,7 @@ async def run_agent_loop(
 
     try:
         response = await generate_chat_completion(
-            request=isolate_request_state(request),
+            request=isolate_request_state(request, form_data["model"]),
             form_data=form_data,
             user=user_obj,
             bypass_filter=True,
@@ -763,7 +771,8 @@ class Tools:
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
-            "__files__": (__metadata__ or {}).get("files", []),
+            "__files__": (__metadata__ or {}).get("files") or [],
+            "__skill_ids__": extract_skill_ids(__messages__),
         }
 
         tool_id_list = []
@@ -802,7 +811,7 @@ class Tools:
             loader_extra_params = {
                 **extra_params,
                 "__model__": filter_pipeline["model"],
-                "__metadata__": dict(extra_params["__metadata__"]),
+                "__metadata__": {**extra_params["__metadata__"], "model_id": effective_model_id},
             }
             tools_dict, mcp_clients = await build_tools_dict(
                 request=__request__,

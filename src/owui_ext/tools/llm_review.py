@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.11
+version: 0.5.12
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -46,11 +46,13 @@ from owui_ext.shared.tool_execution import (
     execute_tool_call,
     normalize_terminal_tools_result,
     process_tool_result,
+    resolve_call_tool,
 )
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients, resolve_mcp_tools
 from owui_ext.shared.models import extract_model_ids, get_available_models
 from owui_ext.shared.skills import (
     drop_unloadable_skill_manifest,
+    extract_skill_ids,
     extract_skill_manifest,
     extract_user_skill_tags,
     isolate_chat_context,
@@ -3056,7 +3058,7 @@ async def run_agent_loop(
 
         try:
             response = await generate_chat_completion(
-                request=isolate_request_state(request),
+                request=isolate_request_state(request, form_data["model"]),
                 form_data=form_data,
                 user=user_obj,
                 bypass_filter=True,  # We handle filters manually above
@@ -3230,7 +3232,7 @@ async def run_agent_loop(
             submission_tool_fired = False
             tool_images = []
             for tool_call in normalized_tool_calls:
-                tc_func = tool_call.get("function")
+                tc_func = resolve_call_tool(tool_call, tools_dict)[0].get("function")
                 tool_name = tc_func.get("name", "unknown") if isinstance(tc_func, dict) else "unknown"
                 tool_args_raw = tc_func.get("arguments", "{}") if isinstance(tc_func, dict) else "{}"
 
@@ -3386,7 +3388,7 @@ async def run_agent_loop(
 
     try:
         response = await generate_chat_completion(
-            request=isolate_request_state(request),
+            request=isolate_request_state(request, form_data["model"]),
             form_data=form_data,
             user=user_obj,
             bypass_filter=True,  # We handle filters manually above
@@ -4228,7 +4230,8 @@ CRITICAL RULES:
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
-            "__files__": metadata.get("files", []),
+            "__files__": metadata.get("files") or [],
+            "__skill_ids__": extract_skill_ids(__messages__),
         }
 
         # Build tool IDs
@@ -4362,11 +4365,12 @@ CRITICAL RULES:
             scratch_extra_params = {
                 **extra_params,
                 "__model__": member_model,
+                "__metadata__": {**metadata, "model_id": real_model_id},
             }
             tools_dict, mcp_clients = await build_tools_dict(
                 request=request,
                 model=member_model,
-                metadata=metadata,
+                metadata=scratch_extra_params["__metadata__"],
                 user=user,
                 valves=self.valves,
                 extra_params=scratch_extra_params,
@@ -4433,6 +4437,7 @@ CRITICAL RULES:
                 member_extra_params = make_member_extra_params(
                     filter_pipeline["model"], terminal_prompt, direct_prompts, agents_md
                 )
+                member_extra_params["__metadata__"]["model_id"] = filter_pipeline["model_id"]
                 return filter_pipeline, tools_dict, member_extra_params
             except Exception as exc:
                 # Let the member's existing failure/progress handling report it.

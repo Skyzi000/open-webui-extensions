@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.24
+version: 0.1.25
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -332,18 +332,22 @@ async def finalize_model_request(
     )
 
 
-def isolate_request_state(request: Request) -> Request:
-    """Copy *request* with its own ``state``.
+def isolate_request_state(request: Request, model_id: str) -> Request:
+    """Copy *request* with its own ``state`` for a completion by *model_id*.
 
     Core's ``generate_chat_completion`` writes per-call flags there, so
     concurrent nested completions sharing one request would race on them.
+    It also merges ``state.metadata`` over the payload metadata, so the
+    caller's ``model_id`` would otherwise reach the child's headers.
     """
     scope = getattr(request, "scope", None)
     if not isinstance(scope, dict):
         return request
+    state = dict(scope.get("state") or {})
+    state["metadata"] = {**(state.get("metadata") or {}), "model_id": model_id}
     isolated = copy.copy(request)
-    isolated.scope = {**scope, "state": dict(scope.get("state") or {})}
-    isolated._state = State(isolated.scope["state"])
+    isolated.scope = {**scope, "state": state}
+    isolated._state = State(state)
     return isolated
 
 # --- inlined from src/owui_ext/shared/mcp_tools.py (owui_ext.shared.mcp_tools) ---
@@ -961,6 +965,7 @@ import copy
 import logging
 import re
 from typing import Any, Optional
+from urllib.parse import quote
 from fastapi import Request
 _skills_log = logging.getLogger("owui_ext.shared.skills")
 
@@ -1060,6 +1065,17 @@ def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
         A list of ``<skill …>…</skill>`` strings, possibly empty.
     """
     return _extract_from_system_messages(messages, _find_skill_tags_in_text)
+
+
+def extract_skill_ids(messages: Optional[list]) -> list[str]:
+    """Return the IDs of the skills the parent lists or inlines, as Core's ``__skill_ids__``."""
+    ids = set(re.findall(r"<id>(.*?)</id>", extract_skill_manifest(messages)))
+    for tag in extract_user_skill_tags(messages):
+        match = re.match(r'<skill (?:id="([^"]+)"|name="([^"]*)")', tag)
+        if match:
+            # Core inlines terminal skills without an id attribute.
+            ids.add(match.group(1) or f'terminal:{quote(match.group(2), safe="")}')
+    return sorted(ids)
 
 
 def drop_unloadable_skill_manifest(messages: list, tools_dict: Optional[dict]) -> list:
@@ -1420,6 +1436,16 @@ async def emit_terminal_tool_event(
         )
 
 
+def resolve_call_tool(tool_call: dict, tools_dict: dict) -> tuple[dict, Optional[str]]:
+    """Return a copy of *tool_call* targeting the tool a Tool Search ``call_tool`` names, or an error."""
+    try:
+        from open_webui.utils.tool_search import resolve_tool_call
+    except ImportError:
+        return tool_call, None
+    resolved = dict(tool_call)
+    return resolved, resolve_tool_call(resolved, tools_dict)
+
+
 async def execute_tool_call(
     tool_call: dict,
     tools_dict: dict,
@@ -1433,12 +1459,15 @@ async def execute_tool_call(
             "content": f"Malformed tool_call: expected dict, got {type(tool_call).__name__}",
         }
     tool_call_id = tool_call.get("id", str(uuid.uuid4()))
-    func = tool_call.get("function")
-    if not isinstance(func, dict):
+    if not isinstance(tool_call.get("function"), dict):
         return {
             "tool_call_id": tool_call_id,
-            "content": f"Malformed tool_call: 'function' is {type(func).__name__}, not dict",
+            "content": f"Malformed tool_call: 'function' is {type(tool_call.get('function')).__name__}, not dict",
         }
+    tool_call, error = resolve_call_tool(tool_call, tools_dict)
+    if error:
+        return {"tool_call_id": tool_call_id, "content": error}
+    func = tool_call["function"]
     tool_function_name = func.get("name", "")
     tool_args_raw = func.get("arguments", "{}")
 
@@ -1634,7 +1663,7 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "view_channel_message",
     },
     "code_interpreter": {"execute_code"},
-    "skills": {"view_skill", "read_skill_file"},
+    "skills": {"view_skill", "read_skill_file", "grep_skill_files"},
     "skills_write": {"update_skill_files", "create_skill"},
     "subagents": {"delegate_task", "timer"},
     "tasks": {"create_tasks", "update_task"},
@@ -1991,8 +2020,9 @@ async def build_tools_dict(
     avoids re-reading ``request.body()`` when the caller already did
     so for its own bookkeeping.
 
-    ``include_terminal_agents_md`` loads Core's terminal instructions once
-    for callers that construct an internal model conversation.
+    ``include_terminal_agents_md`` marks callers that construct an internal
+    model conversation: it loads Core's terminal instructions once and
+    omits ``play_animation``, which Core withholds from internal requests.
     """
     import inspect
     import json
@@ -2259,6 +2289,7 @@ async def build_tools_dict(
                 "__chat_id__": extra_params.get("__chat_id__"),
                 "__message_id__": extra_params.get("__message_id__"),
                 "__oauth_token__": extra_params.get("__oauth_token__"),
+                "__skill_ids__": extra_params.get("__skill_ids__"),
             }
 
             builtin_kwargs = {
@@ -2301,6 +2332,8 @@ async def build_tools_dict(
                     disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
             if not getattr(valves, "ENABLE_SKILLS_TOOLS", True):
                 disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES["skills_write"])
+            if include_terminal_agents_md:
+                disabled_builtin_tools.add("play_animation")
 
             knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
             file_tools_enabled = bool(getattr(valves, "ENABLE_FILE_TOOLS", True))
@@ -2658,7 +2691,7 @@ async def run_agent_loop(
 
         try:
             response = await generate_chat_completion(
-                request=isolate_request_state(request),
+                request=isolate_request_state(request, form_data["model"]),
                 form_data=form_data,
                 user=user_obj,
                 bypass_filter=True,
@@ -2830,7 +2863,7 @@ async def run_agent_loop(
 
     try:
         response = await generate_chat_completion(
-            request=isolate_request_state(request),
+            request=isolate_request_state(request, form_data["model"]),
             form_data=form_data,
             user=user_obj,
             bypass_filter=True,
@@ -3257,7 +3290,8 @@ CRITICAL RULES:
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
-            "__files__": metadata.get("files", []),
+            "__files__": metadata.get("files") or [],
+            "__skill_ids__": extract_skill_ids(__messages__),
         }
 
         # Determine tool IDs (same flow as sub_agent, but MAGI-style execution)
@@ -3319,7 +3353,7 @@ CRITICAL RULES:
             )
             member_model = filter_pipeline["model"]
 
-            member_metadata = isolate_chat_context(metadata)
+            member_metadata = {**isolate_chat_context(metadata), "model_id": filter_pipeline["model_id"]}
             member_extra_params = {
                 **extra_params,
                 "__model__": member_model,

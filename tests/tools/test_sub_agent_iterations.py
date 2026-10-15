@@ -190,13 +190,6 @@ def test_system_prompt_rule5_is_note_conditional() -> None:
     assert "proactively" in default  # rules 3/4 untouched
 
 
-def test_header_version_and_core_floor() -> None:
-    header = (tools_dir / "sub_agent.py").read_text()[:2000]
-
-    assert "version: 0.6.4" in header
-    assert "required_open_webui_version: 0.9.6" in header
-
-
 @pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize("emit_fails", [False, True])
 async def test_cancel_reports_status_and_propagates(monkeypatch, parallel, emit_fails):

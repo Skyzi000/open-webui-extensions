@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.24
+version: 0.1.25
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -35,6 +35,7 @@ from owui_ext.shared.prompt_utils import (
 )
 from owui_ext.shared.skills import (
     drop_unloadable_skill_manifest,
+    extract_skill_ids,
     extract_skill_manifest,
     extract_user_skill_tags,
     isolate_chat_context,
@@ -274,7 +275,7 @@ async def run_agent_loop(
 
         try:
             response = await generate_chat_completion(
-                request=isolate_request_state(request),
+                request=isolate_request_state(request, form_data["model"]),
                 form_data=form_data,
                 user=user_obj,
                 bypass_filter=True,
@@ -446,7 +447,7 @@ async def run_agent_loop(
 
     try:
         response = await generate_chat_completion(
-            request=isolate_request_state(request),
+            request=isolate_request_state(request, form_data["model"]),
             form_data=form_data,
             user=user_obj,
             bypass_filter=True,
@@ -873,7 +874,8 @@ CRITICAL RULES:
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
-            "__files__": metadata.get("files", []),
+            "__files__": metadata.get("files") or [],
+            "__skill_ids__": extract_skill_ids(__messages__),
         }
 
         # Determine tool IDs (same flow as sub_agent, but MAGI-style execution)
@@ -935,7 +937,7 @@ CRITICAL RULES:
             )
             member_model = filter_pipeline["model"]
 
-            member_metadata = isolate_chat_context(metadata)
+            member_metadata = {**isolate_chat_context(metadata), "model_id": filter_pipeline["model_id"]}
             member_extra_params = {
                 **extra_params,
                 "__model__": member_model,

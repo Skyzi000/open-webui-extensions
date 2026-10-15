@@ -231,16 +231,20 @@ async def finalize_model_request(
     )
 
 
-def isolate_request_state(request: Request) -> Request:
-    """Copy *request* with its own ``state``.
+def isolate_request_state(request: Request, model_id: str) -> Request:
+    """Copy *request* with its own ``state`` for a completion by *model_id*.
 
     Core's ``generate_chat_completion`` writes per-call flags there, so
     concurrent nested completions sharing one request would race on them.
+    It also merges ``state.metadata`` over the payload metadata, so the
+    caller's ``model_id`` would otherwise reach the child's headers.
     """
     scope = getattr(request, "scope", None)
     if not isinstance(scope, dict):
         return request
+    state = dict(scope.get("state") or {})
+    state["metadata"] = {**(state.get("metadata") or {}), "model_id": model_id}
     isolated = copy.copy(request)
-    isolated.scope = {**scope, "state": dict(scope.get("state") or {})}
-    isolated._state = State(isolated.scope["state"])
+    isolated.scope = {**scope, "state": state}
+    isolated._state = State(state)
     return isolated

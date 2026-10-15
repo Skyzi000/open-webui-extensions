@@ -33,6 +33,7 @@ import copy
 import logging
 import re
 from typing import Any, Optional
+from urllib.parse import quote
 
 from fastapi import Request
 
@@ -134,6 +135,17 @@ def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
         A list of ``<skill …>…</skill>`` strings, possibly empty.
     """
     return _extract_from_system_messages(messages, _find_skill_tags_in_text)
+
+
+def extract_skill_ids(messages: Optional[list]) -> list[str]:
+    """Return the IDs of the skills the parent lists or inlines, as Core's ``__skill_ids__``."""
+    ids = set(re.findall(r"<id>(.*?)</id>", extract_skill_manifest(messages)))
+    for tag in extract_user_skill_tags(messages):
+        match = re.match(r'<skill (?:id="([^"]+)"|name="([^"]*)")', tag)
+        if match:
+            # Core inlines terminal skills without an id attribute.
+            ids.add(match.group(1) or f'terminal:{quote(match.group(2), safe="")}')
+    return sorted(ids)
 
 
 def drop_unloadable_skill_manifest(messages: list, tools_dict: Optional[dict]) -> list:
