@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.8
+version: 0.2.9
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -393,18 +393,22 @@ async def execute_tool_call(
                 # so tool-specific UserValves injected by get_tools() survive.
                 from open_webui.utils.tools import get_updated_tool_function
 
+                metadata = extra_params.get("__metadata__")
                 call_params = {
                     "__messages__": extra_params.get("__messages__", []),
-                    "__files__": extra_params.get("__files__", []),
+                    "__files__": (
+                        metadata.get("files")
+                        if isinstance(metadata, dict)
+                        else extra_params.get("__files__")
+                    )
+                    or [],
                     "__event_emitter__": extra_params.get("__event_emitter__"),
                     "__event_call__": extra_params.get("__event_call__"),
                 }
-                # Core builtins keep per-agent state (skill revisions, Tool
-                # Search) in metadata, while loaded tools are shared by agents.
-                if tool.get("type") == "builtin" and isinstance(
-                    extra_params.get("__metadata__"), dict
-                ):
-                    call_params["__metadata__"] = extra_params["__metadata__"]
+                # Loaded tools are shared by agents, while Core binds each
+                # chat's own metadata to its tools.
+                if isinstance(metadata, dict):
+                    call_params["__metadata__"] = metadata
                 tool_function = await _maybe_await(get_updated_tool_function(
                     function=tool_function,
                     extra_params=call_params,

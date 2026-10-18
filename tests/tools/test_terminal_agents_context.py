@@ -98,25 +98,17 @@ async def test_agents_md_is_once_before_task_in_initial_and_final_request(monkey
         assert sum(message["content"] == AGENTS_MD for message in users) == 1
 
 
-def test_snapshot_injection_keeps_compaction_task_and_does_not_accumulate(monkeypatch):
-    monkeypatch.setitem(sys.modules, "open_webui.utils.terminals", core_terminals)
-    messages = copy.deepcopy(MESSAGES)
+@pytest.mark.parametrize("agents_md", [AGENTS_MD, f"{AGENTS_MD}\n\nEdited by a request filter."])
+def test_compaction_keeps_agents_md_and_the_task_however_filters_left_them(agents_md):
+    messages = [MESSAGES[0], {"role": "user", "content": agents_md}, MESSAGES[1]]
     for index in range(3):
         messages.extend([
             {"role": "assistant", "content": "", "tool_calls": [{"id": f"c{index}"}]},
             {"role": "tool", "tool_call_id": f"c{index}", "content": "result"},
         ])
-    extra = {"__terminal_agents_md__": AGENTS_MD}
-    snapshot = sub_agent._append_tool_server_prompts({"messages": messages}, extra)
-    snapshot = sub_agent._append_tool_server_prompts(snapshot, extra)
-    assert len(snapshot["messages"]) == len(messages) + 1
-    cut = sub_agent.select_loop_compaction_cut(messages)
-    assert cut.task_user_message == MESSAGES[1]
-    compacted = [cut.preserved_system_message, cut.task_user_message, *cut.tail_messages]
-    next_snapshot = sub_agent._append_tool_server_prompts({"messages": compacted}, extra)
-    assert next_snapshot["messages"][1:3] == [
-        {"role": "user", "content": AGENTS_MD}, MESSAGES[1]
-    ]
+    cut = sub_agent.select_loop_compaction_cut(messages, preserved_count=3)
+    assert cut.preserved_messages == messages[:3]
+    assert sub_agent.loop_task_message_index(messages, 3) == 2
 
 
 def test_older_core_without_agents_helper_keeps_original_messages(monkeypatch):
@@ -133,7 +125,6 @@ async def test_sub_agent_full_estimate_includes_agents_as_user_instructions(monk
         compaction=sub_agent.LoopCompactionOptions(),
         large_results=sub_agent.LargeToolResultOptions(mode="raw"),
         encoder=object(), encoder_ready=True, filter_identity=[],
-        tool_server_prompt_signature={}, terminal_agents_md=AGENTS_MD,
     )
     captured = []
 
@@ -142,12 +133,13 @@ async def test_sub_agent_full_estimate_includes_agents_as_user_instructions(monk
         return 123
 
     monkeypatch.setattr(sub_agent, "estimate_body_tokens", estimate)
+    messages = [MESSAGES[0], {"role": "user", "content": AGENTS_MD}, MESSAGES[1]]
     result = await sub_agent._estimate_loop_tokens(
-        run, model_id="model", tools_param=None, current_messages=copy.deepcopy(MESSAGES),
+        run, model_id="model", tools_param=None, current_messages=copy.deepcopy(messages),
         volatile_tokens=0, metadata={}, user_obj=None,
     )
     assert result == 123
-    assert captured[0]["messages"] == [MESSAGES[0], {"role": "user", "content": AGENTS_MD}, MESSAGES[1]]
+    assert captured[0]["messages"] == messages
 
 
 async def test_review_reuses_agents_md_across_cached_compose_review_and_revise(monkeypatch):

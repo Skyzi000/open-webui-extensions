@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.12
+version: 0.5.13
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -20,24 +20,19 @@ from typing import Any, Callable, Literal, Optional, Type
 from fastapi import Request
 from pydantic import BaseModel, Field
 
+from owui_ext.shared.agent_requests import AgentRequests
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
 from owui_ext.shared.completion_response import format_chat_completion_error
-from owui_ext.shared.inlet_filters import (
-    apply_inlet_filters_if_enabled,
-    finalize_model_request,
-    isolate_request_state,
-    resolve_model_filter_pipeline,
-)
+from owui_ext.shared.inlet_filters import resolve_model_filter_pipeline
 from owui_ext.shared.model_features import (
     model_has_note_knowledge,
     model_knowledge_tools_enabled,
 )
 from owui_ext.shared.notifications import emit_notification
 from owui_ext.shared.prompt_utils import (
-    _append_tool_server_prompts,
-    apply_agent_tool_search,
     merge_prompt_sections,
+    model_custom_tools,
     truncate_text,
 )
 from owui_ext.shared.tool_execution import (
@@ -2917,6 +2912,7 @@ async def run_agent_loop(
     iteration_note_role: Literal["user", "system"] = "user",
     submission_tool_names: Optional[set[str]] = None,
     filter_pipeline: Optional[dict] = None,
+    send_model_custom_tools: bool = True,
 ) -> str:
     """Run the LLM Review agent tool loop until completion.
 
@@ -2950,20 +2946,32 @@ async def run_agent_loop(
             extra_params.get("__metadata__", {}).get("filter_ids", []),
         )
 
-    tools_dict, loop_extra_params, deferred_tools = await apply_agent_tool_search(
-        tools_dict or {}, extra_params, submission_tool_names or ()
+    custom_tools = (
+        await model_custom_tools(filter_pipeline) if send_model_custom_tools else []
+    )
+    agent_requests = AgentRequests(
+        tools_dict or {}, extra_params, custom_tools, submission_tool_names or ()
     )
 
-    # Build tools parameter for native function calling
-    tools_param = None
-    if tools_dict:
-        tools_param = [
-            {"type": "function", "function": tool.get("spec", {})}
-            for name, tool in tools_dict.items()
-            if name not in deferred_tools
-        ]
-
-    current_messages = drop_unloadable_skill_manifest(list(messages), tools_dict)
+    current_messages = drop_unloadable_skill_manifest(
+        list(messages), agent_requests.tools_dict
+    )
+    current_messages = await agent_requests.prepare(
+        filter_pipeline,
+        request,
+        {
+            "model": model_id,
+            "messages": copy.deepcopy(current_messages),
+            "stream": False,
+            "metadata": {
+                "task": "llm_review",
+                "sub_agent_iteration": 1,
+                "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
+            },
+        },
+    )
+    tools_dict = agent_requests.tools_dict
+    extra_params = {**extra_params, "__metadata__": agent_requests.metadata}
     iteration = 0
 
     while iteration < max_iterations:
@@ -3033,32 +3041,14 @@ async def run_agent_loop(
                 {"role": iteration_note_role, "content": iteration_info}
             )
 
-        form_data = {
-            "model": model_id,
-            "messages": copy.deepcopy(messages_with_context),
-            "stream": False,
-            "metadata": {
-                "task": "llm_review",
-                "sub_agent_iteration": iteration,
-                "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
-            },
-        }
-
-        if tools_param:
-            form_data["tools"] = tools_param
-
-        # Match Core's inlet -> tool prompts -> request filter ordering.
-        form_data = await apply_inlet_filters_if_enabled(
-            filter_pipeline, request, form_data, extra_params
-        )
-        form_data = _append_tool_server_prompts(form_data, loop_extra_params)
-        form_data = await finalize_model_request(
-            filter_pipeline, request, form_data, extra_params
+        agent_requests.metadata["sub_agent_iteration"] = iteration
+        form_data = await agent_requests.next_form(
+            filter_pipeline, copy.deepcopy(messages_with_context)
         )
 
         try:
             response = await generate_chat_completion(
-                request=isolate_request_state(request, form_data["model"]),
+                request=agent_requests.chat_request,
                 form_data=form_data,
                 user=user_obj,
                 bypass_filter=True,  # We handle filters manually above
@@ -3365,30 +3355,16 @@ async def run_agent_loop(
     else:
         final_messages.append({"role": "user", "content": final_user_content})
 
-    form_data = {
-        "model": model_id,
-        "messages": copy.deepcopy(final_messages),
-        "stream": False,
-        "metadata": {
-            "task": "llm_review",
-            "sub_agent_iteration": max_iterations + 1,
-            "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
-        },
-    }
-    if final_tools_param:
-        form_data["tools"] = final_tools_param
-
-    form_data = await apply_inlet_filters_if_enabled(
-        filter_pipeline, request, form_data, extra_params
-    )
-    form_data = _append_tool_server_prompts(form_data, extra_params)
-    form_data = await finalize_model_request(
-        filter_pipeline, request, form_data, extra_params
+    agent_requests.metadata["sub_agent_iteration"] = max_iterations + 1
+    form_data = await agent_requests.next_form(
+        filter_pipeline,
+        copy.deepcopy(final_messages),
+        tools=final_tools_param,
     )
 
     try:
         response = await generate_chat_completion(
-            request=isolate_request_state(request, form_data["model"]),
+            request=agent_requests.chat_request,
             form_data=form_data,
             user=user_obj,
             bypass_filter=True,  # We handle filters manually above
@@ -4731,6 +4707,7 @@ CRITICAL RULES:
                             iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                             submission_tool_names={"submit_review"},
                             filter_pipeline=filter_pipeline,
+                            send_model_custom_tools=False,
                         )
 
                         # Strict tool-call contract: only the capture from

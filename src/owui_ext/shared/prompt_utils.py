@@ -1,5 +1,7 @@
 """Prompt-assembly helpers shared across owui_ext tool plugins."""
 
+import copy
+import inspect
 from typing import Iterable, Optional
 
 
@@ -77,8 +79,45 @@ def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
     return form_data
 
 
+async def model_custom_tools(filter_pipeline: dict) -> list:
+    """Return the model's custom ``tools`` param, which Core 0.12.3+ sends after the loaded tools."""
+    try:
+        from open_webui.models.config import Config
+        from open_webui.models.models import Models
+        from open_webui.utils.misc import merge_model_params
+        from open_webui.utils.payload import apply_params_to_form_data
+    except ImportError:
+        return []
+    model = filter_pipeline["model"]
+    model_info = (
+        None
+        if model.get("direct")
+        else await Models.get_model_by_id(filter_pipeline["model_id"])
+    )
+    params = merge_model_params(
+        copy.deepcopy(await Config.get("models.default_params", {}) or {}),
+        model_info.params.model_dump() if model_info and model_info.params else {},
+    )
+    tools = apply_params_to_form_data({}, model, params).get("tools")
+    return tools if isinstance(tools, list) else []
+
+
+def build_agent_tools_param(
+    tools_dict: dict, deferred_tools: set, custom_tools: list
+) -> Optional[list]:
+    tools_param = [
+        {"type": "function", "function": tool.get("spec", {})}
+        for name, tool in tools_dict.items()
+        if name not in deferred_tools
+    ]
+    return tools_param + custom_tools or None
+
+
 async def apply_agent_tool_search(
-    tools_dict: dict, extra_params: dict, always_loaded: Iterable[str] = ()
+    tools_dict: dict,
+    extra_params: dict,
+    always_loaded: Iterable[str] = (),
+    extra_tools: Iterable[dict] = (),
 ) -> tuple[dict, dict, set]:
     """Apply Core's Tool Search to one agent loop.
 
@@ -87,7 +126,7 @@ async def apply_agent_tool_search(
     state lives in ``extra_params["__metadata__"]``, which must belong to this agent.
     """
     try:
-        from open_webui.utils.tool_search import apply_tool_search
+        from open_webui.utils.tool_search import SEARCH_TOOL_NAME, apply_tool_search
     except ImportError:
         return tools_dict, extra_params, set()
 
@@ -97,7 +136,17 @@ async def apply_agent_tool_search(
     if not isinstance(metadata, dict):
         metadata = {}
     form_data: dict = {"messages": []}
-    deferred = await apply_tool_search(form_data, metadata, loop_tools)
+    if "extra_tools" in inspect.signature(apply_tool_search).parameters:
+        deferred = await apply_tool_search(
+            form_data, metadata, loop_tools, list(extra_tools)
+        )
+    elif any(
+        (tool.get("function") or tool).get("name") == SEARCH_TOOL_NAME
+        for tool in extra_tools
+    ):
+        return tools_dict, extra_params, set()
+    else:
+        deferred = await apply_tool_search(form_data, metadata, loop_tools)
     if not deferred:
         return tools_dict, extra_params, set()
     metadata["tools"] = loop_tools

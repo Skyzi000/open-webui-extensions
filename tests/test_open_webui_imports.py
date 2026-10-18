@@ -1132,9 +1132,10 @@ class TestFilterCompatibility:
         self, monkeypatch
     ):
         from open_webui.utils import chat as chat_utils
+        from owui_ext.shared import agent_requests
         from owui_ext.tools import sub_agent
 
-        pipeline = object()
+        pipeline = {"model": {"id": "nested"}, "model_id": "nested"}
         resolve_calls = []
         stage_calls = []
         responses = [
@@ -1165,13 +1166,11 @@ class TestFilterCompatibility:
 
         async def apply(resolved, request, form_data, extra_params):
             stage_calls.append(("inlet", resolved))
-            return {
-                key: value for key, value in form_data.items() if key != "metadata"
-            }
+            return {**form_data, "inlet_marker": True}
 
         async def finalize(resolved, request, form_data, extra_params):
             stage_calls.append(("request", resolved))
-            assert "metadata" not in form_data
+            assert form_data["inlet_marker"] is True
             return form_data
 
         async def generate_chat_completion(**kwargs):
@@ -1181,8 +1180,8 @@ class TestFilterCompatibility:
             return {"tool_call_id": "call-1", "content": "ok"}
 
         monkeypatch.setattr(sub_agent, "resolve_model_filter_pipeline", resolve)
-        monkeypatch.setattr(sub_agent, "apply_inlet_filters_if_enabled", apply)
-        monkeypatch.setattr(sub_agent, "finalize_model_request", finalize)
+        monkeypatch.setattr(agent_requests, "apply_inlet_filters_if_enabled", apply)
+        monkeypatch.setattr(agent_requests, "finalize_model_request", finalize)
         monkeypatch.setattr(sub_agent, "execute_tool_call", execute_tool_call)
         monkeypatch.setattr(
             chat_utils, "generate_chat_completion", generate_chat_completion
@@ -1212,7 +1211,6 @@ class TestFilterCompatibility:
         assert stage_calls == [
             ("inlet", pipeline),
             ("request", pipeline),
-            ("inlet", pipeline),
             ("request", pipeline),
         ]
         assert responses == []

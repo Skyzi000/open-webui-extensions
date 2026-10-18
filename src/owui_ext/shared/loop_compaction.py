@@ -794,7 +794,6 @@ def build_loop_input_fingerprint(
     model_id: str,
     tools_param: Any,
     filter_identity: Any,
-    tool_server_prompt_signature: Any,
     stable_messages: list[dict[str, Any]],
     body_extras: dict[str, Any] | None = None,
 ) -> str:
@@ -803,7 +802,6 @@ def build_loop_input_fingerprint(
         "model": str(model_id or ""),
         "tools": _canonicalize_tools_for_token_extra(tools_param or []),
         "filter_identity": _canonicalize_general_value(filter_identity),
-        "tool_server_prompts": _canonicalize_general_value(tool_server_prompt_signature),
         "message_count": len(stable_messages),
         "messages_hash": _json_hash(
             [canonicalize_message_for_token_estimate(message) for message in stable_messages]
@@ -872,8 +870,7 @@ LOOP_COMPACTION_KEEP_ROUNDS = 2
 
 class LoopCompactionCut:
     __slots__ = (
-        "preserved_system_message",
-        "task_user_message",
+        "preserved_messages",
         "summarization_prefix",
         "tail_messages",
         "source_message_count",
@@ -882,17 +879,29 @@ class LoopCompactionCut:
     def __init__(
         self,
         *,
-        preserved_system_message: dict[str, Any] | None,
-        task_user_message: dict[str, Any],
+        preserved_messages: list[dict[str, Any]],
         summarization_prefix: list[dict[str, Any]],
         tail_messages: list[dict[str, Any]],
         source_message_count: int,
     ) -> None:
-        self.preserved_system_message = preserved_system_message
-        self.task_user_message = task_user_message
+        self.preserved_messages = preserved_messages
         self.summarization_prefix = summarization_prefix
         self.tail_messages = tail_messages
         self.source_message_count = source_message_count
+
+
+def loop_task_message_index(
+    messages: list[dict[str, Any]], preserved_count: int
+) -> int | None:
+    """Index of the task: the last user message among the loop's initial messages."""
+    return next(
+        (
+            index
+            for index in range(min(preserved_count, len(messages)) - 1, -1, -1)
+            if isinstance(messages[index], dict) and messages[index].get("role") == "user"
+        ),
+        None,
+    )
 
 
 def _tool_call_ids(message: dict[str, Any]) -> set[str]:
@@ -924,27 +933,16 @@ def has_orphan_tool_messages(messages: list[dict[str, Any]]) -> bool:
 def select_loop_compaction_cut(
     messages: list[dict[str, Any]],
     *,
+    preserved_count: int,
     completed_rounds_to_keep: int = LOOP_COMPACTION_KEEP_ROUNDS,
 ) -> LoopCompactionCut | None:
     if not messages or has_orphan_tool_messages(messages):
         return None
 
-    system_index = next(
-        (i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "system"),
-        None,
-    )
-    preserved_system = messages[system_index] if system_index is not None else None
-    working_start = (system_index + 1) if system_index is not None else 0
-    working = messages[working_start:]
-
-    task_user_index = next(
-        (i for i, m in enumerate(working) if isinstance(m, dict) and m.get("role") == "user"),
-        None,
-    )
-    if task_user_index is None:
+    if loop_task_message_index(messages, preserved_count) is None:
         return None
-    task_user_message = working[task_user_index]
-    loop_messages = working[task_user_index + 1 :]
+    preserved_messages = messages[:preserved_count]
+    loop_messages = messages[preserved_count:]
     if not loop_messages:
         return None
 
@@ -979,8 +977,7 @@ def select_loop_compaction_cut(
         return None
 
     return LoopCompactionCut(
-        preserved_system_message=preserved_system,
-        task_user_message=task_user_message,
+        preserved_messages=preserved_messages,
         summarization_prefix=summarization_prefix,
         tail_messages=tail_messages,
         source_message_count=len(summarization_prefix),

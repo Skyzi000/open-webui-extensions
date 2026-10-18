@@ -16,8 +16,8 @@ with its sub-helpers:
 - ``execute_tool_call`` orchestrates the above and only injects the
   per-call dynamic context (``__messages__`` / ``__files__`` /
   ``__event_emitter__`` / ``__event_call__``, plus the calling agent's
-  ``__metadata__`` for builtin tools) — never ``__user__`` /
-  ``__request__`` / ``__model__`` / ``__chat_id__`` /
+  ``__metadata__``) — never ``__user__`` / ``__request__`` /
+  ``__model__`` / ``__chat_id__`` /
   ``__message_id__``, because ``get_tools()`` already attached tool-specific
   ``UserValves`` to ``__user__["valves"]`` and overriding it would
   silently overwrite per-tool valves.
@@ -393,18 +393,22 @@ async def execute_tool_call(
                 # so tool-specific UserValves injected by get_tools() survive.
                 from open_webui.utils.tools import get_updated_tool_function
 
+                metadata = extra_params.get("__metadata__")
                 call_params = {
                     "__messages__": extra_params.get("__messages__", []),
-                    "__files__": extra_params.get("__files__", []),
+                    "__files__": (
+                        metadata.get("files")
+                        if isinstance(metadata, dict)
+                        else extra_params.get("__files__")
+                    )
+                    or [],
                     "__event_emitter__": extra_params.get("__event_emitter__"),
                     "__event_call__": extra_params.get("__event_call__"),
                 }
-                # Core builtins keep per-agent state (skill revisions, Tool
-                # Search) in metadata, while loaded tools are shared by agents.
-                if tool.get("type") == "builtin" and isinstance(
-                    extra_params.get("__metadata__"), dict
-                ):
-                    call_params["__metadata__"] = extra_params["__metadata__"]
+                # Loaded tools are shared by agents, while Core binds each
+                # chat's own metadata to its tools.
+                if isinstance(metadata, dict):
+                    call_params["__metadata__"] = metadata
                 tool_function = await _maybe_await(get_updated_tool_function(
                     function=tool_function,
                     extra_params=call_params,

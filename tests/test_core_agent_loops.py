@@ -1,6 +1,7 @@
 """Nested agent loops follow real Core for request state, prompts, Tool Search, skills and embeds."""
 
 import asyncio
+import collections
 import copy
 import importlib
 import importlib.util
@@ -81,12 +82,13 @@ def tool_call(name, arguments=None):
 
 def system_text(form_data):
     return "\n".join(
-        message["content"] for message in form_data["messages"] if message["role"] == "system"
+        content if isinstance(content, str) else json.dumps(content)
+        for content in (message["content"] for message in form_data["messages"] if message["role"] == "system")
     )
 
 
 def tool_names(form_data):
-    return {tool["function"]["name"] for tool in form_data.get("tools") or []}
+    return {tool["function"]["name"] for tool in form_data.get("tools") or [] if "function" in tool}
 
 
 async def run_loop(
@@ -142,13 +144,14 @@ async def test_nested_completions_do_not_share_request_state():
     request = Request({"type": "http", "app": object(), "state": {"direct": False}})
     request._body = b"{}"
 
-    isolated = sub_agent.isolate_request_state(request, "child")
+    metadata = {"model_id": "child"}
+    isolated = sub_agent.isolate_request_state(request, metadata)
     isolated.state.direct = True
     isolated.state.model = {"id": "child"}
 
     assert request.state.direct is False
     assert not hasattr(request.state, "model")
-    assert isolated.state.metadata == {"model_id": "child"}
+    assert isolated.state.metadata is metadata
     assert not hasattr(request.state, "metadata")
     assert isolated.app is request.app
     assert await isolated.body() == b"{}"
@@ -290,6 +293,7 @@ async def test_sub_agent_summary_retry_without_tools_has_no_tool_search_manifest
     system = f"Be brief.\n\n{build_deferred_tools_manifest(loop_tools(), ['lookup'])}"
     body = {
         "model": "model",
+        "metadata": {"model_id": "model"},
         "tools": [{"type": "function", "function": loop_tools()["ping"]["spec"]}],
         "messages": [
             {"role": "system", "content": [{"type": "text", "text": system}] if as_parts else system},
@@ -502,12 +506,14 @@ def test_inline_skill_tags_are_inherited_for_both_core_shapes(tag, skill_id):
     assert sub_agent.extract_skill_ids(messages) == [skill_id]
 
 
-async def call_entry(entry, **kwargs):
+async def call_entry(entry, valves=None, **kwargs):
     module = importlib.import_module("sub_agent" if entry == "parallel_sub_agents" else entry)
     tool = module.Tools()
     if module is sub_agent:
         tool.valves.ENABLE_CONTEXT_COMPACTION = False
         tool.valves.LARGE_TOOL_RESULT_MODE = "raw"
+    for name, value in (valves or {}).items():
+        setattr(tool.valves, name, value)
     if entry == "sub_agent":
         return await tool.run_sub_agent(description="Task", prompt="Task", **kwargs)
     if entry == "parallel_sub_agents":
@@ -524,11 +530,20 @@ async def call_entry(entry, **kwargs):
 
 ENTRIES = ["sub_agent", "parallel_sub_agents", *AGENT_MODULES[1:]]
 LOOKUP_CALL = {"tool_name": "lookup", "params": json.dumps({"query": "key"})}
+TOOL_SEARCH_SETTINGS = {
+    "chat.tool_search.enable": True, "chat.tool_search.defer_threshold": 400,
+    "chat.tool_search.always_loaded": [], "chat.tool_search.defer_builtin_tools": False,
+}
 
 
-async def run_entry(monkeypatch, entry, respond, *, regular_tools=dict, settings=None):
+async def run_entry(
+    monkeypatch, entry, respond, *, regular_tools=dict, settings=None, skill_context=SKILL_MANIFEST, child_params=None,
+    inlet=None, request_filter=None, observe=None, parent_metadata=None, valves=None, bound_tools=None,
+    extra_models=None,
+):
     from starlette.requests import Request
     from open_webui.models.config import Config
+    from open_webui.models.models import ModelForm, Models
     from open_webui.utils import chat
     from open_webui.utils import filter as core_filter
     from open_webui.utils import tools as core_tools
@@ -540,30 +555,42 @@ async def run_entry(monkeypatch, entry, respond, *, regular_tools=dict, settings
     child = {"id": "child", "owned_by": "openai", "info": {"meta": {
         "builtinTools": {category: False for category in ("time", "user_input", "knowledge", "chats", "tasks")},
         "voice_avatar": voice_avatar,
-    }}}
+    }, "params": {}}}
     parent = {"id": "parent", "owned_by": "arena", "info": {"meta": {"model_ids": ["child"], "voice_avatar": voice_avatar}}}
-    models = {"parent": parent, "child": child}
+    models = {"parent": parent, "child": child, **(extra_models or {})}
     request = Request({
         "type": "http", "app": SimpleNamespace(state=SimpleNamespace(MODELS=models)),
-        "state": {"metadata": {"model_id": "parent"}},
+        "state": {"metadata": parent_metadata if parent_metadata is not None else {"model_id": "parent"}},
     })
     request._body = b"{}"
     sent, loaded, filtered = [], [], []
 
     async def get_tools(*, extra_params, **_):
         loaded.append((extra_params["__metadata__"]["model_id"], extra_params["__files__"]))
-        return regular_tools()
+        return await bound_tools(extra_params) if bound_tools else regular_tools()
 
-    async def provider(*, form_data, **_):
+    async def provider(*, form_data, request=None, **_):
         sent.append({
+            "state_metadata": getattr(getattr(request, "state", None), "metadata", None),
+            "temperature": form_data.get("temperature"), "tool_choice": form_data.get("tool_choice"),
+            "parallel_tool_calls": form_data.get("parallel_tool_calls"),
+            "keys": set(form_data),
             "model": form_data["model"], "model_id": form_data["metadata"].get("model_id"),
-            "tools": tool_names(form_data), "system": system_text(form_data),
+            "tools": tool_names(form_data), "raw_tools": copy.deepcopy(form_data.get("tools") or []),
+            "metadata": dict(form_data.get("metadata") or {}),
+            "system": system_text(form_data),
             "messages": copy.deepcopy(form_data["messages"]),
         })
         return respond(sent[-1])
 
-    async def process_filter_functions(*, form_data, extra_params, filter_context=None, **_):
+    async def process_filter_functions(*, form_data, extra_params, filter_type=None, filter_context=None, **_):
         filtered.append(extra_params["__metadata__"]["model_id"])
+        if observe:
+            observe(filter_type, form_data, extra_params, _["request"])
+        if inlet and filter_type == "inlet":
+            form_data = inlet(form_data)
+        if request_filter and filter_type == "request":
+            form_data = request_filter(form_data)
         return form_data, {}
 
     monkeypatch.setattr(core_tools, "get_tools", get_tools)
@@ -574,17 +601,22 @@ async def run_entry(monkeypatch, entry, respond, *, regular_tools=dict, settings
     for module in (llm_review, multi_model_council):
         monkeypatch.setattr(module, "get_available_models", AsyncMock(return_value=list(models.values())))
 
-    await call_entry(
-        entry, __request__=request, __model__=parent, __user__=make_user("admin").model_dump(),
-        __event_call__=AsyncMock(),
-        __metadata__={
-            "model_id": "parent", "files": None, "tool_ids": ["regular"], "features": {"voice": True},
-            "chat_id": "local:entry", "session_id": "browser", "tool_servers": [],
-        },
-        __messages__=[
-            {"role": "system", "content": f"Be brief.\n\n{SKILL_MANIFEST}"}, {"role": "user", "content": "Hi"},
-        ],
-    )
+    if child_params is not None:
+        await Models.insert_new_model(ModelForm(id="child", name="Child", meta={}, params=child_params), "loop-user")
+    try:
+        await call_entry(
+            entry, valves, __request__=request, __model__=parent, __user__=make_user("admin").model_dump(),
+            __event_call__=AsyncMock(),
+            __metadata__=parent_metadata if parent_metadata is not None else {
+                "model_id": "parent", "files": None, "tool_ids": ["regular"], "features": {"voice": True},
+                "chat_id": "local:entry", "session_id": "browser", "tool_servers": [],
+            },
+            __messages__=[
+                {"role": "system", "content": f"Be brief.\n\n{skill_context}"}, {"role": "user", "content": "Hi"},
+            ],
+        )
+    finally:
+        await Models.delete_model_by_id("child")
     return sent, loaded, filtered
 
 
@@ -597,8 +629,13 @@ def answer(body, draft_call=None):
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
-async def test_nested_requests_carry_the_child_model_and_the_parent_skills(monkeypatch, entry):
-    sent, loaded, filtered = await run_entry(monkeypatch, entry, answer)
+@pytest.mark.parametrize("skill_context", [
+    SKILL_MANIFEST,
+    '<skill id="skill" name="Writer">\nWrite well.\n</skill>',
+    '<skill name="Writer notes">\nWrite well.\n</skill>',
+])
+async def test_nested_requests_carry_the_child_model_and_the_parent_skills(monkeypatch, entry, skill_context):
+    sent, loaded, filtered = await run_entry(monkeypatch, entry, answer, skill_context=skill_context)
 
     assert loaded and all(item == ("child", []) for item in loaded)
     assert filtered and set(filtered) == {"child"}
@@ -608,8 +645,604 @@ async def test_nested_requests_carry_the_child_model_and_the_parent_skills(monke
     assert agent_requests
     for body in agent_requests:
         assert SKILL_READ_TOOLS <= body["tools"]
-        assert SKILL_MANIFEST in body["system"]
+        assert skill_context in body["system"]
 
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("source", ["model", "default"])
+@pytest.mark.parametrize("skill_context", [SKILL_MANIFEST, ""])
+async def test_child_custom_tools_param_is_sent_after_its_loaded_tools(monkeypatch, entry, source, skill_context):
+    web_search = {"type": "web_search"}
+    params = {"custom_params": {"tools": json.dumps([web_search])}}
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, answer, skill_context=skill_context,
+        child_params=params if source == "model" else None,
+        settings={"models.default_params": params} if source == "default" else None,
+    )
+
+    review_requests = [body for body in sent if body["tools"] == {"submit_review"}]
+    agent_requests = [body for body in sent if body["raw_tools"] and body not in review_requests]
+    assert agent_requests
+    for body in agent_requests:
+        assert body["raw_tools"][-1] == web_search
+    assert bool(review_requests) == (entry == "llm_review")
+    assert not any(web_search in body["raw_tools"] for body in review_requests)
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_inlet_filters_see_only_the_custom_tools_and_theirs_are_sent_last(monkeypatch, entry):
+    web_search = {"type": "web_search"}
+    added = {"type": "function", "function": {"name": "filter_tool", "parameters": {"type": "object"}}}
+    seen = []
+
+    def inlet(form_data):
+        seen.append(copy.deepcopy(form_data.get("tools")))
+        form_data["tools"] = [*(form_data.get("tools") or []), added]
+        return form_data
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, answer, inlet=inlet, child_params={"custom_params": {"tools": [web_search]}},
+    )
+
+    assert [web_search] in seen
+    assert all(tools in (None, [web_search]) for tools in seen)
+    assert sent and all(body["raw_tools"][-1] == added for body in sent)
+    for body in sent:
+        if web_search in body["raw_tools"]:
+            assert body["raw_tools"][-2:] == [web_search, added]
+
+
+def lookup_first(body):
+    if not any(message["role"] == "tool" for message in body["messages"]):
+        if "lookup" in body["tools"]:
+            return tool_call("lookup", {"query": "key"})
+        if "call_tool" in body["tools"]:
+            return tool_call("call_tool", LOOKUP_CALL)
+    return answer(body)
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_inlet_runs_once_per_agent_loop_and_every_round_keeps_its_result(monkeypatch, entry):
+    issued = []
+
+    def inlet(form_data):
+        issued.append(f"Inlet note {len(issued) + 1}.")
+        form_data["messages"] = [{"role": "system", "content": issued[-1]}, *form_data["messages"]]
+        return form_data
+
+    sent, _, _ = await run_entry(monkeypatch, entry, lookup_first, regular_tools=loop_tools, inlet=inlet)
+
+    notes = [[note for note in issued if note in body["system"]] for body in sent]
+    assert all(len(found) == 1 for found in notes)
+    rounds = collections.Counter(found[0] for found in notes)
+    assert set(rounds) == set(issued)
+    assert all(body["system"].count(found[0]) == 1 for body, found in zip(sent, notes))
+    assert max(rounds.values()) >= 2
+    assert any(message["role"] == "tool" for body in sent for message in body["messages"])
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("replace", [False, True], ids=["in-place", "replaced"])
+async def test_inlet_metadata_kept_like_core_for_every_request_of_the_loop(monkeypatch, entry, replace):
+    def inlet(form_data):
+        if replace:
+            form_data["metadata"] = {**form_data["metadata"], "inlet_flag": True}
+        else:
+            form_data["metadata"]["inlet_flag"] = True
+        return form_data
+
+    sent, _, _ = await run_entry(monkeypatch, entry, lookup_first, regular_tools=loop_tools, inlet=inlet)
+
+    assert any(message["role"] == "tool" for body in sent for message in body["messages"])
+    assert sent and all(body["metadata"].get("inlet_flag") is (None if replace else True) for body in sent)
+
+
+def lookup_twice(body):
+    rounds = sum(message["role"] == "tool" for message in body["messages"])
+    if rounds < 2 and "lookup" in body["tools"]:
+        return {"choices": [{"message": {"content": "", "tool_calls": [{
+            "id": f"lookup-{rounds}", "type": "function",
+            "function": {"name": "lookup", "arguments": json.dumps({"query": "key"})},
+        }]}}]}
+    return answer(body)
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_request_filters_see_the_iteration_note(monkeypatch, entry):
+    def request_filter(form_data):
+        systems = [message for message in form_data["messages"] if message["role"] == "system"]
+        if systems:
+            form_data["messages"] = [
+                {"role": "system", "content": "\n\n".join(str(message["content"]) for message in systems)},
+                *(message for message in form_data["messages"] if message["role"] != "system"),
+            ]
+        return form_data
+
+    note_role = {"ITERATION_NOTE_ROLE": "system"} if entry in ("sub_agent", "parallel_sub_agents", "llm_review") else None
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, lookup_first, regular_tools=loop_tools, request_filter=request_filter, valves=note_role,
+    )
+
+    assert any("[Iteration" in body["system"] for body in sent)
+    assert all(message["role"] != "system" for body in sent for message in body["messages"][1:])
+
+
+@needs_tool_search
+@pytest.mark.parametrize("entry", ["llm_review", "magi_decision_support", "multi_model_council"])
+async def test_final_requests_drop_the_manifest_a_request_filter_moves_to_developer(monkeypatch, entry):
+    def request_filter(form_data):
+        form_data["messages"] = [
+            {**message, "role": "developer"} if message["role"] == "system" else message
+            for message in form_data["messages"]
+        ]
+        return form_data
+
+    def respond(body):
+        return tool_call("ping") if "ping" in body["tools"] else answer(body)
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, respond, regular_tools=loop_tools, settings=TOOL_SEARCH_SETTINGS,
+        request_filter=request_filter, valves={"MAX_ITERATIONS": 1},
+    )
+
+    def developer_text(body):
+        return json.dumps([message["content"] for message in body["messages"] if message["role"] == "developer"])
+
+    searched = [body for body in sent if "search_tools" in body["tools"]]
+    final = [
+        body for body in sent
+        if body["tools"] in (set(), {"submit_draft"}) and any(message["role"] == "tool" for message in body["messages"])
+    ]
+    assert searched and final
+    assert all("<available_tools>" in developer_text(body) for body in searched)
+    assert all("<available_tools>" not in developer_text(body) for body in final)
+
+
+CORE_FILTER_PARAMS = {
+    "__event_emitter__", "__event_call__", "__user__", "__metadata__", "__oauth_token__",
+    "__request__", "__model__", "__chat_id__", "__message_id__",
+}
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_body_metadata_is_the_loops_metadata_like_core(monkeypatch, entry):
+    parent_metadata = {
+        "model_id": "parent", "files": [{"id": "file", "type": "file"}], "tool_ids": ["regular"],
+        "features": {"voice": True}, "chat_id": "local:entry", "session_id": "browser", "tool_servers": [],
+    }
+    parent_before = copy.deepcopy(parent_metadata)
+    calls = []
+
+    def observe(filter_type, form_data, extra_params, request):
+        calls.append((filter_type, form_data["metadata"], extra_params["__metadata__"], dict(extra_params), request))
+        extra_params["__metadata__"]["written"] = True
+        request.state.metadata["through_state"] = True
+        form_data["metadata"]["files"][0]["context"] = "full"
+        form_data["metadata"]["features"]["touched"] = True
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, lookup_twice, regular_tools=loop_tools, observe=observe, parent_metadata=parent_metadata,
+    )
+
+    assert {filter_type for filter_type, *_ in calls} == {"inlet", "request"}
+    for filter_type, body, injected, params, request in calls:
+        assert body is injected
+        assert params["__request__"] is request and request.state.metadata is body
+        assert set(params) <= CORE_FILTER_PARAMS
+    assert all(body["chat_id"] == "local:entry" and body["written"] and body["through_state"] for _, body, *_ in calls)
+    loop_metadata = [body for filter_type, body, *_ in calls if filter_type == "inlet"]
+    assert len({id(body) for body in loop_metadata}) == len(loop_metadata)
+    assert all(any(body["state_metadata"] is metadata for metadata in loop_metadata) for body in sent)
+    assert parent_metadata == parent_before
+
+
+@pytest.mark.parametrize("entry", ["sub_agent", "parallel_sub_agents"])
+async def test_sub_agent_retry_without_tools_keeps_the_child_metadata(monkeypatch, entry):
+    parent_metadata = {
+        "model_id": "parent", "files": None, "tool_ids": ["regular"], "features": {"voice": True},
+        "chat_id": "local:entry", "session_id": "browser", "tool_servers": [],
+        "task": "parent_task", "sub_agent_iteration": 77,
+    }
+
+    def keep_calling(body):
+        if body["tools"]:
+            return {"choices": [{"message": {"content": "", "tool_calls": [{
+                "id": f"lookup-{len(body['messages'])}", "type": "function",
+                "function": {"name": "lookup", "arguments": json.dumps({"query": "key"})},
+            }]}}]}
+        return answer(body)
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, keep_calling, regular_tools=loop_tools, parent_metadata=parent_metadata,
+        valves={"MAX_ITERATIONS": 1},
+    )
+
+    assert len(sent) == 3 and not sent[-1]["tools"]
+    assert [(body["metadata"]["task"], body["metadata"]["sub_agent_iteration"]) for body in sent] == [
+        ("sub_agent", 1), ("sub_agent", 2), ("sub_agent", 2),
+    ]
+    assert parent_metadata["task"] == "parent_task" and parent_metadata["sub_agent_iteration"] == 77
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_loaded_tools_run_with_their_request_and_the_calling_loops_metadata(monkeypatch, entry):
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    parent_metadata = {
+        "model_id": "parent", "files": None, "tool_ids": ["regular"], "features": {"voice": True},
+        "chat_id": "local:entry", "session_id": "browser", "tool_servers": [],
+    }
+    parent_before = copy.copy(parent_metadata)
+    loaded_requests, seen = [], []
+
+    async def bound_tools(extra_params):
+        async def lookup(query: str = "", __request__=None, __metadata__=None, __user__=None):
+            seen.append((__request__, __metadata__, __user__))
+            __metadata__["tool_wrote"] = True
+            return "found"
+
+        loaded_requests.append(extra_params["__request__"])
+        tools = loop_tools()
+        tools["lookup"]["callable"] = await get_async_tool_function_and_apply_extra_params(
+            lookup, {**extra_params, "__user__": {"valves": "lookup-valves"}},
+        )
+        return tools
+
+    def inlet(form_data):
+        form_data["metadata"]["from_inlet"] = True
+        return form_data
+
+    await run_entry(
+        monkeypatch, entry, lookup_first, bound_tools=bound_tools, inlet=inlet, parent_metadata=parent_metadata,
+    )
+
+    assert seen
+    for request, metadata, user in seen:
+        assert any(request is loaded for loaded in loaded_requests)
+        assert "task" not in request.state.metadata
+        assert metadata["from_inlet"] and metadata["model_id"] == "child"
+        assert user == {"valves": "lookup-valves"}
+    assert len({id(metadata) for _, metadata, _ in seen}) == len(seen)
+    assert parent_metadata == parent_before
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_filters_cannot_change_the_parents_filter_ids_or_tools(monkeypatch, entry):
+    parent_tools = {"parent_tool": {"spec": {"name": "parent_tool"}}}
+    parent_metadata = {
+        "model_id": "parent", "files": None, "tool_ids": ["regular"], "features": {}, "filter_ids": ["parent"],
+        "chat_id": "local:entry", "session_id": "browser", "tool_servers": [], "tools": parent_tools,
+    }
+
+    def inlet(form_data):
+        form_data["metadata"]["filter_ids"].append("child")
+        form_data["metadata"]["tools"].clear()
+        return form_data
+
+    await run_entry(monkeypatch, entry, answer, inlet=inlet, parent_metadata=parent_metadata)
+
+    assert parent_metadata["filter_ids"] == ["parent"]
+    assert parent_metadata["tools"] is parent_tools and list(parent_tools) == ["parent_tool"]
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_request_filter_model_change_reaches_the_request_metadata(monkeypatch, entry):
+    def request_filter(form_data):
+        later = any(message["role"] == "tool" for message in form_data["messages"])
+        form_data["model"] = "later" if later else "first"
+        return form_data
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, lookup_first, regular_tools=loop_tools, request_filter=request_filter,
+        extra_models={name: {"id": name, "owned_by": "openai", "info": {"meta": {}}} for name in ("first", "later")},
+    )
+
+    switched = [body for body in sent if body["model"] in ("first", "later")]
+    assert {body["model"] for body in switched} == {"first", "later"}
+    assert all(body["model_id"] == body["model"] for body in switched)
+
+
+COMPACTION_VALVES = {
+    "ENABLE_CONTEXT_COMPACTION": True, "CONTEXT_COMPACTION_TOKEN_THRESHOLD": 1000, "LARGE_TOOL_RESULT_MODE": "raw",
+}
+SUB_AGENT_ENTRIES = ["sub_agent", "parallel_sub_agents"]
+
+
+def big_lookup_tools():
+    async def lookup(query: str = ""):
+        return "substantial result line with detail\n" * 600
+
+    tools = loop_tools()
+    tools["lookup"]["callable"] = lookup
+    return tools
+
+
+def lookup_rounds_then_answer(rounds):
+    agent_calls = []
+
+    def respond(body):
+        if body["metadata"].get("task") == "sub_agent_summary":
+            return {"choices": [{"message": {"content": "SUMMARY"}}]}
+        agent_calls.append(body)
+        if len(agent_calls) <= rounds:
+            return {"choices": [{"message": {"content": "", "tool_calls": [{
+                "id": f"round-{len(agent_calls)}", "type": "function",
+                "function": {"name": "lookup", "arguments": json.dumps({"query": "key"})},
+            }]}}]}
+        return answer(body)
+
+    return respond
+
+
+@pytest.mark.parametrize("entry", SUB_AGENT_ENTRIES)
+async def test_sub_agent_compaction_keeps_the_messages_its_inlet_left_before_the_loop(monkeypatch, entry):
+    def inlet(form_data):
+        messages = form_data["messages"]
+        task = max(index for index, message in enumerate(messages) if message["role"] == "user")
+        form_data["messages"] = [
+            *messages[:task],
+            {"role": "user", "content": "EXAMPLE-QUESTION"},
+            {"role": "assistant", "content": "EXAMPLE-ANSWER"},
+            messages[task],
+            {"role": "system", "content": "INJECTED-AFTER-TASK"},
+            *messages[task + 1:],
+        ]
+        return form_data
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, lookup_rounds_then_answer(4), regular_tools=big_lookup_tools, inlet=inlet,
+        valves=COMPACTION_VALVES,
+    )
+
+    assert any(body["metadata"].get("task") == "sub_agent_summary" for body in sent)
+    compacted = 0
+    for body in sent:
+        if body["metadata"].get("task") == "sub_agent_summary":
+            continue
+        texts = [str(message.get("content")) for message in body["messages"]]
+        for marker in ("EXAMPLE-QUESTION", "EXAMPLE-ANSWER", "INJECTED-AFTER-TASK"):
+            assert sum(marker in text for text in texts) == 1
+        task = texts.index("EXAMPLE-ANSWER") + 1
+        if "<agent_loop_compaction_context>" in "".join(texts):
+            compacted += 1
+            assert "<agent_loop_compaction_context>" in texts[task]
+    assert compacted
+
+
+@pytest.mark.parametrize("entry", SUB_AGENT_ENTRIES)
+async def test_sub_agent_summary_request_names_the_summary_model(monkeypatch, entry):
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, lookup_rounds_then_answer(4), regular_tools=big_lookup_tools,
+        valves={**COMPACTION_VALVES, "COMPACTION_SUMMARY_MODEL": "summarizer"},
+        extra_models={"summarizer": {"id": "summarizer", "owned_by": "openai", "info": {"meta": {}}}},
+    )
+
+    summaries = [body for body in sent if body["metadata"].get("task") == "sub_agent_summary"]
+    assert summaries
+    assert all(body["model"] == "summarizer" and body["model_id"] == "summarizer" for body in summaries)
+
+
+@pytest.mark.parametrize("entry", SUB_AGENT_ENTRIES)
+async def test_sub_agent_compaction_keeps_an_agents_md_its_request_filter_edited(monkeypatch, entry):
+    from open_webui.utils import terminals
+    from open_webui.utils import tools as core_tools
+
+    if not hasattr(terminals, "add_terminal_agents_md"):
+        pytest.skip("Core before 0.12.0 has no terminal AGENTS.md")
+    agents_md = "# AGENTS.md\n\nFollow the project conventions."
+    if hasattr(terminals, "get_terminal_json"):
+        monkeypatch.setattr(terminals, "get_terminal_json", AsyncMock(return_value={
+            "home": "/home/test", "content": "Follow the project conventions.",
+        }))
+    else:
+        monkeypatch.setattr(terminals, "get_terminal_agents_md", AsyncMock(return_value=agents_md))
+    monkeypatch.setattr(core_tools, "get_terminal_tools", AsyncMock(return_value=({}, "")))
+
+    def request_filter(form_data):
+        for message in form_data["messages"]:
+            if message["role"] == "user" and message["content"] == agents_md:
+                message["content"] += "\nEdited by a request filter."
+        return form_data
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, lookup_rounds_then_answer(4), regular_tools=big_lookup_tools, skill_context="",
+        request_filter=request_filter, valves=COMPACTION_VALVES,
+        settings={"terminal_server.connections": [{"id": "terminal"}]},
+        parent_metadata={
+            "model_id": "parent", "tool_ids": ["regular"], "terminal_id": "terminal",
+            "chat_id": "local:entry", "tool_servers": [],
+        },
+    )
+
+    assert any(body["metadata"].get("task") == "sub_agent_summary" for body in sent)
+    compacted = 0
+    for body in sent:
+        if body["metadata"].get("task") == "sub_agent_summary":
+            continue
+        users = [str(message["content"]) for message in body["messages"] if message["role"] == "user"]
+        assert [text for text in users if text.startswith("# AGENTS.md")] == [
+            f"{agents_md}\nEdited by a request filter."
+        ]
+        task = [text for text in users if text.startswith("Task")]
+        assert len(task) == 1
+        if "<agent_loop_compaction_context>" in "".join(users):
+            compacted += 1
+            assert "<agent_loop_compaction_context>" in task[0]
+    assert compacted
+
+
+@needs_tool_search
+@pytest.mark.parametrize("entry", ["llm_review", "magi_decision_support", "multi_model_council"])
+async def test_final_requests_drop_the_tool_search_manifest_from_system_parts(monkeypatch, entry):
+    def inlet(form_data):
+        for message in form_data["messages"]:
+            if message["role"] == "system" and isinstance(message["content"], str):
+                message["content"] = [{"type": "text", "text": message["content"]}]
+        return form_data
+
+    def respond(body):
+        return tool_call("ping") if "ping" in body["tools"] else answer(body)
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, respond, regular_tools=loop_tools, settings=TOOL_SEARCH_SETTINGS, inlet=inlet,
+        valves={"MAX_ITERATIONS": 1},
+    )
+
+    searched = [body for body in sent if "search_tools" in body["tools"]]
+    final = [body for body in sent if body["tools"] in (set(), {"submit_draft"})]
+    assert searched and final
+    assert all("<available_tools>" in body["system"] for body in searched)
+    assert any(
+        isinstance(message["content"], list)
+        for body in final for message in body["messages"] if message["role"] == "system"
+    )
+    assert all("<available_tools>" not in body["system"] for body in final)
+
+
+@pytest.mark.parametrize("entry", ["llm_review", "magi_decision_support", "multi_model_council"])
+async def test_final_requests_keep_the_inlets_parallel_tool_calls_only_with_tools(monkeypatch, entry):
+    def inlet(form_data):
+        form_data["parallel_tool_calls"] = False
+        return form_data
+
+    def respond(body):
+        return tool_call("ping") if "ping" in body["tools"] else answer(body)
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, respond, regular_tools=loop_tools, inlet=inlet, valves={"MAX_ITERATIONS": 1},
+    )
+
+    final = [
+        body for body in sent
+        if "ping" not in body["tools"] and any(message["role"] == "tool" for message in body["messages"])
+    ]
+    assert final
+    for body in final:
+        assert body["parallel_tool_calls"] is (False if body["tools"] else None)
+
+
+@pytest.mark.parametrize("entry", ["sub_agent", "parallel_sub_agents"])
+async def test_sub_agent_retry_without_tools_runs_the_request_filters(monkeypatch, entry):
+    filter_tool = {"type": "function", "function": {"name": "filter_tool", "parameters": {"type": "object"}}}
+
+    def request_filter(form_data):
+        form_data["temperature"] = float(len(form_data.get("tools") or []))
+        form_data["tools"] = [*(form_data.get("tools") or []), filter_tool]
+        return form_data
+
+    def respond(body):
+        return tool_call("ping") if body["tools"] else {"choices": [{"message": {"content": "done"}}]}
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, respond, regular_tools=loop_tools, request_filter=request_filter,
+        valves={"MAX_ITERATIONS": 1},
+    )
+
+    retries = [body for body in sent if not body["tools"]]
+    assert retries and all(body["temperature"] for body in sent if body["tools"])
+    assert all(body["temperature"] == 0.0 for body in retries)
+
+
+@pytest.mark.parametrize("entry", ["llm_review", "magi_decision_support", "multi_model_council"])
+async def test_final_request_drops_a_tool_choice_for_a_tool_it_no_longer_sends(monkeypatch, entry):
+    def request_filter(form_data):
+        if not any(message["role"] == "tool" for message in form_data["messages"]):
+            form_data["tool_choice"] = {"type": "function", "function": {"name": "ping"}}
+        return form_data
+
+    def respond(body):
+        return tool_call("ping") if "ping" in body["tools"] else answer(body)
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, respond, regular_tools=loop_tools, request_filter=request_filter,
+        valves={"MAX_ITERATIONS": 1},
+    )
+
+    final = [
+        body for body in sent
+        if "ping" not in body["tools"] and any(message["role"] == "tool" for message in body["messages"])
+    ]
+    assert any(body["tool_choice"] for body in sent if "ping" in body["tools"])
+    assert final
+    for body in final:
+        choice = body["tool_choice"]
+        assert choice is None or choice["function"]["name"] in body["tools"]
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_loaded_tools_get_the_files_the_loops_inlet_left(monkeypatch, entry):
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    parent_metadata = {
+        "model_id": "parent", "files": [{"id": "file", "type": "file"}], "tool_ids": ["regular"],
+        "features": {}, "chat_id": "local:entry", "session_id": "browser", "tool_servers": [],
+    }
+    parent_before = copy.deepcopy(parent_metadata)
+    seen = []
+
+    async def bound_tools(extra_params):
+        async def lookup(query: str = "", __files__=None, __metadata__=None):
+            seen.append((__files__, __metadata__))
+            return "found"
+
+        tools = loop_tools()
+        tools["lookup"]["callable"] = await get_async_tool_function_and_apply_extra_params(lookup, extra_params)
+        return tools
+
+    def inlet(form_data):
+        for file in form_data["metadata"]["files"]:
+            file["context"] = "full"
+        return form_data
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, lookup_first, bound_tools=bound_tools, inlet=inlet, parent_metadata=parent_metadata,
+    )
+
+    assert seen
+    for files, metadata in seen:
+        assert files is metadata["files"]
+        assert files == [{"id": "file", "type": "file", "context": "full"}]
+    assert parent_metadata == parent_before
+
+
+SEARCH_TOOLS_FUNCTION = {"type": "function", "function": {"name": "search_tools", "parameters": {"type": "object"}}}
+
+
+def add_search_tools(form_data):
+    form_data["tools"] = [*(form_data.get("tools") or []), SEARCH_TOOLS_FUNCTION]
+    return form_data
+
+
+def drop_search_tools(form_data):
+    form_data["tools"] = [tool for tool in form_data.get("tools") or [] if tool != SEARCH_TOOLS_FUNCTION]
+    return form_data
+
+
+@needs_tool_search
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("child_params, inlet, tool_search_on", [
+    ({"custom_params": {"tools": [SEARCH_TOOLS_FUNCTION]}}, None, False),
+    (None, add_search_tools, False),
+    ({"custom_params": {"tools": [SEARCH_TOOLS_FUNCTION]}}, drop_search_tools, True),
+], ids=["custom", "inlet", "inlet-drops-custom"])
+async def test_search_tools_left_by_inlet_filters_turns_tool_search_off(
+    monkeypatch, entry, child_params, inlet, tool_search_on,
+):
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, lookup_first, regular_tools=loop_tools, settings=TOOL_SEARCH_SETTINGS,
+        child_params=child_params, inlet=inlet,
+    )
+
+    agent_requests = [body for body in sent if body["tools"] - {"submit_review", "search_tools"}]
+    assert agent_requests
+    for body in agent_requests:
+        searched = [tool for tool in body["raw_tools"] if tool.get("function", {}).get("name") == "search_tools"]
+        assert ("lookup" not in body["tools"]) == tool_search_on
+        assert (searched == [SEARCH_TOOLS_FUNCTION]) != tool_search_on
+        assert len(searched) == 1
+    if HAS_CALL_TOOL or not tool_search_on:
+        assert any(message["role"] == "tool" for body in agent_requests for message in body["messages"])
 
 @needs_call_tool
 @pytest.mark.parametrize("entry", ENTRIES)
@@ -620,10 +1253,7 @@ async def test_call_tool_runs_its_target_and_history_keeps_the_model_call(monkey
         draft = {"tool_name": "submit_draft", "params": json.dumps({"draft": "A complete draft"})}
         return answer(body, ("call_tool", draft))
 
-    sent, _, _ = await run_entry(monkeypatch, entry, respond, regular_tools=loop_tools, settings={
-        "chat.tool_search.enable": True, "chat.tool_search.defer_threshold": 400,
-        "chat.tool_search.always_loaded": [], "chat.tool_search.defer_builtin_tools": False,
-    })
+    sent, _, _ = await run_entry(monkeypatch, entry, respond, regular_tools=loop_tools, settings=TOOL_SEARCH_SETTINGS)
 
     followups = [body for body in sent if any(message.get("tool_calls") for message in body["messages"])]
     assert followups

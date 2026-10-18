@@ -555,7 +555,7 @@ async def test_reader_unavailable_falls_back_to_raw_not_truncate(monkeypatch, ca
 
 
 @pytest.mark.asyncio
-async def test_filters_run_once_per_send(monkeypatch):
+async def test_inlet_runs_once_per_loop_and_request_filters_once_per_send(monkeypatch):
     harness = _LoopHarness(monkeypatch)
     big = _big_tool_result("FILTERS")
 
@@ -593,7 +593,8 @@ async def test_filters_run_once_per_send(monkeypatch):
     main_calls = [
         c for c in harness.calls if (c.get("metadata") or {}).get("task") != "sub_agent_summary"
     ]
-    assert inlet_calls["n"] == len(main_calls)
+    assert len(main_calls) == 2
+    assert inlet_calls["n"] == 1
     assert finalize_calls["n"] == len(main_calls)
 
 
@@ -645,7 +646,7 @@ async def test_filters_apply_once_per_new_body_never_for_summary_or_resend(monke
     ]
     assert len(main_calls) == 4
     assert len(harness.summary_calls) >= 1
-    assert inlet_calls["n"] == len(main_calls)
+    assert inlet_calls["n"] == 1
     assert finalize_calls["n"] == len(main_calls)
 
 
@@ -862,17 +863,14 @@ async def test_final_send_keeps_tools_and_strips_once_on_tool_call(monkeypatch):
 
     async def forcing_finalize(filter_pipeline, request, form_data, extra_params):
         form_data = await original_finalize(filter_pipeline, request, form_data, extra_params)
-        messages = form_data.get("messages")
-        if isinstance(messages, list) and messages and isinstance(messages[-1], dict):
-            content = messages[-1].get("content", "")
-            if isinstance(content, str) and content.startswith("Maximum tool iterations reached"):
-                form_data = {
-                    **form_data,
-                    "tool_choice": {
-                        "type": "function",
-                        "function": {"name": "noisy"},
-                    },
-                }
+        if (form_data.get("metadata") or {}).get("sub_agent_iteration") == 2:
+            form_data = {
+                **form_data,
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "noisy"},
+                },
+            }
         return form_data
 
     monkeypatch.setattr(sub_agent, "finalize_model_request", forcing_finalize)
@@ -1053,10 +1051,10 @@ async def test_boundary_folded_side_mismatch_aborts_normal_compaction_succeeds(m
         _text_response("done"),
     ]
 
-    original_inlet = sub_agent.apply_inlet_filters_if_enabled
+    original_finalize = sub_agent.finalize_model_request
 
-    async def round_dropping_inlet(filter_pipeline, request, form_data, extra_params):
-        form_data = await original_inlet(filter_pipeline, request, form_data, extra_params)
+    async def round_dropping_request_filter(filter_pipeline, request, form_data, extra_params):
+        form_data = await original_finalize(filter_pipeline, request, form_data, extra_params)
         messages = form_data.get("messages")
         if isinstance(messages, list):
             kept = [
@@ -1070,7 +1068,7 @@ async def test_boundary_folded_side_mismatch_aborts_normal_compaction_succeeds(m
     degraded = _LoopHarness(monkeypatch)
     degraded.script = list(script)
     degraded.summary_script = [_text_response("never used")]
-    monkeypatch.setattr(sub_agent, "apply_inlet_filters_if_enabled", round_dropping_inlet)
+    monkeypatch.setattr(sub_agent, "finalize_model_request", round_dropping_request_filter)
 
     result = await _run(
         monkeypatch,
@@ -1093,7 +1091,7 @@ async def test_boundary_folded_side_mismatch_aborts_normal_compaction_succeeds(m
     # folded side diverge) before a summary or another send happens.
     assert len(main_calls) == 3
 
-    monkeypatch.setattr(sub_agent, "apply_inlet_filters_if_enabled", original_inlet)
+    monkeypatch.setattr(sub_agent, "finalize_model_request", original_finalize)
     normal = _LoopHarness(monkeypatch)
     normal.script = list(script)
     normal.summary_script = [_text_response("folded summary")]
@@ -1516,7 +1514,7 @@ async def test_full_estimate_counts_model_system_prompt_after_variable_expansion
 
     assert result == "done"
     assert len(harness.summary_calls) >= 1
-    assert requested_ids == ["arena-child-model"]
+    assert set(requested_ids) == {"arena-child-model"}
     assert harness.calls[0]["model"] == "arena-child-model"
     assert "research context" in harness.calls[0]["messages"][0]["content"]
 

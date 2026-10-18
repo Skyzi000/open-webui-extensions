@@ -38,11 +38,13 @@ def _messages(rounds: int) -> list[dict]:
 
 
 def test_cut_keeps_system_task_user_and_last_two_rounds() -> None:
-    cut = m.select_loop_compaction_cut(_messages(5))
+    cut = m.select_loop_compaction_cut(_messages(5), preserved_count=2)
 
     assert cut is not None
-    assert cut.preserved_system_message == {"role": "system", "content": "sys"}
-    assert cut.task_user_message == {"role": "user", "content": "task"}
+    assert cut.preserved_messages == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+    ]
     assert len(cut.summarization_prefix) == 2 * 3
     assert len(cut.tail_messages) == 2 * 2
     assert cut.tail_messages[0]["tool_calls"][0]["id"] == "c3"
@@ -50,15 +52,15 @@ def test_cut_keeps_system_task_user_and_last_two_rounds() -> None:
 
 
 def test_cut_refuses_when_only_keepable_rounds_exist() -> None:
-    assert m.select_loop_compaction_cut(_messages(2)) is None
-    assert m.select_loop_compaction_cut(_messages(1)) is None
+    assert m.select_loop_compaction_cut(_messages(2), preserved_count=2) is None
+    assert m.select_loop_compaction_cut(_messages(1), preserved_count=2) is None
 
 
 def test_cut_refuses_orphan_tool_messages() -> None:
     messages = _messages(4)
     messages.append({"role": "tool", "tool_call_id": "missing", "content": "orphan"})
 
-    assert m.select_loop_compaction_cut(messages) is None
+    assert m.select_loop_compaction_cut(messages, preserved_count=2) is None
 
 
 def test_cut_refuses_incomplete_round_tail() -> None:
@@ -79,14 +81,14 @@ def test_cut_refuses_incomplete_round_tail() -> None:
         ]
     )
 
-    cut = m.select_loop_compaction_cut(messages)
+    cut = m.select_loop_compaction_cut(messages, preserved_count=2)
 
     assert cut is not None
     assert cut.tail_messages[-1]["role"] == "assistant"
 
 
 def test_cut_refuses_without_task_user() -> None:
-    assert m.select_loop_compaction_cut([{"role": "system", "content": "s"}]) is None
+    assert m.select_loop_compaction_cut([{"role": "system", "content": "s"}], preserved_count=1) is None
 
 
 def test_cut_defaults_to_two_kept_rounds_constant() -> None:
@@ -180,7 +182,6 @@ def _fingerprint(messages: list[dict], *, model: str = "m1") -> str:
         model_id=model,
         tools_param=[{"type": "function", "function": {"name": "t"}}],
         filter_identity=["f1"],
-        tool_server_prompt_signature={"servers": 1},
         stable_messages=messages,
     )
 
@@ -254,20 +255,18 @@ def test_anchor_estimate_misses_when_anchor_prefix_changes() -> None:
     assert estimate == 5_000
 
 
-def test_fingerprint_changes_with_tools_filter_or_prompts() -> None:
+def test_fingerprint_changes_with_tools_filter_or_messages() -> None:
     stable = [{"role": "system", "content": "s"}]
     base = dict(
         model_id="m1",
         tools_param=[],
         filter_identity=[],
-        tool_server_prompt_signature=None,
         stable_messages=stable,
     )
     fp = m.build_loop_input_fingerprint(**base)
 
     assert fp != m.build_loop_input_fingerprint(**{**base, "tools_param": [{"function": {"name": "x"}}]})
     assert fp != m.build_loop_input_fingerprint(**{**base, "filter_identity": ["f"]})
-    assert fp != m.build_loop_input_fingerprint(**{**base, "tool_server_prompt_signature": {"s": 1}})
     assert fp != m.build_loop_input_fingerprint(**{**base, "stable_messages": stable + [{"role": "user", "content": "u"}]})
 
 

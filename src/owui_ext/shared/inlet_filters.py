@@ -35,6 +35,18 @@ from fastapi import Request
 from starlette.datastructures import State
 
 _inlet_filters_log = logging.getLogger("owui_ext.shared.inlet_filters")
+# The injected parameters Core's process_chat_payload gives filters.
+_CORE_FILTER_PARAMS = (
+    "__event_emitter__",
+    "__event_call__",
+    "__user__",
+    "__metadata__",
+    "__oauth_token__",
+    "__request__",
+    "__model__",
+    "__chat_id__",
+    "__message_id__",
+)
 
 
 async def _inlet_filters_maybe_await(value: Any) -> Any:
@@ -184,7 +196,12 @@ async def _apply_filter_pipeline(
 
         # Isolate __user__ so filter UserValves injection doesn't leak out
         # and pollute subsequent tool calls under a different tool id.
-        local_extra_params = dict(extra_params or {})
+        local_extra_params = {
+            key: value
+            for key, value in (extra_params or {}).items()
+            if key in _CORE_FILTER_PARAMS
+        }
+        local_extra_params["__request__"] = request
         local_extra_params["__model__"] = filter_pipeline["model"]
         if isinstance(local_extra_params.get("__user__"), dict):
             local_extra_params["__user__"] = dict(local_extra_params["__user__"])
@@ -231,19 +248,19 @@ async def finalize_model_request(
     )
 
 
-def isolate_request_state(request: Request, model_id: str) -> Request:
-    """Copy *request* with its own ``state`` for a completion by *model_id*.
+def isolate_request_state(request: Request, metadata: dict) -> Request:
+    """Copy *request* with its own ``state``, whose ``metadata`` is *metadata*.
 
     Core's ``generate_chat_completion`` writes per-call flags there, so
     concurrent nested completions sharing one request would race on them.
-    It also merges ``state.metadata`` over the payload metadata, so the
-    caller's ``model_id`` would otherwise reach the child's headers.
+    It also merges ``state.metadata`` over the payload metadata, as Core's
+    chat request shares one metadata dict between its body and its state.
     """
     scope = getattr(request, "scope", None)
     if not isinstance(scope, dict):
         return request
     state = dict(scope.get("state") or {})
-    state["metadata"] = {**(state.get("metadata") or {}), "model_id": model_id}
+    state["metadata"] = metadata
     isolated = copy.copy(request)
     isolated.scope = {**scope, "state": state}
     isolated._state = State(state)

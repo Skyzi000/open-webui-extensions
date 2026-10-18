@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.25
+version: 0.1.26
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -26,107 +26,6 @@ async def maybe_await(value):
         return await value
     return value
 
-# --- inlined from src/owui_ext/shared/completion_response.py (owui_ext.shared.completion_response) ---
-import json
-from typing import Any, Optional
-from starlette.responses import JSONResponse, Response
-_RESPONSE_BODY_PREVIEW_CHARS = 1024
-
-
-def _truncate_preview(text: str) -> str:
-    if len(text) > _RESPONSE_BODY_PREVIEW_CHARS:
-        return text[:_RESPONSE_BODY_PREVIEW_CHARS] + "...[truncated]"
-    return text
-
-
-def _decode_response_body(response: Response) -> str:
-    body = getattr(response, "body", None)
-    if body is None:
-        return ""
-    if isinstance(body, (bytes, bytearray)):
-        try:
-            text = bytes(body).decode("utf-8", errors="replace")
-        except Exception:
-            text = repr(body)
-    else:
-        text = str(body)
-    return _truncate_preview(text.strip())
-
-
-def _extract_json_response_error(response: JSONResponse) -> str:
-    status = getattr(response, "status_code", "unknown")
-    try:
-        error_data = json.loads(bytes(response.body).decode("utf-8"))
-    except Exception:
-        return f"API error (status {status}): Failed to parse response"
-    if isinstance(error_data, dict):
-        error_field = error_data.get("error")
-        if isinstance(error_field, dict):
-            msg = error_field.get("message")
-            if isinstance(msg, str) and msg:
-                return f"API error: {_truncate_preview(msg)}"
-            return f"API error: {_truncate_preview(str(error_data))}"
-        if isinstance(error_field, str) and error_field:
-            return f"API error: {_truncate_preview(error_field)}"
-        msg = error_data.get("message")
-        if isinstance(msg, str) and msg:
-            return f"API error: {_truncate_preview(msg)}"
-        return f"API error: {_truncate_preview(str(error_data))}"
-    return f"API error: {_truncate_preview(str(error_data))}"
-
-
-def format_chat_completion_error(response: Any) -> Optional[str]:
-    """Classify a ``generate_chat_completion`` response.
-
-    Returns:
-        ``None`` when ``response`` is a ``dict`` (success path); the
-        caller should proceed to read ``response['choices']``.
-
-        ``str`` describing the upstream failure for any other shape.
-        ``JSONResponse`` bodies are unwrapped to surface the provider's
-        error message; other ``Response`` subclasses (notably
-        ``PlainTextResponse`` returned by Open WebUI core when the
-        provider replies with non-JSON 400+ content) are reported with
-        their status code and a truncated body preview so the caller
-        can show the real cause to the parent loop.
-    """
-    if isinstance(response, dict):
-        return None
-    if isinstance(response, JSONResponse):
-        return _extract_json_response_error(response)
-    if isinstance(response, Response):
-        status = getattr(response, "status_code", "unknown")
-        body_text = _decode_response_body(response)
-        type_name = type(response).__name__
-        if body_text:
-            return f"API error (status {status}, {type_name}): {body_text}"
-        return f"API error (status {status}, {type_name}): empty body"
-    return f"Unexpected response type: {type(response).__name__}"
-
-# --- inlined from src/owui_ext/shared/event_emitter.py (owui_ext.shared.event_emitter) ---
-from typing import Any, Callable, Optional
-class EventEmitter:
-    def __init__(self, event_emitter: Optional[Callable[[dict], Any]] = None):
-        self.event_emitter = event_emitter
-
-    async def emit(
-        self,
-        description: str = "Unknown state",
-        status: str = "in_progress",
-        done: bool = False,
-    ) -> None:
-        if self.event_emitter:
-            await self.event_emitter(
-                {
-                    "type": "status",
-                    "data": {
-                        "status": status,
-                        "description": description,
-                        "done": done,
-                    },
-                }
-            )
-
 # --- inlined from src/owui_ext/shared/inlet_filters.py (owui_ext.shared.inlet_filters) ---
 import copy
 import inspect
@@ -136,6 +35,18 @@ from typing import Any
 from fastapi import Request
 from starlette.datastructures import State
 _inlet_filters_log = logging.getLogger("owui_ext.shared.inlet_filters")
+# The injected parameters Core's process_chat_payload gives filters.
+_CORE_FILTER_PARAMS = (
+    "__event_emitter__",
+    "__event_call__",
+    "__user__",
+    "__metadata__",
+    "__oauth_token__",
+    "__request__",
+    "__model__",
+    "__chat_id__",
+    "__message_id__",
+)
 
 
 async def _inlet_filters_maybe_await(value: Any) -> Any:
@@ -285,7 +196,12 @@ async def _apply_filter_pipeline(
 
         # Isolate __user__ so filter UserValves injection doesn't leak out
         # and pollute subsequent tool calls under a different tool id.
-        local_extra_params = dict(extra_params or {})
+        local_extra_params = {
+            key: value
+            for key, value in (extra_params or {}).items()
+            if key in _CORE_FILTER_PARAMS
+        }
+        local_extra_params["__request__"] = request
         local_extra_params["__model__"] = filter_pipeline["model"]
         if isinstance(local_extra_params.get("__user__"), dict):
             local_extra_params["__user__"] = dict(local_extra_params["__user__"])
@@ -332,23 +248,473 @@ async def finalize_model_request(
     )
 
 
-def isolate_request_state(request: Request, model_id: str) -> Request:
-    """Copy *request* with its own ``state`` for a completion by *model_id*.
+def isolate_request_state(request: Request, metadata: dict) -> Request:
+    """Copy *request* with its own ``state``, whose ``metadata`` is *metadata*.
 
     Core's ``generate_chat_completion`` writes per-call flags there, so
     concurrent nested completions sharing one request would race on them.
-    It also merges ``state.metadata`` over the payload metadata, so the
-    caller's ``model_id`` would otherwise reach the child's headers.
+    It also merges ``state.metadata`` over the payload metadata, as Core's
+    chat request shares one metadata dict between its body and its state.
     """
     scope = getattr(request, "scope", None)
     if not isinstance(scope, dict):
         return request
     state = dict(scope.get("state") or {})
-    state["metadata"] = {**(state.get("metadata") or {}), "model_id": model_id}
+    state["metadata"] = metadata
     isolated = copy.copy(request)
     isolated.scope = {**scope, "state": state}
     isolated._state = State(state)
     return isolated
+
+# --- inlined from src/owui_ext/shared/prompt_utils.py (owui_ext.shared.prompt_utils) ---
+import copy
+import inspect
+from typing import Iterable, Optional
+def merge_prompt_sections(*sections: Optional[str]) -> str:
+    """Join non-empty prompt sections with blank lines."""
+    merged_sections = []
+    for section in sections:
+        if not isinstance(section, str):
+            continue
+        stripped = section.strip()
+        if stripped:
+            merged_sections.append(stripped)
+    return "\n\n".join(merged_sections)
+
+
+def truncate_text(value: str, limit: int = 200) -> str:
+    if not value:
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
+def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
+    """Add terminal instructions and tool-server prompts to a request snapshot.
+
+    Open WebUI core injects these prompts AFTER inlet filters so they survive
+    filters that rewrite the system message.  We replicate the same ordering by
+    calling this helper after ``apply_inlet_filters_if_enabled``.
+    """
+    prompts: list[str] = []
+    terminal_prompt = (extra_params or {}).get("__terminal_system_prompt__")
+    if isinstance(terminal_prompt, str) and terminal_prompt.strip():
+        prompts.append(terminal_prompt)
+    direct_prompts = (extra_params or {}).get(
+        "__direct_tool_server_system_prompts__", []
+    )
+    if isinstance(direct_prompts, list):
+        prompts.extend(p for p in direct_prompts if isinstance(p, str) and p.strip())
+    agents_md = (extra_params or {}).get("__terminal_agents_md__")
+    if not isinstance(agents_md, str):
+        agents_md = ""
+    if not prompts and not agents_md:
+        return form_data
+    messages = list(form_data.get("messages", []))
+    combined = "\n\n".join(prompts)
+    if combined and messages and messages[0].get("role") == "system":
+        msg = {**messages[0]}
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            msg["content"] = [
+                (
+                    {**item, "text": f"{item['text']}\n{combined}"}
+                    if item.get("type") == "text"
+                    else item
+                )
+                for item in content
+            ]
+        else:
+            msg["content"] = f"{content}\n\n{combined}" if content else combined
+        messages[0] = msg
+    elif combined:
+        messages.insert(0, {"role": "system", "content": combined})
+    if agents_md and not any(
+        message.get("role") == "user" and message.get("content") == agents_md
+        for message in messages
+    ):
+        try:
+            from open_webui.utils.terminals import add_terminal_agents_md
+        except ImportError:
+            pass  # Older Core versions do not support terminal AGENTS.md.
+        else:
+            messages = add_terminal_agents_md(messages, agents_md)
+    form_data["messages"] = messages
+    return form_data
+
+
+async def model_custom_tools(filter_pipeline: dict) -> list:
+    """Return the model's custom ``tools`` param, which Core 0.12.3+ sends after the loaded tools."""
+    try:
+        from open_webui.models.config import Config
+        from open_webui.models.models import Models
+        from open_webui.utils.misc import merge_model_params
+        from open_webui.utils.payload import apply_params_to_form_data
+    except ImportError:
+        return []
+    model = filter_pipeline["model"]
+    model_info = (
+        None
+        if model.get("direct")
+        else await Models.get_model_by_id(filter_pipeline["model_id"])
+    )
+    params = merge_model_params(
+        copy.deepcopy(await Config.get("models.default_params", {}) or {}),
+        model_info.params.model_dump() if model_info and model_info.params else {},
+    )
+    tools = apply_params_to_form_data({}, model, params).get("tools")
+    return tools if isinstance(tools, list) else []
+
+
+def build_agent_tools_param(
+    tools_dict: dict, deferred_tools: set, custom_tools: list
+) -> Optional[list]:
+    tools_param = [
+        {"type": "function", "function": tool.get("spec", {})}
+        for name, tool in tools_dict.items()
+        if name not in deferred_tools
+    ]
+    return tools_param + custom_tools or None
+
+
+async def apply_agent_tool_search(
+    tools_dict: dict,
+    extra_params: dict,
+    always_loaded: Iterable[str] = (),
+    extra_tools: Iterable[dict] = (),
+) -> tuple[dict, dict, set]:
+    """Apply Core's Tool Search to one agent loop.
+
+    Returns the loop's tools (with ``search_tools``), extra_params carrying the
+    manifest, and the names to leave out of the request's ``tools``. The search
+    state lives in ``extra_params["__metadata__"]``, which must belong to this agent.
+    """
+    try:
+        from open_webui.utils.tool_search import SEARCH_TOOL_NAME, apply_tool_search
+    except ImportError:
+        return tools_dict, extra_params, set()
+
+    kept = {name: tools_dict[name] for name in always_loaded if name in tools_dict}
+    loop_tools = {name: tool for name, tool in tools_dict.items() if name not in kept}
+    metadata = extra_params.get("__metadata__")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    form_data: dict = {"messages": []}
+    if "extra_tools" in inspect.signature(apply_tool_search).parameters:
+        deferred = await apply_tool_search(
+            form_data, metadata, loop_tools, list(extra_tools)
+        )
+    elif any(
+        (tool.get("function") or tool).get("name") == SEARCH_TOOL_NAME
+        for tool in extra_tools
+    ):
+        return tools_dict, extra_params, set()
+    else:
+        deferred = await apply_tool_search(form_data, metadata, loop_tools)
+    if not deferred:
+        return tools_dict, extra_params, set()
+    metadata["tools"] = loop_tools
+    prompts = extra_params.get("__direct_tool_server_system_prompts__") or []
+    return (
+        {**loop_tools, **kept},
+        {
+            **extra_params,
+            "__metadata__": metadata,
+            "__direct_tool_server_system_prompts__": [
+                *prompts,
+                form_data["messages"][0]["content"],
+            ],
+        },
+        deferred,
+    )
+
+# --- inlined from src/owui_ext/shared/agent_requests.py (owui_ext.shared.agent_requests) ---
+def strip_tool_search_manifest(messages: list) -> list:
+    """Drop Core's Tool Search manifest from system messages, for requests sent without its tools."""
+    try:
+        from open_webui.utils.tool_search import strip_deferred_tools_manifest
+    except ImportError:
+        return messages
+
+    def without_manifest(message):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            return message
+        content = message.get("content")
+        if isinstance(content, str):
+            return {**message, "content": strip_deferred_tools_manifest(content)}
+        if isinstance(content, list):
+            return {
+                **message,
+                "content": [
+                    {**part, "text": strip_deferred_tools_manifest(part["text"])}
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    else part
+                    for part in content
+                ],
+            }
+        return message
+
+    return [without_manifest(message) for message in messages]
+
+
+TOOL_REQUEST_KEYS = (
+    "tools",
+    "tool_choice",
+    "functions",
+    "function_call",
+    "parallel_tool_calls",
+)
+
+
+def strip_tool_request_keys(body: dict) -> dict:
+    """Copy *body* without its tools, tool selection or Tool Search manifest."""
+    body = {key: value for key, value in body.items() if key not in TOOL_REQUEST_KEYS}
+    if isinstance(body.get("messages"), list):
+        body["messages"] = strip_tool_search_manifest(body["messages"])
+    return body
+
+
+def own_metadata(metadata: dict) -> dict:
+    """Copy inherited metadata so a nested request can change it without touching its parent."""
+    import copy
+
+    owned = {}
+    for key, value in metadata.items():
+        # Core keeps live objects (tool callables, MCP clients) in metadata.
+        if key in ("tools", "mcp_clients"):
+            owned[key] = dict(value) if isinstance(value, dict) else value
+            continue
+        try:
+            owned[key] = copy.deepcopy(value)
+        except Exception:
+            owned[key] = value
+    return owned
+
+
+class AgentRequests:
+    """One agent loop's requests, assembled the way Core assembles a chat request.
+
+    ``prepare`` runs the inlet filters once with only the model's custom tools in the
+    request, then Tool Search with the tools they left and the tool prompts. Every
+    request of the loop starts from that form and runs the request filters. Body,
+    ``__metadata__`` and request state share one dict, and ``chat_request`` carries
+    that state through the filters and every send.
+    """
+
+    def __init__(
+        self,
+        tools_dict: dict,
+        extra_params: dict,
+        custom_tools: list = (),
+        always_loaded=(),
+    ):
+        metadata = extra_params.get("__metadata__")
+        metadata = own_metadata(metadata) if isinstance(metadata, dict) else {}
+        extra_params = {**extra_params, "__metadata__": metadata}
+        self.tools_dict = tools_dict
+        self.extra_params = extra_params
+        self.metadata = metadata
+        self.custom_tools = list(custom_tools)
+        self.always_loaded = tuple(always_loaded)
+        self.base: dict = {}
+        self.chat_request = None
+
+    @property
+    def tools_param(self) -> list | None:
+        return self.base.get("tools")
+
+    async def prepare(self, filter_pipeline, request, form_data: dict) -> list:
+        """Run the loop's inlet filters once and return the messages the loop starts from."""
+        import copy
+
+        self.chat_request = isolate_request_state(request, self.metadata)
+        request = self.chat_request
+        filter_params = self._filter_params()
+        self.metadata.update(own_metadata(form_data.get("metadata") or {}))
+        form_data["metadata"] = self.metadata
+        if self.custom_tools:
+            form_data["tools"] = self.custom_tools
+        form_data = await apply_inlet_filters_if_enabled(
+            filter_pipeline, request, form_data, filter_params
+        )
+        form_data["metadata"] = self.metadata
+        self._sync_model_id(form_data)
+        filter_tools = form_data.get("tools") or []
+        (
+            self.tools_dict,
+            self.extra_params,
+            deferred,
+        ) = await apply_agent_tool_search(
+            self.tools_dict, self.extra_params, self.always_loaded, filter_tools
+        )
+        if not deferred:
+            if self.tools_dict:
+                self.metadata["tools"] = self.tools_dict
+            else:
+                self.metadata.pop("tools", None)
+        tools = build_agent_tools_param(self.tools_dict, deferred, filter_tools)
+        if tools:
+            form_data["tools"] = tools
+        else:
+            form_data.pop("tools", None)
+        form_data = _append_tool_server_prompts(form_data, self.extra_params)
+        self.base = {
+            key: value
+            for key, value in form_data.items()
+            if key not in ("messages", "metadata")
+        }
+        return copy.deepcopy(form_data["messages"])
+
+    async def next_form(
+        self,
+        filter_pipeline,
+        messages: list,
+        tools=...,
+    ) -> dict:
+        """Return the loop's next request; ``tools`` replaces the loop's tools when given."""
+        import copy
+
+        form_data = {
+            **copy.deepcopy(self.base),
+            "messages": messages,
+            "stream": False,
+            "metadata": self.metadata,
+        }
+        if tools is not ...:
+            choice = form_data.get("tool_choice")
+            parallel = form_data.get("parallel_tool_calls")
+            form_data = strip_tool_request_keys(form_data)
+            if tools:
+                form_data["tools"] = tools
+                if parallel is not None:
+                    form_data["parallel_tool_calls"] = parallel
+                names = {(tool.get("function") or {}).get("name") for tool in tools}
+                if isinstance(choice, str) or (
+                    isinstance(choice, dict)
+                    and ((choice.get("function") or {}).get("name") or choice.get("name"))
+                    in names
+                ):
+                    form_data["tool_choice"] = choice
+        form_data = await finalize_model_request(
+            filter_pipeline,
+            self.chat_request,
+            form_data,
+            self._filter_params(),
+        )
+        self._sync_model_id(form_data)
+        return form_data
+
+    def _filter_params(self) -> dict:
+        return {
+            **self.extra_params,
+            "__metadata__": self.metadata,
+        }
+
+    def _sync_model_id(self, form_data: dict) -> None:
+        if form_data.get("model"):
+            self.metadata["model_id"] = form_data["model"]
+
+# --- inlined from src/owui_ext/shared/completion_response.py (owui_ext.shared.completion_response) ---
+import json
+from typing import Any, Optional
+from starlette.responses import JSONResponse, Response
+_RESPONSE_BODY_PREVIEW_CHARS = 1024
+
+
+def _truncate_preview(text: str) -> str:
+    if len(text) > _RESPONSE_BODY_PREVIEW_CHARS:
+        return text[:_RESPONSE_BODY_PREVIEW_CHARS] + "...[truncated]"
+    return text
+
+
+def _decode_response_body(response: Response) -> str:
+    body = getattr(response, "body", None)
+    if body is None:
+        return ""
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            text = bytes(body).decode("utf-8", errors="replace")
+        except Exception:
+            text = repr(body)
+    else:
+        text = str(body)
+    return _truncate_preview(text.strip())
+
+
+def _extract_json_response_error(response: JSONResponse) -> str:
+    status = getattr(response, "status_code", "unknown")
+    try:
+        error_data = json.loads(bytes(response.body).decode("utf-8"))
+    except Exception:
+        return f"API error (status {status}): Failed to parse response"
+    if isinstance(error_data, dict):
+        error_field = error_data.get("error")
+        if isinstance(error_field, dict):
+            msg = error_field.get("message")
+            if isinstance(msg, str) and msg:
+                return f"API error: {_truncate_preview(msg)}"
+            return f"API error: {_truncate_preview(str(error_data))}"
+        if isinstance(error_field, str) and error_field:
+            return f"API error: {_truncate_preview(error_field)}"
+        msg = error_data.get("message")
+        if isinstance(msg, str) and msg:
+            return f"API error: {_truncate_preview(msg)}"
+        return f"API error: {_truncate_preview(str(error_data))}"
+    return f"API error: {_truncate_preview(str(error_data))}"
+
+
+def format_chat_completion_error(response: Any) -> Optional[str]:
+    """Classify a ``generate_chat_completion`` response.
+
+    Returns:
+        ``None`` when ``response`` is a ``dict`` (success path); the
+        caller should proceed to read ``response['choices']``.
+
+        ``str`` describing the upstream failure for any other shape.
+        ``JSONResponse`` bodies are unwrapped to surface the provider's
+        error message; other ``Response`` subclasses (notably
+        ``PlainTextResponse`` returned by Open WebUI core when the
+        provider replies with non-JSON 400+ content) are reported with
+        their status code and a truncated body preview so the caller
+        can show the real cause to the parent loop.
+    """
+    if isinstance(response, dict):
+        return None
+    if isinstance(response, JSONResponse):
+        return _extract_json_response_error(response)
+    if isinstance(response, Response):
+        status = getattr(response, "status_code", "unknown")
+        body_text = _decode_response_body(response)
+        type_name = type(response).__name__
+        if body_text:
+            return f"API error (status {status}, {type_name}): {body_text}"
+        return f"API error (status {status}, {type_name}): empty body"
+    return f"Unexpected response type: {type(response).__name__}"
+
+# --- inlined from src/owui_ext/shared/event_emitter.py (owui_ext.shared.event_emitter) ---
+from typing import Any, Callable, Optional
+class EventEmitter:
+    def __init__(self, event_emitter: Optional[Callable[[dict], Any]] = None):
+        self.event_emitter = event_emitter
+
+    async def emit(
+        self,
+        description: str = "Unknown state",
+        status: str = "in_progress",
+        done: bool = False,
+    ) -> None:
+        if self.event_emitter:
+            await self.event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "status": status,
+                        "description": description,
+                        "done": done,
+                    },
+                }
+            )
 
 # --- inlined from src/owui_ext/shared/mcp_tools.py (owui_ext.shared.mcp_tools) ---
 import asyncio
@@ -845,120 +1211,6 @@ def normalize_text(value: Optional[str]) -> str:
     if not value:
         return ""
     return str(value).strip()
-
-# --- inlined from src/owui_ext/shared/prompt_utils.py (owui_ext.shared.prompt_utils) ---
-from typing import Iterable, Optional
-def merge_prompt_sections(*sections: Optional[str]) -> str:
-    """Join non-empty prompt sections with blank lines."""
-    merged_sections = []
-    for section in sections:
-        if not isinstance(section, str):
-            continue
-        stripped = section.strip()
-        if stripped:
-            merged_sections.append(stripped)
-    return "\n\n".join(merged_sections)
-
-
-def truncate_text(value: str, limit: int = 200) -> str:
-    if not value:
-        return ""
-    if len(value) <= limit:
-        return value
-    return value[: limit - 3] + "..."
-
-
-def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
-    """Add terminal instructions and tool-server prompts to a request snapshot.
-
-    Open WebUI core injects these prompts AFTER inlet filters so they survive
-    filters that rewrite the system message.  We replicate the same ordering by
-    calling this helper after ``apply_inlet_filters_if_enabled``.
-    """
-    prompts: list[str] = []
-    terminal_prompt = (extra_params or {}).get("__terminal_system_prompt__")
-    if isinstance(terminal_prompt, str) and terminal_prompt.strip():
-        prompts.append(terminal_prompt)
-    direct_prompts = (extra_params or {}).get(
-        "__direct_tool_server_system_prompts__", []
-    )
-    if isinstance(direct_prompts, list):
-        prompts.extend(p for p in direct_prompts if isinstance(p, str) and p.strip())
-    agents_md = (extra_params or {}).get("__terminal_agents_md__")
-    if not isinstance(agents_md, str):
-        agents_md = ""
-    if not prompts and not agents_md:
-        return form_data
-    messages = list(form_data.get("messages", []))
-    combined = "\n\n".join(prompts)
-    if combined and messages and messages[0].get("role") == "system":
-        msg = {**messages[0]}
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            msg["content"] = [
-                (
-                    {**item, "text": f"{item['text']}\n{combined}"}
-                    if item.get("type") == "text"
-                    else item
-                )
-                for item in content
-            ]
-        else:
-            msg["content"] = f"{content}\n\n{combined}" if content else combined
-        messages[0] = msg
-    elif combined:
-        messages.insert(0, {"role": "system", "content": combined})
-    if agents_md and not any(
-        message.get("role") == "user" and message.get("content") == agents_md
-        for message in messages
-    ):
-        try:
-            from open_webui.utils.terminals import add_terminal_agents_md
-        except ImportError:
-            pass  # Older Core versions do not support terminal AGENTS.md.
-        else:
-            messages = add_terminal_agents_md(messages, agents_md)
-    form_data["messages"] = messages
-    return form_data
-
-
-async def apply_agent_tool_search(
-    tools_dict: dict, extra_params: dict, always_loaded: Iterable[str] = ()
-) -> tuple[dict, dict, set]:
-    """Apply Core's Tool Search to one agent loop.
-
-    Returns the loop's tools (with ``search_tools``), extra_params carrying the
-    manifest, and the names to leave out of the request's ``tools``. The search
-    state lives in ``extra_params["__metadata__"]``, which must belong to this agent.
-    """
-    try:
-        from open_webui.utils.tool_search import apply_tool_search
-    except ImportError:
-        return tools_dict, extra_params, set()
-
-    kept = {name: tools_dict[name] for name in always_loaded if name in tools_dict}
-    loop_tools = {name: tool for name, tool in tools_dict.items() if name not in kept}
-    metadata = extra_params.get("__metadata__")
-    if not isinstance(metadata, dict):
-        metadata = {}
-    form_data: dict = {"messages": []}
-    deferred = await apply_tool_search(form_data, metadata, loop_tools)
-    if not deferred:
-        return tools_dict, extra_params, set()
-    metadata["tools"] = loop_tools
-    prompts = extra_params.get("__direct_tool_server_system_prompts__") or []
-    return (
-        {**loop_tools, **kept},
-        {
-            **extra_params,
-            "__metadata__": metadata,
-            "__direct_tool_server_system_prompts__": [
-                *prompts,
-                form_data["messages"][0]["content"],
-            ],
-        },
-        deferred,
-    )
 
 # --- inlined from src/owui_ext/shared/skills.py (owui_ext.shared.skills) ---
 import copy
@@ -1522,18 +1774,22 @@ async def execute_tool_call(
                 # so tool-specific UserValves injected by get_tools() survive.
                 from open_webui.utils.tools import get_updated_tool_function
 
+                metadata = extra_params.get("__metadata__")
                 call_params = {
                     "__messages__": extra_params.get("__messages__", []),
-                    "__files__": extra_params.get("__files__", []),
+                    "__files__": (
+                        metadata.get("files")
+                        if isinstance(metadata, dict)
+                        else extra_params.get("__files__")
+                    )
+                    or [],
                     "__event_emitter__": extra_params.get("__event_emitter__"),
                     "__event_call__": extra_params.get("__event_call__"),
                 }
-                # Core builtins keep per-agent state (skill revisions, Tool
-                # Search) in metadata, while loaded tools are shared by agents.
-                if tool.get("type") == "builtin" and isinstance(
-                    extra_params.get("__metadata__"), dict
-                ):
-                    call_params["__metadata__"] = extra_params["__metadata__"]
+                # Loaded tools are shared by agents, while Core binds each
+                # chat's own metadata to its tools.
+                if isinstance(metadata, dict):
+                    call_params["__metadata__"] = metadata
                 tool_function = await _maybe_await(get_updated_tool_function(
                     function=tool_function,
                     extra_params=call_params,
@@ -2631,19 +2887,27 @@ async def run_agent_loop(
             extra_params.get("__metadata__", {}).get("filter_ids", []),
         )
 
-    final_extra_params = extra_params
-    tools_dict, extra_params, deferred_tools = await apply_agent_tool_search(
-        tools_dict or {}, extra_params
+    agent_requests = AgentRequests(
+        tools_dict or {}, extra_params, await model_custom_tools(filter_pipeline)
     )
-    tools_param = None
-    if tools_dict:
-        tools_param = [
-            {"type": "function", "function": tool.get("spec", {})}
-            for name, tool in tools_dict.items()
-            if name not in deferred_tools
-        ]
 
-    current_messages = drop_unloadable_skill_manifest(list(messages), tools_dict)
+    current_messages = drop_unloadable_skill_manifest(
+        list(messages), agent_requests.tools_dict
+    )
+    current_messages = await agent_requests.prepare(
+        filter_pipeline,
+        request,
+        {
+            "model": model_id,
+            "messages": copy.deepcopy(current_messages),
+            "stream": False,
+            "metadata": {
+                "task": "multi_model_council",
+                "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
+            },
+        },
+    )
+    tools_dict, extra_params = agent_requests.tools_dict, agent_requests.extra_params
     iteration = 0
 
     while iteration < max_iterations:
@@ -2664,34 +2928,15 @@ async def run_agent_loop(
         if iteration == max_iterations:
             iteration_info += " This is your FINAL tool call opportunity. Provide your final JSON response now."
 
-        messages_with_context = current_messages + [
-            {"role": "system", "content": iteration_info}
-        ]
-
-        form_data = {
-            "model": model_id,
-            "messages": copy.deepcopy(messages_with_context),
-            "stream": False,
-            "metadata": {
-                "task": "multi_model_council",
-                "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
-            },
-        }
-
-        if tools_param:
-            form_data["tools"] = tools_param
-
-        form_data = await apply_inlet_filters_if_enabled(
-            filter_pipeline, request, form_data, extra_params
-        )
-        form_data = _append_tool_server_prompts(form_data, extra_params)
-        form_data = await finalize_model_request(
-            filter_pipeline, request, form_data, extra_params
+        form_data = await agent_requests.next_form(
+            filter_pipeline,
+            copy.deepcopy(current_messages)
+            + [{"role": "system", "content": iteration_info}],
         )
 
         try:
             response = await generate_chat_completion(
-                request=isolate_request_state(request, form_data["model"]),
+                request=agent_requests.chat_request,
                 form_data=form_data,
                 user=user_obj,
                 bypass_filter=True,
@@ -2837,33 +3082,21 @@ async def run_agent_loop(
             }
         )
 
-    form_data = {
-        "model": model_id,
-        "messages": copy.deepcopy(current_messages)
+    form_data = await agent_requests.next_form(
+        filter_pipeline,
+        copy.deepcopy(current_messages)
         + [
             {
                 "role": "user",
                 "content": "Maximum tool iterations reached. Provide your final answer based on gathered information.",
             }
         ],
-        "stream": False,
-        "metadata": {
-            "task": "multi_model_council",
-            "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
-        },
-    }
-
-    form_data = await apply_inlet_filters_if_enabled(
-        filter_pipeline, request, form_data, final_extra_params
-    )
-    form_data = _append_tool_server_prompts(form_data, final_extra_params)
-    form_data = await finalize_model_request(
-        filter_pipeline, request, form_data, final_extra_params
+        tools=None,
     )
 
     try:
         response = await generate_chat_completion(
-            request=isolate_request_state(request, form_data["model"]),
+            request=agent_requests.chat_request,
             form_data=form_data,
             user=user_obj,
             bypass_filter=True,

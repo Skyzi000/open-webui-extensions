@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.25
+version: 0.1.26
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -16,21 +16,16 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
+from owui_ext.shared.agent_requests import AgentRequests
 from owui_ext.shared.completion_response import format_chat_completion_error
 from owui_ext.shared.event_emitter import EventEmitter
-from owui_ext.shared.inlet_filters import (
-    apply_inlet_filters_if_enabled,
-    finalize_model_request,
-    isolate_request_state,
-    resolve_model_filter_pipeline,
-)
+from owui_ext.shared.inlet_filters import resolve_model_filter_pipeline
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients
 from owui_ext.shared.models import extract_model_ids, get_available_models
 from owui_ext.shared.parsing import normalize_text, safe_json_loads
 from owui_ext.shared.prompt_utils import (
-    _append_tool_server_prompts,
-    apply_agent_tool_search,
     merge_prompt_sections,
+    model_custom_tools,
     truncate_text,
 )
 from owui_ext.shared.skills import (
@@ -215,19 +210,27 @@ async def run_agent_loop(
             extra_params.get("__metadata__", {}).get("filter_ids", []),
         )
 
-    final_extra_params = extra_params
-    tools_dict, extra_params, deferred_tools = await apply_agent_tool_search(
-        tools_dict or {}, extra_params
+    agent_requests = AgentRequests(
+        tools_dict or {}, extra_params, await model_custom_tools(filter_pipeline)
     )
-    tools_param = None
-    if tools_dict:
-        tools_param = [
-            {"type": "function", "function": tool.get("spec", {})}
-            for name, tool in tools_dict.items()
-            if name not in deferred_tools
-        ]
 
-    current_messages = drop_unloadable_skill_manifest(list(messages), tools_dict)
+    current_messages = drop_unloadable_skill_manifest(
+        list(messages), agent_requests.tools_dict
+    )
+    current_messages = await agent_requests.prepare(
+        filter_pipeline,
+        request,
+        {
+            "model": model_id,
+            "messages": copy.deepcopy(current_messages),
+            "stream": False,
+            "metadata": {
+                "task": "multi_model_council",
+                "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
+            },
+        },
+    )
+    tools_dict, extra_params = agent_requests.tools_dict, agent_requests.extra_params
     iteration = 0
 
     while iteration < max_iterations:
@@ -248,34 +251,15 @@ async def run_agent_loop(
         if iteration == max_iterations:
             iteration_info += " This is your FINAL tool call opportunity. Provide your final JSON response now."
 
-        messages_with_context = current_messages + [
-            {"role": "system", "content": iteration_info}
-        ]
-
-        form_data = {
-            "model": model_id,
-            "messages": copy.deepcopy(messages_with_context),
-            "stream": False,
-            "metadata": {
-                "task": "multi_model_council",
-                "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
-            },
-        }
-
-        if tools_param:
-            form_data["tools"] = tools_param
-
-        form_data = await apply_inlet_filters_if_enabled(
-            filter_pipeline, request, form_data, extra_params
-        )
-        form_data = _append_tool_server_prompts(form_data, extra_params)
-        form_data = await finalize_model_request(
-            filter_pipeline, request, form_data, extra_params
+        form_data = await agent_requests.next_form(
+            filter_pipeline,
+            copy.deepcopy(current_messages)
+            + [{"role": "system", "content": iteration_info}],
         )
 
         try:
             response = await generate_chat_completion(
-                request=isolate_request_state(request, form_data["model"]),
+                request=agent_requests.chat_request,
                 form_data=form_data,
                 user=user_obj,
                 bypass_filter=True,
@@ -421,33 +405,21 @@ async def run_agent_loop(
             }
         )
 
-    form_data = {
-        "model": model_id,
-        "messages": copy.deepcopy(current_messages)
+    form_data = await agent_requests.next_form(
+        filter_pipeline,
+        copy.deepcopy(current_messages)
         + [
             {
                 "role": "user",
                 "content": "Maximum tool iterations reached. Provide your final answer based on gathered information.",
             }
         ],
-        "stream": False,
-        "metadata": {
-            "task": "multi_model_council",
-            "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
-        },
-    }
-
-    form_data = await apply_inlet_filters_if_enabled(
-        filter_pipeline, request, form_data, final_extra_params
-    )
-    form_data = _append_tool_server_prompts(form_data, final_extra_params)
-    form_data = await finalize_model_request(
-        filter_pipeline, request, form_data, final_extra_params
+        tools=None,
     )
 
     try:
         response = await generate_chat_completion(
-            request=isolate_request_state(request, form_data["model"]),
+            request=agent_requests.chat_request,
             form_data=form_data,
             user=user_obj,
             bypass_filter=True,
