@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.26
+version: 0.1.27
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -16,7 +16,11 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
-from owui_ext.shared.agent_requests import AgentRequests
+from owui_ext.shared.agent_requests import (
+    AgentRequests,
+    core_chat_completion,
+    follow_core_session,
+)
 from owui_ext.shared.completion_response import format_chat_completion_error
 from owui_ext.shared.event_emitter import EventEmitter
 from owui_ext.shared.inlet_filters import resolve_model_filter_pipeline
@@ -24,12 +28,10 @@ from owui_ext.shared.mcp_tools import cleanup_mcp_clients
 from owui_ext.shared.models import extract_model_ids, get_available_models
 from owui_ext.shared.parsing import normalize_text, safe_json_loads
 from owui_ext.shared.prompt_utils import (
-    merge_prompt_sections,
     model_custom_tools,
     truncate_text,
 )
 from owui_ext.shared.skills import (
-    drop_unloadable_skill_manifest,
     extract_skill_ids,
     extract_skill_manifest,
     extract_user_skill_tags,
@@ -189,12 +191,13 @@ async def run_agent_loop(
     agent_name: str = "Agent",
     event_emitter: Optional[Callable] = None,
     filter_pipeline: Optional[dict] = None,
+    skills: list[str] = (),
 ) -> str:
     from open_webui.models.users import UserModel
-    from open_webui.utils.chat import generate_chat_completion
 
     if extra_params is None:
         extra_params = {}
+    generate_chat_completion = core_chat_completion(extra_params)
 
     # Prepare user object
     if isinstance(user, dict):
@@ -214,21 +217,19 @@ async def run_agent_loop(
         tools_dict or {}, extra_params, await model_custom_tools(filter_pipeline)
     )
 
-    current_messages = drop_unloadable_skill_manifest(
-        list(messages), agent_requests.tools_dict
-    )
     current_messages = await agent_requests.prepare(
         filter_pipeline,
         request,
         {
             "model": model_id,
-            "messages": copy.deepcopy(current_messages),
+            "messages": copy.deepcopy(list(messages)),
             "stream": False,
             "metadata": {
                 "task": "multi_model_council",
                 "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
             },
         },
+        skills,
     )
     tools_dict, extra_params = agent_requests.tools_dict, agent_requests.extra_params
     iteration = 0
@@ -535,12 +536,14 @@ class Tools:
         ENABLE_SKILLS_TOOLS: bool = Field(
             default=True,
             description=(
-                "Enable skill context for council members. When the parent "
-                "conversation has a <available_skills> manifest, the manifest "
-                "is appended to each member's system prompt and the skill reading "
-                "tools (view_skill, read_skill_file) are registered so members can "
-                "lazy-load skill contents. "
-                "User-selected <skill> tags are also inlined when present."
+                "Pass the parent conversation's skills to council members and "
+                "allow the skill reading tools (view_skill, read_skill_file, "
+                "grep_skill_files). Each member gets the parent's <skill> blocks "
+                "and <available_skills> list. A member whose model has no skill "
+                "tools gets the chat's skills inlined the way Open WebUI does for "
+                "such a model instead (Open WebUI 0.12.1+; older versions pass "
+                "only the <skill> blocks). When off, members get no skills or "
+                "skill tools."
             ),
         )
         ENABLE_SKILLS_WRITE_TOOLS: bool = Field(
@@ -839,7 +842,7 @@ CRITICAL RULES:
         extra_params = {
             "__user__": __user__,
             "__event_emitter__": __event_emitter__,
-            "__event_call__": __event_call__,
+            "__event_call__": follow_core_session(__event_call__, __metadata__),
             "__request__": request,
             "__model__": __model__,
             "__metadata__": metadata,
@@ -884,13 +887,7 @@ CRITICAL RULES:
         skills_enabled = bool(getattr(self.valves, "ENABLE_SKILLS_TOOLS", True))
         skill_manifest = extract_skill_manifest(__messages__) if skills_enabled else ""
         user_skill_tags = extract_user_skill_tags(__messages__) if skills_enabled else []
-
-        if skills_enabled and (user_skill_tags or skill_manifest):
-            base_system_prompt = merge_prompt_sections(
-                base_system_prompt,
-                *user_skill_tags,
-                skill_manifest,
-            )
+        parent_skills = [skill for skill in (*user_skill_tags, skill_manifest) if skill]
 
         await emitter.emit(
             description=f"Council Starting: {prop}",
@@ -959,6 +956,7 @@ CRITICAL RULES:
                 agent_name=member_model_id,
                 event_emitter=__event_emitter__,
                 filter_pipeline=filter_pipeline,
+                skills=parent_skills,
             )
 
             parsed = safe_json_loads(content)

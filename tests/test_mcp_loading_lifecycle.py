@@ -43,7 +43,7 @@ def mcp_lifecycle(monkeypatch):
             self.exit_stack = AsyncExitStack()
             self.exit_stack.enter_context(self.scope)
             self.exit_stack.push_async_callback(checkpoint, f"{url}:disconnect")
-            self.session = object()
+            self.client = object()
             self.instructions = state.instructions
             clients.append(self)
             await checkpoint(f"{url}:connect")

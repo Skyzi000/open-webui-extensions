@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.19
+version: 0.2.20
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -25,7 +25,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fastapi import Request
 from pydantic import BaseModel, Field
 
-from owui_ext.shared.agent_requests import AgentRequests, own_metadata
+from owui_ext.shared.agent_requests import (
+    AgentRequests,
+    core_chat_completion,
+    follow_core_session,
+    own_metadata,
+)
 from owui_ext.shared.completion_response import format_chat_completion_error
 from owui_ext.shared.event_emitter import EventEmitter
 from owui_ext.shared.inlet_filters import (
@@ -36,12 +41,8 @@ from owui_ext.shared.inlet_filters import (
 )
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients
 from owui_ext.shared.parsing import normalize_text, safe_json_loads
-from owui_ext.shared.prompt_utils import (
-    merge_prompt_sections,
-    model_custom_tools,
-)
+from owui_ext.shared.prompt_utils import model_custom_tools
 from owui_ext.shared.skills import (
-    drop_unloadable_skill_manifest,
     extract_skill_ids,
     extract_skill_manifest,
     extract_user_skill_tags,
@@ -215,7 +216,7 @@ async def generate_single_completion(
     extra_params: dict,
     apply_inlet_filters: bool,
 ) -> str:
-    from open_webui.utils.chat import generate_chat_completion
+    generate_chat_completion = core_chat_completion(extra_params)
 
     filter_pipeline = await resolve_model_filter_pipeline(
         apply_inlet_filters,
@@ -278,12 +279,13 @@ async def run_agent_loop(
     agent_name: str = "Agent",
     event_emitter: Optional[Callable] = None,
     filter_pipeline: Optional[dict] = None,
+    skills: list[str] = (),
 ) -> str:
     from open_webui.models.users import UserModel
-    from open_webui.utils.chat import generate_chat_completion
 
     if extra_params is None:
         extra_params = {}
+    generate_chat_completion = core_chat_completion(extra_params)
 
     # Prepare user object
     if isinstance(user, dict):
@@ -303,21 +305,19 @@ async def run_agent_loop(
         tools_dict or {}, extra_params, await model_custom_tools(filter_pipeline)
     )
 
-    current_messages = drop_unloadable_skill_manifest(
-        list(messages), agent_requests.tools_dict
-    )
     current_messages = await agent_requests.prepare(
         filter_pipeline,
         request,
         {
             "model": model_id,
-            "messages": copy.deepcopy(current_messages),
+            "messages": copy.deepcopy(list(messages)),
             "stream": False,
             "metadata": {
                 "task": "magi_agent",
                 "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
             },
         },
+        skills,
     )
     tools_dict, extra_params = agent_requests.tools_dict, agent_requests.extra_params
     iteration = 0
@@ -589,12 +589,14 @@ class Tools:
         ENABLE_SKILLS_TOOLS: bool = Field(
             default=True,
             description=(
-                "Enable skill context for MAGI agents. When the parent "
-                "conversation has a <available_skills> manifest, the manifest "
-                "is appended to each agent's system prompt and the skill reading "
-                "tools (view_skill, read_skill_file) are registered so agents can "
-                "lazy-load skill contents. "
-                "User-selected <skill> tags are also inlined when present."
+                "Pass the parent conversation's skills to MAGI agents and allow "
+                "the skill reading tools (view_skill, read_skill_file, "
+                "grep_skill_files). Each agent gets the parent's <skill> blocks "
+                "and <available_skills> list. An agent whose model has no skill "
+                "tools gets the chat's skills inlined the way Open WebUI does for "
+                "such a model instead (Open WebUI 0.12.1+; older versions pass "
+                "only the <skill> blocks). When off, agents get no skills or "
+                "skill tools."
             ),
         )
         ENABLE_SKILLS_WRITE_TOOLS: bool = Field(
@@ -744,7 +746,7 @@ class Tools:
         extra_params = {
             "__user__": __user__,
             "__event_emitter__": __event_emitter__,
-            "__event_call__": __event_call__,
+            "__event_call__": follow_core_session(__event_call__, __metadata__),
             "__request__": __request__,
             "__metadata__": __metadata__ or {},
             "__chat_id__": __chat_id__,
@@ -765,6 +767,7 @@ class Tools:
         skills_enabled = bool(getattr(self.valves, "ENABLE_SKILLS_TOOLS", True))
         skill_manifest = extract_skill_manifest(__messages__) if skills_enabled else ""
         user_skill_tags = extract_user_skill_tags(__messages__) if skills_enabled else []
+        parent_skills = [skill for skill in (*user_skill_tags, skill_manifest) if skill]
 
         roles = [
             ("MELCHIOR", "scientific/technical"),
@@ -832,20 +835,12 @@ class Tools:
                 option_b=opt_b,
                 include_sources=include_sources,
             )
-            if skills_enabled and (user_skill_tags or skill_manifest):
-                system_prompt = merge_prompt_sections(
-                    base_system_prompt,
-                    *user_skill_tags,
-                    skill_manifest,
-                )
-            else:
-                system_prompt = base_system_prompt
             content = await run_agent_loop(
                 request=__request__,
                 user=user,
                 model_id=model_id,
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": base_system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 tools_dict=tools_dict,
@@ -853,6 +848,7 @@ class Tools:
                 extra_params=agent_extra_params,
                 apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
                 filter_pipeline=filter_pipeline,
+                skills=parent_skills,
                 agent_name=role_name,
                 event_emitter=__event_emitter__,
             )

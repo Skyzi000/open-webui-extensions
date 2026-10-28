@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.6.6
+version: 0.6.7
 license: MIT
 required_open_webui_version: 0.9.6
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -35,7 +35,12 @@ from typing import Any, Callable, List, Literal, Optional, Type
 from fastapi import Request
 from pydantic import BaseModel, Field
 
-from owui_ext.shared.agent_requests import AgentRequests, strip_tool_request_keys
+from owui_ext.shared.agent_requests import (
+    AgentRequests,
+    core_chat_completion,
+    follow_core_session,
+    strip_tool_request_keys,
+)
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
 from owui_ext.shared.completion_response import format_chat_completion_error
@@ -93,7 +98,6 @@ from owui_ext.shared.tool_execution import (
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients, resolve_mcp_tools
 from owui_ext.shared.tool_loader import build_tools_dict
 from owui_ext.shared.skills import (
-    drop_unloadable_skill_manifest,
     extract_skill_ids,
     extract_skill_manifest,
     extract_user_skill_tags,
@@ -980,6 +984,7 @@ async def run_sub_agent_loop(
     compaction: Optional[LoopCompactionOptions] = None,
     large_results: Optional[LargeToolResultOptions] = None,
     filter_pipeline: Optional[dict] = None,
+    skills: list[str] = (),
 ) -> str:
     """Run the sub-agent tool loop until completion.
 
@@ -995,15 +1000,16 @@ async def run_sub_agent_loop(
         apply_inlet_filters: Whether to apply inlet filters (outlet filters are never applied)
         iteration_note_role: Role for the per-iteration meta note ("user" keeps the
             leading system message intact; "system" appends an extra system message)
+        skills: Skill tags and manifest inherited from the parent conversation
 
     Returns:
         Final text response from the sub-agent
     """
     from open_webui.models.users import UserModel
-    from open_webui.utils.chat import generate_chat_completion
 
     if extra_params is None:
         extra_params = {}
+    generate_chat_completion = core_chat_completion(extra_params)
 
     # Prepare user object
     if isinstance(user, dict):
@@ -1081,13 +1087,12 @@ async def run_sub_agent_loop(
 
     agent_requests = AgentRequests(loop_tools_dict, extra_params, custom_tools, always_loaded)
 
-    current_messages = drop_unloadable_skill_manifest(list(messages), tools_dict)
     current_messages = await agent_requests.prepare(
         filter_pipeline,
         request,
         {
             "model": model_id,
-            "messages": copy.deepcopy(current_messages),
+            "messages": copy.deepcopy(list(messages)),
             "stream": False,
             "metadata": {
                 "task": "sub_agent",
@@ -1095,6 +1100,7 @@ async def run_sub_agent_loop(
                 "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
             },
         },
+        skills,
     )
     run.preserved_message_count = len(current_messages)
     loop_tools_dict, extra_params = agent_requests.tools_dict, agent_requests.extra_params
@@ -1686,7 +1692,7 @@ class Tools:
         )
         ENABLE_SKILLS_TOOLS: bool = Field(
             default=True,
-            description="Enable skill reading tools (view_skill, read_skill_file). When enabled and the parent conversation has skills, the sub-agent can view skill contents.",
+            description="Pass the parent conversation's skills to the sub-agent and allow the skill reading tools (view_skill, read_skill_file, grep_skill_files). The sub-agent gets the parent's <skill> blocks and <available_skills> list. If its model has no skill tools, it gets the chat's skills inlined the way Open WebUI does for such a model instead (Open WebUI 0.12.1+; older versions pass only the <skill> blocks). When off, the sub-agent gets no skills or skill tools.",
         )
         ENABLE_SKILLS_WRITE_TOOLS: bool = Field(
             default=False,
@@ -1868,8 +1874,6 @@ RESPONSE REQUIREMENTS:
         user_valves = coerce_user_valves(raw_user_valves, self.UserValves)
 
         # Extract skills from parent conversation messages.
-        # Since v0.8.2, user-selected skills are injected as full <skill> tags,
-        # while model-attached skills appear in the <available_skills> manifest.
         # __messages__ is injected via get_tools/get_updated_tool_function.
         skill_manifest = extract_skill_manifest(__messages__)
         user_skill_tags = extract_user_skill_tags(__messages__)
@@ -1892,7 +1896,7 @@ RESPONSE REQUIREMENTS:
         common_extra_params = {
             "__user__": __user__,
             "__event_emitter__": __event_emitter__,
-            "__event_call__": __event_call__,
+            "__event_call__": follow_core_session(__event_call__, __metadata__),
             "__request__": __request__,
             "__metadata__": isolate_chat_context(__metadata__),
             "__chat_id__": __chat_id__,
@@ -1934,20 +1938,16 @@ RESPONSE REQUIREMENTS:
                 self_tool_id=__id__,
             )
 
-            # Register view_skill if model-attached skills manifest is available
             if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
                 await register_view_skill(tools_dict, __request__, common_extra_params)
 
-            # Build initial messages with skills context
-            prompt_sections: list[str] = [user_valves.SYSTEM_PROMPT]
+            parent_skills: list[str] = []
             if self.valves.ENABLE_SKILLS_TOOLS:
-                # User-selected skills: inject full content (v0.8.2+)
                 if user_skill_tags:
-                    prompt_sections.extend(user_skill_tags)
-                # Model-attached skills: inject manifest for lazy loading via view_skill
+                    parent_skills.extend(user_skill_tags)
                 if skill_manifest:
-                    prompt_sections.append(skill_manifest)
-            system_content = merge_prompt_sections(*prompt_sections)
+                    parent_skills.append(skill_manifest)
+            system_content = merge_prompt_sections(user_valves.SYSTEM_PROMPT)
 
             messages = [
                 {"role": "system", "content": system_content},
@@ -1979,6 +1979,7 @@ RESPONSE REQUIREMENTS:
                     extra_params=common_extra_params,
                     apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
                     filter_pipeline=filter_pipeline,
+                    skills=parent_skills,
                     iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                     compaction=LoopCompactionOptions(
                         enabled=self.valves.ENABLE_CONTEXT_COMPACTION,
@@ -2123,7 +2124,7 @@ RESPONSE REQUIREMENTS:
         common_extra_params = {
             "__user__": __user__,
             "__event_emitter__": __event_emitter__,
-            "__event_call__": __event_call__,
+            "__event_call__": follow_core_session(__event_call__, __metadata__),
             "__request__": __request__,
             "__metadata__": __metadata__ or {},
             "__chat_id__": __chat_id__,
@@ -2184,14 +2185,13 @@ RESPONSE REQUIREMENTS:
                 )
                 prepared_tasks.append((filter_pipeline, await ensure_tools(filter_pipeline)))
 
-            # Build system content with skills context
-            parallel_prompt_sections: list[str] = [user_valves.SYSTEM_PROMPT]
+            parent_skills: list[str] = []
             if self.valves.ENABLE_SKILLS_TOOLS:
                 if user_skill_tags:
-                    parallel_prompt_sections.extend(user_skill_tags)
+                    parent_skills.extend(user_skill_tags)
                 if skill_manifest:
-                    parallel_prompt_sections.append(skill_manifest)
-            parallel_system_content = merge_prompt_sections(*parallel_prompt_sections)
+                    parent_skills.append(skill_manifest)
+            parallel_system_content = merge_prompt_sections(user_valves.SYSTEM_PROMPT)
             if __event_emitter__:
                 await __event_emitter__(
                     {
@@ -2254,6 +2254,7 @@ RESPONSE REQUIREMENTS:
                         extra_params=extra_params,
                         apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
                         filter_pipeline=filter_pipeline,
+                        skills=parent_skills,
                         iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                         compaction=LoopCompactionOptions(
                             enabled=self.valves.ENABLE_CONTEXT_COMPACTION,

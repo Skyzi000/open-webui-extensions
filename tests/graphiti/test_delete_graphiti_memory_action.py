@@ -329,6 +329,45 @@ class TestActionMethod:
         # Then: episode was NOT deleted
         action.graphiti.remove_episode.assert_not_called()
 
+    async def test_should_not_delete_when_core_reports_the_dialog_session_gone(
+        self, action, user, event_emitter, monkeypatch
+    ):
+        from open_webui.socket import main as socket
+
+        # Given: Open WebUI's real event caller for a browser session that is gone
+        monkeypatch.setattr(socket, "SESSION_POOL", {})
+        event_call = await socket.get_event_call(
+            {"session_id": "gone", "user_id": "test-user-id", "chat_id": "chat1", "message_id": "msg"}
+        )
+        message_id = "msg-gone-1"
+        body = {
+            "messages": [
+                {"role": "user", "content": "Hello", "id": message_id},
+                {"role": "assistant", "content": "Hi there"},
+            ],
+        }
+        record = {
+            "uuid": "ep-gone-1",
+            "name": "test_episode",
+            "group_id": "test-user-id",
+            "source_description": f"20250101T000000Z_Chat_chat1_message_{message_id}",
+            "content": "Hello world content",
+            "source": "message",
+            "created_at": "2025-01-01T00:00:00Z",
+            "valid_at": "2025-01-01T00:00:00Z",
+            "entity_edges": [],
+        }
+        action.graphiti.driver.execute_query.return_value = ([record], None, None)
+        action.graphiti.remove_episode = AsyncMock()
+
+        # When
+        await action.action(body, __user__=user, __event_emitter__=event_emitter, __event_call__=event_call)
+
+        # Then: the error reply is not an approval
+        action.graphiti.remove_episode.assert_not_called()
+        statuses = [call.args[0]["data"]["description"] for call in event_emitter.call_args_list]
+        assert any("Client session disconnected." in status for status in statuses)
+
     async def test_should_extract_id_from_clicked_user_message(self, action, user, event_emitter, event_call):
         # Given: clicked message is a user message
         body = {

@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.13
+version: 0.5.14
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -20,7 +20,11 @@ from typing import Any, Callable, Literal, Optional, Type
 from fastapi import Request
 from pydantic import BaseModel, Field
 
-from owui_ext.shared.agent_requests import AgentRequests
+from owui_ext.shared.agent_requests import (
+    AgentRequests,
+    core_chat_completion,
+    follow_core_session,
+)
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
 from owui_ext.shared.completion_response import format_chat_completion_error
@@ -46,7 +50,6 @@ from owui_ext.shared.tool_execution import (
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients, resolve_mcp_tools
 from owui_ext.shared.models import extract_model_ids, get_available_models
 from owui_ext.shared.skills import (
-    drop_unloadable_skill_manifest,
     extract_skill_ids,
     extract_skill_manifest,
     extract_user_skill_tags,
@@ -2913,6 +2916,7 @@ async def run_agent_loop(
     submission_tool_names: Optional[set[str]] = None,
     filter_pipeline: Optional[dict] = None,
     send_model_custom_tools: bool = True,
+    skills: list[str] = (),
 ) -> str:
     """Run the LLM Review agent tool loop until completion.
 
@@ -2927,10 +2931,10 @@ async def run_agent_loop(
     submission with additional text or tool calls.
     """
     from open_webui.models.users import UserModel
-    from open_webui.utils.chat import generate_chat_completion
 
     if extra_params is None:
         extra_params = {}
+    generate_chat_completion = core_chat_completion(extra_params)
 
     # Prepare user object
     if isinstance(user, dict):
@@ -2953,15 +2957,12 @@ async def run_agent_loop(
         tools_dict or {}, extra_params, custom_tools, submission_tool_names or ()
     )
 
-    current_messages = drop_unloadable_skill_manifest(
-        list(messages), agent_requests.tools_dict
-    )
     current_messages = await agent_requests.prepare(
         filter_pipeline,
         request,
         {
             "model": model_id,
-            "messages": copy.deepcopy(current_messages),
+            "messages": copy.deepcopy(list(messages)),
             "stream": False,
             "metadata": {
                 "task": "llm_review",
@@ -2969,6 +2970,7 @@ async def run_agent_loop(
                 "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
             },
         },
+        skills,
     )
     tools_dict = agent_requests.tools_dict
     extra_params = {**extra_params, "__metadata__": agent_requests.metadata}
@@ -3537,8 +3539,8 @@ class Tools:
             description="Maximum tool-call iterations per agent during compose/revise phases.",
         )
         REVIEW_MAX_ITERATIONS: int = Field(
-            default=2,
-            description="Maximum iterations for the review (no-tool) phase.",
+            default=10,
+            description="Maximum iterations for the review phase, whose only tools are submit_review and the skill reading tools.",
         )
         AVAILABLE_TOOL_IDS: str = Field(
             default="",
@@ -3645,7 +3647,7 @@ class Tools:
         )
         ENABLE_SKILLS_TOOLS: bool = Field(
             default=True,
-            description="Enable skill reading tools (view_skill, read_skill_file). When enabled and the parent conversation has skills, review agents can view skill contents.",
+            description="Pass the parent conversation's skills to review agents and allow the skill reading tools (view_skill, read_skill_file, grep_skill_files). Each agent gets the parent's <skill> blocks and <available_skills> list. An agent whose model has no skill tools gets the chat's skills inlined the way Open WebUI does for such a model instead (Open WebUI 0.12.1+; older versions pass only the <skill> blocks). When off, agents get no skills or skill tools.",
         )
         ENABLE_SKILLS_WRITE_TOOLS: bool = Field(
             default=False,
@@ -4014,19 +4016,16 @@ CRITICAL RULES:
         )
 
         # Extract skills from parent conversation messages.
-        # Since v0.8.2, user-selected skills are injected as full <skill> tags,
-        # while model-attached skills appear in the <available_skills> manifest.
-        # Matches sub_agent's injection order: SYSTEM_PROMPT, user tags, manifest.
         skill_manifest = extract_skill_manifest(__messages__)
         user_skill_tags = extract_user_skill_tags(__messages__)
 
-        prompt_sections: list[str] = [str(user_valves.SYSTEM_PROMPT)]
+        parent_skills: list[str] = []
         if bool(getattr(self.valves, "ENABLE_SKILLS_TOOLS", True)):
             if user_skill_tags:
-                prompt_sections.extend(user_skill_tags)
+                parent_skills.extend(user_skill_tags)
             if skill_manifest:
-                prompt_sections.append(skill_manifest)
-        base_system_prompt = merge_prompt_sections(*prompt_sections)
+                parent_skills.append(skill_manifest)
+        base_system_prompt = merge_prompt_sections(str(user_valves.SYSTEM_PROMPT))
 
         topic_text = normalize_text(topic)
         requirements_text = normalize_text(requirements)
@@ -4199,7 +4198,7 @@ CRITICAL RULES:
             # RICH_PROGRESS is on, raw otherwise) so any downstream tool that
             # emits `embeds` also keeps our progress shell at index 0.
             "__event_emitter__": emitter.event_emitter,
-            "__event_call__": __event_call__,
+            "__event_call__": follow_core_session(__event_call__, __metadata__),
             "__request__": request,
             "__model__": __model__,
             "__metadata__": metadata,
@@ -4493,6 +4492,7 @@ CRITICAL RULES:
                         iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                         submission_tool_names={"submit_draft"},
                         filter_pipeline=filter_pipeline,
+                        skills=parent_skills,
                     )
 
                     # Strict tool-call contract: the only authoritative
@@ -4664,7 +4664,7 @@ CRITICAL RULES:
                     try:
                         if isinstance(prepared, Exception):
                             raise prepared
-                        filter_pipeline, _, member_extra_params = prepared
+                        filter_pipeline, tools_dict, member_extra_params = prepared
 
                         system_prompt = build_review_system_prompt(
                             base_system_prompt,
@@ -4675,12 +4675,14 @@ CRITICAL RULES:
                             topic_text, author_persona["name"], author_draft
                         )
 
-                        # Reviewers use only the submit_review pseudo-tool —
-                        # they do not need research tools, and locking them
-                        # to the submission channel matches compose/revise's
-                        # escape-free tool-call contract.
                         review_capture: dict = {"payload": None}
                         review_tools = {
+                            **{
+                                name: tool
+                                for name, tool in tools_dict.items()
+                                if name in BUILTIN_TOOL_CATEGORIES["skills"]
+                                and tool.get("type") == "builtin"
+                            },
                             "submit_review": make_submission_tool(
                                 spec=build_submit_review_spec(),
                                 capture=review_capture,
@@ -4707,6 +4709,7 @@ CRITICAL RULES:
                             iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                             submission_tool_names={"submit_review"},
                             filter_pipeline=filter_pipeline,
+                            skills=parent_skills,
                             send_model_custom_tools=False,
                         )
 
@@ -4846,6 +4849,7 @@ CRITICAL RULES:
                             iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                             submission_tool_names={"submit_draft"},
                             filter_pipeline=filter_pipeline,
+                            skills=parent_skills,
                         )
 
                         # Strict tool-call contract — same rationale as

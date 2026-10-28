@@ -10,6 +10,7 @@ from owui_ext.shared.prompt_utils import (
     apply_agent_tool_search,
     build_agent_tools_param,
 )
+from owui_ext.shared.skills import add_skills
 
 
 def strip_tool_search_manifest(messages: list) -> list:
@@ -57,6 +58,51 @@ def strip_tool_request_keys(body: dict) -> dict:
     return body
 
 
+def follow_core_session(event_call, core_metadata):
+    """Return *event_call* sending with the browser session Core holds in *core_metadata*.
+
+    Core 0.12.4+ points its chat metadata at the browser's new session when it
+    reconnects during an input request; nested agents send from their own copies.
+    """
+    if (
+        not callable(event_call)
+        or not isinstance(core_metadata, dict)
+        or isinstance(getattr(event_call, "core_metadata", None), dict)
+    ):
+        return event_call
+
+    async def call(event_data):
+        data = event_data.get("data") if isinstance(event_data, dict) else None
+        # Core resumes an input request only when its data has no session_id.
+        if isinstance(data, dict) and "session_id" in data:
+            event_data = {**event_data, "data": {**data, "session_id": core_metadata.get("session_id")}}
+        return await event_call(event_data)
+
+    call.core_metadata = core_metadata
+    return call
+
+
+def core_chat_completion(extra_params: dict):
+    """Core's ``generate_chat_completion``, sent with the browser session Core holds now.
+
+    Core calls a direct connection model through the session in the request's metadata.
+    """
+    from open_webui.utils.chat import generate_chat_completion
+
+    core_metadata = getattr((extra_params or {}).get("__event_call__"), "core_metadata", None)
+    if not isinstance(core_metadata, dict):
+        return generate_chat_completion
+
+    async def send(request, form_data, *args, **kwargs):
+        state = getattr(request, "state", None)
+        for metadata in (form_data.get("metadata"), getattr(state, "metadata", None)):
+            if isinstance(metadata, dict) and "session_id" in metadata:
+                metadata["session_id"] = core_metadata.get("session_id")
+        return await generate_chat_completion(request, form_data, *args, **kwargs)
+
+    return send
+
+
 def own_metadata(metadata: dict) -> dict:
     """Copy inherited metadata so a nested request can change it without touching its parent."""
     import copy
@@ -77,8 +123,9 @@ def own_metadata(metadata: dict) -> dict:
 class AgentRequests:
     """One agent loop's requests, assembled the way Core assembles a chat request.
 
-    ``prepare`` runs the inlet filters once with only the model's custom tools in the
-    request, then Tool Search with the tools they left and the tool prompts. Every
+    ``prepare`` runs the inlet filters once with only the model's custom tools and no
+    skills in the request, then adds the skills, Tool Search with the tools the filters
+    left, and the tool prompts. Every
     request of the loop starts from that form and runs the request filters. Body,
     ``__metadata__`` and request state share one dict, and ``chat_request`` carries
     that state through the filters and every send.
@@ -106,8 +153,8 @@ class AgentRequests:
     def tools_param(self) -> list | None:
         return self.base.get("tools")
 
-    async def prepare(self, filter_pipeline, request, form_data: dict) -> list:
-        """Run the loop's inlet filters once and return the messages the loop starts from."""
+    async def prepare(self, filter_pipeline, request, form_data: dict, skills: list[str] = ()) -> list:
+        """Run the loop's inlet filters once, add the parent's *skills*, and return the messages the loop starts from."""
         import copy
 
         self.chat_request = isolate_request_state(request, self.metadata)
@@ -121,6 +168,9 @@ class AgentRequests:
             filter_pipeline, request, form_data, filter_params
         )
         form_data["metadata"] = self.metadata
+        form_data["messages"] = await add_skills(
+            form_data["messages"], list(skills), self.tools_dict, request, self.extra_params
+        )
         self._sync_model_id(form_data)
         filter_tools = form_data.get("tools") or []
         (

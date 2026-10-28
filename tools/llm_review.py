@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.13
+version: 0.5.14
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -428,6 +428,298 @@ async def apply_agent_tool_search(
         deferred,
     )
 
+# --- inlined from src/owui_ext/shared/skills.py (owui_ext.shared.skills) ---
+import copy
+import logging
+import re
+from typing import Any, Optional
+from urllib.parse import quote
+from fastapi import Request
+_skills_log = logging.getLogger("owui_ext.shared.skills")
+
+_SKILL_READ_TOOLS = ("view_skill", "read_skill_file", "grep_skill_files")
+_SKILLS_MANIFEST_START = "<available_skills>"
+_SKILLS_MANIFEST_END = "</available_skills>"
+_SKILL_TAG_PATTERN = re.compile(
+    r"<skill [^\n]*?name=.*?>\n.*?\n</skill>", re.DOTALL
+)
+
+
+async def _skills_maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _find_manifest_in_text(text: str) -> str:
+    """Return the <available_skills>…</available_skills> substring, or ""."""
+    start = text.find(_SKILLS_MANIFEST_START)
+    if start == -1:
+        return ""
+    end = text.find(_SKILLS_MANIFEST_END, start)
+    if end == -1:
+        return ""
+    return text[start : end + len(_SKILLS_MANIFEST_END)]
+
+
+def _find_skill_tags_in_text(text: str) -> list[str]:
+    """Return all ``<skill ... name="...">…</skill>`` blocks found in *text*."""
+    return _SKILL_TAG_PATTERN.findall(text)
+
+
+def _extract_from_system_messages(
+    messages: Optional[list],
+    extractor,
+):
+    """Walk system messages and apply *extractor* to each text chunk.
+
+    ``extractor`` is called with a single ``str`` argument and should return a
+    list of results (or a single truthy result).  The function handles both
+    plain-string content and list-of-parts content
+    (``[{"type": "text", "text": "..."}]``).
+    """
+    results: list = []
+    if not messages:
+        return results
+    for msg in messages:
+        if msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            found = extractor(content)
+            if found:
+                results.append(found) if isinstance(found, str) else results.extend(
+                    found
+                )
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    found = extractor(part.get("text") or "")
+                    if found:
+                        results.append(found) if isinstance(
+                            found, str
+                        ) else results.extend(found)
+    return results
+
+
+def extract_skill_manifest(messages: Optional[list]) -> str:
+    """Extract the ``<available_skills>`` manifest from the parent
+    conversation's system messages.
+
+    Core can list model-attached, accessible workspace, and terminal skills.
+    Inline skills may also appear as ``<skill>`` tags
+    (see :func:`extract_user_skill_tags`).
+
+    Args:
+        messages: The parent conversation messages (``__messages__``).
+
+    Returns:
+        The manifest XML string, or empty string if not found.
+    """
+    results = _extract_from_system_messages(messages, _find_manifest_in_text)
+    return results[0] if results else ""
+
+
+def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
+    """Extract ``<skill name="...">content</skill>`` tags from the parent
+    conversation's system messages.
+
+    Args:
+        messages: The parent conversation messages (``__messages__``).
+
+    Returns:
+        A list of ``<skill …>…</skill>`` strings, possibly empty.
+    """
+    return _extract_from_system_messages(messages, _find_skill_tags_in_text)
+
+
+def extract_skill_ids(messages: Optional[list]) -> list[str]:
+    """Return the IDs of the skills the parent lists or inlines, as Core's ``__skill_ids__``."""
+    ids = set(re.findall(r"<id>(.*?)</id>", extract_skill_manifest(messages)))
+    for tag in extract_user_skill_tags(messages):
+        match = re.match(r'<skill (?:id="([^"]+)"|name="([^"]*)")', tag)
+        if match:
+            # Core inlines terminal skills without an id attribute.
+            ids.add(match.group(1) or f'terminal:{quote(match.group(2), safe="")}')
+    return sorted(ids)
+
+
+async def _core_inline_skill_tags(
+    skill_ids: list[str], request: Request, extra_params: dict
+) -> Optional[list[str]]:
+    """Render *skill_ids* as Core inlines them for a model without skill tools; None if Core cannot."""
+    try:
+        from fastapi import HTTPException
+        from open_webui.models.skills import Skills, get_skill_snapshot
+        from open_webui.utils.skill_files import format_skill_content, skill_overview
+        from open_webui.utils.terminals import (
+            format_terminal_skill_context,
+            get_terminal_skill,
+        )
+    except ImportError:
+        return None
+    from urllib.parse import unquote
+
+    user = extra_params.get("__user__") or {}
+    metadata = extra_params.get("__metadata__") or {}
+    context = metadata.get("chat_context") or {}
+    metadata["chat_context"] = context
+    skill_versions = context.setdefault("skill_versions", {})
+    db_ids = [sid for sid in skill_ids if not sid.startswith("terminal:")]
+    skills = (
+        {skill.id: skill for skill in await Skills.get_skills(user_id=user.get("id"), ids=db_ids)}
+        if db_ids
+        else {}
+    )
+    tags = []
+    for sid in db_ids:
+        skill = skills.get(sid)
+        if not skill or not skill.is_active:
+            continue
+        version_id = skill_versions.get(sid) or skill.version_id
+        try:
+            snapshot = await get_skill_snapshot(skill, version_id)
+        except HTTPException as error:
+            if error.status_code != 404:
+                raise
+            continue
+        skill_versions[sid] = version_id
+        # Core 0.12.1 and 0.12.2 define skill_overview synchronously.
+        overview = await _skills_maybe_await(
+            skill_overview(
+                snapshot["content"],
+                [f["path"] for f in snapshot["data"]["files"] if f["path"] != "SKILL.md"],
+                tools_enabled=False,
+            )
+        )
+        hint = (
+            "\nSupporting files require a model with skill tools enabled."
+            if overview.get("files")
+            else ""
+        )
+        if overview.get("notice"):
+            hint += "\n" + overview["notice"]
+        tags.append(
+            f'<skill id="{skill.id}" name="{skill.name}">\n'
+            f"{format_skill_content(overview, skill.id, False)}{hint}\n</skill>"
+        )
+    if metadata.get("terminal_id"):
+        for sid in skill_ids:
+            if not sid.startswith("terminal:"):
+                continue
+            loaded = await get_terminal_skill(
+                request,
+                user,
+                metadata,
+                unquote(sid.removeprefix("terminal:")),
+                extra_params,
+                overview=True,
+                tools_enabled=False,
+            )
+            if loaded:
+                tags.append(format_terminal_skill_context(loaded, sid, False))
+    return tags
+
+
+async def add_skills(
+    messages: list,
+    skills: list[str],
+    tools_dict: Optional[dict],
+    request: Request,
+    extra_params: dict,
+) -> list:
+    """Append the parent's *skills* to the system message, as Core adds them after the inlet filters.
+
+    A child without Core's skill reading tools gets the chat's skills (``metadata["skill_ids"]``) as Core inlines
+    them for a model without skill tools. When Core cannot render them, it keeps the parent's skills and drops
+    the ``<available_skills>`` list unless a ``view_skill`` tool can load it.
+    """
+    if not skills:
+        return messages
+    tools_dict = tools_dict or {}
+    if not any(tools_dict.get(name, {}).get("type") == "builtin" for name in _SKILL_READ_TOOLS):
+        skill_ids = (extra_params.get("__metadata__") or {}).get("skill_ids") or []
+        rendered = await _core_inline_skill_tags(skill_ids, request, extra_params)
+        if rendered is not None:
+            skills = rendered
+        elif "view_skill" not in tools_dict:
+            skills = [skill for skill in skills if not skill.startswith(_SKILLS_MANIFEST_START)]
+    from open_webui.utils.misc import add_or_update_system_message
+
+    for skill in skills:
+        messages = add_or_update_system_message(skill, messages, append=True)
+    return messages
+
+
+def isolate_chat_context(metadata: Optional[dict]) -> dict:
+    """Copy *metadata* with its own ``chat_context``, as Core does for sub-agent runs."""
+    metadata = metadata or {}
+    return {
+        **metadata,
+        "chat_context": copy.deepcopy(metadata.get("chat_context") or {}),
+    }
+
+
+async def register_view_skill(
+    tools_dict: dict,
+    request: Request,
+    extra_params: dict,
+) -> None:
+    """Manually register the view_skill builtin tool in tools_dict.
+
+    This is needed for available skills whose content is not injected
+    inline. The agent loop can call ``view_skill`` to lazily load their
+    content from the ``<available_skills>`` manifest.
+
+    Skills already supplied as full ``<skill>`` tags do not require
+    ``view_skill``; they are passed directly in the system message.
+
+    Args:
+        tools_dict: The tools dict to add view_skill to (modified in-place).
+        request: FastAPI request object.
+        extra_params: Extra parameters for tool binding.
+    """
+    if "view_skill" in tools_dict:
+        return
+
+    try:
+        from open_webui.tools import builtin
+
+        # Core 0.12.0+ registers skill tools in get_builtin_tools per model.
+        if hasattr(builtin, "read_skill_file"):
+            return
+        view_skill = builtin.view_skill
+        from open_webui.utils.tools import (
+            get_async_tool_function_and_apply_extra_params,
+            convert_function_to_pydantic_model,
+            convert_pydantic_model_to_openai_function_spec,
+        )
+
+        callable_fn = await _skills_maybe_await(get_async_tool_function_and_apply_extra_params(
+            view_skill,
+            {
+                "__request__": request,
+                "__user__": extra_params.get("__user__", {}),
+                "__event_emitter__": extra_params.get("__event_emitter__"),
+                "__event_call__": extra_params.get("__event_call__"),
+                "__metadata__": extra_params.get("__metadata__"),
+                "__chat_id__": extra_params.get("__chat_id__"),
+                "__message_id__": extra_params.get("__message_id__"),
+            },
+        ))
+
+        pydantic_model = convert_function_to_pydantic_model(view_skill)
+        spec = convert_pydantic_model_to_openai_function_spec(pydantic_model)
+
+        tools_dict["view_skill"] = {
+            "tool_id": "builtin:view_skill",
+            "callable": callable_fn,
+            "spec": spec,
+            "type": "builtin",
+        }
+    except Exception as e:
+        _skills_log.warning(f"Failed to register view_skill: {e}")
+
 # --- inlined from src/owui_ext/shared/agent_requests.py (owui_ext.shared.agent_requests) ---
 def strip_tool_search_manifest(messages: list) -> list:
     """Drop Core's Tool Search manifest from system messages, for requests sent without its tools."""
@@ -474,6 +766,51 @@ def strip_tool_request_keys(body: dict) -> dict:
     return body
 
 
+def follow_core_session(event_call, core_metadata):
+    """Return *event_call* sending with the browser session Core holds in *core_metadata*.
+
+    Core 0.12.4+ points its chat metadata at the browser's new session when it
+    reconnects during an input request; nested agents send from their own copies.
+    """
+    if (
+        not callable(event_call)
+        or not isinstance(core_metadata, dict)
+        or isinstance(getattr(event_call, "core_metadata", None), dict)
+    ):
+        return event_call
+
+    async def call(event_data):
+        data = event_data.get("data") if isinstance(event_data, dict) else None
+        # Core resumes an input request only when its data has no session_id.
+        if isinstance(data, dict) and "session_id" in data:
+            event_data = {**event_data, "data": {**data, "session_id": core_metadata.get("session_id")}}
+        return await event_call(event_data)
+
+    call.core_metadata = core_metadata
+    return call
+
+
+def core_chat_completion(extra_params: dict):
+    """Core's ``generate_chat_completion``, sent with the browser session Core holds now.
+
+    Core calls a direct connection model through the session in the request's metadata.
+    """
+    from open_webui.utils.chat import generate_chat_completion
+
+    core_metadata = getattr((extra_params or {}).get("__event_call__"), "core_metadata", None)
+    if not isinstance(core_metadata, dict):
+        return generate_chat_completion
+
+    async def send(request, form_data, *args, **kwargs):
+        state = getattr(request, "state", None)
+        for metadata in (form_data.get("metadata"), getattr(state, "metadata", None)):
+            if isinstance(metadata, dict) and "session_id" in metadata:
+                metadata["session_id"] = core_metadata.get("session_id")
+        return await generate_chat_completion(request, form_data, *args, **kwargs)
+
+    return send
+
+
 def own_metadata(metadata: dict) -> dict:
     """Copy inherited metadata so a nested request can change it without touching its parent."""
     import copy
@@ -494,8 +831,9 @@ def own_metadata(metadata: dict) -> dict:
 class AgentRequests:
     """One agent loop's requests, assembled the way Core assembles a chat request.
 
-    ``prepare`` runs the inlet filters once with only the model's custom tools in the
-    request, then Tool Search with the tools they left and the tool prompts. Every
+    ``prepare`` runs the inlet filters once with only the model's custom tools and no
+    skills in the request, then adds the skills, Tool Search with the tools the filters
+    left, and the tool prompts. Every
     request of the loop starts from that form and runs the request filters. Body,
     ``__metadata__`` and request state share one dict, and ``chat_request`` carries
     that state through the filters and every send.
@@ -523,8 +861,8 @@ class AgentRequests:
     def tools_param(self) -> list | None:
         return self.base.get("tools")
 
-    async def prepare(self, filter_pipeline, request, form_data: dict) -> list:
-        """Run the loop's inlet filters once and return the messages the loop starts from."""
+    async def prepare(self, filter_pipeline, request, form_data: dict, skills: list[str] = ()) -> list:
+        """Run the loop's inlet filters once, add the parent's *skills*, and return the messages the loop starts from."""
         import copy
 
         self.chat_request = isolate_request_state(request, self.metadata)
@@ -538,6 +876,9 @@ class AgentRequests:
             filter_pipeline, request, form_data, filter_params
         )
         form_data["metadata"] = self.metadata
+        form_data["messages"] = await add_skills(
+            form_data["messages"], list(skills), self.tools_dict, request, self.extra_params
+        )
         self._sync_model_id(form_data)
         filter_tools = form_data.get("tools") or []
         (
@@ -1141,6 +1482,14 @@ async def emit_terminal_tool_event(
         )
 
 
+def filter_tool_arguments(tool: dict, arguments: dict) -> dict:
+    """Keep the *arguments* *tool*'s spec lists, as Core does; MCP servers validate their own."""
+    if tool.get("type") == "mcp":
+        return arguments
+    allowed = tool.get("spec", {}).get("parameters", {}).get("properties", {}).keys()
+    return {k: v for k, v in arguments.items() if k in allowed}
+
+
 def resolve_call_tool(tool_call: dict, tools_dict: dict) -> tuple[dict, Optional[str]]:
     """Return a copy of *tool_call* targeting the tool a Tool Search ``call_tool`` names, or an error."""
     try:
@@ -1204,14 +1553,14 @@ async def execute_tool_call(
     emit_terminal_event = False
     if tool_function_name in tools_dict:
         tool = tools_dict[tool_function_name]
-        spec = tool.get("spec", {})
         direct_tool = bool(tool.get("direct", False))
+        metadata = extra_params.get("__metadata__")
+        core_metadata = getattr(extra_params.get("__event_call__"), "core_metadata", None)
+        if isinstance(metadata, dict) and isinstance(core_metadata, dict) and "session_id" in metadata:
+            metadata["session_id"] = core_metadata.get("session_id")
 
         try:
-            allowed_params = spec.get("parameters", {}).get("properties", {}).keys()
-            tool_function_params = {
-                k: v for k, v in tool_function_params.items() if k in allowed_params
-            }
+            tool_function_params = filter_tool_arguments(tool, tool_function_params)
 
             if direct_tool:
                 tool_result = await execute_direct_tool_call(
@@ -1227,7 +1576,6 @@ async def execute_tool_call(
                 # so tool-specific UserValves injected by get_tools() survive.
                 from open_webui.utils.tools import get_updated_tool_function
 
-                metadata = extra_params.get("__metadata__")
                 call_params = {
                     "__messages__": extra_params.get("__messages__", []),
                     "__files__": (
@@ -1786,211 +2134,6 @@ def extract_model_ids(models: list[dict]) -> list[str]:
             seen.add(model_id)
             ids.append(model_id)
     return ids
-
-# --- inlined from src/owui_ext/shared/skills.py (owui_ext.shared.skills) ---
-import copy
-import logging
-import re
-from typing import Any, Optional
-from urllib.parse import quote
-from fastapi import Request
-_skills_log = logging.getLogger("owui_ext.shared.skills")
-
-_SKILLS_MANIFEST_START = "<available_skills>"
-_SKILLS_MANIFEST_END = "</available_skills>"
-_SKILL_TAG_PATTERN = re.compile(
-    r"<skill [^\n]*?name=.*?>\n.*?\n</skill>", re.DOTALL
-)
-
-
-async def _skills_maybe_await(value: Any) -> Any:
-    if hasattr(value, "__await__"):
-        return await value
-    return value
-
-
-def _find_manifest_in_text(text: str) -> str:
-    """Return the <available_skills>…</available_skills> substring, or ""."""
-    start = text.find(_SKILLS_MANIFEST_START)
-    if start == -1:
-        return ""
-    end = text.find(_SKILLS_MANIFEST_END, start)
-    if end == -1:
-        return ""
-    return text[start : end + len(_SKILLS_MANIFEST_END)]
-
-
-def _find_skill_tags_in_text(text: str) -> list[str]:
-    """Return all ``<skill ... name="...">…</skill>`` blocks found in *text*."""
-    return _SKILL_TAG_PATTERN.findall(text)
-
-
-def _extract_from_system_messages(
-    messages: Optional[list],
-    extractor,
-):
-    """Walk system messages and apply *extractor* to each text chunk.
-
-    ``extractor`` is called with a single ``str`` argument and should return a
-    list of results (or a single truthy result).  The function handles both
-    plain-string content and list-of-parts content
-    (``[{"type": "text", "text": "..."}]``).
-    """
-    results: list = []
-    if not messages:
-        return results
-    for msg in messages:
-        if msg.get("role") != "system":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            found = extractor(content)
-            if found:
-                results.append(found) if isinstance(found, str) else results.extend(
-                    found
-                )
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    found = extractor(part.get("text") or "")
-                    if found:
-                        results.append(found) if isinstance(
-                            found, str
-                        ) else results.extend(found)
-    return results
-
-
-def extract_skill_manifest(messages: Optional[list]) -> str:
-    """Extract the ``<available_skills>`` manifest from the parent
-    conversation's system messages.
-
-    Core can list model-attached, accessible workspace, and terminal skills.
-    Inline skills may also appear as full ``<skill>`` tags
-    (see :func:`extract_user_skill_tags`).
-
-    Args:
-        messages: The parent conversation messages (``__messages__``).
-
-    Returns:
-        The manifest XML string, or empty string if not found.
-    """
-    results = _extract_from_system_messages(messages, _find_manifest_in_text)
-    return results[0] if results else ""
-
-
-def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
-    """Extract ``<skill name="...">content</skill>`` tags from the parent
-    conversation's system messages.
-
-    Mentioned skills, or selected skills on older Core / without builtin
-    tools, can appear as ``<skill>`` tags alongside the available manifest.
-
-    Args:
-        messages: The parent conversation messages (``__messages__``).
-
-    Returns:
-        A list of ``<skill …>…</skill>`` strings, possibly empty.
-    """
-    return _extract_from_system_messages(messages, _find_skill_tags_in_text)
-
-
-def extract_skill_ids(messages: Optional[list]) -> list[str]:
-    """Return the IDs of the skills the parent lists or inlines, as Core's ``__skill_ids__``."""
-    ids = set(re.findall(r"<id>(.*?)</id>", extract_skill_manifest(messages)))
-    for tag in extract_user_skill_tags(messages):
-        match = re.match(r'<skill (?:id="([^"]+)"|name="([^"]*)")', tag)
-        if match:
-            # Core inlines terminal skills without an id attribute.
-            ids.add(match.group(1) or f'terminal:{quote(match.group(2), safe="")}')
-    return sorted(ids)
-
-
-def drop_unloadable_skill_manifest(messages: list, tools_dict: Optional[dict]) -> list:
-    """Remove the ``<available_skills>`` manifest when no ``view_skill`` tool can load it."""
-    if "view_skill" in (tools_dict or {}):
-        return messages
-
-    def without_manifest(message: dict) -> dict:
-        content = message.get("content")
-        if message.get("role") != "system" or not isinstance(content, str):
-            return message
-        manifest = _find_manifest_in_text(content)
-        if not manifest:
-            return message
-        parts = (part.strip() for part in content.split(manifest, 1))
-        return {**message, "content": "\n\n".join(part for part in parts if part)}
-
-    return [without_manifest(message) for message in messages]
-
-
-def isolate_chat_context(metadata: Optional[dict]) -> dict:
-    """Copy *metadata* with its own ``chat_context``, as Core does for sub-agent runs."""
-    metadata = metadata or {}
-    return {
-        **metadata,
-        "chat_context": copy.deepcopy(metadata.get("chat_context") or {}),
-    }
-
-
-async def register_view_skill(
-    tools_dict: dict,
-    request: Request,
-    extra_params: dict,
-) -> None:
-    """Manually register the view_skill builtin tool in tools_dict.
-
-    This is needed for available skills whose content is not injected
-    inline. The agent loop can call ``view_skill`` to lazily load their
-    content from the ``<available_skills>`` manifest.
-
-    Skills already supplied as full ``<skill>`` tags do not require
-    ``view_skill``; they are passed directly in the system message.
-
-    Args:
-        tools_dict: The tools dict to add view_skill to (modified in-place).
-        request: FastAPI request object.
-        extra_params: Extra parameters for tool binding.
-    """
-    if "view_skill" in tools_dict:
-        return
-
-    try:
-        from open_webui.tools import builtin
-
-        # Core 0.12.0+ registers skill tools in get_builtin_tools per model.
-        if hasattr(builtin, "read_skill_file"):
-            return
-        view_skill = builtin.view_skill
-        from open_webui.utils.tools import (
-            get_async_tool_function_and_apply_extra_params,
-            convert_function_to_pydantic_model,
-            convert_pydantic_model_to_openai_function_spec,
-        )
-
-        callable_fn = await _skills_maybe_await(get_async_tool_function_and_apply_extra_params(
-            view_skill,
-            {
-                "__request__": request,
-                "__user__": extra_params.get("__user__", {}),
-                "__event_emitter__": extra_params.get("__event_emitter__"),
-                "__event_call__": extra_params.get("__event_call__"),
-                "__metadata__": extra_params.get("__metadata__"),
-                "__chat_id__": extra_params.get("__chat_id__"),
-                "__message_id__": extra_params.get("__message_id__"),
-            },
-        ))
-
-        pydantic_model = convert_function_to_pydantic_model(view_skill)
-        spec = convert_pydantic_model_to_openai_function_spec(pydantic_model)
-
-        tools_dict["view_skill"] = {
-            "tool_id": "builtin:view_skill",
-            "callable": callable_fn,
-            "spec": spec,
-            "type": "builtin",
-        }
-    except Exception as e:
-        _skills_log.warning(f"Failed to register view_skill: {e}")
 
 # --- inlined from src/owui_ext/shared/tool_servers.py (owui_ext.shared.tool_servers) ---
 import json
@@ -5506,6 +5649,7 @@ async def run_agent_loop(
     submission_tool_names: Optional[set[str]] = None,
     filter_pipeline: Optional[dict] = None,
     send_model_custom_tools: bool = True,
+    skills: list[str] = (),
 ) -> str:
     """Run the LLM Review agent tool loop until completion.
 
@@ -5520,10 +5664,10 @@ async def run_agent_loop(
     submission with additional text or tool calls.
     """
     from open_webui.models.users import UserModel
-    from open_webui.utils.chat import generate_chat_completion
 
     if extra_params is None:
         extra_params = {}
+    generate_chat_completion = core_chat_completion(extra_params)
 
     # Prepare user object
     if isinstance(user, dict):
@@ -5546,15 +5690,12 @@ async def run_agent_loop(
         tools_dict or {}, extra_params, custom_tools, submission_tool_names or ()
     )
 
-    current_messages = drop_unloadable_skill_manifest(
-        list(messages), agent_requests.tools_dict
-    )
     current_messages = await agent_requests.prepare(
         filter_pipeline,
         request,
         {
             "model": model_id,
-            "messages": copy.deepcopy(current_messages),
+            "messages": copy.deepcopy(list(messages)),
             "stream": False,
             "metadata": {
                 "task": "llm_review",
@@ -5562,6 +5703,7 @@ async def run_agent_loop(
                 "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
             },
         },
+        skills,
     )
     tools_dict = agent_requests.tools_dict
     extra_params = {**extra_params, "__metadata__": agent_requests.metadata}
@@ -6130,8 +6272,8 @@ class Tools:
             description="Maximum tool-call iterations per agent during compose/revise phases.",
         )
         REVIEW_MAX_ITERATIONS: int = Field(
-            default=2,
-            description="Maximum iterations for the review (no-tool) phase.",
+            default=10,
+            description="Maximum iterations for the review phase, whose only tools are submit_review and the skill reading tools.",
         )
         AVAILABLE_TOOL_IDS: str = Field(
             default="",
@@ -6238,7 +6380,7 @@ class Tools:
         )
         ENABLE_SKILLS_TOOLS: bool = Field(
             default=True,
-            description="Enable skill reading tools (view_skill, read_skill_file). When enabled and the parent conversation has skills, review agents can view skill contents.",
+            description="Pass the parent conversation's skills to review agents and allow the skill reading tools (view_skill, read_skill_file, grep_skill_files). Each agent gets the parent's <skill> blocks and <available_skills> list. An agent whose model has no skill tools gets the chat's skills inlined the way Open WebUI does for such a model instead (Open WebUI 0.12.1+; older versions pass only the <skill> blocks). When off, agents get no skills or skill tools.",
         )
         ENABLE_SKILLS_WRITE_TOOLS: bool = Field(
             default=False,
@@ -6607,19 +6749,16 @@ CRITICAL RULES:
         )
 
         # Extract skills from parent conversation messages.
-        # Since v0.8.2, user-selected skills are injected as full <skill> tags,
-        # while model-attached skills appear in the <available_skills> manifest.
-        # Matches sub_agent's injection order: SYSTEM_PROMPT, user tags, manifest.
         skill_manifest = extract_skill_manifest(__messages__)
         user_skill_tags = extract_user_skill_tags(__messages__)
 
-        prompt_sections: list[str] = [str(user_valves.SYSTEM_PROMPT)]
+        parent_skills: list[str] = []
         if bool(getattr(self.valves, "ENABLE_SKILLS_TOOLS", True)):
             if user_skill_tags:
-                prompt_sections.extend(user_skill_tags)
+                parent_skills.extend(user_skill_tags)
             if skill_manifest:
-                prompt_sections.append(skill_manifest)
-        base_system_prompt = merge_prompt_sections(*prompt_sections)
+                parent_skills.append(skill_manifest)
+        base_system_prompt = merge_prompt_sections(str(user_valves.SYSTEM_PROMPT))
 
         topic_text = normalize_text(topic)
         requirements_text = normalize_text(requirements)
@@ -6792,7 +6931,7 @@ CRITICAL RULES:
             # RICH_PROGRESS is on, raw otherwise) so any downstream tool that
             # emits `embeds` also keeps our progress shell at index 0.
             "__event_emitter__": emitter.event_emitter,
-            "__event_call__": __event_call__,
+            "__event_call__": follow_core_session(__event_call__, __metadata__),
             "__request__": request,
             "__model__": __model__,
             "__metadata__": metadata,
@@ -7086,6 +7225,7 @@ CRITICAL RULES:
                         iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                         submission_tool_names={"submit_draft"},
                         filter_pipeline=filter_pipeline,
+                        skills=parent_skills,
                     )
 
                     # Strict tool-call contract: the only authoritative
@@ -7257,7 +7397,7 @@ CRITICAL RULES:
                     try:
                         if isinstance(prepared, Exception):
                             raise prepared
-                        filter_pipeline, _, member_extra_params = prepared
+                        filter_pipeline, tools_dict, member_extra_params = prepared
 
                         system_prompt = build_review_system_prompt(
                             base_system_prompt,
@@ -7268,12 +7408,14 @@ CRITICAL RULES:
                             topic_text, author_persona["name"], author_draft
                         )
 
-                        # Reviewers use only the submit_review pseudo-tool —
-                        # they do not need research tools, and locking them
-                        # to the submission channel matches compose/revise's
-                        # escape-free tool-call contract.
                         review_capture: dict = {"payload": None}
                         review_tools = {
+                            **{
+                                name: tool
+                                for name, tool in tools_dict.items()
+                                if name in BUILTIN_TOOL_CATEGORIES["skills"]
+                                and tool.get("type") == "builtin"
+                            },
                             "submit_review": make_submission_tool(
                                 spec=build_submit_review_spec(),
                                 capture=review_capture,
@@ -7300,6 +7442,7 @@ CRITICAL RULES:
                             iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                             submission_tool_names={"submit_review"},
                             filter_pipeline=filter_pipeline,
+                            skills=parent_skills,
                             send_model_custom_tools=False,
                         )
 
@@ -7439,6 +7582,7 @@ CRITICAL RULES:
                             iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                             submission_tool_names={"submit_draft"},
                             filter_pipeline=filter_pipeline,
+                            skills=parent_skills,
                         )
 
                         # Strict tool-call contract — same rationale as

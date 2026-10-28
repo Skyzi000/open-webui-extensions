@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.9
+version: 0.2.10
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -30,6 +30,7 @@ from owui_ext.shared.tool_execution import (
     CITATION_TOOLS,
     emit_terminal_tool_event,
     execute_direct_tool_call,
+    filter_tool_arguments,
     process_tool_result,
     resolve_call_tool,
     split_tool_result_files,
@@ -92,12 +93,9 @@ async def execute_single_tool(
         }
 
     tool = tools_dict[tool_name]
-    spec = tool.get("spec", {})
 
     try:
-        # Filter to allowed parameters
-        allowed_params = spec.get("parameters", {}).get("properties", {}).keys()
-        filtered_args = {k: v for k, v in tool_args.items() if k in allowed_params}
+        filtered_args = filter_tool_arguments(tool, tool_args)
         direct_tool = bool(tool.get("direct", False))
         tool_result_files: list[dict] = []
         tool_result_embeds: list[Any] = []

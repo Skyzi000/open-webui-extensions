@@ -1,18 +1,13 @@
 """Skill manifest / tag extraction shared by nested agent tools.
 
 Open WebUI's skill subsystem injects two different shapes into the
-parent conversation's system messages depending on how a skill was
-selected:
+parent conversation's system messages:
 
 - **Available skills** are listed in a single ``<available_skills>``
   manifest block; their content is loaded lazily by ``view_skill``.
   Core v0.11.4+ can include accessible workspace and terminal skills,
   in addition to model-attached skills.
-- **Inline skills** use full ``<skill ... name="...">...</skill>`` blocks
-  (Core v0.12.0 adds ``id`` and ``version_id`` attributes);
-  ``view_skill`` is unnecessary for their already-expanded content.
-  Older Core versions inline user-selected skills. Core v0.11.4+ inlines
-  mentioned skills, or selected skills when builtin tools are unavailable.
+- **Inline skills** use ``<skill ... name="...">...</skill>`` blocks.
 
 The plugins that spawn agent loops
 need to read both shapes out of ``__messages__`` so the spawned agent
@@ -39,6 +34,7 @@ from fastapi import Request
 
 _skills_log = logging.getLogger("owui_ext.shared.skills")
 
+_SKILL_READ_TOOLS = ("view_skill", "read_skill_file", "grep_skill_files")
 _SKILLS_MANIFEST_START = "<available_skills>"
 _SKILLS_MANIFEST_END = "</available_skills>"
 _SKILL_TAG_PATTERN = re.compile(
@@ -108,7 +104,7 @@ def extract_skill_manifest(messages: Optional[list]) -> str:
     conversation's system messages.
 
     Core can list model-attached, accessible workspace, and terminal skills.
-    Inline skills may also appear as full ``<skill>`` tags
+    Inline skills may also appear as ``<skill>`` tags
     (see :func:`extract_user_skill_tags`).
 
     Args:
@@ -124,9 +120,6 @@ def extract_skill_manifest(messages: Optional[list]) -> str:
 def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
     """Extract ``<skill name="...">content</skill>`` tags from the parent
     conversation's system messages.
-
-    Mentioned skills, or selected skills on older Core / without builtin
-    tools, can appear as ``<skill>`` tags alongside the available manifest.
 
     Args:
         messages: The parent conversation messages (``__messages__``).
@@ -148,22 +141,111 @@ def extract_skill_ids(messages: Optional[list]) -> list[str]:
     return sorted(ids)
 
 
-def drop_unloadable_skill_manifest(messages: list, tools_dict: Optional[dict]) -> list:
-    """Remove the ``<available_skills>`` manifest when no ``view_skill`` tool can load it."""
-    if "view_skill" in (tools_dict or {}):
+async def _core_inline_skill_tags(
+    skill_ids: list[str], request: Request, extra_params: dict
+) -> Optional[list[str]]:
+    """Render *skill_ids* as Core inlines them for a model without skill tools; None if Core cannot."""
+    try:
+        from fastapi import HTTPException
+        from open_webui.models.skills import Skills, get_skill_snapshot
+        from open_webui.utils.skill_files import format_skill_content, skill_overview
+        from open_webui.utils.terminals import (
+            format_terminal_skill_context,
+            get_terminal_skill,
+        )
+    except ImportError:
+        return None
+    from urllib.parse import unquote
+
+    user = extra_params.get("__user__") or {}
+    metadata = extra_params.get("__metadata__") or {}
+    context = metadata.get("chat_context") or {}
+    metadata["chat_context"] = context
+    skill_versions = context.setdefault("skill_versions", {})
+    db_ids = [sid for sid in skill_ids if not sid.startswith("terminal:")]
+    skills = (
+        {skill.id: skill for skill in await Skills.get_skills(user_id=user.get("id"), ids=db_ids)}
+        if db_ids
+        else {}
+    )
+    tags = []
+    for sid in db_ids:
+        skill = skills.get(sid)
+        if not skill or not skill.is_active:
+            continue
+        version_id = skill_versions.get(sid) or skill.version_id
+        try:
+            snapshot = await get_skill_snapshot(skill, version_id)
+        except HTTPException as error:
+            if error.status_code != 404:
+                raise
+            continue
+        skill_versions[sid] = version_id
+        # Core 0.12.1 and 0.12.2 define skill_overview synchronously.
+        overview = await _skills_maybe_await(
+            skill_overview(
+                snapshot["content"],
+                [f["path"] for f in snapshot["data"]["files"] if f["path"] != "SKILL.md"],
+                tools_enabled=False,
+            )
+        )
+        hint = (
+            "\nSupporting files require a model with skill tools enabled."
+            if overview.get("files")
+            else ""
+        )
+        if overview.get("notice"):
+            hint += "\n" + overview["notice"]
+        tags.append(
+            f'<skill id="{skill.id}" name="{skill.name}">\n'
+            f"{format_skill_content(overview, skill.id, False)}{hint}\n</skill>"
+        )
+    if metadata.get("terminal_id"):
+        for sid in skill_ids:
+            if not sid.startswith("terminal:"):
+                continue
+            loaded = await get_terminal_skill(
+                request,
+                user,
+                metadata,
+                unquote(sid.removeprefix("terminal:")),
+                extra_params,
+                overview=True,
+                tools_enabled=False,
+            )
+            if loaded:
+                tags.append(format_terminal_skill_context(loaded, sid, False))
+    return tags
+
+
+async def add_skills(
+    messages: list,
+    skills: list[str],
+    tools_dict: Optional[dict],
+    request: Request,
+    extra_params: dict,
+) -> list:
+    """Append the parent's *skills* to the system message, as Core adds them after the inlet filters.
+
+    A child without Core's skill reading tools gets the chat's skills (``metadata["skill_ids"]``) as Core inlines
+    them for a model without skill tools. When Core cannot render them, it keeps the parent's skills and drops
+    the ``<available_skills>`` list unless a ``view_skill`` tool can load it.
+    """
+    if not skills:
         return messages
+    tools_dict = tools_dict or {}
+    if not any(tools_dict.get(name, {}).get("type") == "builtin" for name in _SKILL_READ_TOOLS):
+        skill_ids = (extra_params.get("__metadata__") or {}).get("skill_ids") or []
+        rendered = await _core_inline_skill_tags(skill_ids, request, extra_params)
+        if rendered is not None:
+            skills = rendered
+        elif "view_skill" not in tools_dict:
+            skills = [skill for skill in skills if not skill.startswith(_SKILLS_MANIFEST_START)]
+    from open_webui.utils.misc import add_or_update_system_message
 
-    def without_manifest(message: dict) -> dict:
-        content = message.get("content")
-        if message.get("role") != "system" or not isinstance(content, str):
-            return message
-        manifest = _find_manifest_in_text(content)
-        if not manifest:
-            return message
-        parts = (part.strip() for part in content.split(manifest, 1))
-        return {**message, "content": "\n\n".join(part for part in parts if part)}
-
-    return [without_manifest(message) for message in messages]
+    for skill in skills:
+        messages = add_or_update_system_message(skill, messages, append=True)
+    return messages
 
 
 def isolate_chat_context(metadata: Optional[dict]) -> dict:

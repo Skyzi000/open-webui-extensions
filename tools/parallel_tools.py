@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.9
+version: 0.2.10
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -307,6 +307,14 @@ async def emit_terminal_tool_event(
         )
 
 
+def filter_tool_arguments(tool: dict, arguments: dict) -> dict:
+    """Keep the *arguments* *tool*'s spec lists, as Core does; MCP servers validate their own."""
+    if tool.get("type") == "mcp":
+        return arguments
+    allowed = tool.get("spec", {}).get("parameters", {}).get("properties", {}).keys()
+    return {k: v for k, v in arguments.items() if k in allowed}
+
+
 def resolve_call_tool(tool_call: dict, tools_dict: dict) -> tuple[dict, Optional[str]]:
     """Return a copy of *tool_call* targeting the tool a Tool Search ``call_tool`` names, or an error."""
     try:
@@ -370,14 +378,14 @@ async def execute_tool_call(
     emit_terminal_event = False
     if tool_function_name in tools_dict:
         tool = tools_dict[tool_function_name]
-        spec = tool.get("spec", {})
         direct_tool = bool(tool.get("direct", False))
+        metadata = extra_params.get("__metadata__")
+        core_metadata = getattr(extra_params.get("__event_call__"), "core_metadata", None)
+        if isinstance(metadata, dict) and isinstance(core_metadata, dict) and "session_id" in metadata:
+            metadata["session_id"] = core_metadata.get("session_id")
 
         try:
-            allowed_params = spec.get("parameters", {}).get("properties", {}).keys()
-            tool_function_params = {
-                k: v for k, v in tool_function_params.items() if k in allowed_params
-            }
+            tool_function_params = filter_tool_arguments(tool, tool_function_params)
 
             if direct_tool:
                 tool_result = await execute_direct_tool_call(
@@ -393,7 +401,6 @@ async def execute_tool_call(
                 # so tool-specific UserValves injected by get_tools() survive.
                 from open_webui.utils.tools import get_updated_tool_function
 
-                metadata = extra_params.get("__metadata__")
                 call_params = {
                     "__messages__": extra_params.get("__messages__", []),
                     "__files__": (
@@ -1775,12 +1782,9 @@ async def execute_single_tool(
         }
 
     tool = tools_dict[tool_name]
-    spec = tool.get("spec", {})
 
     try:
-        # Filter to allowed parameters
-        allowed_params = spec.get("parameters", {}).get("properties", {}).keys()
-        filtered_args = {k: v for k, v in tool_args.items() if k in allowed_params}
+        filtered_args = filter_tool_arguments(tool, tool_args)
         direct_tool = bool(tool.get("direct", False))
         tool_result_files: list[dict] = []
         tool_result_embeds: list[Any] = []

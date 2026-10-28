@@ -457,19 +457,20 @@ async def test_skill_write_tools_need_their_own_valve(skill_tools, module_name, 
 async def test_skill_manifest_is_passed_only_with_a_tool_that_loads_it(monkeypatch, module_name, loadable):
     tools = loop_tools()
     if loadable:
-        tools["view_skill"] = {**tools["ping"], "spec": {**tools["ping"]["spec"], "name": "view_skill"}}
+        tools["view_skill"] = {**tools["ping"], "type": "builtin", "spec": {**tools["ping"]["spec"], "name": "view_skill"}}
     manifest = "<available_skills>\n<skill>\n<name>Writer</name>\n</skill>\n</available_skills>"
     inline = '<skill name="Editor">\nEdit well.\n</skill>'
 
     _, sent, _ = await run_loop(
         monkeypatch, module_name, [{"choices": [{"message": {"content": "done"}}]}], tools=tools,
-        messages=[
-            {"role": "system", "content": f"Be brief.\n\n{inline}\n\n{manifest}"},
-            {"role": "user", "content": "Hi"},
-        ],
+        messages=[{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}],
+        skills=[inline, manifest],
     )
 
-    assert sent[0]["messages"][0]["content"] == f"Be brief.\n\n{inline}" + f"\n\n{manifest}" * loadable
+    system = sent[0]["messages"][0]["content"]
+    assert ("<available_skills>" in system) is loadable
+    if loadable:
+        assert system == f"Be brief.\n{inline}\n{manifest}"
 
 
 @needs_core_skill_tools
@@ -520,7 +521,7 @@ async def call_entry(entry, valves=None, **kwargs):
         return await tool.run_parallel_sub_agents(tasks=[{"description": "Task", "prompt": "Task"}], **kwargs)
     if entry == "llm_review":
         tool.valves.DEFAULT_MODELS = "parent"
-        kwargs["__user__"]["valves"] = {"ROUNDS": 1, "RICH_PROGRESS": False}
+        kwargs["__user__"]["valves"] = {**kwargs["__user__"]["valves"], "ROUNDS": 1, "RICH_PROGRESS": False}
         return await tool.llm_review(topic="Write the draft", **kwargs)
     decision = {"proposition": "Choose", "option_a": "A", "option_b": "B"}
     if entry == "magi_decision_support":
@@ -539,7 +540,7 @@ TOOL_SEARCH_SETTINGS = {
 async def run_entry(
     monkeypatch, entry, respond, *, regular_tools=dict, settings=None, skill_context=SKILL_MANIFEST, child_params=None,
     inlet=None, request_filter=None, observe=None, parent_metadata=None, valves=None, bound_tools=None,
-    extra_models=None,
+    extra_models=None, event_call=None, direct=False, user_valves=None,
 ):
     from starlette.requests import Request
     from open_webui.models.config import Config
@@ -560,7 +561,10 @@ async def run_entry(
     models = {"parent": parent, "child": child, **(extra_models or {})}
     request = Request({
         "type": "http", "app": SimpleNamespace(state=SimpleNamespace(MODELS=models)),
-        "state": {"metadata": parent_metadata if parent_metadata is not None else {"model_id": "parent"}},
+        "state": {
+            "metadata": parent_metadata if parent_metadata is not None else {"model_id": "parent"},
+            **({"direct": True, "model": models["child"]} if direct else {}),
+        },
     })
     request._body = b"{}"
     sent, loaded, filtered = [], [], []
@@ -605,8 +609,9 @@ async def run_entry(
         await Models.insert_new_model(ModelForm(id="child", name="Child", meta={}, params=child_params), "loop-user")
     try:
         await call_entry(
-            entry, valves, __request__=request, __model__=parent, __user__=make_user("admin").model_dump(),
-            __event_call__=AsyncMock(),
+            entry, valves, __request__=request, __model__=parent,
+            __user__={**make_user("admin").model_dump(), "valves": user_valves or {}},
+            __event_call__=event_call or AsyncMock(),
             __metadata__=parent_metadata if parent_metadata is not None else {
                 "model_id": "parent", "files": None, "tool_ids": ["regular"], "features": {"voice": True},
                 "chat_id": "local:entry", "session_id": "browser", "tool_servers": [],
@@ -635,17 +640,73 @@ def answer(body, draft_call=None):
     '<skill name="Writer notes">\nWrite well.\n</skill>',
 ])
 async def test_nested_requests_carry_the_child_model_and_the_parent_skills(monkeypatch, entry, skill_context):
-    sent, loaded, filtered = await run_entry(monkeypatch, entry, answer, skill_context=skill_context)
+    seen = []
 
+    def inlet(form_data):
+        seen.append(system_text(form_data))
+        return form_data
+
+    sent, loaded, filtered = await run_entry(monkeypatch, entry, answer, skill_context=skill_context, inlet=inlet)
+
+    assert seen and not any(skill_context in text for text in seen)
     assert loaded and all(item == ("child", []) for item in loaded)
     assert filtered and set(filtered) == {"child"}
     assert sent and {(body["model"], body["model_id"]) for body in sent} == {("child", "child")}
     assert not any("play_animation" in body["tools"] for body in sent)
-    agent_requests = [body for body in sent if body["tools"] - {"submit_review"}]
-    assert agent_requests
+    agent_requests = [body for body in sent if body["tools"]]
+    assert any("submit_review" in body["tools"] for body in agent_requests) == (entry == "llm_review")
     for body in agent_requests:
         assert SKILL_READ_TOOLS <= body["tools"]
         assert skill_context in body["system"]
+
+
+@needs_core_skill_tools
+async def test_reviewers_read_skills_before_submitting_without_being_told_to_stop(monkeypatch):
+    from open_webui.models.skills import SkillForm, Skills
+
+    reads = [("view_skill", {"id": "writer"}), ("read_skill_file", {"id": "writer", "path": "SKILL.md"})]
+
+    def read_skill_then_answer(body):
+        for name, arguments in reads:
+            if "submit_review" in body["tools"] and not called(body, name):
+                return tool_call(name, arguments)
+        return answer(body)
+
+    await Skills.insert_new_skill("loop-user", SkillForm(id="writer", name="Writer", content="Write well."))
+    try:
+        sent, _, _ = await run_entry(
+            monkeypatch, "llm_review", read_skill_then_answer,
+            skill_context=SKILL_MANIFEST.replace("<id>skill</id>", "<id>writer</id>"),
+        )
+    finally:
+        await Skills.delete_skill_by_id("writer")
+
+    reviews = [body for body in sent if "submit_review" in body["tools"]]
+    submitted = [body for body in reviews if called(body, "read_skill_file")]
+    assert submitted and all(
+        sum(message["role"] == "tool" and "Write well." in message["content"] for message in body["messages"]) == 2
+        for body in submitted
+    )
+    assert not any(
+        note in str(body["messages"]) for body in reviews for note in ("FINAL opportunity", "Maximum tool iterations")
+    )
+    assert any("submit_draft" in body["tools"] and "Review feedback" in str(body["messages"]) for body in sent)
+
+
+def tools_with_a_regular_view_skill():
+    tools = loop_tools()
+    tools["view_skill"] = {**tools["ping"], "spec": {**tools["ping"]["spec"], "name": "view_skill"}}
+    return tools
+
+
+async def test_a_regular_tool_named_like_a_skill_tool_stays_out_of_reviews_when_skills_are_off(monkeypatch):
+    sent, _, _ = await run_entry(
+        monkeypatch, "llm_review", answer, regular_tools=tools_with_a_regular_view_skill,
+        valves={"ENABLE_SKILLS_TOOLS": False},
+    )
+
+    reviews = [body for body in sent if "submit_review" in body["tools"]]
+    assert reviews and all(body["tools"] == {"submit_review"} for body in reviews)
 
 
 
@@ -661,7 +722,7 @@ async def test_child_custom_tools_param_is_sent_after_its_loaded_tools(monkeypat
         settings={"models.default_params": params} if source == "default" else None,
     )
 
-    review_requests = [body for body in sent if body["tools"] == {"submit_review"}]
+    review_requests = [body for body in sent if "submit_review" in body["tools"]]
     agent_requests = [body for body in sent if body["raw_tools"] and body not in review_requests]
     assert agent_requests
     for body in agent_requests:
@@ -1234,7 +1295,7 @@ async def test_search_tools_left_by_inlet_filters_turns_tool_search_off(
         child_params=child_params, inlet=inlet,
     )
 
-    agent_requests = [body for body in sent if body["tools"] - {"submit_review", "search_tools"}]
+    agent_requests = [body for body in sent if "submit_review" not in body["tools"] and body["tools"] - {"search_tools"}]
     assert agent_requests
     for body in agent_requests:
         searched = [tool for tool in body["raw_tools"] if tool.get("function", {}).get("name") == "search_tools"]
@@ -1262,3 +1323,575 @@ async def test_call_tool_runs_its_target_and_history_keeps_the_model_call(monkey
         assert [call["function"] for call in calls] == [{"name": "call_tool", "arguments": json.dumps(LOOKUP_CALL)}]
         assert not any("provider_function" in call for call in calls)
         assert [message["content"] for message in body["messages"] if message["role"] == "tool"] == ["found"]
+
+
+def called(body, name):
+    return any(
+        call["function"]["name"] == name
+        for message in body["messages"] if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    )
+
+
+def calling(*steps):
+    """Call each (name, arguments) tool once the loop offers it, then answer."""
+    def respond(body):
+        for name, arguments in steps:
+            if name in body["tools"] and not called(body, name):
+                return tool_call(name, arguments)
+        return answer(body)
+
+    return respond
+
+
+PAGE_PARAMETERS = {"type": "object", "anyOf": [
+    {"properties": {"id": {"type": "string"}}, "required": ["id"]},
+    {"properties": {"path": {"type": "string"}}, "required": ["path"]},
+]}
+
+
+@pytest.fixture
+def page_tools(monkeypatch):
+    """The same anyOf page tool from an MCP server and as a regular tool."""
+    from open_webui.utils import tools as core_tools
+
+    received = []
+
+    async def call_tool(name, function_args):
+        received.append(function_args)
+        return [{"type": "text", "text": "page"}]
+
+    async def fetch_page(**kwargs):
+        received.append(kwargs)
+        return "page"
+
+    spec = {"name": "fetch_page", "description": "Fetch a page by id or path.", "parameters": PAGE_PARAMETERS}
+    client = SimpleNamespace(call_tool=call_tool, disconnect=AsyncMock(), instructions=None)
+    monkeypatch.setattr(core_tools, "connect_mcp_server", AsyncMock(return_value=(client, [spec])), raising=False)
+    regular = {"fetch_page": {"type": "tool", "tool_id": "regular", "callable": fetch_page, "spec": spec}}
+    kinds = {
+        "mcp": ("server:mcp:docs", "docs_fetch_page", {"path": "guide"}),
+        "regular": ("regular", "fetch_page", {}),
+    }
+    return SimpleNamespace(received=received, regular=regular, kinds=kinds)
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("kind", ["mcp", "regular"])
+async def test_only_mcp_tools_get_arguments_their_schema_does_not_list(monkeypatch, page_tools, entry, kind):
+    tool_id, name, expected = page_tools.kinds[kind]
+    metadata = {
+        "model_id": "parent", "files": None, "tool_ids": [tool_id], "chat_id": "local:entry",
+        "session_id": "browser", "tool_servers": [],
+    }
+
+    await run_entry(
+        monkeypatch, entry, calling((name, {"path": "guide"})), regular_tools=lambda: page_tools.regular,
+        parent_metadata=metadata, skill_context="",
+    )
+
+    assert page_tools.received and all(arguments == expected for arguments in page_tools.received)
+
+
+@pytest.mark.parametrize("kind", ["mcp", "regular"])
+async def test_parallel_passes_only_mcp_tools_arguments_their_schema_does_not_list(monkeypatch, page_tools, kind):
+    from open_webui.models.config import Config
+    from open_webui.utils import tools as core_tools
+
+    tool_id, name, expected = page_tools.kinds[kind]
+    monkeypatch.setattr(Config, "get", AsyncMock(side_effect=lambda key, default=None: {} if key == "user.permissions" else default))
+    monkeypatch.setattr(Config, "get_many", AsyncMock(return_value={}))
+    monkeypatch.setattr(core_tools, "get_tools", AsyncMock(return_value=page_tools.regular))
+    model = {"id": "model", "info": {"meta": {"builtinTools": {
+        category: False for category in ("time", "user_input", "knowledge", "chats", "tasks", "skills")
+    }}}}
+
+    await parallel_tools.Tools().run_tools_parallel(
+        [parallel_tools.ToolCallItem(name=name, args={"path": "guide"})],
+        __request__=make_request(model), __user__=make_user("admin").model_dump(), __model__=model,
+        __metadata__={"model_id": "model", "tool_ids": [tool_id], "chat_id": "local:parallel", "tool_servers": []},
+    )
+
+    assert page_tools.received == [expected]
+
+
+@pytest.fixture
+def reconnecting_browser(monkeypatch):
+    """Real Core event calls to a browser that reconnects while a confirmation is open."""
+    import time
+    from open_webui.socket import main as socket
+
+    if not hasattr(socket, "get_user_chat_session_id"):
+        pytest.skip("Core before 0.12.4 does not resume input requests on a reconnected session")
+    sessions = {"old": {"id": "loop-user"}}
+    browser = SimpleNamespace(events=[], replies={}, metadata={
+        "model_id": "parent", "files": None, "tool_ids": ["regular"], "tool_servers": [],
+        "chat_id": "saved-chat", "message_id": "message", "session_id": "old", "user_id": "loop-user",
+    })
+
+    async def call(event_name, payload, *, to, timeout):
+        event = payload["data"]
+        data = event.get("data") or {}
+        browser.events.append((event["type"], to, data))
+        if event["type"] == "confirmation":
+            if to == "old":
+                sessions.clear()
+                sessions["new"] = {"id": "loop-user", "chat_ids": ["saved-chat"], "last_seen_at": time.time()}
+                await asyncio.sleep(10)
+            return True
+        if data.get("session_id") != to:
+            # The browser never answers a call for another session; failing fast keeps the test from hanging.
+            return {"error": f"{to} ignored a call for {data.get('session_id')}"}
+        return browser.replies[event["type"]](data)
+
+    monkeypatch.setattr(socket, "SESSION_POOL", sessions)
+    monkeypatch.setattr(socket.sio, "call", call)
+    monkeypatch.setattr(socket.sio, "emit", AsyncMock())
+    browser.sent = lambda kind: [(to, data) for sent_kind, to, data in browser.events if sent_kind == kind]
+    return browser
+
+
+async def confirm_gate(__event_call__=None) -> str:
+    """Ask the user whether to continue."""
+    return str(await __event_call__(event_data={"type": "confirmation", "data": {"title": "Continue?", "message": "Continue?"}}))
+
+
+def gated_tools(**targets):
+    """Load a confirmation gate and *targets* (name -> (function, parameters)) as Core binds tools."""
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    async def bound(extra_params):
+        tools = {}
+        for name, (function, properties) in {"confirm_gate": (confirm_gate, {}), **targets}.items():
+            tools[name] = {
+                "type": "tool", "tool_id": "regular",
+                "spec": {"name": name, "description": name, "parameters": {"type": "object", "properties": properties}},
+                **({"direct": True, "server": {"url": "http://browser"}} if function is None else {
+                    "callable": await get_async_tool_function_and_apply_extra_params(function, extra_params),
+                }),
+            }
+        return tools
+
+    return bound
+
+
+def assert_followed_the_resumed_session(browser, kind):
+    sends = browser.sent(kind)
+    assert sends and all(data["session_id"] == to for to, data in sends), sends
+    assert "new" in {to for to, _ in sends}
+    confirmations = browser.sent("confirmation")
+    # Core resumes only confirmations whose data has no session_id.
+    assert "new" in {to for to, _ in confirmations}
+    assert not any("session_id" in data for _, data in confirmations)
+    assert browser.metadata["session_id"] == "new"
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_direct_tools_follow_the_session_core_resumes_on(monkeypatch, reconnecting_browser, entry):
+    from open_webui.socket.main import get_event_call
+
+    browser = reconnecting_browser
+    browser.replies["execute:tool"] = lambda data: "ran"
+
+    await run_entry(
+        monkeypatch, entry, calling(("confirm_gate", {}), ("browser_lookup", {})),
+        bound_tools=gated_tools(browser_lookup=(None, {})), parent_metadata=browser.metadata,
+        event_call=await get_event_call(browser.metadata), skill_context="",
+    )
+
+    assert_followed_the_resumed_session(browser, "execute:tool")
+
+
+async def test_core_code_execution_follows_the_session_core_resumes_on(monkeypatch, reconnecting_browser):
+    from open_webui.socket.main import get_event_call
+
+    browser = reconnecting_browser
+    browser.replies["execute:python"] = lambda data: {"stdout": "2\n", "stderr": "", "result": ""}
+
+    await run_entry(
+        monkeypatch, "sub_agent", calling(("confirm_gate", {}), ("run_python", {"code": "print(1 + 1)"})),
+        bound_tools=gated_tools(run_python=(builtin.execute_code, {"code": {"type": "string"}})),
+        parent_metadata=browser.metadata, event_call=await get_event_call(browser.metadata), skill_context="",
+    )
+
+    assert_followed_the_resumed_session(browser, "execute:python")
+
+
+async def test_core_terminal_requests_follow_the_session_core_resumes_on(monkeypatch, reconnecting_browser):
+    from open_webui.socket.main import get_event_call
+
+    browser = reconnecting_browser
+    browser.metadata["terminal_id"] = "user-terminal"
+    browser.replies["request:terminal"] = lambda data: {"data": (
+        {"name": "Notes", "content": "Terminal notes."} if data["path"].startswith("/skills/read") else None
+    )}
+
+    await run_entry(
+        monkeypatch, "sub_agent", calling(("confirm_gate", {}), ("read_terminal_skill", {"id": "terminal:Notes"})),
+        bound_tools=gated_tools(read_terminal_skill=(builtin.view_skill, {"id": {"type": "string"}})),
+        parent_metadata=browser.metadata, event_call=await get_event_call(browser.metadata), skill_context="",
+    )
+
+    assert_followed_the_resumed_session(browser, "request:terminal")
+    assert any(data["path"].startswith("/skills/read") and to == "new" for to, data in browser.sent("request:terminal"))
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_tools_after_a_resumed_request_in_the_same_turn_see_the_session_core_holds(
+    monkeypatch, reconnecting_browser, entry
+):
+    from open_webui.socket.main import get_event_call
+
+    browser = reconnecting_browser
+    seen = []
+
+    async def record_session(__metadata__=None) -> str:
+        """Report the browser session this tool runs for."""
+        seen.append((browser.metadata["session_id"], __metadata__["session_id"]))
+        return "recorded"
+
+    def gate_then_record(body):
+        if "record_session" in body["tools"] and not called(body, "record_session"):
+            calls = [tool_call(name)["choices"][0]["message"]["tool_calls"][0] for name in ("confirm_gate", "record_session")]
+            return {"choices": [{"message": {"content": "", "tool_calls": calls}}]}
+        return answer(body)
+
+    await run_entry(
+        monkeypatch, entry, gate_then_record, bound_tools=gated_tools(record_session=(record_session, {})),
+        parent_metadata=browser.metadata, event_call=await get_event_call(browser.metadata), skill_context="",
+    )
+
+    assert ("new", "new") in seen and all(core == tool for core, tool in seen), seen
+
+
+@pytest.mark.parametrize("entry, nested", [
+    *((entry, False) for entry in ENTRIES), ("magi_decision_support", True),
+], ids=[*ENTRIES, "magi_decision_support called by another agent"])
+async def test_direct_model_requests_follow_the_session_core_resumes_on(
+    monkeypatch, reconnecting_browser, entry, nested
+):
+    from open_webui.socket.main import get_event_call
+
+    browser = reconnecting_browser
+    respond = calling(("confirm_gate", {}))
+    browser.replies["request:chat:completion"] = lambda data: respond({
+        "tools": tool_names(data["form_data"]), "messages": data["form_data"]["messages"],
+    })
+
+    from open_webui.utils import chat
+
+    async def record_model_caller(info):
+        browser.events.append(("model caller", info["session_id"], {}))
+        return await get_event_call(info)
+
+    monkeypatch.setattr(chat, "get_event_call", record_model_caller)
+
+    event_call = await get_event_call(browser.metadata)
+    await run_entry(
+        monkeypatch, entry, answer, bound_tools=gated_tools(), skill_context="", direct=True,
+        parent_metadata=copy.deepcopy(browser.metadata) if nested else browser.metadata,
+        event_call=sub_agent.follow_core_session(event_call, browser.metadata) if nested else event_call,
+    )
+
+    assert_followed_the_resumed_session(browser, "request:chat:completion")
+    # Core rejects a caller for a gone session before sending, so check every caller it built.
+    resumed = next(index for index, (kind, to, _) in enumerate(browser.events) if (kind, to) == ("confirmation", "new"))
+    later_callers = {to for kind, to, _ in browser.events[resumed:] if kind == "model caller"}
+    assert later_callers == {"new"}
+
+
+needs_core_skill_overview = pytest.mark.skipif(
+    importlib.util.find_spec("open_webui.utils.skill_files") is None
+    or not hasattr(importlib.import_module("open_webui.utils.skill_files"), "skill_overview"),
+    reason="Core before 0.12.1 has no skill_overview to inline skills with",
+)
+NO_SKILL_TOOLS_CHILD = {"id": "child", "owned_by": "openai", "info": {"meta": {"builtinTools": {
+    category: False for category in ("time", "user_input", "knowledge", "chats", "tasks", "skills")
+}}, "params": {}}}
+
+
+@needs_core_skill_overview
+@pytest.mark.parametrize("child_skill_tools", [True, False])
+async def test_a_regular_view_skill_does_not_decide_whether_skills_are_inlined(monkeypatch, child_skill_tools):
+    from open_webui.models.skills import SkillForm, Skills
+
+    manifest = SKILL_MANIFEST.replace("<id>skill</id>", "<id>writer</id>")
+    await Skills.insert_new_skill("loop-user", SkillForm(id="writer", name="Writer", content="Write well."))
+    try:
+        sent, _, _ = await run_entry(
+            monkeypatch, "llm_review", answer, regular_tools=tools_with_a_regular_view_skill, skill_context=manifest,
+            parent_metadata={
+                "model_id": "parent", "files": None, "tool_ids": ["regular"], "chat_id": "local:entry",
+                "session_id": "browser", "tool_servers": [], "skill_ids": ["writer"],
+            },
+            extra_models=None if child_skill_tools else {"child": NO_SKILL_TOOLS_CHILD},
+        )
+    finally:
+        await Skills.delete_skill_by_id("writer")
+
+    agent_requests = [body for body in sent if body["tools"]]
+    assert any("submit_review" in body["tools"] for body in agent_requests)
+    assert any("submit_draft" in body["tools"] and "view_skill" in body["tools"] for body in agent_requests)
+    for body in agent_requests:
+        assert (manifest in body["system"]) == child_skill_tools
+        assert ("Write well." in body["system"]) != child_skill_tools
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_a_regular_view_skill_keeps_the_skill_list_where_core_cannot_inline_skills(monkeypatch, entry):
+    if importlib.util.find_spec("open_webui.utils.skill_files"):
+        monkeypatch.delattr(importlib.import_module("open_webui.utils.skill_files"), "skill_overview", raising=False)
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, answer, regular_tools=tools_with_a_regular_view_skill,
+        extra_models={"child": NO_SKILL_TOOLS_CHILD},
+    )
+
+    agent_requests = [body for body in sent if body["tools"]]
+    assert any("view_skill" in body["tools"] for body in agent_requests)
+    for body in agent_requests:
+        assert (SKILL_MANIFEST in body["system"]) == ("view_skill" in body["tools"])
+
+
+async def run_without_skill_tools(
+    monkeypatch, entry, skill_ids, skill_context, metadata=None, respond=answer, inlet=None, **kwargs,
+):
+    """Run *entry* with a child model that has no skill tools; return its requests and what inlet saw."""
+    seen = []
+
+    def record(form_data):
+        seen.append(system_text(form_data))
+        return inlet(form_data) if inlet else form_data
+
+    metadata = {
+        "model_id": "parent", "files": None, "tool_ids": ["regular"], "chat_id": "local:entry",
+        "session_id": "browser", "tool_servers": [], "skill_ids": skill_ids, **(metadata or {}),
+    }
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, respond, regular_tools=loop_tools, parent_metadata=metadata, inlet=record,
+        skill_context=skill_context, extra_models={"child": NO_SKILL_TOOLS_CHILD}, **kwargs,
+    )
+    agent_requests = [body for body in sent if body["tools"]]
+    assert any("submit_review" in body["tools"] for body in agent_requests) == (entry == "llm_review")
+    assert not any(SKILL_READ_TOOLS & body["tools"] for body in agent_requests)
+    return agent_requests, seen
+
+
+@needs_core_skill_overview
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_skills_only_listed_for_a_child_without_skill_tools_are_inlined_like_core(monkeypatch, entry):
+    from open_webui.models.skills import SkillForm, Skills
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    pins = []
+
+    async def bound_tools(extra_params):
+        async def lookup(query: str = "", __metadata__=None):
+            pins.append(copy.deepcopy((__metadata__.get("chat_context") or {}).get("skill_versions")))
+            return "found"
+
+        tools = loop_tools()
+        tools["lookup"]["callable"] = await get_async_tool_function_and_apply_extra_params(lookup, extra_params)
+        return tools
+
+    content = "Write well.\n" + "x" * 20_000
+    skill = await Skills.insert_new_skill("loop-user", SkillForm(id="writer", name="Writer", content=content))
+    try:
+        agent_requests, seen = await run_without_skill_tools(
+            monkeypatch, entry, ["writer"], SKILL_MANIFEST.replace("<id>skill</id>", "<id>writer</id>"),
+            respond=lookup_first, bound_tools=bound_tools,
+        )
+    finally:
+        await Skills.delete_skill_by_id("writer")
+
+    assert seen and not any("Write well." in text or "<available_skills>" in text for text in seen)
+    for body in agent_requests:
+        assert body["system"].count(f'<skill id="writer" name="Writer">\n{content}\n</skill>') == 1
+        assert "<available_skills>" not in body["system"]
+    assert pins and all(pin == {"writer": skill.version_id} for pin in pins)
+
+
+@needs_core_skill_overview
+@pytest.mark.parametrize("module_name", AGENT_MODULES)
+async def test_skills_a_child_cannot_load_come_before_the_tool_server_prompts_as_in_core(monkeypatch, module_name):
+    from open_webui.models.skills import SkillForm, Skills
+
+    manifest = SKILL_MANIFEST.replace("<id>skill</id>", "<id>writer</id>")
+    await Skills.insert_new_skill("loop-user", SkillForm(id="writer", name="Writer", content="Write well."))
+    try:
+        _, sent, _ = await run_loop(
+            monkeypatch, module_name, [{"choices": [{"message": {"content": "done"}}]}], tools=loop_tools(),
+            messages=[{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}],
+            skills=[manifest], extra_params={"__metadata__": {"skill_ids": ["writer"]}, "__direct_tool_server_system_prompts__": ["Server prompt."]},
+        )
+    finally:
+        await Skills.delete_skill_by_id("writer")
+
+    system = system_text(sent[0])
+    assert -1 < system.find("Write well.") < system.find("Server prompt.")
+
+
+@needs_core_skill_overview
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_skills_the_parent_inlined_for_skill_tools_are_rebuilt_for_a_child_without_them(monkeypatch, entry):
+    from open_webui.models.skills import SkillForm, Skills
+
+    content = "Write well.\n" + "x" * 20_000
+    preview = (
+        f'<skill id="writer" name="Writer">\n{content[:5_000]}\nSkill instructions truncated.'
+        '\nSkill ID: "writer".\nnext_offset: 5000\n</skill>'
+    )
+    await Skills.insert_new_skill("loop-user", SkillForm(id="writer", name="Writer", content=content))
+    try:
+        agent_requests, seen = await run_without_skill_tools(monkeypatch, entry, ["writer"], preview)
+    finally:
+        await Skills.delete_skill_by_id("writer")
+
+    assert seen and not any("Write well." in text for text in seen)
+    for body in agent_requests:
+        assert body["system"].count(f'<skill id="writer" name="Writer">\n{content}\n</skill>') == 1
+        assert "next_offset" not in body["system"]
+
+
+@needs_core_skill_tools
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_a_child_without_skill_tools_keeps_only_the_parent_skill_tags_on_core_0_12_0(monkeypatch, entry):
+    from open_webui.utils import skill_files
+
+    monkeypatch.delattr(skill_files, "skill_overview", raising=False)
+    tag = '<skill id="writer" name="Writer">\nWrite well.\n</skill>'
+    manifest = SKILL_MANIFEST.replace("<id>skill</id>", "<id>notes</id>")
+
+    agent_requests, seen = await run_without_skill_tools(
+        monkeypatch, entry, ["writer", "notes"], f"{tag}\n\n{manifest}",
+    )
+
+    assert seen and not any("<skill" in text for text in seen)
+    for body in agent_requests:
+        assert body["system"].count(tag) == 1
+        assert "<available_skills>" not in body["system"]
+
+
+@needs_core_skill_overview
+@pytest.mark.parametrize("pinned", ["first", "gone"])
+async def test_inlined_skills_stay_on_the_version_the_chat_pinned(monkeypatch, pinned):
+    from open_webui.models.skills import SkillForm, Skills
+
+    skill = await Skills.insert_new_skill("loop-user", SkillForm(id="writer", name="Writer", content="First."))
+    version = skill.version_id if pinned == "first" else "gone"
+    try:
+        await Skills.update_skill_by_id("writer", {"content": "Second."})
+        agent_requests, _ = await run_without_skill_tools(
+            monkeypatch, "sub_agent", ["writer"], SKILL_MANIFEST.replace("<id>skill</id>", "<id>writer</id>"),
+            metadata={"chat_context": {"skill_versions": {"writer": version}}},
+        )
+    finally:
+        await Skills.delete_skill_by_id("writer")
+
+    for body in agent_requests:
+        assert ("First." in body["system"]) is (pinned == "first")
+        assert "Second." not in body["system"]
+
+
+@needs_core_skill_overview
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_inlined_skills_follow_the_version_an_inlet_pins_as_in_core(monkeypatch, entry):
+    from open_webui.models.skills import SkillForm, Skills
+
+    first = await Skills.insert_new_skill("loop-user", SkillForm(id="writer", name="Writer", content="First."))
+    try:
+        second = await Skills.update_skill_by_id("writer", {"content": "Second."})
+
+        def inlet(form_data):
+            form_data["metadata"]["chat_context"]["skill_versions"]["writer"] = second.version_id
+            return form_data
+
+        agent_requests, _ = await run_without_skill_tools(
+            monkeypatch, entry, ["writer"], SKILL_MANIFEST.replace("<id>skill</id>", "<id>writer</id>"),
+            metadata={"chat_context": {"skill_versions": {"writer": first.version_id}}}, inlet=inlet,
+        )
+    finally:
+        await Skills.delete_skill_by_id("writer")
+
+    for body in agent_requests:
+        assert "Second." in body["system"] and "First." not in body["system"]
+        assert body["metadata"]["chat_context"]["skill_versions"] == {"writer": second.version_id}
+
+
+@needs_core_skill_overview
+@pytest.mark.parametrize("entry", ["sub_agent", "parallel_sub_agents", "llm_review"])
+@pytest.mark.parametrize("skills_on", [True, False])
+async def test_skill_tags_in_the_user_system_prompt_stay_and_bring_no_parent_skills(monkeypatch, entry, skills_on):
+    from open_webui.models.skills import SkillForm, Skills
+
+    own = '<skill id="own" name="Own">\nOwn rules.\n</skill>'
+    await Skills.insert_new_skill("loop-user", SkillForm(id="writer", name="Writer", content="Write well."))
+    try:
+        agent_requests, _ = await run_without_skill_tools(
+            monkeypatch, entry, ["writer"], '<skill id="writer" name="Writer">\nWrite well.\n</skill>',
+            valves={"ENABLE_SKILLS_TOOLS": skills_on}, user_valves={"SYSTEM_PROMPT": own},
+        )
+    finally:
+        await Skills.delete_skill_by_id("writer")
+
+    for body in agent_requests:
+        assert body["system"].count(own) == 1
+        assert ("Write well." in body["system"]) is skills_on
+
+
+@needs_core_skill_overview
+async def test_terminal_skills_a_child_cannot_load_are_inlined_like_core(monkeypatch):
+    async def terminal(event_data):
+        path = (event_data.get("data") or {}).get("path") or ""
+        return {"data": {"name": "Notes", "content": "Terminal notes."} if path.startswith("/skills/read") else None}
+
+    agent_requests, seen = await run_without_skill_tools(
+        monkeypatch, "sub_agent", ["terminal:Notes"],
+        SKILL_MANIFEST.replace("<id>skill</id>", "<id>terminal:Notes</id>").replace("Writer", "Notes"),
+        metadata={"terminal_id": "user-terminal"}, event_call=terminal,
+    )
+
+    assert seen and not any("Terminal notes." in text for text in seen)
+    for body in agent_requests:
+        assert body["system"].count('<skill name="Notes">\nTerminal notes.\n</skill>') == 1
+        assert "<available_skills>" not in body["system"]
+
+
+@needs_core_skill_overview
+async def test_skills_inline_with_the_synchronous_skill_overview_of_core_0_12_1(monkeypatch):
+    from open_webui.models.skills import SkillForm, Skills
+    from open_webui.utils import skill_files
+
+    def synchronous_overview(content, files, field="files", tools_enabled=True):
+        assert not tools_enabled
+        return {"content": content, "next_offset": None, **skill_files.bounded_skill_manifest(files, field)}
+
+    monkeypatch.setattr(skill_files, "skill_overview", synchronous_overview)
+    await Skills.insert_new_skill("loop-user", SkillForm(id="writer", name="Writer", content="Write well."))
+    try:
+        agent_requests, _ = await run_without_skill_tools(
+            monkeypatch, "sub_agent", ["writer"], SKILL_MANIFEST.replace("<id>skill</id>", "<id>writer</id>"),
+        )
+    finally:
+        await Skills.delete_skill_by_id("writer")
+
+    assert all('<skill id="writer" name="Writer">\nWrite well.\n</skill>' in body["system"] for body in agent_requests)
+
+
+@needs_core_skill_overview
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_children_get_no_skills_when_skills_are_turned_off(monkeypatch, entry):
+    from open_webui.models.skills import SkillForm, Skills
+
+    await Skills.insert_new_skill("loop-user", SkillForm(id="writer", name="Writer", content="Write well."))
+    try:
+        agent_requests, _ = await run_without_skill_tools(
+            monkeypatch, entry, ["writer"],
+            '<skill id="writer" name="Writer">\nWrite well.\n</skill>\n\n'
+            + SKILL_MANIFEST.replace("<id>skill</id>", "<id>writer</id>"),
+            valves={"ENABLE_SKILLS_TOOLS": False},
+        )
+    finally:
+        await Skills.delete_skill_by_id("writer")
+
+    assert not any("<skill" in body["system"] or "Write well." in body["system"] for body in agent_requests)
