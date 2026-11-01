@@ -6,6 +6,7 @@ import copy
 import importlib
 import importlib.util
 import json
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -518,7 +519,8 @@ async def call_entry(entry, valves=None, **kwargs):
     if entry == "sub_agent":
         return await tool.run_sub_agent(description="Task", prompt="Task", **kwargs)
     if entry == "parallel_sub_agents":
-        return await tool.run_parallel_sub_agents(tasks=[{"description": "Task", "prompt": "Task"}], **kwargs)
+        tasks = kwargs.pop("tasks", [{"description": "Task", "prompt": "Task"}])
+        return await tool.run_parallel_sub_agents(tasks=tasks, **kwargs)
     if entry == "llm_review":
         tool.valves.DEFAULT_MODELS = "parent"
         kwargs["__user__"]["valves"] = {**kwargs["__user__"]["valves"], "ROUNDS": 1, "RICH_PROGRESS": False}
@@ -540,7 +542,8 @@ TOOL_SEARCH_SETTINGS = {
 async def run_entry(
     monkeypatch, entry, respond, *, regular_tools=dict, settings=None, skill_context=SKILL_MANIFEST, child_params=None,
     inlet=None, request_filter=None, observe=None, parent_metadata=None, valves=None, bound_tools=None,
-    extra_models=None, event_call=None, direct=False, user_valves=None,
+    extra_models=None, event_call=None, direct=False, user_valves=None, event_emitter=None, request_state=None,
+    entry_kwargs=None,
 ):
     from starlette.requests import Request
     from open_webui.models.config import Config
@@ -564,6 +567,7 @@ async def run_entry(
         "state": {
             "metadata": parent_metadata if parent_metadata is not None else {"model_id": "parent"},
             **({"direct": True, "model": models["child"]} if direct else {}),
+            **(request_state or {}),
         },
     })
     request._body = b"{}"
@@ -608,18 +612,20 @@ async def run_entry(
     if child_params is not None:
         await Models.insert_new_model(ModelForm(id="child", name="Child", meta={}, params=child_params), "loop-user")
     try:
-        await call_entry(
-            entry, valves, __request__=request, __model__=parent,
-            __user__={**make_user("admin").model_dump(), "valves": user_valves or {}},
-            __event_call__=event_call or AsyncMock(),
-            __metadata__=parent_metadata if parent_metadata is not None else {
+        await call_entry(entry, valves, **{
+            "__request__": request, "__model__": parent,
+            "__user__": {**make_user("admin").model_dump(), "valves": user_valves or {}},
+            "__event_call__": event_call or AsyncMock(),
+            **({"__event_emitter__": event_emitter} if event_emitter else {}),
+            "__metadata__": parent_metadata if parent_metadata is not None else {
                 "model_id": "parent", "files": None, "tool_ids": ["regular"], "features": {"voice": True},
                 "chat_id": "local:entry", "session_id": "browser", "tool_servers": [],
             },
-            __messages__=[
+            "__messages__": [
                 {"role": "system", "content": f"Be brief.\n\n{skill_context}"}, {"role": "user", "content": "Hi"},
             ],
-        )
+            **(entry_kwargs or {}),
+        })
     finally:
         await Models.delete_model_by_id("child")
     return sent, loaded, filtered
@@ -960,7 +966,7 @@ async def test_loaded_tools_run_with_their_request_and_the_calling_loops_metadat
 
     assert seen
     for request, metadata, user in seen:
-        assert any(request is loaded for loaded in loaded_requests)
+        assert any(request.state.metadata is loaded.state.metadata for loaded in loaded_requests)
         assert "task" not in request.state.metadata
         assert metadata["from_inlet"] and metadata["model_id"] == "child"
         assert user == {"valves": "lookup-valves"}
@@ -1895,3 +1901,786 @@ async def test_children_get_no_skills_when_skills_are_turned_off(monkeypatch, en
         await Skills.delete_skill_by_id("writer")
 
     assert not any("<skill" in body["system"] or "Write well." in body["system"] for body in agent_requests)
+
+
+ENTRY_METADATA = {
+    "model_id": "parent", "files": None, "tool_ids": ["regular"], "chat_id": "local:entry",
+    "session_id": "browser", "tool_servers": [],
+}
+needs_display_file = pytest.mark.skipif(
+    not hasattr(builtin, "display_file"), reason="Core before 0.12.5 has no builtin display_file"
+)
+
+
+def child_model(**meta):
+    return {"id": "child", "owned_by": "openai", "info": {"meta": meta, "params": {}}}
+
+
+def calls_in_order(*steps):
+    """Make each (name, arguments) call in turn while the loop offers it, then answer."""
+    def respond(body):
+        done = sum(message["role"] == "tool" for message in body["messages"])
+        if done < len(steps) and steps[done][0] in body["tools"]:
+            return tool_call(*steps[done])
+        return answer(body)
+    return respond
+
+
+@needs_display_file
+@pytest.mark.parametrize("files_on, knowledge_on, knowledge, kb_exec, shown", [
+    (True, False, [], False, True),
+    (False, True, [], False, True),
+    (False, True, [{"type": "note", "id": "note"}], False, False),
+    (False, True, [{"type": "note", "id": "note"}], True, True),
+    (False, False, [], False, False),
+])
+async def test_display_file_stays_while_a_category_core_offers_it_through_is_on(
+    monkeypatch, files_on, knowledge_on, knowledge, kb_exec, shown,
+):
+    from open_webui import env
+
+    monkeypatch.setattr(env, "ENABLE_KB_EXEC", kb_exec)
+    sent, _, _ = await run_entry(
+        monkeypatch, "sub_agent", answer,
+        extra_models={"child": child_model(capabilities={"file_context": False}, knowledge=knowledge)},
+        parent_metadata={**ENTRY_METADATA, "files": [{"type": "file", "id": "file"}]},
+        valves={"ENABLE_FILE_TOOLS": files_on, "ENABLE_KNOWLEDGE_TOOLS": knowledge_on},
+    )
+
+    assert sent and all(("display_file" in body["tools"]) == shown for body in sent)
+
+
+@needs_display_file
+@pytest.mark.parametrize("builtin_offered", [True, False])
+async def test_uploaded_files_display_through_cores_builtin_behind_a_terminal_display_file(
+    monkeypatch, builtin_offered,
+):
+    import uuid
+    from open_webui.models.files import FileForm, Files
+    from open_webui.utils import tools as core_tools
+
+    terminal_paths, events = [], []
+
+    async def terminal_display_file(path: str, page: int = None, inline: bool = False):
+        terminal_paths.append(path)
+        return {"exists": True, "path": path}
+
+    terminal_tool = {
+        "type": "terminal", "tool_id": "terminal:terminal", "callable": terminal_display_file,
+        "spec": {"name": "display_file", "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}, "page": {"type": "integer"}, "inline": {"type": "boolean"},
+        }}},
+    }
+    monkeypatch.setattr(core_tools, "get_terminal_tools", AsyncMock(return_value=({"display_file": terminal_tool}, "")))
+
+    async def emit(event):
+        events.append(event)
+
+    file_id = str(uuid.uuid4())
+    await Files.insert_new_file("loop-user", FileForm(
+        id=file_id, filename="report.pdf", path="", meta={"name": "report.pdf", "content_type": "application/pdf"},
+    ))
+    try:
+        sent, _, _ = await run_entry(
+            monkeypatch, "sub_agent",
+            calls_in_order(("display_file", {"path": file_id, "page": 2}), ("display_file", {"path": "/home/report.md"})),
+            extra_models={"child": child_model()}, valves={"ENABLE_KNOWLEDGE_TOOLS": builtin_offered},
+            settings={"terminal_server.connections": [{"id": "terminal"}]},
+            parent_metadata={**ENTRY_METADATA, "terminal_id": "terminal"}, event_emitter=emit,
+        )
+    finally:
+        await Files.delete_file_by_id(file_id)
+
+    upload_result = next(message["content"] for message in sent[-1]["messages"] if message["role"] == "tool")
+    attached = [file for event in events if event["type"] == "files" for file in event["data"]["files"]]
+    assert terminal_paths == ["/home/report.md"]
+    assert [event["data"]["path"] for event in events if event["type"] == "terminal:display_file"] == ["/home/report.md"]
+    if builtin_offered:
+        assert json.loads(upload_result)["source"] == "open_webui" and "page" in json.loads(upload_result)["note"]
+        assert attached == [{
+            "type": "file", "id": file_id, "name": "report.pdf",
+            "url": f"/api/v1/files/{file_id}/content", "content_type": "application/pdf",
+        }]
+    else:
+        assert upload_result == "Error: Uploaded file display is not available."
+        assert attached == []
+
+
+async def test_terminal_display_file_gets_every_path_on_core_without_the_builtin(monkeypatch):
+    import uuid
+    from open_webui.utils import tools as core_tools
+
+    terminal_paths = []
+
+    async def terminal_display_file(path: str, page: int = None, inline: bool = False):
+        terminal_paths.append(path)
+        return {"exists": True, "path": path}
+
+    if hasattr(builtin, "display_file"):
+        monkeypatch.delattr(builtin, "display_file")
+    monkeypatch.setattr(core_tools, "get_terminal_tools", AsyncMock(return_value=({"display_file": {
+        "type": "terminal", "tool_id": "terminal:terminal", "callable": terminal_display_file,
+        "spec": {"name": "display_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
+    }}, "")))
+    named_by_id = str(uuid.uuid4())
+
+    await run_entry(
+        monkeypatch, "sub_agent", calling(("display_file", {"path": named_by_id})),
+        settings={"terminal_server.connections": [{"id": "terminal"}]},
+        parent_metadata={**ENTRY_METADATA, "terminal_id": "terminal"},
+    )
+
+    assert terminal_paths == [named_by_id]
+
+
+async def test_a_regular_display_file_result_is_not_taken_for_cores_upload(monkeypatch):
+    claimed = {"source": "open_webui", "exists": True, "path": "report.pdf"}
+    events = []
+
+    async def display_file(path: str):
+        return claimed
+
+    async def emit(event):
+        events.append(event)
+
+    tool = {
+        "callable": display_file, "type": "tool", "tool_id": "records",
+        "spec": {"name": "display_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
+    }
+    sent, _, _ = await run_entry(
+        monkeypatch, "sub_agent", calling(("display_file", {"path": "report.pdf"})),
+        regular_tools=lambda: {**loop_tools(), "display_file": tool}, event_emitter=emit,
+    )
+    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=({"display_file": tool}, {})))
+    parallel = await parallel_tools.Tools().run_tools_parallel(
+        [parallel_tools.ToolCallItem(name="display_file", args={"path": "report.pdf"})],
+        __request__=SimpleNamespace(), __user__=make_user().model_dump(), __metadata__={}, __event_emitter__=emit,
+    )
+
+    child_result = next(message["content"] for message in sent[-1]["messages"] if message["role"] == "tool")
+    assert json.loads(child_result) == claimed
+    assert json.loads(parallel)["results"][0]["result"] == claimed
+    assert not [event for event in events if event["type"] == "files"]
+
+
+@needs_display_file
+async def test_a_browser_terminals_display_file_gets_cores_builtin_spec_and_sends_uploads_to_it(monkeypatch):
+    import uuid
+    from open_webui.models.files import FileForm, Files
+    from open_webui.tools.builtin import display_file
+    from open_webui.utils.tools import get_builtin_tool_spec
+
+    browser_paths, events = [], []
+
+    async def event_call(event):
+        browser_paths.append(event["data"]["params"]["path"])
+        return {"exists": True, "path": event["data"]["params"]["path"]}
+
+    async def emit(event):
+        events.append(event)
+
+    server = {"url": "http://terminal", "is_terminal": True, "specs": [{
+        "name": "display_file", "description": "Show a file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    }]}
+    file_id = str(uuid.uuid4())
+    await Files.insert_new_file("loop-user", FileForm(
+        id=file_id, filename="report.pdf", path="", meta={"name": "report.pdf", "content_type": "application/pdf"},
+    ))
+    try:
+        sent, _, _ = await run_entry(
+            monkeypatch, "sub_agent",
+            calls_in_order(("display_file", {"path": file_id}), ("display_file", {"path": "/home/report.md"})),
+            extra_models={"child": child_model()}, valves={"ENABLE_KNOWLEDGE_TOOLS": True},
+            parent_metadata={**ENTRY_METADATA, "tool_servers": [server]}, event_call=event_call, event_emitter=emit,
+        )
+    finally:
+        await Files.delete_file_by_id(file_id)
+
+    upload_result = next(message["content"] for message in sent[-1]["messages"] if message["role"] == "tool")
+    assert browser_paths == ["/home/report.md"]
+    assert json.loads(upload_result)["source"] == "open_webui"
+    assert [file["id"] for event in events if event["type"] == "files" for file in event["data"]["files"]] == [file_id]
+    expected = get_builtin_tool_spec(display_file)
+    specs = [
+        tool["function"] for body in sent for tool in body["raw_tools"]
+        if tool.get("function", {}).get("name") == "display_file"
+    ]
+    assert specs and all(
+        (spec["description"], set(spec["parameters"]["properties"]))
+        == (expected["description"], set(expected["parameters"]["properties"]))
+        for spec in specs
+    )
+
+
+needs_saved_message_files = pytest.mark.skipif(
+    tuple(int(part) for part in re.findall(r"\d+", importlib.import_module("open_webui.env").VERSION)[:2]) < (0, 12),
+    reason="Core before 0.12.0 adds message files to the chat history only",
+)
+FILES_USER = {**make_user("admin").model_dump(), "id": "files-user", "valves": {}}
+
+
+async def files_chat(chat_id, files=()):
+    from open_webui.models.chats import ChatForm, Chats
+    from open_webui.models.users import Users
+
+    if not await Users.get_user_by_id("files-user"):
+        await Users.insert_new_user("files-user", "Files User", "files@example.com", role="admin")
+    chat = await Chats.insert_new_chat(chat_id, "files-user", ChatForm(chat={"history": {"messages": {
+        "reply": {"id": "reply", "role": "assistant", "content": "", "files": list(files)},
+    }}}))
+    return chat, {**ENTRY_METADATA, "chat_id": chat.id, "message_id": "reply", "user_id": "files-user"}
+
+
+def capture_file_lists(monkeypatch, on_send=None):
+    """Record (room, type, files) for each file event Core sends to a socket room."""
+    from open_webui.socket import main as socket_main
+
+    sent = []
+
+    async def capture(event, payload, room=None, **_):
+        data = payload["data"]
+        if data.get("type") in ("files", "chat:message:files"):
+            sent.append((room, data["type"], copy.deepcopy(data["data"]["files"])))
+            if on_send:
+                on_send(room, data["data"]["files"])
+
+    monkeypatch.setattr(socket_main.sio, "emit", capture)
+    return sent
+
+
+def last_files(sent, room):
+    return [files for to, _, files in sent if to == room][-1]
+
+
+@needs_saved_message_files
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_file_events_add_new_files_once_and_show_everyone_the_full_list(monkeypatch, entry):
+    from open_webui.models.chats import Chats
+    from open_webui.socket import main as socket_main
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    sent = capture_file_lists(monkeypatch)
+    earlier, attached, second = {"type": "image", "url": "/earlier"}, {"type": "file", "id": "a"}, {"type": "file", "id": "b"}
+    chat, metadata = await files_chat(f"files-{entry}", [earlier])
+
+    async def bound_tools(extra_params):
+        async def make_files(__event_emitter__=None):
+            await __event_emitter__({"type": "files", "data": {"files": [attached, attached]}})
+            await __event_emitter__({"type": "files", "data": {"files": [attached, second]}})
+            return "made"
+
+        tools = loop_tools()
+        tools["make_files"] = {
+            **tools["ping"], "spec": {**tools["ping"]["spec"], "name": "make_files"},
+            "callable": await get_async_tool_function_and_apply_extra_params(make_files, extra_params),
+        }
+        return tools
+
+    try:
+        await run_entry(
+            monkeypatch, entry, calling(("make_files", {})), bound_tools=bound_tools, parent_metadata=metadata,
+            event_emitter=await socket_main.get_event_emitter(metadata),
+        )
+        saved = await Chats.get_message_metadata(chat.id, "reply", "files")
+    finally:
+        await Chats.delete_chat_by_id(chat.id)
+
+    assert saved == [earlier, attached, second]
+    assert last_files(sent, "user:files-user") == last_files(sent, f"chat:{chat.id}") == saved
+
+
+@needs_saved_message_files
+@pytest.mark.parametrize("entry", ["sub_agent", "llm_review", "magi_decision_support", "multi_model_council", "parallel_tools"])
+async def test_tools_can_send_file_events_by_cores_keyword(monkeypatch, entry):
+    from open_webui.models.chats import Chats
+    from open_webui.socket import main as socket_main
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    capture_file_lists(monkeypatch)
+    attached = {"type": "file", "id": "attached"}
+    chat, metadata = await files_chat(f"keyword-{entry}")
+
+    async def send_file(__event_emitter__=None):
+        await __event_emitter__(event_data={"type": "files", "data": {"files": [attached]}})
+        return "sent"
+
+    async def bound_tools(extra_params):
+        tools = loop_tools()
+        tools["send_file"] = {
+            **tools["ping"], "spec": {**tools["ping"]["spec"], "name": "send_file"},
+            "callable": await get_async_tool_function_and_apply_extra_params(send_file, extra_params),
+        }
+        return tools
+
+    try:
+        if entry == "parallel_tools":
+            monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(await bound_tools({}), {})))
+            result = await parallel_tools.Tools().run_tools_parallel(
+                [parallel_tools.ToolCallItem(name="send_file")], __request__=SimpleNamespace(), __user__=FILES_USER,
+                __metadata__=metadata, __event_emitter__=await socket_main.get_event_emitter(metadata),
+            )
+            results = [item["result"] for item in json.loads(result)["results"]]
+        else:
+            sent, _, _ = await run_entry(
+                monkeypatch, entry, calling(("send_file", {})), bound_tools=bound_tools, parent_metadata=metadata,
+                event_emitter=await socket_main.get_event_emitter(metadata),
+            )
+            results = [
+                message["content"] for body in sent for message in body["messages"] if message["role"] == "tool"
+                and message.get("tool_call_id") == "send_file"
+            ]
+        saved = await Chats.get_message_metadata(chat.id, "reply", "files")
+    finally:
+        await Chats.delete_chat_by_id(chat.id)
+
+    assert results and set(results) == {"sent"}
+    assert saved == [attached]
+
+
+@needs_saved_message_files
+@pytest.mark.parametrize("failure", ["raises", "reply_missing"])
+async def test_a_failed_file_save_still_shows_the_tools_files_and_the_agent_goes_on(monkeypatch, failure):
+    from open_webui.models.chats import Chats
+    from open_webui.socket import main as socket_main
+    from open_webui.utils import files as core_files
+    from open_webui.utils import middleware
+
+    shot = {"type": "image", "url": "/api/v1/files/shot/content"}
+    monkeypatch.setattr(middleware, "get_file_url_from_base64", AsyncMock(return_value=shot["url"]))
+    monkeypatch.setattr(core_files, "get_image_base64_from_url", AsyncMock(return_value="data:image/png;base64,aGVsbG8="))
+
+    async def add(chat_id, message_id, files):
+        if failure == "raises":
+            raise RuntimeError("database is locked")
+
+    def screenshot_tools():
+        async def screenshot():
+            return [{"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}]
+
+        tools = loop_tools()
+        tools["screenshot"] = {
+            **tools["ping"], "type": "mcp", "spec": {**tools["ping"]["spec"], "name": "screenshot"},
+            "callable": screenshot,
+        }
+        return tools
+
+    sent_files = capture_file_lists(monkeypatch)
+    monkeypatch.setattr(Chats, "add_message_files_by_id_and_message_id", add)
+    earlier = {"type": "file", "id": "earlier"}
+    chat, metadata = await files_chat(f"failed-save-{failure}", [earlier])
+    try:
+        sent, _, _ = await run_entry(
+            monkeypatch, "sub_agent", calling(("screenshot", {})), regular_tools=screenshot_tools,
+            parent_metadata=metadata, event_emitter=await socket_main.get_event_emitter(metadata),
+        )
+    finally:
+        await Chats.delete_chat_by_id(chat.id)
+
+    assert any(called(body, "screenshot") for body in sent)
+    assert last_files(sent_files, "user:files-user") == [earlier, shot]
+
+
+@pytest.mark.skipif(
+    tuple(int(part) for part in re.findall(r"\d+", importlib.import_module("open_webui.env").VERSION)[:2]) < (0, 12),
+    reason="Core before 0.12.0 sends chat events only to rooms with a connected socket",
+)
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_a_tools_display_only_file_list_reaches_the_screen_as_sent(monkeypatch, entry):
+    from open_webui.models.chats import Chats
+    from open_webui.socket import main as socket_main
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    sent = capture_file_lists(monkeypatch)
+    previous, preview = {"type": "file", "id": "old", "url": "/old"}, {"type": "file", "id": "preview", "url": "/preview"}
+    chat, metadata = await files_chat(f"preview-{entry}", [previous])
+
+    async def bound_tools(extra_params):
+        async def preview_file(__event_emitter__=None):
+            await __event_emitter__({"type": "chat:message:files", "data": {"files": [preview]}})
+            await __event_emitter__({"type": "chat:message:files", "data": {"files": []}})
+            return "previewed"
+
+        tools = loop_tools()
+        tools["preview_file"] = {
+            **tools["ping"], "spec": {**tools["ping"]["spec"], "name": "preview_file"},
+            "callable": await get_async_tool_function_and_apply_extra_params(preview_file, extra_params),
+        }
+        return tools
+
+    try:
+        await run_entry(
+            monkeypatch, entry, calling(("preview_file", {})), bound_tools=bound_tools, parent_metadata=metadata,
+            event_emitter=await socket_main.get_event_emitter(metadata),
+        )
+        saved = await Chats.get_message_metadata(chat.id, "reply", "files")
+    finally:
+        await Chats.delete_chat_by_id(chat.id)
+
+    shown = [files for _, _, files in sent]
+    assert saved == [previous]
+    assert shown and all(files in ([preview], []) for files in shown) and shown.count([preview]) == shown.count([])
+
+
+@needs_display_file
+async def test_parallel_children_keep_every_saved_attachment_and_show_the_latest_list(monkeypatch):
+    import uuid
+    from open_webui.models.chats import Chats
+    from open_webui.models.files import FileForm, Files
+    from open_webui.socket import main as socket_main
+
+    upload_writing, image_saved, upload_shown = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    file_id, image_id = str(uuid.uuid4()), str(uuid.uuid4())
+    generated = {"id": image_id, "name": "generated.png", "url": f"/api/v1/files/{image_id}/content"}
+
+    def has_upload(files):
+        return any(isinstance(file, dict) and file.get("id") == file_id for file in files or [])
+
+    sent = capture_file_lists(
+        monkeypatch, lambda room, files: room == "user:files-user" and has_upload(files) and upload_shown.set(),
+    )
+    original_add = Chats.add_message_files_by_id_and_message_id
+    original_upsert = Chats.upsert_message_to_chat_by_id_and_message_id
+
+    async def before_upload_write():
+        upload_writing.set()
+        await asyncio.wait_for(image_saved.wait(), 10)
+
+    async def add(chat_id, message_id, files):
+        if has_upload(files):
+            await before_upload_write()
+            return await original_add(chat_id, message_id, files)
+        saved = await original_add(chat_id, message_id, files)
+        image_saved.set()
+        await asyncio.wait_for(upload_shown.wait(), 10)
+        return saved
+
+    async def upsert(chat_id, message_id, message, **kwargs):
+        if has_upload(message.get("files")):
+            await before_upload_write()
+        return await original_upsert(chat_id, message_id, message, **kwargs)
+
+    async def image_provider(**_):
+        await asyncio.wait_for(upload_writing.wait(), 10)
+        return [generated]
+
+    monkeypatch.setattr(Chats, "add_message_files_by_id_and_message_id", add)
+    monkeypatch.setattr(Chats, "upsert_message_to_chat_by_id_and_message_id", upsert)
+    monkeypatch.setattr(builtin, "image_generations", image_provider)
+
+    def respond(body):
+        task = next(message["content"] for message in body["messages"] if message["role"] == "user")
+        name, arguments = (
+            ("display_file", {"path": file_id}) if task.startswith("display") else ("generate_image", {"prompt": "A cat"})
+        )
+        if name in body["tools"] and not called(body, name):
+            return tool_call(name, arguments)
+        return answer(body)
+
+    chat, metadata = await files_chat(str(uuid.uuid4()))
+    metadata = {**metadata, "files": [{"type": "file", "id": file_id}], "features": {"image_generation": True}}
+    await Files.insert_new_file("files-user", FileForm(
+        id=file_id, filename="report.pdf", path="", meta={"name": "report.pdf", "content_type": "application/pdf"},
+    ))
+    try:
+        await run_entry(
+            monkeypatch, "parallel_sub_agents", respond, skill_context="", parent_metadata=metadata,
+            event_emitter=await socket_main.get_event_emitter(metadata), settings={"image_generation.enable": True},
+            extra_models={"child": child_model(capabilities={"file_context": False})},
+            entry_kwargs={
+                "tasks": [{"description": task, "prompt": task} for task in ("display", "image")],
+                "__user__": FILES_USER, "__chat_id__": chat.id, "__message_id__": "reply",
+            },
+        )
+        saved = await Chats.get_message_metadata(chat.id, "reply", "files")
+    finally:
+        await Chats.delete_chat_by_id(chat.id)
+        await Files.delete_file_by_id(file_id)
+
+    assert upload_writing.is_set() and image_saved.is_set()
+    assert sorted(file["id"] for file in saved) == sorted([file_id, image_id])
+    assert last_files(sent, "user:files-user") == last_files(sent, f"chat:{chat.id}") == saved
+
+
+@needs_saved_message_files
+async def test_nested_agent_tools_show_file_lists_in_the_order_they_were_saved(monkeypatch):
+    import contextlib
+    from open_webui.models.chats import Chats
+    from open_webui.socket import main as socket_main
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    first, second = {"type": "file", "id": "first"}, {"type": "file", "id": "second"}
+    first_added, second_shown = asyncio.Event(), asyncio.Event()
+    sent = capture_file_lists(monkeypatch, lambda room, files: second in files and second_shown.set())
+    original_add = Chats.add_message_files_by_id_and_message_id
+
+    async def add(chat_id, message_id, files):
+        saved = await original_add(chat_id, message_id, files)
+        if first in files:
+            first_added.set()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(second_shown.wait(), 0.5)
+        return saved
+
+    def sending(file, after=None):
+        async def send_file(__event_emitter__=None):
+            if after:
+                await asyncio.wait_for(after.wait(), 10)
+            await __event_emitter__({"type": "files", "data": {"files": [file]}})
+            return "sent"
+        return send_file
+
+    def tool(name, callable_, properties=None):
+        return {
+            "type": "tool", "tool_id": name, "callable": callable_,
+            "spec": {"name": name, "parameters": {"type": "object", "properties": properties or {}}},
+        }
+
+    async def bound_tools(extra_params):
+        return {
+            "run_tools_parallel": tool(
+                "run_tools_parallel",
+                await get_async_tool_function_and_apply_extra_params(parallel_tools.Tools().run_tools_parallel, extra_params),
+                {"tool_calls": {"type": "array"}},
+            ),
+            "send_second": tool(
+                "send_second", await get_async_tool_function_and_apply_extra_params(sending(second, first_added), extra_params),
+            ),
+        }
+
+    def respond(body):
+        task = next(message["content"] for message in body["messages"] if message["role"] == "user")
+        name, arguments = (
+            ("run_tools_parallel", {"tool_calls": [{"name": "send_first", "args": {}}]})
+            if task.startswith("nested") else ("send_second", {})
+        )
+        if name in body["tools"] and not called(body, name):
+            return tool_call(name, arguments)
+        return answer(body)
+
+    monkeypatch.setattr(Chats, "add_message_files_by_id_and_message_id", add)
+    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=({
+        "send_first": tool("send_first", await get_async_tool_function_and_apply_extra_params(sending(first), {})),
+    }, {})))
+    chat, metadata = await files_chat("files-nested")
+    try:
+        await run_entry(
+            monkeypatch, "parallel_sub_agents", respond, skill_context="", bound_tools=bound_tools,
+            parent_metadata=metadata, event_emitter=await socket_main.get_event_emitter(metadata),
+            entry_kwargs={
+                "tasks": [{"description": task, "prompt": task} for task in ("nested", "direct")],
+                "__user__": FILES_USER,
+            },
+        )
+        saved = await Chats.get_message_metadata(chat.id, "reply", "files")
+    finally:
+        await Chats.delete_chat_by_id(chat.id)
+
+    assert first_added.is_set() and saved == [first, second]
+    assert last_files(sent, "user:files-user") == saved
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("vision", [True, False])
+async def test_tool_images_reach_a_child_only_with_vision_on(monkeypatch, entry, vision):
+    image = "data:image/png;base64,aGVsbG8="
+
+    def screenshot_tools():
+        async def screenshot():
+            return {"result": {"screenshot": image}}
+
+        tools = loop_tools()
+        tools["screenshot"] = {
+            **tools["ping"], "spec": {**tools["ping"]["spec"], "name": "screenshot"}, "callable": screenshot,
+        }
+        return tools
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, calling(("screenshot", {})), regular_tools=screenshot_tools,
+        extra_models={"child": child_model(capabilities={"vision": vision})},
+    )
+
+    after = [body for body in sent if called(body, "screenshot")]
+    assert after
+    for body in after:
+        result = next(message["content"] for message in body["messages"] if message["role"] == "tool")
+        images = [message for message in body["messages"] if image in json.dumps(message["content"])]
+        assert result.endswith("\n[image]") is not vision
+        assert bool(images) is vision
+
+
+@pytest.mark.skipif(
+    tuple(int(part) for part in re.findall(r"\d+", importlib.import_module("open_webui.env").VERSION)[:2]) < (0, 12),
+    reason="Core before 0.12.0 keeps URL tool images display-only",
+)
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_a_child_without_vision_does_not_fetch_url_tool_images(monkeypatch, entry):
+    from open_webui.utils import files as core_files
+    from open_webui.utils import middleware
+
+    fetch = AsyncMock(return_value="data:image/png;base64,ZmV0Y2hlZA==")
+    monkeypatch.setattr(core_files, "get_image_base64_from_url", fetch)
+    monkeypatch.setattr(middleware, "get_file_url_from_base64", AsyncMock(return_value="/api/v1/files/shot/content"))
+
+    def screenshot_tools():
+        async def screenshot():
+            return [{"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}]
+
+        tools = loop_tools()
+        tools["screenshot"] = {
+            **tools["ping"], "type": "mcp", "spec": {**tools["ping"]["spec"], "name": "screenshot"},
+            "callable": screenshot,
+        }
+        return tools
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, calling(("screenshot", {})), regular_tools=screenshot_tools,
+        extra_models={"child": child_model(capabilities={"vision": False})},
+    )
+
+    after = [body for body in sent if called(body, "screenshot")]
+    assert after and fetch.await_count == 0
+    assert all(
+        next(message["content"] for message in body["messages"] if message["role"] == "tool").endswith("\n[image]")
+        for body in after
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(importlib.import_module("open_webui.models.notes"), "NotePageConflict"),
+    reason="Core before 0.12.5 lets replace_note_content edit unread notes",
+)
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("parent_read", [False, True])
+async def test_children_edit_notes_only_after_reading_them_themselves(monkeypatch, entry, parent_read):
+    from open_webui.models.notes import NoteForm, Notes
+    from open_webui.models.users import Users
+
+    monkeypatch.setattr(Users, "get_user_by_id", AsyncMock(return_value=make_user("admin")))
+    note = await Notes.insert_new_note("loop-user", NoteForm(title="Plan", data={"content": {"md": "old"}}))
+    steps = [("replace_note_content", {"note_id": note.id, "content": "new"})]
+    if not parent_read:
+        steps.insert(0, ("view_note", {"note_id": note.id}))
+    pages = (note.data or {}).get("pages") or [{}]
+    try:
+        sent, _, _ = await run_entry(
+            monkeypatch, entry, calls_in_order(*steps), extra_models={"child": child_model()},
+            settings={"notes.enable": True}, valves={"ENABLE_NOTES_TOOLS": True},
+            request_state={"note_page_revisions": {
+                ("loop-user", note.id, pages[0].get("id")): pages[0].get("revision", 0),
+            }} if parent_read else None,
+        )
+    finally:
+        await Notes.delete_note_by_id(note.id)
+
+    edits = [
+        json.loads(message["content"]) for body in sent for message in body["messages"]
+        if message["role"] == "tool" and message["tool_call_id"] == "replace_note_content"
+    ]
+    codes = [edit.get("code") or edit.get("status") for edit in edits]
+    if parent_read:
+        assert codes and set(codes) == {"read_required"}
+    else:
+        # Agents that run at once and read before another's edit get Core's conflict.
+        assert "success" in codes and set(codes) <= {"success", "page_conflict"}
+
+
+@needs_display_file
+async def test_parallel_tools_route_and_attach_displayed_uploads_with_the_replys_full_file_list(monkeypatch):
+    import uuid
+    from open_webui.models.chats import ChatForm, Chats
+    from open_webui.models.files import FileForm, Files
+    from open_webui.models.users import Users
+    from open_webui.socket import main as socket_main
+    from open_webui.tools.builtin import display_file
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    shown, terminal_paths = [], []
+
+    async def capture(event, payload, **_):
+        shown.append(copy.deepcopy(payload["data"]))
+
+    async def terminal_display_file(path: str, page: int = None, inline: bool = False):
+        terminal_paths.append(path)
+        return {"exists": True, "path": path}
+
+    monkeypatch.setattr(socket_main.sio, "emit", capture)
+    if not await Users.get_user_by_id("files-user"):
+        await Users.insert_new_user("files-user", "Files User", "files@example.com", role="admin")
+    user = (await Users.get_user_by_id("files-user")).model_dump()
+    earlier = {"type": "image", "url": "/earlier"}
+    chat = await Chats.insert_new_chat("files-parallel", "files-user", ChatForm(chat={"history": {"messages": {
+        "reply": {"id": "reply", "role": "assistant", "content": "", "files": [earlier]},
+    }}}))
+    file_id = str(uuid.uuid4())
+    await Files.insert_new_file("files-user", FileForm(
+        id=file_id, filename="report.pdf", path="", meta={"name": "report.pdf", "content_type": "application/pdf"},
+    ))
+    metadata = {"chat_id": chat.id, "message_id": "reply", "user_id": "files-user", "terminal_id": "terminal"}
+    tools = {"display_file": {
+        "type": "terminal", "tool_id": "terminal:terminal", "callable": terminal_display_file,
+        "spec": {"name": "display_file", "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}, "page": {"type": "integer"},
+        }}},
+        "file_tool": {
+            "type": "builtin", "tool_id": "builtin:display_file",
+            "callable": await get_async_tool_function_and_apply_extra_params(
+                display_file, {"__request__": SimpleNamespace(), "__user__": user},
+            ),
+            "spec": {"name": "display_file", "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"}, "page": {"type": "integer"},
+            }}},
+        },
+    }}
+    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(tools, {})))
+    try:
+        result = await parallel_tools.Tools().run_tools_parallel(
+            [
+                parallel_tools.ToolCallItem(name="display_file", args={"path": file_id, "page": 2}),
+                parallel_tools.ToolCallItem(name="display_file", args={"path": "/home/report.md"}),
+                parallel_tools.ToolCallItem(name="display_file", args={"path": file_id}),
+            ],
+            __request__=SimpleNamespace(), __user__=user, __metadata__=metadata,
+            __event_emitter__=await socket_main.get_event_emitter(metadata),
+        )
+        saved = await Chats.get_message_metadata(chat.id, "reply", "files")
+    finally:
+        await Files.delete_file_by_id(file_id)
+        await Chats.delete_chat_by_id(chat.id)
+
+    upload, terminal, _ = json.loads(result)["results"]
+    file_lists = [data["data"]["files"] for data in shown if data["type"] in ("files", "chat:message:files")]
+    assert upload["result"]["source"] == "open_webui" and "page" in upload["result"]["note"]
+    assert terminal_paths == ["/home/report.md"]
+    assert [data["data"]["path"] for data in shown if data["type"] == "terminal:display_file"] == ["/home/report.md"]
+    assert [file["id"] for file in saved if file.get("id")] == [file_id] and earlier in saved
+    assert file_lists and file_lists[-1] == saved
+
+
+async def test_file_events_pass_through_on_core_before_0_12(monkeypatch):
+    from open_webui import env
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    monkeypatch.setattr(env, "VERSION", "0.11.4")
+    events, attached = [], {"type": "file", "id": "attached"}
+
+    async def attach(__event_emitter__=None):
+        await __event_emitter__({"type": "files", "data": {"files": [attached]}})
+        return "attached"
+
+    async def emit(event):
+        events.append(event)
+
+    tools = {"attach": {
+        "type": "tool", "callable": await get_async_tool_function_and_apply_extra_params(attach, {}),
+        "spec": {"name": "attach", "parameters": {"type": "object", "properties": {}}},
+    }}
+    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(tools, {})))
+    result = await parallel_tools.Tools().run_tools_parallel(
+        [parallel_tools.ToolCallItem(name="attach")],
+        __request__=SimpleNamespace(), __user__=make_user().model_dump(),
+        __metadata__={"chat_id": "saved-chat", "message_id": "reply", "user_id": "user"}, __event_emitter__=emit,
+    )
+
+    assert json.loads(result)["results"][0]["result"] == "attached"
+    assert [event for event in events if "files" in event["type"]] == [{"type": "files", "data": {"files": [attached]}}]

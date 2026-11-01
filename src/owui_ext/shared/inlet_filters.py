@@ -256,11 +256,19 @@ def isolate_request_state(request: Request, metadata: dict) -> Request:
     It also merges ``state.metadata`` over the payload metadata, as Core's
     chat request shares one metadata dict between its body and its state.
     """
+    return _copy_request_state(request, metadata=metadata)
+
+
+def isolate_tool_request(request: Request) -> Request:
+    """Copy *request* with its own note read records, as Core runs each sub-agent on a new request."""
+    return _copy_request_state(request, note_page_revisions={})
+
+
+def _copy_request_state(request: Request, **values: Any) -> Request:
     scope = getattr(request, "scope", None)
     if not isinstance(scope, dict):
         return request
-    state = dict(scope.get("state") or {})
-    state["metadata"] = metadata
+    state = {**(scope.get("state") or {}), **values}
     isolated = copy.copy(request)
     isolated.scope = {**scope, "state": state}
     isolated._state = State(state)

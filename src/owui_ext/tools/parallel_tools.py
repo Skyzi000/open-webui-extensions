@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.10
+version: 0.2.11
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -28,11 +28,15 @@ from pydantic import BaseModel, Field
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.tool_execution import (
     CITATION_TOOLS,
+    attach_displayed_upload,
     emit_terminal_tool_event,
     execute_direct_tool_call,
     filter_tool_arguments,
+    mark_saved_image_files,
+    order_file_events,
     process_tool_result,
     resolve_call_tool,
+    resolve_display_file_tool,
     split_tool_result_files,
     structure_terminal_file_tool_result,
 )
@@ -93,6 +97,10 @@ async def execute_single_tool(
         }
 
     tool = tools_dict[tool_name]
+    if tool_name == "display_file":
+        tool, error = resolve_display_file_tool(tool, tool_args)
+        if error:
+            return {"tool_name": tool_name, "result": error}
 
     try:
         filtered_args = filter_tool_arguments(tool, tool_args)
@@ -118,7 +126,7 @@ async def execute_single_tool(
                 extra_params={
                     "__messages__": extra_params.get("__messages__", []),
                     "__files__": extra_params.get("__files__", []),
-                    "__event_emitter__": extra_params.get("__event_emitter__"),
+                    "__event_emitter__": mark_saved_image_files(extra_params.get("__event_emitter__"), tool, tool_name),
                     "__event_call__": extra_params.get("__event_call__"),
                 },
             ))
@@ -152,6 +160,8 @@ async def execute_single_tool(
                 tool_result_images, tool_result_files = await split_tool_result_files(
                     tool_result_files, extra_params.get("__user__")
                 )
+        if tool_name == "display_file" and tool.get("type") == "builtin":
+            result = attach_displayed_upload(result, tool_result_files)
 
         # Emit terminal:* events for display/refresh behavior in UI
         await emit_terminal_tool_event(
@@ -389,6 +399,7 @@ class Tools:
 
         user = UserModel(**__user__)
         __metadata__ = __metadata__ or {}
+        __event_emitter__ = order_file_events(__event_emitter__, __metadata__, __request__)
 
         extra_params = {
             "__user__": __user__,

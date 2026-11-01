@@ -17,7 +17,7 @@ priority order:
 4. **Direct tools** from ``metadata.tool_servers`` (OpenAPI servers).
 5. **Builtin tools** from ``get_builtin_tools()``, filtered by the
    plugin's per-category Valves (``ENABLE_*_TOOLS``) plus overlap handling
-   for ``view_note`` and ``view_file``.
+   for ``view_note``, ``view_file``, and ``display_file``.
 
 Each merge step warns on duplicate names (debug-only) and surfaces
 load failures to the user via ``shared.notifications.emit_notification``.
@@ -47,7 +47,7 @@ from owui_ext.shared.model_features import (
     model_knowledge_tools_enabled,
 )
 from owui_ext.shared.notifications import emit_notification
-from owui_ext.shared.tool_execution import normalize_terminal_tools_result
+from owui_ext.shared.tool_execution import core_version, is_terminal_tool, normalize_terminal_tools_result
 from owui_ext.shared.tool_servers import (
     build_direct_tools_dict,
     extract_direct_tool_server_prompts,
@@ -91,12 +91,10 @@ async def build_tools_dict(
     import inspect
     import json
     import logging
-    import re
 
     log = logging.getLogger("owui_ext.shared.tool_loader")
     debug = bool(getattr(valves, "DEBUG", False))
 
-    from open_webui.env import VERSION
     from open_webui.utils.tools import get_builtin_tools, get_tools
 
     try:
@@ -389,7 +387,7 @@ async def build_tools_dict(
             disabled_builtin_tools: set = set()
             # Core before 0.12.0 keeps a single browser event callback and no
             # call timeout, so concurrent ask_user prompts can wait forever.
-            if tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2]) < (0, 12):
+            if core_version() < (0, 12):
                 disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES["user_input"])
             for valve_field, category in VALVE_TO_CATEGORY.items():
                 if not getattr(valves, valve_field, True):
@@ -422,17 +420,27 @@ async def build_tools_dict(
                 and model_has_file_knowledge(model, knowledge_metadata)
             )
 
+            keep_display_file = (
+                file_tools_enabled and "list_chat_files" in all_builtin_tools
+            ) or (
+                knowledge_tools_enabled
+                and not {"kb_exec", "view_knowledge_file"}.isdisjoint(all_builtin_tools)
+            )
+
             # Regular tools take priority over builtin tools with the same name.
             builtin_count = 0
             for name, tool_dict in all_builtin_tools.items():
                 if name in disabled_builtin_tools and not (
                     (name == "view_note" and keep_view_note_for_knowledge)
                     or (name == "view_file" and keep_view_file)
+                    or (name == "display_file" and keep_display_file)
                 ):
                     continue
                 if name not in tools_dict:
                     tools_dict[name] = tool_dict
                     builtin_count += 1
+                elif name == "display_file" and is_terminal_tool(tools_dict[name]):
+                    tools_dict[name] = {**tools_dict[name], "file_tool": tool_dict}
                 elif debug:
                     log.warning(
                         f"Builtin tool '{name}' skipped: "
@@ -476,10 +484,7 @@ async def build_tools_dict(
 
         for name in ("read_user_terminal", "send_user_terminal_input"):
             tool = tools_dict.get(name)
-            if tool and (
-                tool.get("type") == "terminal"
-                or tool.get("server", {}).get("is_terminal") is True
-            ):
+            if tool and is_terminal_tool(tool):
                 if not (
                     inherit_user_shell
                     and is_selected_terminal_tool(tool)

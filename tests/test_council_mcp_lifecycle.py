@@ -2,12 +2,13 @@
 
 import asyncio
 import json
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import anyio
 import pytest
+from mcp_sdk import patch_mcp_sdk
 
 
 @pytest.mark.asyncio
@@ -23,12 +24,17 @@ async def test_council_mcp_lifetime(monkeypatch, outcome):
 
     @asynccontextmanager
     async def connection(label):
-        async with anyio.create_task_group():
-            opened.append((label, asyncio.current_task()))
-            try:
-                yield
-            finally:
-                exit_attempts.append((label, asyncio.current_task()))
+        try:
+            async with anyio.create_task_group():
+                opened.append((label, asyncio.current_task()))
+                try:
+                    yield None
+                finally:
+                    exit_attempts.append((label, asyncio.current_task()))
+        except asyncio.CancelledError:
+            # Core 0.12.5+ closes a session by cancelling the task that holds it.
+            closed.append(label)
+            raise
         # Core catches RuntimeError, so check successful exits too.
         closed.append(label)
 
@@ -36,10 +42,7 @@ async def test_council_mcp_lifetime(monkeypatch, outcome):
         clients = {}
         for index in range(2):
             client = MCPClient()
-            client.exit_stack = AsyncExitStack()
-            await client.exit_stack.enter_async_context(
-                connection(f"{kwargs['model']['id']}:{index}")
-            )
+            await client.connect(url=f"{kwargs['model']['id']}:{index}")
             clients[str(index)] = client
         await asyncio.sleep(0)
         return {}, clients
@@ -61,6 +64,7 @@ async def test_council_mcp_lifetime(monkeypatch, outcome):
         await asyncio.sleep(0)
         return '{"vote":"A","reasoning":"done"}'
 
+    patch_mcp_sdk(monkeypatch, connection)
     monkeypatch.setattr(council, "build_tools_dict", load_tools)
     monkeypatch.setattr(council, "run_agent_loop", loop)
     monkeypatch.setattr(council, "register_view_skill", register_skill)
@@ -99,6 +103,5 @@ async def test_council_mcp_lifetime(monkeypatch, outcome):
             assert loops == ["first", "second"]
 
     assert [label for label, _ in opened] == ["first:0", "first:1", "second:0", "second:1"]
-    assert all(owner is invocation for _, owner in opened)
-    assert all(owner is invocation for _, owner in exit_attempts)
+    assert dict(exit_attempts) == dict(opened)
     assert [label for label, _ in exit_attempts] == closed == [label for label, _ in reversed(opened)]

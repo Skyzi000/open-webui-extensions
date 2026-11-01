@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.20
+version: 0.2.21
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -37,6 +37,7 @@ from owui_ext.shared.inlet_filters import (
     apply_inlet_filters_if_enabled,
     finalize_model_request,
     isolate_request_state,
+    isolate_tool_request,
     resolve_model_filter_pipeline,
 )
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients
@@ -53,6 +54,7 @@ from owui_ext.shared.tool_execution import (
     append_tool_result_images,
     execute_direct_tool_call,
     execute_tool_call,
+    order_file_events,
     process_tool_result,
 )
 from owui_ext.shared.tool_loader import build_tools_dict
@@ -286,6 +288,7 @@ async def run_agent_loop(
     if extra_params is None:
         extra_params = {}
     generate_chat_completion = core_chat_completion(extra_params)
+    tool_request = isolate_tool_request(extra_params.get("__request__"))
 
     # Prepare user object
     if isinstance(user, dict):
@@ -445,6 +448,7 @@ async def run_agent_loop(
                     {
                         **extra_params,
                         "__messages__": current_messages,
+                        "__request__": tool_request,
                     },
                     event_emitter=event_emitter,
                 )
@@ -550,8 +554,8 @@ class Tools:
         ENABLE_FILE_TOOLS: bool = Field(
             default=True,
             description=(
-                "Enable Core tools for listing, searching, and reading files attached to the current chat "
-                "(list_chat_files, query_chat_files, grep_chat_files, view_file). Files exposed through "
+                "Enable Core tools for listing, searching, reading, and showing files attached to the current chat "
+                "(list_chat_files, query_chat_files, grep_chat_files, view_file, display_file). Files exposed through "
                 "attached knowledge remain controlled by ENABLE_KNOWLEDGE_TOOLS."
             ),
         )
@@ -681,6 +685,7 @@ class Tools:
         - summary: Brief summary of the analysis
         - agents: MELCHIOR, BALTHASAR, CASPER results with votes and reasoning
         """
+        __event_emitter__ = order_file_events(__event_emitter__, __metadata__, __request__)
         emitter = EventEmitter(__event_emitter__)
 
         if __request__ is None:

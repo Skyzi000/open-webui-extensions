@@ -2647,7 +2647,7 @@ def test_builtin_memory_category_includes_v010_memory_tools(module_name, module,
         (
             "ENABLE_FILE_TOOLS",
             "files",
-            {"list_chat_files", "query_chat_files", "grep_chat_files", "view_file"},
+            {"list_chat_files", "query_chat_files", "grep_chat_files", "view_file", "display_file"},
         ),
         ("ENABLE_SUBAGENT_TOOLS", "subagents", {"delegate_task", "timer"}),
         ("ENABLE_NOTIFICATION_TOOLS", "notifications", {"notify"}),

@@ -1341,10 +1341,7 @@ class TestTerminalCompatibility:
         assert result["source"] == "open_terminal"
         assert result["terminal_id"] == "test"
         assert result["session_id"] == "chat-1"
-        if inline:
-            assert result["displayed"] is True
-        else:
-            assert "displayed" not in result
+        assert result.get("displayed", False) is inline
 
 
 # =============================================================================

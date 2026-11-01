@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.6.7
+version: 0.6.8
 license: MIT
 required_open_webui_version: 0.9.6
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -46,6 +46,7 @@ from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATE
 from owui_ext.shared.completion_response import format_chat_completion_error
 from owui_ext.shared.inlet_filters import (
     isolate_request_state,
+    isolate_tool_request,
     resolve_model_filter_pipeline,
 )
 from owui_ext.shared.loop_compaction import (
@@ -93,6 +94,7 @@ from owui_ext.shared.tool_execution import (
     execute_direct_tool_call,
     execute_tool_call,
     normalize_terminal_tools_result,
+    order_file_events,
     process_tool_result,
 )
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients, resolve_mcp_tools
@@ -1010,6 +1012,7 @@ async def run_sub_agent_loop(
     if extra_params is None:
         extra_params = {}
     generate_chat_completion = core_chat_completion(extra_params)
+    tool_request = isolate_tool_request(extra_params.get("__request__"))
 
     # Prepare user object
     if isinstance(user, dict):
@@ -1343,6 +1346,7 @@ async def run_sub_agent_loop(
                     {
                         **extra_params,
                         "__messages__": current_messages,
+                        "__request__": tool_request,
                     },
                     event_emitter=event_emitter,
                 )
@@ -1654,8 +1658,8 @@ class Tools:
         ENABLE_FILE_TOOLS: bool = Field(
             default=True,
             description=(
-                "Enable Core tools for listing, searching, and reading files attached to the current chat "
-                "(list_chat_files, query_chat_files, grep_chat_files, view_file). Files exposed through "
+                "Enable Core tools for listing, searching, reading, and showing files attached to the current chat "
+                "(list_chat_files, query_chat_files, grep_chat_files, view_file, display_file). Files exposed through "
                 "attached knowledge remain controlled by ENABLE_KNOWLEDGE_TOOLS."
             ),
         )
@@ -1854,6 +1858,7 @@ RESPONSE REQUIREMENTS:
         :param prompt: Detailed instructions for the sub-agent; this can be written in any language that best suits the task.
         :return: Sub-agent's final response after task completion
         """
+        __event_emitter__ = order_file_events(__event_emitter__, __metadata__, __request__)
         if __request__ is None:
             return json.dumps(
                 {"error": "Request context not available. Cannot run sub-agent."}
@@ -2057,6 +2062,7 @@ RESPONSE REQUIREMENTS:
         :return: JSON with "results" array in the same order as tasks.
                  Each element has "description" and either "result" or "error".
         """
+        __event_emitter__ = order_file_events(__event_emitter__, __metadata__, __request__)
         if __request__ is None:
             return json.dumps(
                 {"error": "Request context not available. Cannot run sub-agents."},
@@ -2118,9 +2124,7 @@ RESPONSE REQUIREMENTS:
         # all parallel tasks.  They reference the *parent* conversation message
         # that triggered this tool call; sub-agents build their own internal
         # message history.  Creating fake per-task IDs would be incorrect
-        # because no such messages exist in the DB.  Tools that write to the
-        # parent message (e.g. generate_image) may interleave, but since all
-        # tasks run on the same event loop this is not a data-race.
+        # because no such messages exist in the DB.
         common_extra_params = {
             "__user__": __user__,
             "__event_emitter__": __event_emitter__,

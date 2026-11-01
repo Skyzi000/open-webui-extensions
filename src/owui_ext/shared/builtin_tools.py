@@ -24,6 +24,7 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "query_chat_files",
         "grep_chat_files",
         "view_file",
+        "display_file",
     },
     "knowledge": {
         "list_knowledge",
@@ -36,6 +37,7 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "kb_exec",
         "view_file",
         "view_knowledge_file",
+        "display_file",
     },
     "chat": {"search_chats", "view_chat"},
     "memory": {

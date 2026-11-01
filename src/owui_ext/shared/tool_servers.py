@@ -142,6 +142,18 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
     return servers
 
 
+def _direct_tool_spec(server: dict, spec: dict) -> dict:
+    """Give a browser terminal's ``display_file`` Core's builtin spec, as Core 0.12.5+ does."""
+    if not (server.get("is_terminal") and spec.get("name") == "display_file"):
+        return spec
+    try:
+        from open_webui.tools.builtin import display_file
+        from open_webui.utils.tools import get_builtin_tool_spec
+    except ImportError:
+        return spec
+    return get_builtin_tool_spec(display_file)
+
+
 def build_direct_tools_dict(
     *, tool_servers: list[dict], debug: bool = False
 ) -> dict:
@@ -161,7 +173,7 @@ def build_direct_tools_dict(
             if not isinstance(name, str) or not name:
                 continue
             direct_tools[name] = {
-                "spec": spec,
+                "spec": _direct_tool_spec(server_payload, spec),
                 "direct": True,
                 "server": server_payload,
                 "type": "direct",

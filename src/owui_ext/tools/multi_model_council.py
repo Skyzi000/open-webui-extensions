@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.27
+version: 0.1.28
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -23,7 +23,7 @@ from owui_ext.shared.agent_requests import (
 )
 from owui_ext.shared.completion_response import format_chat_completion_error
 from owui_ext.shared.event_emitter import EventEmitter
-from owui_ext.shared.inlet_filters import resolve_model_filter_pipeline
+from owui_ext.shared.inlet_filters import isolate_tool_request, resolve_model_filter_pipeline
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients
 from owui_ext.shared.models import extract_model_ids, get_available_models
 from owui_ext.shared.parsing import normalize_text, safe_json_loads
@@ -42,6 +42,7 @@ from owui_ext.shared.tool_execution import (
     append_tool_result_images,
     execute_direct_tool_call,
     execute_tool_call,
+    order_file_events,
     process_tool_result,
 )
 from owui_ext.shared.tool_loader import build_tools_dict
@@ -198,6 +199,7 @@ async def run_agent_loop(
     if extra_params is None:
         extra_params = {}
     generate_chat_completion = core_chat_completion(extra_params)
+    tool_request = isolate_tool_request(extra_params.get("__request__"))
 
     # Prepare user object
     if isinstance(user, dict):
@@ -366,6 +368,7 @@ async def run_agent_loop(
                     {
                         **extra_params,
                         "__messages__": current_messages,
+                        "__request__": tool_request,
                     },
                     event_emitter=event_emitter,
                 )
@@ -497,8 +500,8 @@ class Tools:
         ENABLE_FILE_TOOLS: bool = Field(
             default=True,
             description=(
-                "Enable Core tools for listing, searching, and reading files attached to the current chat "
-                "(list_chat_files, query_chat_files, grep_chat_files, view_file). Files exposed through "
+                "Enable Core tools for listing, searching, reading, and showing files attached to the current chat "
+                "(list_chat_files, query_chat_files, grep_chat_files, view_file, display_file). Files exposed through "
                 "attached knowledge remain controlled by ENABLE_KNOWLEDGE_TOOLS."
             ),
         )
@@ -702,6 +705,7 @@ CRITICAL RULES:
         - vote_tally: {"A": n, "B": n, "abstain": n}
         - members: per-model outputs
         """
+        __event_emitter__ = order_file_events(__event_emitter__, __metadata__, __request__)
         emitter = EventEmitter(__event_emitter__)
 
         if __request__ is None:

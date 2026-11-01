@@ -1,14 +1,15 @@
-"""Exercise review-owned MCP scopes with Core's real disconnect implementation."""
+"""Exercise review-owned MCP scopes with Core's real connect and disconnect."""
 
 import asyncio
 import copy
 import json
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import anyio
 import pytest
+from mcp_sdk import patch_mcp_sdk
 
 
 @pytest.mark.asyncio
@@ -47,12 +48,17 @@ async def test_review_mcp_lifetime_across_effective_models(monkeypatch, outcome)
     @asynccontextmanager
     async def connection(label):
         # A real AnyIO task group enforces both task ownership and scope LIFO.
-        async with anyio.create_task_group():
-            opened.append((label, asyncio.current_task()))
-            try:
-                yield
-            finally:
-                exit_attempts.append((label, asyncio.current_task()))
+        try:
+            async with anyio.create_task_group():
+                opened.append((label, asyncio.current_task()))
+                try:
+                    yield None
+                finally:
+                    exit_attempts.append((label, asyncio.current_task()))
+        except asyncio.CancelledError:
+            # Core 0.12.5+ closes a session by cancelling the task that holds it.
+            closed.append(label)
+            raise
         # Core suppresses RuntimeError on disconnect; only successful scope
         # exits reach this line, so a swallowed ownership error still fails.
         closed.append(label)
@@ -63,8 +69,7 @@ async def test_review_mcp_lifetime_across_effective_models(monkeypatch, outcome)
         clients = {}
         for index in range(2):
             client = MCPClient()
-            client.exit_stack = AsyncExitStack()
-            await client.exit_stack.enter_async_context(connection(f"{model_id}:{index}"))
+            await client.connect(url=f"{model_id}:{index}")
             clients[str(index)] = client
         await asyncio.sleep(0)
         return {}, clients
@@ -104,6 +109,7 @@ async def test_review_mcp_lifetime_across_effective_models(monkeypatch, outcome)
 
     monkeypatch.setattr(resolve.__globals__["random"], "choice", choose)
     monkeypatch.setattr(llm_review, "resolve_model_filter_pipeline", resolve_once)
+    patch_mcp_sdk(monkeypatch, connection)
     monkeypatch.setattr(llm_review, "build_tools_dict", load_tools)
     monkeypatch.setattr(llm_review, "run_agent_loop", loop)
     monkeypatch.setattr(llm_review, "register_view_skill", register_skill)
@@ -158,5 +164,4 @@ async def test_review_mcp_lifetime_across_effective_models(monkeypatch, outcome)
     assert len({id(pipeline) for pipeline in pipelines}) == expected_routes
     expected_closes = [label for label, _ in reversed(opened)]
     assert [label for label, _ in exit_attempts] == closed == expected_closes
-    assert all(owner is invocation for _, owner in opened)
-    assert all(owner is invocation for _, owner in exit_attempts)
+    assert dict(exit_attempts) == dict(opened)

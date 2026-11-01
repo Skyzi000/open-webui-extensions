@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.14
+version: 0.5.15
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -255,11 +255,19 @@ def isolate_request_state(request: Request, metadata: dict) -> Request:
     It also merges ``state.metadata`` over the payload metadata, as Core's
     chat request shares one metadata dict between its body and its state.
     """
+    return _copy_request_state(request, metadata=metadata)
+
+
+def isolate_tool_request(request: Request) -> Request:
+    """Copy *request* with its own note read records, as Core runs each sub-agent on a new request."""
+    return _copy_request_state(request, note_page_revisions={})
+
+
+def _copy_request_state(request: Request, **values: Any) -> Request:
     scope = getattr(request, "scope", None)
     if not isinstance(scope, dict):
         return request
-    state = dict(scope.get("state") or {})
-    state["metadata"] = metadata
+    state = {**(scope.get("state") or {}), **values}
     isolated = copy.copy(request)
     isolated.scope = {**scope, "state": state}
     isolated._state = State(state)
@@ -972,6 +980,7 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "query_chat_files",
         "grep_chat_files",
         "view_file",
+        "display_file",
     },
     "knowledge": {
         "list_knowledge",
@@ -984,6 +993,7 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "kb_exec",
         "view_file",
         "view_knowledge_file",
+        "display_file",
     },
     "chat": {"search_chats", "view_chat"},
     "memory": {
@@ -1213,6 +1223,7 @@ async def emit_notification(
 
 # --- inlined from src/owui_ext/shared/tool_execution.py (owui_ext.shared.tool_execution) ---
 import ast
+import asyncio
 import json
 import logging
 import re
@@ -1238,6 +1249,143 @@ TERMINAL_EVENT_TOOLS: set[str] = {
     "replace_file_content",
     "run_command",
 }
+
+
+_UPLOADED_FILE_ID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+
+def is_terminal_tool(tool: dict) -> bool:
+    return tool.get("type") == "terminal" or (tool.get("server") or {}).get("is_terminal") is True
+
+
+def resolve_display_file_tool(tool: dict, params: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Send an uploaded file's ``display_file`` call to Core's builtin, as Core does for terminal tools."""
+    path = str(params.get("path", ""))
+    if not (path.startswith("/api/v1/files/") or _UPLOADED_FILE_ID.fullmatch(path)):
+        return tool, None
+    if tool.get("file_tool"):
+        return tool["file_tool"], None
+    try:
+        from open_webui.tools.builtin import display_file  # noqa: F401
+    except ImportError:
+        # Core before 0.12.5 sends every display_file path to the terminal.
+        return tool, None
+    if is_terminal_tool(tool):
+        return None, "Error: Uploaded file display is not available."
+    return tool, None
+
+
+def attach_displayed_upload(tool_result: Any, files: list) -> Any:
+    """Attach the uploaded file ``display_file`` showed to the reply, since a nested call cannot preview it inline."""
+    try:
+        result = json.loads(tool_result) if isinstance(tool_result, str) else tool_result
+    except ValueError:
+        return tool_result
+    if not (isinstance(result, dict) and result.get("source") == "open_webui" and result.get("exists") is True):
+        return tool_result
+    files.append(
+        {
+            "type": "file",
+            "id": result["path"].split("/")[4],
+            "name": result.get("name"),
+            "url": result["path"],
+            "content_type": result.get("content_type"),
+        }
+    )
+    if not result.get("page"):
+        return tool_result
+    return json.dumps(
+        {**result, "note": "The file is attached to the reply instead of previewed, so the page was not opened."},
+        ensure_ascii=False,
+    )
+
+
+def core_version() -> tuple[int, ...]:
+    from open_webui.env import VERSION
+
+    return tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2])
+
+
+def _saved_reply(metadata: Optional[dict]) -> bool:
+    metadata = metadata or {}
+    # Core before 0.12.0 adds message files to the chat history only, not to the message table it reads them from.
+    if core_version() < (0, 12) or not (metadata.get("user_id") and metadata.get("message_id")):
+        return False
+    from open_webui.utils.chat_id import is_saved_chat_id
+
+    return is_saved_chat_id(metadata.get("chat_id"))
+
+
+def _reply_file_lock(request: Any, chat_id: str, message_id: str) -> asyncio.Lock:
+    """Share one lock per reply with nested agent tools, which get copies of this request's state."""
+    state = getattr(request, "state", None)
+    locks = getattr(state, "reply_file_locks", None)
+    if locks is None:
+        locks = {}
+        if state is not None:
+            state.reply_file_locks = locks
+    return locks.setdefault((chat_id, message_id), asyncio.Lock())
+
+
+def order_file_events(event_emitter: Optional[Callable], metadata: Optional[dict], request: Any) -> Optional[Callable]:
+    """Add each file event's new files to a saved chat's reply in one write, then show everyone viewing it the full list.
+
+    Core saves a file event by reading the reply's files and writing them back, which drops files another
+    tool adds in between, and its chat screen replaces the reply's files with each event's list.
+    """
+    if not callable(event_emitter) or not _saved_reply(metadata):
+        return event_emitter
+    from open_webui.models.chats import Chats
+    from open_webui.socket.main import get_event_emitter
+
+    chat_id, message_id = metadata["chat_id"], metadata["message_id"]
+    lock = _reply_file_lock(request, chat_id, message_id)
+
+    async def emit(event_data):
+        event_type = event_data.get("type") if isinstance(event_data, dict) else None
+        if not (event_type == "files" or (event_type == "chat:message:files" and event_data.get(_ALREADY_SAVED))):
+            return await event_emitter(event_data)
+        data = event_data.get("data") or {}
+        files = list(data.get("files") or [])
+        async with lock:
+            saved, added = [], files
+            try:
+                stored = await Chats.get_message_metadata(chat_id, message_id, "files")
+                saved = stored if isinstance(stored, list) else []
+                added = [file for index, file in enumerate(files) if file not in saved and file not in files[:index]]
+                if added:
+                    saved = await Chats.add_message_files_by_id_and_message_id(chat_id, message_id, added) or saved
+            except Exception:
+                _tool_execution_log.exception("Could not save the reply's files")
+            show = await get_event_emitter(metadata, update_db=False)
+            # Core's emitter shows each event before saving it and goes on when the save fails.
+            await show({"type": "files", "data": {**data, "files": saved + [file for file in added if file not in saved]}})
+
+    return emit
+
+
+_ALREADY_SAVED = "already_saved"
+
+
+def mark_saved_image_files(event_emitter: Optional[Callable], tool: dict, tool_name: str) -> Optional[Callable]:
+    """Mark the file list Core's image tools send after saving, so ``order_file_events`` shows the reply's current list.
+
+    Core ignores the extra key, so an emitter without ``order_file_events`` handles the event as sent.
+    """
+    if not (callable(event_emitter) and tool.get("type") == "builtin" and tool_name in ("generate_image", "edit_image")):
+        return event_emitter
+
+    async def emit(event_data):
+        if isinstance(event_data, dict) and event_data.get("type") == "chat:message:files":
+            event_data = {**event_data, _ALREADY_SAVED: True}
+        return await event_emitter(event_data)
+
+    return emit
+
+
+def _model_has_vision(model: Optional[dict]) -> bool:
+    meta = ((model or {}).get("info") or {}).get("meta") or {}
+    return bool((meta.get("capabilities") or {}).get("vision", True))
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -1297,7 +1445,9 @@ async def process_tool_result(
     )
 
 
-async def split_tool_result_files(files: list, user: Any = None) -> tuple[list[str], list]:
+async def split_tool_result_files(
+    files: list, user: Any = None, fetch_url_images: bool = True
+) -> tuple[list[str], list]:
     """Match native Core: data images go to the model, URL images to both, other files to display."""
     images = []
     display_files = []
@@ -1308,10 +1458,11 @@ async def split_tool_result_files(files: list, user: Any = None) -> tuple[list[s
             continue
         display_files.append(file)
         if isinstance(url, str) and url:
-            from open_webui.env import VERSION
-
             # Core before 0.12.0 keeps URL images display-only.
-            if tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2]) >= (0, 12):
+            if core_version() >= (0, 12):
+                if not fetch_url_images:
+                    images.append(url)
+                    continue
                 from open_webui.utils.files import get_image_base64_from_url
 
                 image = await get_image_base64_from_url(url, user=_normalize_user(user))
@@ -1446,7 +1597,7 @@ async def emit_terminal_tool_event(
         )
         if not isinstance(path, str) or not path:
             return
-        if isinstance(parsed, dict) and parsed.get("exists") is False:
+        if isinstance(parsed, dict) and (parsed.get("exists") is False or parsed.get("source") == "open_webui"):
             return
         page = tool_function_params.get("page")
         # NOTE: nested calls cannot produce Core's top-level structured
@@ -1549,10 +1700,15 @@ async def execute_tool_call(
     tool_result: Any = None
     tool_result_files: list[dict] = []
     tool_result_embeds: list[Any] = []
+    vision = _model_has_vision(extra_params.get("__model__"))
     tool_result_images: list[str] = []
     emit_terminal_event = False
     if tool_function_name in tools_dict:
         tool = tools_dict[tool_function_name]
+        if tool_function_name == "display_file":
+            tool, error = resolve_display_file_tool(tool, tool_function_params)
+            if error:
+                return {"tool_call_id": tool_call_id, "content": error}
         direct_tool = bool(tool.get("direct", False))
         metadata = extra_params.get("__metadata__")
         core_metadata = getattr(extra_params.get("__event_call__"), "core_metadata", None)
@@ -1584,13 +1740,17 @@ async def execute_tool_call(
                         else extra_params.get("__files__")
                     )
                     or [],
-                    "__event_emitter__": extra_params.get("__event_emitter__"),
+                    "__event_emitter__": mark_saved_image_files(
+                        extra_params.get("__event_emitter__"), tool, tool_function_name
+                    ),
                     "__event_call__": extra_params.get("__event_call__"),
                 }
                 # Loaded tools are shared by agents, while Core binds each
                 # chat's own metadata to its tools.
                 if isinstance(metadata, dict):
                     call_params["__metadata__"] = metadata
+                if extra_params.get("__request__") is not None:
+                    call_params["__request__"] = extra_params["__request__"]
                 tool_function = await _maybe_await(get_updated_tool_function(
                     function=tool_function,
                     extra_params=call_params,
@@ -1616,8 +1776,10 @@ async def execute_tool_call(
                 user=extra_params.get("__user__"),
             )
             tool_result_images, tool_result_files = await split_tool_result_files(
-                tool_result_files, extra_params.get("__user__")
+                tool_result_files, extra_params.get("__user__"), fetch_url_images=vision
             )
+            if tool_function_name == "display_file" and tool.get("type") == "builtin":
+                tool_result = attach_displayed_upload(tool_result, tool_result_files)
             emit_terminal_event = True
 
         except Exception as exc:
@@ -1665,6 +1827,10 @@ async def execute_tool_call(
             _tool_execution_log.warning(
                 f"Error extracting citation sources from {tool_function_name}: {exc}"
             )
+
+    if tool_result_images and not vision:
+        tool_result += "\n[image]" * len(tool_result_images)
+        tool_result_images = []
 
     return {
         "tool_call_id": tool_call_id,
@@ -2256,6 +2422,18 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
     return servers
 
 
+def _direct_tool_spec(server: dict, spec: dict) -> dict:
+    """Give a browser terminal's ``display_file`` Core's builtin spec, as Core 0.12.5+ does."""
+    if not (server.get("is_terminal") and spec.get("name") == "display_file"):
+        return spec
+    try:
+        from open_webui.tools.builtin import display_file
+        from open_webui.utils.tools import get_builtin_tool_spec
+    except ImportError:
+        return spec
+    return get_builtin_tool_spec(display_file)
+
+
 def build_direct_tools_dict(
     *, tool_servers: list[dict], debug: bool = False
 ) -> dict:
@@ -2275,7 +2453,7 @@ def build_direct_tools_dict(
             if not isinstance(name, str) or not name:
                 continue
             direct_tools[name] = {
-                "spec": spec,
+                "spec": _direct_tool_spec(server_payload, spec),
                 "direct": True,
                 "server": server_payload,
                 "type": "direct",
@@ -2374,12 +2552,10 @@ async def build_tools_dict(
     import inspect
     import json
     import logging
-    import re
 
     log = logging.getLogger("owui_ext.shared.tool_loader")
     debug = bool(getattr(valves, "DEBUG", False))
 
-    from open_webui.env import VERSION
     from open_webui.utils.tools import get_builtin_tools, get_tools
 
     try:
@@ -2672,7 +2848,7 @@ async def build_tools_dict(
             disabled_builtin_tools: set = set()
             # Core before 0.12.0 keeps a single browser event callback and no
             # call timeout, so concurrent ask_user prompts can wait forever.
-            if tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2]) < (0, 12):
+            if core_version() < (0, 12):
                 disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES["user_input"])
             for valve_field, category in VALVE_TO_CATEGORY.items():
                 if not getattr(valves, valve_field, True):
@@ -2705,17 +2881,27 @@ async def build_tools_dict(
                 and model_has_file_knowledge(model, knowledge_metadata)
             )
 
+            keep_display_file = (
+                file_tools_enabled and "list_chat_files" in all_builtin_tools
+            ) or (
+                knowledge_tools_enabled
+                and not {"kb_exec", "view_knowledge_file"}.isdisjoint(all_builtin_tools)
+            )
+
             # Regular tools take priority over builtin tools with the same name.
             builtin_count = 0
             for name, tool_dict in all_builtin_tools.items():
                 if name in disabled_builtin_tools and not (
                     (name == "view_note" and keep_view_note_for_knowledge)
                     or (name == "view_file" and keep_view_file)
+                    or (name == "display_file" and keep_display_file)
                 ):
                     continue
                 if name not in tools_dict:
                     tools_dict[name] = tool_dict
                     builtin_count += 1
+                elif name == "display_file" and is_terminal_tool(tools_dict[name]):
+                    tools_dict[name] = {**tools_dict[name], "file_tool": tool_dict}
                 elif debug:
                     log.warning(
                         f"Builtin tool '{name}' skipped: "
@@ -2759,10 +2945,7 @@ async def build_tools_dict(
 
         for name in ("read_user_terminal", "send_user_terminal_input"):
             tool = tools_dict.get(name)
-            if tool and (
-                tool.get("type") == "terminal"
-                or tool.get("server", {}).get("is_terminal") is True
-            ):
+            if tool and is_terminal_tool(tool):
                 if not (
                     inherit_user_shell
                     and is_selected_terminal_tool(tool)
@@ -5668,6 +5851,7 @@ async def run_agent_loop(
     if extra_params is None:
         extra_params = {}
     generate_chat_completion = core_chat_completion(extra_params)
+    tool_request = isolate_tool_request(extra_params.get("__request__"))
 
     # Prepare user object
     if isinstance(user, dict):
@@ -5980,6 +6164,7 @@ async def run_agent_loop(
                     {
                         **extra_params,
                         "__messages__": current_messages,
+                        "__request__": tool_request,
                     },
                     event_emitter=event_emitter,
                 )
@@ -6175,6 +6360,7 @@ async def run_agent_loop(
                                         {
                                             **extra_params,
                                             "__messages__": current_messages,
+                                            "__request__": tool_request,
                                         },
                                         event_emitter=event_emitter,
                                     )
@@ -6324,8 +6510,8 @@ class Tools:
         ENABLE_FILE_TOOLS: bool = Field(
             default=True,
             description=(
-                "Enable Core tools for listing, searching, and reading files attached to the current chat "
-                "(list_chat_files, query_chat_files, grep_chat_files, view_file). Files exposed through "
+                "Enable Core tools for listing, searching, reading, and showing files attached to the current chat "
+                "(list_chat_files, query_chat_files, grep_chat_files, view_file, display_file). Files exposed through "
                 "attached knowledge remain controlled by ENABLE_KNOWLEDGE_TOOLS."
             ),
         )
@@ -6701,6 +6887,7 @@ CRITICAL RULES:
         :param models: Optional comma-separated 3 model IDs; honored only when the operator enabled AI model selection in Valves, otherwise silently ignored — DEFAULT_MODELS or the current chat model is used instead.
         :param personas: Optional list of exactly 3 persona objects with `name` and `description`; choose markedly contrasting profiles to maximize divergence — similar personas defeat the tool's purpose. If fewer than 3 are provided, defaults are used (Analytical Thinker, Creative Visionary, Practical Strategist).
         """
+        __event_emitter__ = order_file_events(__event_emitter__, __metadata__, __request__)
         if __request__ is None:
             return json.dumps(
                 {

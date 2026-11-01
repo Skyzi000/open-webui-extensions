@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.14
+version: 0.5.15
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -28,7 +28,7 @@ from owui_ext.shared.agent_requests import (
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
 from owui_ext.shared.completion_response import format_chat_completion_error
-from owui_ext.shared.inlet_filters import resolve_model_filter_pipeline
+from owui_ext.shared.inlet_filters import isolate_tool_request, resolve_model_filter_pipeline
 from owui_ext.shared.model_features import (
     model_has_note_knowledge,
     model_knowledge_tools_enabled,
@@ -44,6 +44,7 @@ from owui_ext.shared.tool_execution import (
     execute_direct_tool_call,
     execute_tool_call,
     normalize_terminal_tools_result,
+    order_file_events,
     process_tool_result,
     resolve_call_tool,
 )
@@ -2935,6 +2936,7 @@ async def run_agent_loop(
     if extra_params is None:
         extra_params = {}
     generate_chat_completion = core_chat_completion(extra_params)
+    tool_request = isolate_tool_request(extra_params.get("__request__"))
 
     # Prepare user object
     if isinstance(user, dict):
@@ -3247,6 +3249,7 @@ async def run_agent_loop(
                     {
                         **extra_params,
                         "__messages__": current_messages,
+                        "__request__": tool_request,
                     },
                     event_emitter=event_emitter,
                 )
@@ -3442,6 +3445,7 @@ async def run_agent_loop(
                                         {
                                             **extra_params,
                                             "__messages__": current_messages,
+                                            "__request__": tool_request,
                                         },
                                         event_emitter=event_emitter,
                                     )
@@ -3591,8 +3595,8 @@ class Tools:
         ENABLE_FILE_TOOLS: bool = Field(
             default=True,
             description=(
-                "Enable Core tools for listing, searching, and reading files attached to the current chat "
-                "(list_chat_files, query_chat_files, grep_chat_files, view_file). Files exposed through "
+                "Enable Core tools for listing, searching, reading, and showing files attached to the current chat "
+                "(list_chat_files, query_chat_files, grep_chat_files, view_file, display_file). Files exposed through "
                 "attached knowledge remain controlled by ENABLE_KNOWLEDGE_TOOLS."
             ),
         )
@@ -3968,6 +3972,7 @@ CRITICAL RULES:
         :param models: Optional comma-separated 3 model IDs; honored only when the operator enabled AI model selection in Valves, otherwise silently ignored — DEFAULT_MODELS or the current chat model is used instead.
         :param personas: Optional list of exactly 3 persona objects with `name` and `description`; choose markedly contrasting profiles to maximize divergence — similar personas defeat the tool's purpose. If fewer than 3 are provided, defaults are used (Analytical Thinker, Creative Visionary, Practical Strategist).
         """
+        __event_emitter__ = order_file_events(__event_emitter__, __metadata__, __request__)
         if __request__ is None:
             return json.dumps(
                 {
