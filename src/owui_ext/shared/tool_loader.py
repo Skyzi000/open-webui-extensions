@@ -461,13 +461,11 @@ async def build_tools_dict(
                 content=f"Could not load builtin tools: {e}",
             )
 
-        # Core already checked the originating browser's shell connection. Do not
+        # Core already checked that the user's shell is available. Do not
         # restore shell tools it withheld when rebuilding a nested tool catalogue.
         parent_tools = metadata.get("tools") or {}
         inherit_user_shell = (
             terminal_context_enabled
-            and metadata.get("session_id")
-            and metadata.get("chat_id")
             and not metadata.get("automation_id")
             and not metadata.get("internal")
         )
@@ -485,12 +483,19 @@ async def build_tools_dict(
         for name in ("read_user_terminal", "send_user_terminal_input"):
             tool = tools_dict.get(name)
             if tool and is_terminal_tool(tool):
+                parent_tool = parent_tools.get(name)
                 if not (
                     inherit_user_shell
                     and is_selected_terminal_tool(tool)
-                    and is_selected_terminal_tool(parent_tools.get(name))
+                    and is_selected_terminal_tool(parent_tool)
                 ):
                     tools_dict.pop(name)
+                elif "description" in (parent_tool.get("spec") or {}):
+                    # Core 0.13.0+ adds to the description it offered the parent.
+                    tools_dict[name] = {
+                        **tool,
+                        "spec": {**tool["spec"], "description": parent_tool["spec"]["description"]},
+                    }
     except BaseException:
         await cleanup_mcp_clients(mcp_clients)
         raise

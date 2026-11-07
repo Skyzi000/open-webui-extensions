@@ -65,6 +65,7 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
     "code_interpreter": {"execute_code"},
     "skills": {"view_skill", "read_skill_file", "grep_skill_files"},
     "skills_write": {"update_skill_files", "create_skill"},
+    "tool_creation": {"create_tool"},
     "subagents": {"delegate_task", "timer"},
     "tasks": {"create_tasks", "update_task"},
     "automations": {
@@ -97,6 +98,7 @@ VALVE_TO_CATEGORY: dict[str, str] = {
     "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
     "ENABLE_SKILLS_TOOLS": "skills",
     "ENABLE_SKILLS_WRITE_TOOLS": "skills_write",
+    "ENABLE_TOOL_CREATION_TOOLS": "tool_creation",
     "ENABLE_SUBAGENT_TOOLS": "subagents",
     "ENABLE_TASK_TOOLS": "tasks",
     "ENABLE_AUTOMATION_TOOLS": "automations",

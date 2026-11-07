@@ -118,12 +118,8 @@ async def test_parallel_images_match_direct_core_files(monkeypatch, with_emitter
     monkeypatch.setattr(parallel_tools, "_core_process_tool_result", middleware.process_tool_result)
 
     tools = image_tools()
-    async def load_tools(**kwargs):
-        return tools, {}
-
-    monkeypatch.setattr(parallel_tools, "build_tools_dict", load_tools)
     user = make_user()
-    metadata = {"chat_id": "image-chat", "message_id": "image-message"}
+    metadata = {"chat_id": "image-chat", "message_id": "image-message", "tools": tools}
     wrapper_events = []
     stores, reads = [], []
 
@@ -184,7 +180,6 @@ async def test_parallel_keeps_json_image_text_out_of_outer_core_extraction(monke
         for name, fn in (("json_image_text", json_image_text), ("ordinary", ordinary))
     })
     monkeypatch.setattr(parallel_tools, "_core_process_tool_result", middleware.process_tool_result)
-    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(tools, {})))
     user = make_user()
 
     # Core treats a JSON string as text, even if an image URI is inside it.
@@ -196,7 +191,7 @@ async def test_parallel_keeps_json_image_text_out_of_outer_core_extraction(monke
     names = (["screenshot"] if with_image else []) + ["json_image_text", "ordinary"]
     result = await parallel_tools.Tools().run_tools_parallel(
         [parallel_tools.ToolCallItem(name=name) for name in names],
-        __request__=SimpleNamespace(), __user__=user.model_dump(), __metadata__={},
+        __request__=SimpleNamespace(), __user__=user.model_dump(), __metadata__={"tools": tools},
     )
     assert isinstance(result, dict if with_image else str)
     payload = result if with_image else json.loads(result)
@@ -264,9 +259,9 @@ async def test_mcp_saved_images_reach_the_model_from_core_0_12(
     elif executor == "parallel_single":
         result = await parallel_tools.execute_single_tool("screenshot", {}, tools, extra, event_emitter=emitter)
     else:
-        monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(tools, {})))
         payload = await parallel_tools.Tools().run_tools_parallel(
-            [parallel_tools.ToolCallItem(name="screenshot")], __request__=extra["__request__"], __user__=extra["__user__"], __metadata__={}, __event_emitter__=emitter,
+            [parallel_tools.ToolCallItem(name="screenshot")], __request__=extra["__request__"], __user__=extra["__user__"],
+            __metadata__={"tools": tools}, __event_emitter__=emitter,
         )
         result = payload["results"][0]
     assert result["images"] == ([FETCHED_IMAGE, IMAGE] if model_sees_saved_image else [IMAGE])
@@ -291,12 +286,11 @@ async def test_older_core_keeps_images_on_existing_files_path(monkeypatch, extra
 
     files = [{"type": "image", "url": IMAGE}]
     monkeypatch.setattr(parallel_tools, "_core_process_tool_result", AsyncMock(return_value=("", files, [])))
-    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(image_tools(), {})))
     emitter = AsyncMock() if with_emitter else None
     result = await parallel_tools.Tools().run_tools_parallel(
         [parallel_tools.ToolCallItem(name="screenshot")],
         __request__=SimpleNamespace(), __user__=make_user().model_dump(),
-        __metadata__={}, __event_emitter__=emitter,
+        __metadata__={"tools": image_tools()}, __event_emitter__=emitter,
     )
     assert isinstance(result, str)
     item = json.loads(result)["results"][0]

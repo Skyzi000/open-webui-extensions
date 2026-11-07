@@ -161,6 +161,9 @@ class AgentRequests:
         request = self.chat_request
         filter_params = self._filter_params()
         self.metadata.update(own_metadata(form_data.get("metadata") or {}))
+        # Core's delegate_task accepts the sub-agent models of metadata["model"], the model the tools were loaded for.
+        if (filter_pipeline or {}).get("model"):
+            self.metadata.update(own_metadata({"model": filter_pipeline["model"]}))
         form_data["metadata"] = self.metadata
         if self.custom_tools:
             form_data["tools"] = self.custom_tools
@@ -181,8 +184,14 @@ class AgentRequests:
             self.tools_dict, self.extra_params, self.always_loaded, filter_tools
         )
         if not deferred:
-            if self.tools_dict:
-                self.metadata["tools"] = self.tools_dict
+            # As with Tool Search, leave out the tools the loop handles itself (a submission ends it).
+            listed = {
+                name: tool
+                for name, tool in self.tools_dict.items()
+                if name not in self.always_loaded
+            }
+            if listed:
+                self.metadata["tools"] = listed
             else:
                 self.metadata.pop("tools", None)
         tools = build_agent_tools_param(self.tools_dict, deferred, filter_tools)

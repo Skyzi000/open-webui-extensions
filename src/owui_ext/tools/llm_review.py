@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.15
+version: 0.5.16
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -3658,6 +3658,13 @@ class Tools:
             description=(
                 "Enable skill writing tools (update_skill_files, create_skill; Open WebUI 0.12.0+). "
                 "Off by default because they change saved skills. Requires ENABLE_SKILLS_TOOLS."
+            ),
+        )
+        ENABLE_TOOL_CREATION_TOOLS: bool = Field(
+            default=False,
+            description=(
+                "Enable the tool creation tool (create_tool; Open WebUI 0.13.0+). "
+                "Off by default because it saves a new workspace tool and runs its code on the server."
             ),
         )
         ENABLE_SUBAGENT_TOOLS: bool = Field(

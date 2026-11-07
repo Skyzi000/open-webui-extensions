@@ -101,17 +101,9 @@ async def test_parallel_reaches_real_core_workspace_and_terminal_skill(monkeypat
 
 
 @pytest.mark.skipif(CORE_REGISTERS_SKILL_TOOLS, reason="Core 0.12.0+ needs no parent entry")
-@pytest.mark.parametrize("parent_entry", ["missing", "wrong_type", "wrong_id"])
-async def test_parallel_does_not_add_skill_without_core_builtin_entry(skill_context, parent_entry):
+async def test_parallel_does_not_add_skill_without_core_builtin_entry(skill_context):
     context = skill_context
-    tools = await parent_skill_tools(context, "workspace-skill")
-    if parent_entry == "missing":
-        tools = {}
-    elif parent_entry == "wrong_type":
-        tools["view_skill"]["type"] = "tool"
-    else:
-        tools["view_skill"]["tool_id"] = "builtin:other"
-    context.metadata["tools"] = tools
+    context.metadata["tools"] = {}
 
     result = await run_skill(context, "workspace-skill")
 
@@ -120,23 +112,28 @@ async def test_parallel_does_not_add_skill_without_core_builtin_entry(skill_cont
 
 @pytest.mark.skipif(not CORE_REGISTERS_SKILL_TOOLS, reason="Core before 0.12.0 has no skills switch")
 async def test_parallel_follows_the_model_skills_switch(skill_context):
+    from open_webui.utils.tools import get_builtin_tools
+
     context = skill_context
     context.model["info"]["meta"]["builtinTools"]["skills"] = False
+    context.metadata["tools"] = await get_builtin_tools(
+        context.request,
+        {"__user__": context.user, "__metadata__": context.metadata, "__skill_ids__": ["workspace-skill"]},
+        model=context.model,
+    )
+    assert "view_skill" not in context.metadata["tools"]
 
     assert "Tool 'view_skill' not found" in await run_skill(context, "workspace-skill")
 
 
-async def test_parallel_keeps_regular_tool_with_same_name(monkeypatch, skill_context):
-    from open_webui.utils import tools as core_tools
-
+async def test_parallel_keeps_regular_tool_with_same_name(skill_context):
     context = skill_context
-    context.metadata["tools"] = await parent_skill_tools(context, "workspace-skill")
-    context.metadata["tool_ids"] = ["custom"]
     regular = AsyncMock(return_value="Custom skill result")
-    monkeypatch.setattr(core_tools, "get_tools", AsyncMock(return_value={"view_skill": {
+    # Core keeps a regular tool over a builtin of the same name.
+    context.metadata["tools"] = {**await parent_skill_tools(context, "workspace-skill"), "view_skill": {
         "type": "tool", "tool_id": "custom", "callable": regular,
         "spec": {"name": "view_skill", "parameters": {"properties": {"id": {"type": "string"}}}},
-    }}))
+    }}
 
     result = await run_skill(context, "workspace-skill")
 

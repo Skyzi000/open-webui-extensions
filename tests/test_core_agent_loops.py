@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import json
 import re
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -328,7 +329,6 @@ async def test_parallel_reuses_the_chat_search_tools(monkeypatch, tool_search):
     chat_tools = loop_tools()
     assert await apply_tool_search({"messages": []}, metadata, chat_tools) == {"lookup"}
     metadata["tools"] = chat_tools
-    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(loop_tools(), {})))
 
     result = await parallel_tools.Tools().run_tools_parallel(
         [parallel_tools.ToolCallItem(name="search_tools", args={"query": "lookup"})],
@@ -346,7 +346,6 @@ async def test_parallel_runs_call_tool_with_the_chat_dispatcher(monkeypatch, too
     chat_tools = loop_tools()
     await apply_tool_search({"messages": []}, metadata, chat_tools)
     metadata["tools"] = chat_tools
-    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(loop_tools(), {})))
 
     result = await parallel_tools.Tools().run_tools_parallel(
         [
@@ -1401,22 +1400,24 @@ async def test_only_mcp_tools_get_arguments_their_schema_does_not_list(monkeypat
 
 @pytest.mark.parametrize("kind", ["mcp", "regular"])
 async def test_parallel_passes_only_mcp_tools_arguments_their_schema_does_not_list(monkeypatch, page_tools, kind):
-    from open_webui.models.config import Config
+    from open_webui.utils import middleware
     from open_webui.utils import tools as core_tools
 
     tool_id, name, expected = page_tools.kinds[kind]
-    monkeypatch.setattr(Config, "get", AsyncMock(side_effect=lambda key, default=None: {} if key == "user.permissions" else default))
-    monkeypatch.setattr(Config, "get_many", AsyncMock(return_value={}))
-    monkeypatch.setattr(core_tools, "get_tools", AsyncMock(return_value=page_tools.regular))
-    model = {"id": "model", "info": {"meta": {"builtinTools": {
-        category: False for category in ("time", "user_input", "knowledge", "chats", "tasks", "skills")
-    }}}}
+    load_tools = middleware.get_tools
 
-    await parallel_tools.Tools().run_tools_parallel(
-        [parallel_tools.ToolCallItem(name=name, args={"path": "guide"})],
-        __request__=make_request(model), __user__=make_user("admin").model_dump(), __model__=model,
-        __metadata__={"model_id": "model", "tool_ids": [tool_id], "chat_id": "local:parallel", "tool_servers": []},
+    async def get_tools(request, tool_ids, user, extra_params):
+        tools = await load_tools(request, [tool_id for tool_id in tool_ids if tool_id != "regular"], user, extra_params)
+        return {**tools, **(page_tools.regular if "regular" in tool_ids else {})}
+
+    monkeypatch.setattr(middleware, "get_tools", get_tools)
+    monkeypatch.setattr(middleware, "connect_mcp_server", core_tools.connect_mcp_server)
+    model = {"id": "model", "owned_by": "openai", "info": {"meta": {}}}
+    metadata = await core_chat_tools(
+        monkeypatch, parallel_request(model), make_user("admin"), model, tool_ids=[tool_id],
     )
+
+    await call_parallel(metadata, (name, {"path": "guide"}))
 
     assert page_tools.received == [expected]
 
@@ -2051,10 +2052,10 @@ async def test_a_regular_display_file_result_is_not_taken_for_cores_upload(monke
         monkeypatch, "sub_agent", calling(("display_file", {"path": "report.pdf"})),
         regular_tools=lambda: {**loop_tools(), "display_file": tool}, event_emitter=emit,
     )
-    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=({"display_file": tool}, {})))
     parallel = await parallel_tools.Tools().run_tools_parallel(
         [parallel_tools.ToolCallItem(name="display_file", args={"path": "report.pdf"})],
-        __request__=SimpleNamespace(), __user__=make_user().model_dump(), __metadata__={}, __event_emitter__=emit,
+        __request__=SimpleNamespace(), __user__=make_user().model_dump(), __metadata__={"tools": {"display_file": tool}},
+        __event_emitter__=emit,
     )
 
     child_result = next(message["content"] for message in sent[-1]["messages"] if message["role"] == "tool")
@@ -2215,10 +2216,10 @@ async def test_tools_can_send_file_events_by_cores_keyword(monkeypatch, entry):
 
     try:
         if entry == "parallel_tools":
-            monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(await bound_tools({}), {})))
             result = await parallel_tools.Tools().run_tools_parallel(
                 [parallel_tools.ToolCallItem(name="send_file")], __request__=SimpleNamespace(), __user__=FILES_USER,
-                __metadata__=metadata, __event_emitter__=await socket_main.get_event_emitter(metadata),
+                __metadata__={**metadata, "tools": await bound_tools({})},
+                __event_emitter__=await socket_main.get_event_emitter(metadata),
             )
             results = [item["result"] for item in json.loads(result)["results"]]
         else:
@@ -2443,6 +2444,7 @@ async def test_nested_agent_tools_show_file_lists_in_the_order_they_were_saved(m
                 await get_async_tool_function_and_apply_extra_params(parallel_tools.Tools().run_tools_parallel, extra_params),
                 {"tool_calls": {"type": "array"}},
             ),
+            "send_first": tool("send_first", await get_async_tool_function_and_apply_extra_params(sending(first), {})),
             "send_second": tool(
                 "send_second", await get_async_tool_function_and_apply_extra_params(sending(second, first_added), extra_params),
             ),
@@ -2459,9 +2461,6 @@ async def test_nested_agent_tools_show_file_lists_in_the_order_they_were_saved(m
         return answer(body)
 
     monkeypatch.setattr(Chats, "add_message_files_by_id_and_message_id", add)
-    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=({
-        "send_first": tool("send_first", await get_async_tool_function_and_apply_extra_params(sending(first), {})),
-    }, {})))
     chat, metadata = await files_chat("files-nested")
     try:
         await run_entry(
@@ -2585,6 +2584,40 @@ async def test_children_edit_notes_only_after_reading_them_themselves(monkeypatc
         assert "success" in codes and set(codes) <= {"success", "page_conflict"}
 
 
+@pytest.mark.skipif(
+    not hasattr(importlib.import_module("open_webui.models.notes"), "NotePageConflict"),
+    reason="Core before 0.12.5 lets replace_note_content edit unread notes",
+)
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_a_childs_note_reads_through_parallel_tools_stay_its_own(monkeypatch, entry):
+    from open_webui.models.notes import NoteForm, Notes
+    from open_webui.models.users import Users
+
+    monkeypatch.setattr(Users, "get_user_by_id", AsyncMock(return_value=make_user("admin")))
+    note = await Notes.insert_new_note("loop-user", NoteForm(title="Plan", data={"content": {"md": "old"}}))
+    parent_reads = {}
+    try:
+        sent, _, _ = await run_entry(
+            monkeypatch, entry, calls_in_order(
+                ("run_tools_parallel", {"tool_calls": [{"name": "view_note", "args": {"note_id": note.id}}]}),
+                ("replace_note_content", {"note_id": note.id, "content": "new"}),
+            ),
+            extra_models={"child": child_model()}, settings={"notes.enable": True},
+            valves={"ENABLE_NOTES_TOOLS": True}, bound_tools=parallel_tools_for,
+            request_state={"note_page_revisions": parent_reads},
+        )
+    finally:
+        await Notes.delete_note_by_id(note.id)
+
+    edits = [
+        json.loads(message["content"]) for body in sent for message in body["messages"]
+        if message["role"] == "tool" and message["tool_call_id"] == "replace_note_content"
+    ]
+    codes = [edit.get("code") or edit.get("status") for edit in edits]
+    assert parent_reads == {}
+    assert "success" in codes and set(codes) <= {"success", "page_conflict"}
+
+
 @needs_display_file
 async def test_parallel_tools_route_and_attach_displayed_uploads_with_the_replys_full_file_list(monkeypatch):
     import uuid
@@ -2617,7 +2650,7 @@ async def test_parallel_tools_route_and_attach_displayed_uploads_with_the_replys
         id=file_id, filename="report.pdf", path="", meta={"name": "report.pdf", "content_type": "application/pdf"},
     ))
     metadata = {"chat_id": chat.id, "message_id": "reply", "user_id": "files-user", "terminal_id": "terminal"}
-    tools = {"display_file": {
+    metadata["tools"] = {"display_file": {
         "type": "terminal", "tool_id": "terminal:terminal", "callable": terminal_display_file,
         "spec": {"name": "display_file", "parameters": {"type": "object", "properties": {
             "path": {"type": "string"}, "page": {"type": "integer"},
@@ -2632,7 +2665,6 @@ async def test_parallel_tools_route_and_attach_displayed_uploads_with_the_replys
             }}},
         },
     }}
-    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(tools, {})))
     try:
         result = await parallel_tools.Tools().run_tools_parallel(
             [
@@ -2675,12 +2707,431 @@ async def test_file_events_pass_through_on_core_before_0_12(monkeypatch):
         "type": "tool", "callable": await get_async_tool_function_and_apply_extra_params(attach, {}),
         "spec": {"name": "attach", "parameters": {"type": "object", "properties": {}}},
     }}
-    monkeypatch.setattr(parallel_tools, "build_tools_dict", AsyncMock(return_value=(tools, {})))
     result = await parallel_tools.Tools().run_tools_parallel(
         [parallel_tools.ToolCallItem(name="attach")],
         __request__=SimpleNamespace(), __user__=make_user().model_dump(),
-        __metadata__={"chat_id": "saved-chat", "message_id": "reply", "user_id": "user"}, __event_emitter__=emit,
+        __metadata__={"chat_id": "saved-chat", "message_id": "reply", "user_id": "user", "tools": tools},
+        __event_emitter__=emit,
     )
 
     assert json.loads(result)["results"][0]["result"] == "attached"
     assert [event for event in events if "files" in event["type"]] == [{"type": "files", "data": {"files": [attached]}}]
+
+
+needs_create_tool = pytest.mark.skipif(not hasattr(builtin, "create_tool"), reason="Core before 0.13.0 has no create_tool")
+needs_sub_agent_models = pytest.mark.skipif(
+    "model_id" not in getattr(getattr(builtin, "delegate_task", None), "__annotations__", {}),
+    reason="Core before 0.13.0 delegates only to the current model",
+)
+ROUTED_CHILD = {"id": "child", "owned_by": "openai", "info": {"meta": {
+    "builtinTools": {category: False for category in ("time", "user_input", "knowledge", "chats", "tasks")},
+    "subagents": {"model_ids": ["worker"]},
+}, "params": {}}}
+WORKER = {"id": "worker", "owned_by": "openai", "info": {"meta": {}}}
+
+
+def capture_sub_agent_chats(monkeypatch):
+    from open_webui.models.chats import Chats
+
+    created = []
+
+    async def insert_new_chat(chat_id, user_id, form_data, *args, **kwargs):
+        created.append(form_data.chat["models"])
+
+    monkeypatch.setattr(Chats, "insert_new_chat", insert_new_chat)
+    return created
+
+
+@needs_create_tool
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_tool_creation_needs_its_own_valve(monkeypatch, entry, enabled):
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, answer, valves={"ENABLE_TOOL_CREATION_TOOLS": True} if enabled else None,
+    )
+
+    assert sent
+    assert any("create_tool" in body["tools"] for body in sent) is enabled
+
+
+@needs_sub_agent_models
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_children_delegate_to_the_sub_agent_models_they_are_offered(monkeypatch, entry):
+    created = capture_sub_agent_chats(monkeypatch)
+    offered = []
+
+    def respond(body):
+        delegate = next((tool for tool in body["raw_tools"] if tool["function"]["name"] == "delegate_task"), None)
+        if delegate and not any(message["role"] == "tool" for message in body["messages"]):
+            offered.append(delegate["function"]["parameters"]["properties"]["model_id"]["enum"])
+            return tool_call("delegate_task", {"task": "Check", "model_id": "worker"})
+        return answer(body)
+
+    parent_metadata = {
+        "model_id": "parent", "model": {"id": "parent", "owned_by": "arena", "info": {"meta": {}}},
+        "files": None, "tool_ids": ["regular"], "features": {}, "chat_id": "chat-1",
+        "session_id": "browser", "tool_servers": [],
+    }
+    parent_before = copy.deepcopy(parent_metadata)
+    await run_entry(
+        monkeypatch, entry, respond, settings={"subagents.enable": True}, parent_metadata=parent_metadata,
+        valves={"ENABLE_SUBAGENT_TOOLS": True}, extra_models={"child": ROUTED_CHILD, "worker": WORKER},
+        entry_kwargs={"__chat_id__": "chat-1"},
+    )
+
+    assert offered and all(models == ["worker"] for models in offered)
+    assert created and all(models == ["worker"] for models in created)
+    assert parent_metadata == parent_before
+
+
+def parallel_request(*models):
+    from starlette.requests import Request
+
+    request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(
+        MODELS={model["id"]: model for model in models},
+    )), "state": {}})
+    request._body = b"{}"
+    return request
+
+
+def keep_core_config(monkeypatch, settings):
+    """Override *settings* and read every other setting from Core's store."""
+    from open_webui.models.config import Config
+
+    get, get_many = Config.get, Config.get_many
+
+    async def patched_get(key, *args, **kwargs):
+        return settings[key] if key in settings else await get(key, *args, **kwargs)
+
+    async def patched_get_many(*keys):
+        return {**await get_many(*keys), **{key: settings[key] for key in keys if key in settings}}
+
+    monkeypatch.setattr(Config, "get", patched_get)
+    monkeypatch.setattr(Config, "get_many", patched_get_many)
+
+
+PARALLEL_TOOLS_SOURCE = Path(parallel_tools.__file__).read_text()
+
+
+def workspace_tool(name, prefix):
+    """Python source of a workspace tool whose ``name`` method returns ``prefix`` and its command."""
+    return f"class Tools:\n    async def {name}(self, command: str = '') -> str:\n        return {prefix!r} + command\n"
+
+
+async def save_workspace_tools(monkeypatch, user, sources, valves=None):
+    """Save *sources* ({tool_id: Python source}) as the user's tools, which Core loads from their source."""
+    from open_webui.models.tools import Tools
+    from open_webui.utils.plugin import load_tool_module_by_id
+    from open_webui.utils.tools import get_tool_specs
+
+    records = {}
+    for tool_id, content in sources.items():
+        module = (await load_tool_module_by_id(tool_id, content=content))[0]
+        records[tool_id] = SimpleNamespace(
+            id=tool_id, user_id=user.id, is_active=True, content=content, specs=get_tool_specs(module),
+        )
+    stores = {
+        "get_tools_by_ids": lambda ids: {tool_id: records[tool_id] for tool_id in ids if tool_id in records},
+        "get_tool_by_id": records.get,
+        "is_tool_active": lambda tool_id: True,
+        "get_tool_valves_by_id": lambda tool_id: (valves or {}) if tool_id == "parallel" else {},
+        "get_user_valves_by_id_and_user_id": lambda tool_id, user_id: {},
+    }
+    for name, read in stores.items():
+        monkeypatch.setattr(Tools, name, AsyncMock(side_effect=read), raising=False)
+
+
+async def core_chat_tools(
+    monkeypatch, request, user, model, *, workspace=None, unattached=None, valves=None, tool_ids=(), form=None,
+    **metadata,
+):
+    """Send a chat with Parallel Tools and *workspace* tools attached through Core.
+
+    *unattached* tools are saved but not attached. Returns the metadata Core gives the chat's tools.
+    """
+    from open_webui.utils import chat as core_chat
+    from open_webui.utils.middleware import process_chat_payload
+
+    attached = {"parallel": PARALLEL_TOOLS_SOURCE, **(workspace or {})}
+    await save_workspace_tools(monkeypatch, user, {**attached, **(unattached or {})}, valves)
+    monkeypatch.setattr(core_chat, "generate_openai_chat_completion", AsyncMock(return_value={}))
+    tool_ids = [*attached, *tool_ids]
+    metadata = {
+        "model": model, "model_id": model["id"], "chat_id": "", "message_id": "reply", "session_id": "browser",
+        "user_id": user.id, "tool_ids": tool_ids, "files": None, "features": {},
+        "params": {"function_calling": "native"}, "tool_servers": [], **metadata,
+    }
+    form_data = {
+        "model": model["id"], "messages": [{"role": "user", "content": "Go"}], "tool_ids": tool_ids,
+        "metadata": metadata, **(form or {}),
+    }
+    request.state.metadata = metadata
+    form_data, metadata = (await process_chat_payload(request, form_data, user, metadata, model))[:2]
+    await core_chat.generate_chat_completion(request, form_data, user)
+    return metadata
+
+
+async def call_parallel(metadata, *calls):
+    """Run (name, args) *calls* through the Parallel Tools callable Core gave the chat; return each result."""
+    raw = await metadata["tools"]["run_tools_parallel"]["callable"](
+        tool_calls=[{"name": name, "args": args} for name, args in calls],
+    )
+    return [item["result"] for item in json.loads(raw)["results"]]
+
+
+def parallel_tools_model(metadata):
+    return metadata["tools"]["run_tools_parallel"]["callable"].__extra_params__["__model__"]["id"]
+
+
+@needs_sub_agent_models
+async def test_parallel_tools_delegate_to_the_chat_models_sub_agent_models(monkeypatch):
+    keep_core_config(monkeypatch, {"subagents.enable": True, "task.model.external": "task"})
+    created = capture_sub_agent_chats(monkeypatch)
+    chat_model = {"id": "chat", "owned_by": "openai", "info": {"meta": {"subagents": {"model_ids": ["worker"]}}}}
+    task_model = {"id": "task", "owned_by": "openai", "info": {"meta": {}}}
+    request = parallel_request(chat_model, task_model, WORKER)
+    metadata = await core_chat_tools(monkeypatch, request, make_user("admin"), chat_model, chat_id="chat-1")
+    assert parallel_tools_model(metadata) == "task"
+
+    await call_parallel(metadata, ("delegate_task", {"task": "Check", "model_id": "worker"}))
+
+    assert created == [["worker"]]
+
+
+@needs_create_tool
+async def test_parallel_tools_run_cores_tool_creation_without_a_valve_of_their_own(monkeypatch):
+    chat_model = {"id": "chat", "owned_by": "openai", "info": {"meta": {}}}
+    metadata = await core_chat_tools(monkeypatch, parallel_request(chat_model), make_user("admin"), chat_model)
+
+    [result] = await call_parallel(metadata, ("create_tool", {
+        "id": "not an id", "name": "Draft", "description": "Draft.", "content": "class Tools:\n    pass\n",
+    }))
+
+    assert "alphanumeric" in result["error"]
+
+
+@pytest.mark.parametrize("withheld", ["no_session", "legacy", "builtin_tools_off"])
+async def test_parallel_tools_never_run_builtins_core_withheld_from_the_chat(monkeypatch, withheld):
+    capabilities = {"builtin_tools": withheld != "builtin_tools_off"}
+    chat_model = {"id": "chat", "owned_by": "openai", "info": {"meta": {"capabilities": capabilities}}}
+    fields = {"no_session": {"session_id": None}, "legacy": {"params": {"function_calling": "legacy"}}}
+    metadata = await core_chat_tools(
+        monkeypatch, parallel_request(chat_model), make_user("admin"), chat_model, **fields.get(withheld, {}),
+    )
+    assert "get_current_timestamp" not in metadata["tools"]
+
+    [result] = await call_parallel(metadata, ("get_current_timestamp", {}))
+
+    assert "'get_current_timestamp' not found" in result
+
+
+@pytest.mark.parametrize("picked_time, task_time", [(True, False), (False, True)])
+async def test_parallel_tools_run_the_builtins_core_gave_an_arena_chat(monkeypatch, picked_time, task_time):
+    keep_core_config(monkeypatch, {"task.model.external": "task"})
+    arena = {"id": "arena", "owned_by": "arena", "info": {"meta": {"model_ids": ["picked"]}}}
+    picked = {"id": "picked", "owned_by": "openai", "info": {"meta": {"builtinTools": {"time": picked_time}}}}
+    task = {"id": "task", "owned_by": "openai", "info": {"meta": {"builtinTools": {"time": task_time}}}}
+    metadata = await core_chat_tools(monkeypatch, parallel_request(arena, picked, task), make_user("admin"), arena)
+    # Nothing a tool receives names the model Core picked.
+    assert parallel_tools_model(metadata) == "task" and "selected_model_id" not in metadata
+    assert ("get_current_timestamp" in metadata["tools"]) is picked_time
+
+    [result] = await call_parallel(metadata, ("get_current_timestamp", {}))
+
+    assert ("'get_current_timestamp' not found" not in str(result)) is picked_time
+
+
+async def test_parallel_tools_run_the_chats_tool_where_a_withheld_terminal_tool_shares_its_name(monkeypatch):
+    from open_webui.utils import middleware, terminals
+    from open_webui.utils import tools as core_tools
+
+    keep_core_config(monkeypatch, {"terminal_server.connections": [{"id": "term", "url": "https://terminal.invalid"}]})
+    terminal_commands = []
+
+    async def get_terminal_tools(*args, **kwargs):
+        async def run_command(command: str = ""):
+            terminal_commands.append(command)
+            return "terminal:" + command
+
+        return {"run_command": {
+            "type": "terminal", "tool_id": "terminal:term", "callable": run_command,
+            "spec": {"name": "run_command", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}},
+        }}
+
+    monkeypatch.setattr(core_tools, "get_terminal_tools", get_terminal_tools, raising=False)
+    monkeypatch.setattr(middleware, "get_terminal_tools", get_terminal_tools, raising=False)
+    # Core lists the terminal's skills from the server before loading tools.
+    monkeypatch.setattr(terminals, "get_terminal_json", AsyncMock(return_value=None), raising=False)
+    monkeypatch.setattr(terminals, "get_terminal_request_info", AsyncMock(return_value=None), raising=False)
+    arena = {"id": "arena", "owned_by": "arena", "info": {"meta": {"model_ids": ["picked"]}}}
+    picked = {"id": "picked", "owned_by": "openai", "info": {"meta": {"capabilities": {"terminal": False}}}}
+    metadata = await core_chat_tools(
+        monkeypatch, parallel_request(arena, picked), make_user("admin"), arena,
+        workspace={"workspace": workspace_tool("run_command", "workspace:")},
+        terminal_id="term", form={"terminal_id": "term"},
+    )
+    assert metadata["tools"]["run_command"]["tool_id"] == "workspace"
+
+    assert await call_parallel(metadata, ("run_command", {"command": "pwd"})) == ["workspace:pwd"]
+    assert terminal_commands == []
+
+
+async def test_parallel_tools_keep_the_names_core_gave_colliding_tools(monkeypatch):
+    chat_model = {"id": "chat", "owned_by": "openai", "info": {"meta": {}}}
+    metadata = await core_chat_tools(
+        monkeypatch, parallel_request(chat_model), make_user("admin"), chat_model, workspace={
+            "workspace": workspace_tool("run_command", "workspace:"), "second": workspace_tool("run_command", "second:"),
+        }, valves={"EXCLUDED_TOOL_IDS": "workspace"},
+    )
+    assert metadata["tools"]["second_run_command"]["tool_id"] == "second"
+
+    second, excluded = await call_parallel(
+        metadata, ("second_run_command", {"command": "pwd"}), ("run_command", {"command": "pwd"}),
+    )
+
+    assert second == "second:pwd"
+    assert "'run_command' not found" in excluded
+
+
+async def test_parallel_tools_available_ids_only_narrow_the_chats_tools(monkeypatch):
+    chat_model = {"id": "chat", "owned_by": "openai", "info": {"meta": {}}}
+    metadata = await core_chat_tools(
+        monkeypatch, parallel_request(chat_model), make_user("admin"), chat_model, workspace={
+            "workspace": workspace_tool("run_command", "workspace:"), "other": workspace_tool("other_command", "other:"),
+        }, unattached={"hidden": workspace_tool("hidden_command", "hidden:")},
+        valves={"AVAILABLE_TOOL_IDS": "workspace,hidden"},
+    )
+
+    allowed, other, hidden = await call_parallel(
+        metadata, ("run_command", {"command": "pwd"}), ("other_command", {}), ("hidden_command", {}),
+    )
+
+    assert allowed == "workspace:pwd"
+    assert "'other_command' not found" in other
+    assert "'hidden_command' not found" in hidden
+
+
+@pytest.mark.parametrize("server_id", ["docs", "suite:docs"])
+async def test_parallel_tools_exclude_an_mcp_server_core_connected(monkeypatch, page_tools, server_id):
+    from open_webui.utils import middleware
+    from open_webui.utils import tools as core_tools
+
+    monkeypatch.setattr(middleware, "connect_mcp_server", core_tools.connect_mcp_server)
+    chat_model = {"id": "chat", "owned_by": "openai", "info": {"meta": {}}}
+    metadata = await core_chat_tools(
+        monkeypatch, parallel_request(chat_model), make_user("admin"), chat_model,
+        tool_ids=[f"server:mcp:{server_id}"], valves={"EXCLUDED_TOOL_IDS": f"server:mcp:{server_id}"},
+    )
+    name = f"{server_id}_fetch_page"
+    assert name in metadata["tools"]
+
+    [result] = await call_parallel(metadata, (name, {"path": "guide"}))
+
+    assert f"'{name}' not found" in result
+    assert page_tools.received == []
+
+
+async def test_parallel_tools_run_no_tool_the_chat_was_not_given(monkeypatch):
+    chat_model = {"id": "chat", "owned_by": "openai", "info": {"meta": {}}}
+    user = make_user("admin")
+    await save_workspace_tools(monkeypatch, user, {
+        "parallel": PARALLEL_TOOLS_SOURCE, "workspace": workspace_tool("run_command", "workspace:"),
+    })
+    metadata = {
+        "model": chat_model, "model_id": "chat", "chat_id": "", "message_id": "reply", "session_id": "browser",
+        "tool_ids": ["parallel", "workspace"], "files": None, "features": {}, "params": {}, "tool_servers": [],
+    }
+
+    raw = await parallel_tools.Tools().run_tools_parallel(
+        [parallel_tools.ToolCallItem(name="run_command", args={"command": "pwd"})],
+        __request__=parallel_request(chat_model), __user__=user.model_dump(), __model__=chat_model,
+        __metadata__=metadata, __id__="parallel",
+    )
+
+    assert "'run_command' not found" in json.loads(raw)["results"][0]["result"]
+
+
+def parallel_tools_for(extra_params):
+    """Parallel Tools as an agent loads it, bound to the agent's parameters."""
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    async def bound():
+        return {"run_tools_parallel": {
+            "tool_id": "parallel_tools",
+            "callable": await get_async_tool_function_and_apply_extra_params(
+                parallel_tools.Tools().run_tools_parallel, extra_params,
+            ),
+            "spec": {"name": "run_tools_parallel", "parameters": {
+                "type": "object", "properties": {"tool_calls": {"type": "array"}},
+            }},
+        }}
+
+    return bound()
+
+
+def parallel_results(sent):
+    return [
+        json.loads(message["content"])["results"][0]["result"] for body in sent for message in body["messages"]
+        if message["role"] == "tool" and message["tool_call_id"] == "run_tools_parallel"
+    ]
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_parallel_tools_in_a_child_keep_the_tools_its_valves_turned_off(monkeypatch, entry):
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, calls_in_order(
+            ("run_tools_parallel", {"tool_calls": [{"name": "view_note", "args": {"note_id": "unread"}}]}),
+        ),
+        extra_models={"child": child_model()}, settings={"notes.enable": True},
+        valves={"ENABLE_NOTES_TOOLS": False}, bound_tools=parallel_tools_for,
+    )
+
+    results = parallel_results(sent)
+    assert results and all("'view_note' not found" in result for result in results)
+
+
+@pytest.mark.parametrize("submission", ["submit_draft", "submit_review"])
+async def test_parallel_tools_cannot_submit_for_a_review_agent(monkeypatch, submission):
+    sent, _, _ = await run_entry(
+        monkeypatch, "llm_review", calls_in_order(
+            ("run_tools_parallel", {"tool_calls": [{"name": submission, "args": {"draft": "Parallel draft"}}]}),
+        ),
+        bound_tools=parallel_tools_for,
+    )
+
+    results = parallel_results(sent)
+    assert results and all(f"'{submission}' not found" in result for result in results)
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_a_childs_model_changes_stay_in_its_own_loop(monkeypatch, entry):
+    from open_webui.utils.tools import get_async_tool_function_and_apply_extra_params
+
+    child = copy.deepcopy(ROUTED_CHILD)
+    child_before = copy.deepcopy(child)
+    parent_metadata = {
+        "model_id": "parent", "model": {"id": "parent", "owned_by": "arena", "info": {"meta": {}}},
+        "files": None, "tool_ids": ["regular"], "features": {}, "chat_id": "local:entry",
+        "session_id": "browser", "tool_servers": [],
+    }
+    parent_before = copy.deepcopy(parent_metadata)
+    seen = []
+
+    async def bound_tools(extra_params):
+        async def lookup(query: str = "", __metadata__=None):
+            seen.append(copy.deepcopy(__metadata__["model"]))
+            __metadata__["model"]["info"]["meta"]["changed"] = True
+            return "found"
+
+        tools = loop_tools()
+        tools["lookup"]["callable"] = await get_async_tool_function_and_apply_extra_params(lookup, extra_params)
+        return tools
+
+    await run_entry(
+        monkeypatch, entry, lookup_first, bound_tools=bound_tools, parent_metadata=parent_metadata,
+        extra_models={"child": child},
+    )
+
+    assert seen and all(model == child_before for model in seen)
+    assert child == child_before
+    assert parent_metadata == parent_before

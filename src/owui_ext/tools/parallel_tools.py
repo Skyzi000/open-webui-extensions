@@ -1,9 +1,9 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.11
+version: 0.2.12
 license: MIT
-required_open_webui_version: 0.7.0
+required_open_webui_version: 0.11.0
 description: Execute multiple independent tool calls in parallel for faster results.
 
 Open WebUI executes tool calls sequentially, which can be slow when multiple
@@ -29,9 +29,11 @@ from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.tool_execution import (
     CITATION_TOOLS,
     attach_displayed_upload,
+    core_version,
     emit_terminal_tool_event,
     execute_direct_tool_call,
     filter_tool_arguments,
+    is_terminal_tool,
     mark_saved_image_files,
     order_file_events,
     process_tool_result,
@@ -40,8 +42,7 @@ from owui_ext.shared.tool_execution import (
     split_tool_result_files,
     structure_terminal_file_tool_result,
 )
-from owui_ext.shared.mcp_tools import cleanup_mcp_clients
-from owui_ext.shared.tool_loader import build_tools_dict
+from owui_ext.shared.builtin_tools import BUILTIN_TOOL_CATEGORIES, VALVE_TO_CATEGORY
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,48 @@ class ToolCallItem(BaseModel):
 # ============================================================================
 # Helper functions (outside class - AI cannot invoke these)
 # ============================================================================
+
+
+def select_caller_tools(
+    caller_tools: dict, mcp_clients: dict, valves: Any, excluded_ids: set, available_ids: set
+) -> dict:
+    """Return the caller's tools that Parallel Tools may run, under the names the caller offered them."""
+    # Core's MCP entries carry their client instead of a tool ID.
+    mcp_tool_ids = {
+        id(client): f"server:mcp:{server_id}" for server_id, client in (mcp_clients or {}).items()
+    }
+    disabled_builtins: set = set()
+    # Core before 0.12.0 keeps a single browser event callback and no call
+    # timeout, so concurrent ask_user prompts can wait forever.
+    if core_version() < (0, 12):
+        disabled_builtins.update(BUILTIN_TOOL_CATEGORIES["user_input"])
+    for valve_field, category in VALVE_TO_CATEGORY.items():
+        if not getattr(valves, valve_field, True):
+            disabled_builtins.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
+
+    selected = {}
+    for name, tool in caller_tools.items():
+        if not isinstance(tool, dict):
+            continue
+        if is_terminal_tool(tool) and not valves.ENABLE_TERMINAL_TOOLS:
+            tool = tool.get("file_tool") if name == "display_file" else None
+            if not isinstance(tool, dict):
+                continue
+        tool_id = tool.get("tool_id") or mcp_tool_ids.get(id(tool.get("client")), "")
+        if tool_id in excluded_ids:
+            continue
+        if tool.get("type") == "builtin":
+            if name in disabled_builtins:
+                continue
+        elif (
+            available_ids
+            and not tool.get("direct")
+            and not is_terminal_tool(tool)
+            and tool_id not in available_ids
+        ):
+            continue
+        selected[name] = tool
+    return selected
 
 
 async def execute_single_tool(
@@ -128,6 +171,10 @@ async def execute_single_tool(
                     "__files__": extra_params.get("__files__", []),
                     "__event_emitter__": mark_saved_image_files(extra_params.get("__event_emitter__"), tool, tool_name),
                     "__event_call__": extra_params.get("__event_call__"),
+                    # The caller's tools are bound to the request and metadata of the agent
+                    # that loaded them; a sub-agent's note reads live on its own request.
+                    "__metadata__": extra_params.get("__metadata__"),
+                    "__request__": extra_params.get("__request__"),
                 },
             ))
 
@@ -242,10 +289,11 @@ class Tools:
         AVAILABLE_TOOL_IDS: str = Field(
             default="",
             description=(
-                "[Advanced] Comma-separated list of regular or MCP tool IDs available for parallel execution. "
-                "Leave empty (recommended) to use regular and MCP tools enabled in the chat UI. "
+                "[Advanced] Comma-separated list of regular or MCP tool IDs to allow for parallel execution, "
+                "among the tools the current chat offers; it never adds others. "
+                "Leave empty (recommended) to allow every regular and MCP tool the chat offers. "
                 "Tool server IDs require their full prefix (e.g., 'server:mcp:context7' or 'server:context7'). "
-                "Terminal tools are controlled by ENABLE_TERMINAL_TOOLS, and builtin/direct tools follow the current chat metadata."
+                "Terminal tools are controlled by ENABLE_TERMINAL_TOOLS, and builtin/direct tools follow the current chat."
             ),
         )
         EXCLUDED_TOOL_IDS: str = Field(
@@ -265,7 +313,7 @@ class Tools:
         ENABLE_TERMINAL_TOOLS: bool = Field(
             default=True,
             description=(
-                "Enable Open Terminal tools when terminal_id is available in chat metadata "
+                "Enable the Open Terminal tools the current chat offers "
                 "(e.g., run_command, list_files, read_file, write_file, display_file)."
             ),
         )
@@ -394,10 +442,6 @@ class Tools:
             if not isinstance(calls[i].get("arguments"), dict):
                 calls[i]["arguments"] = {}
 
-        # Import here to avoid issues when not running in Open WebUI
-        from open_webui.models.users import UserModel
-
-        user = UserModel(**__user__)
         __metadata__ = __metadata__ or {}
         __event_emitter__ = order_file_events(__event_emitter__, __metadata__, __request__)
 
@@ -414,148 +458,104 @@ class Tools:
             "__files__": __metadata__.get("files") or [],
         }
 
-        # Determine which tools to use
-        available_tool_ids: list[str] = []
-        if __metadata__ and __metadata__.get("tool_ids"):
-            available_tool_ids = list(__metadata__.get("tool_ids", []))
-
-        if self.valves.AVAILABLE_TOOL_IDS.strip():
-            tool_id_list = [
-                tid.strip()
-                for tid in self.valves.AVAILABLE_TOOL_IDS.split(",")
-                if tid.strip()
-            ]
-        else:
-            tool_id_list = available_tool_ids
-
-        # Apply exclusions
-        excluded = set()
-        if self.valves.EXCLUDED_TOOL_IDS.strip():
-            excluded = {
-                tid.strip()
-                for tid in self.valves.EXCLUDED_TOOL_IDS.split(",")
-                if tid.strip()
-            }
-
+        available = {
+            tid.strip() for tid in self.valves.AVAILABLE_TOOL_IDS.split(",") if tid.strip()
+        }
+        excluded = {
+            tid.strip() for tid in self.valves.EXCLUDED_TOOL_IDS.split(",") if tid.strip()
+        }
         # Exclude this tool itself
         if __id__:
             excluded.add(__id__)
 
         if self.valves.DEBUG:
-            log.info(f"[ParallelTools] Tool IDs: {tool_id_list}")
+            if available:
+                log.info(f"[ParallelTools] Allowed tool IDs: {sorted(available)}")
             if excluded:
                 log.info(f"[ParallelTools] Excluded tool IDs: {sorted(excluded)}")
 
-        try:
-            tools_dict, mcp_clients = await build_tools_dict(
-                request=__request__,
-                model=__model__ or {},
-                metadata=__metadata__,
-                user=user,
-                valves=self.valves,
-                extra_params=extra_params,
-                tool_id_list=tool_id_list,
-                excluded_tool_ids=excluded,
+        # Core resolved the caller's tools under its own names and gates, for the
+        # model that runs the chat (an Arena's pick, which tools cannot identify).
+        caller_tools = __metadata__.get("tools")
+        tools_dict = select_caller_tools(
+            caller_tools if isinstance(caller_tools, dict) else {},
+            __metadata__.get("mcp_clients") or {},
+            self.valves,
+            excluded,
+            available,
+        )
+
+        if self.valves.DEBUG:
+            log.info(f"[ParallelTools] Total tools available: {len(tools_dict)}")
+
+        exec_extra_params = {
+            **extra_params,
+            "__messages__": __messages__ or [],
+            "__defer_artifact_events__": True,
+        }
+
+        # Execute all tools in parallel
+        tasks = [
+            execute_single_tool(
+                tool_name=call.get("name", ""),
+                tool_args=call.get("arguments", {}),
+                tools_dict=tools_dict,
+                extra_params=exec_extra_params,
+                event_emitter=__event_emitter__,
             )
-        except Exception as e:
-            log.exception(f"Error loading tools: {e}")
-            return json.dumps({"error": f"Failed to load tools: {e}"})
+            for call in calls
+        ]
 
-        try:
-            # Core binds these builtins to chat state the loader cannot rebuild.
-            parent_tools = __metadata__.get("tools") or {}
-            for name in (
-                "view_skill",
-                "read_skill_file",
-                "grep_skill_files",
-                "update_skill_files",
-                "search_tools",
-                "call_tool",
-            ):
-                parent_tool = parent_tools.get(name)
-                if (
-                    isinstance(parent_tool, dict)
-                    and parent_tool.get("type") == "builtin"
-                    and parent_tool.get("tool_id") == f"builtin:{name}"
-                ):
-                    tools_dict.setdefault(name, parent_tool)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            if self.valves.DEBUG:
-                log.info(f"[ParallelTools] Total tools available: {len(tools_dict)}")
-
-            # Prepare extra params for execution. Reuse the loader params so
-            # metadata mutations such as resolved terminal/direct bindings stay
-            # visible to direct, terminal, and MCP result processing.
-            exec_extra_params = {
-                **extra_params,
-                "__messages__": __messages__ or [],
-                "__defer_artifact_events__": True,
-            }
-
-            # Execute all tools in parallel
-            tasks = [
-                execute_single_tool(
-                    tool_name=call.get("name", ""),
-                    tool_args=call.get("arguments", {}),
-                    tools_dict=tools_dict,
-                    extra_params=exec_extra_params,
-                    event_emitter=__event_emitter__,
+        # Process results
+        processed_results = []
+        aggregated_files = []
+        aggregated_embeds = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                processed_results.append(
+                    {
+                        "tool_name": calls[i].get("name", "unknown"),
+                        "result": f"Error: {result}",
+                    }
                 )
-                for call in calls
-            ]
+            else:
+                if isinstance(result, dict):
+                    files = result.get("files", [])
+                    embeds = result.get("embeds", [])
+                    if isinstance(files, list):
+                        aggregated_files.extend(files)
+                        if __event_emitter__:
+                            result = {k: v for k, v in result.items() if k != "files"}
+                    if isinstance(embeds, list):
+                        aggregated_embeds.extend(embeds)
+                        if __event_emitter__:
+                            result = {k: v for k, v in result.items() if k != "embeds"}
+                processed_results.append(result)
 
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        if __event_emitter__ and aggregated_files:
+            await __event_emitter__(
+                {"type": "files", "data": {"files": aggregated_files}}
+            )
+        if __event_emitter__ and aggregated_embeds:
+            await __event_emitter__(
+                {"type": "embeds", "data": {"embeds": aggregated_embeds}}
+            )
 
-            # Process results
-            processed_results = []
-            aggregated_files = []
-            aggregated_embeds = []
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    processed_results.append(
-                        {
-                            "tool_name": calls[i].get("name", "unknown"),
-                            "result": f"Error: {result}",
-                        }
-                    )
-                else:
-                    if isinstance(result, dict):
-                        files = result.get("files", [])
-                        embeds = result.get("embeds", [])
-                        if isinstance(files, list):
-                            aggregated_files.extend(files)
-                            if __event_emitter__:
-                                result = {k: v for k, v in result.items() if k != "files"}
-                        if isinstance(embeds, list):
-                            aggregated_embeds.extend(embeds)
-                            if __event_emitter__:
-                                result = {k: v for k, v in result.items() if k != "embeds"}
-                    processed_results.append(result)
+        payload = {"results": processed_results}
+        # Core extracts data-image values from containers, not JSON strings.
+        if any(result.get("images") for result in processed_results if isinstance(result, dict)):
+            from open_webui.utils.middleware import extract_base64_images
 
-            if __event_emitter__ and aggregated_files:
-                await __event_emitter__(
-                    {"type": "files", "data": {"files": aggregated_files}}
-                )
-            if __event_emitter__ and aggregated_embeds:
-                await __event_emitter__(
-                    {"type": "embeds", "data": {"embeds": aggregated_embeds}}
-                )
-
-            payload = {"results": processed_results}
-            # Core extracts data-image values from containers, not JSON strings.
-            if any(result.get("images") for result in processed_results if isinstance(result, dict)):
-                from open_webui.utils.middleware import extract_base64_images
-
-                for result in processed_results:
-                    if not isinstance(result, dict):
-                        continue
-                    embedded_images = []
-                    extract_base64_images(result.get("result"), embedded_images)
-                    if embedded_images:
-                        # JSON parsing must not promote another tool's text
-                        # into extra images when Core processes this batch.
-                        result["result"] = json.dumps(result["result"], ensure_ascii=False)
-                return payload
-            return json.dumps(payload, ensure_ascii=False)
-        finally:
-            await cleanup_mcp_clients(mcp_clients)
+            for result in processed_results:
+                if not isinstance(result, dict):
+                    continue
+                embedded_images = []
+                extract_base64_images(result.get("result"), embedded_images)
+                if embedded_images:
+                    # JSON parsing must not promote another tool's text
+                    # into extra images when Core processes this batch.
+                    result["result"] = json.dumps(result["result"], ensure_ascii=False)
+            return payload
+        return json.dumps(payload, ensure_ascii=False)

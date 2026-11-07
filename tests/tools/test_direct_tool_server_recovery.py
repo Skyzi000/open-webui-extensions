@@ -28,16 +28,31 @@ def approved_tool(server, name="run_command"):
     return {"direct": True, "server": server, "spec": {"name": name}}
 
 
+try:
+    from open_webui.utils import terminals
+except ImportError:  # Core before 0.11.0
+    terminals = None
+SERVER_CHECKS_USER_SHELLS = hasattr(terminals, "filter_user_terminal_tools")
+
+
 @pytest.fixture
-def core_direct_catalogue():
-    """Execute the actual Core Direct-loading and browser-shell gate blocks."""
+def core_direct_catalogue(monkeypatch):
+    """Execute the actual Core Direct-loading block and user-shell gate."""
     path = Path(__file__).parents[2] / "references/open-webui/backend/open_webui/utils/middleware.py"
     module = ast.parse(path.read_text())
     process = next(node for node in module.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "process_chat_payload")
     direct = next(node for node in ast.walk(process) if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "direct_tool_servers")
     resolution = next(node for node in ast.walk(process) if isinstance(node, ast.If) and isinstance(node.test, ast.Compare) and isinstance(node.test.left, ast.Name) and node.test.left.id == "payload_tools")
-    start = next(index for index, node in enumerate(resolution.body) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "shell_tools" for target in node.targets))
-    end = next(index for index, node in enumerate(resolution.body[start:], start) if isinstance(node, ast.For) and isinstance(node.iter, ast.Name) and node.iter.id == "shell_tools")
+    if SERVER_CHECKS_USER_SHELLS:
+        shell_gate = [next(
+            node for node in resolution.body
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Await)
+            and getattr(node.value.value.func, "id", None) == "filter_user_terminal_tools"
+        )]
+    else:
+        start = next(index for index, node in enumerate(resolution.body) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "shell_tools" for target in node.targets))
+        end = next(index for index, node in enumerate(resolution.body[start:], start) if isinstance(node, ast.For) and isinstance(node.iter, ast.Name) and node.iter.id == "shell_tools")
+        shell_gate = resolution.body[start:end + 1]
     wrapper = ast.parse("""
 async def catalogue(metadata, event_caller):
     direct_tool_servers = metadata['tool_servers']
@@ -45,22 +60,34 @@ async def catalogue(metadata, event_caller):
     terminal_capability = True
     form_data = {'messages': []}
     tools_dict = {}
+    request = user = None
+    extra_params = {}
 """)
-    wrapper.body[0].body.extend([direct, *resolution.body[start:end + 1]])
+    wrapper.body[0].body.extend([direct, *shell_gate])
     wrapper.body[0].body.extend(ast.parse("metadata['tools'] = tools_dict\nreturn tools_dict").body)
     import asyncio
 
     namespace = {
         "asyncio": asyncio,
         "add_or_update_system_message": lambda content, messages, append: messages + [{"role": "system", "content": content}],
+        "filter_user_terminal_tools": getattr(terminals, "filter_user_terminal_tools", None),
     }
     exec(compile(ast.fix_missing_locations(wrapper), str(path), "exec"), namespace)
-    return namespace["catalogue"]
+
+    async def catalogue(metadata, connected):
+        # Core 0.13.0+ asks the terminal server; earlier Core asks the browser.
+        monkeypatch.setattr(
+            terminals, "get_terminal_json", AsyncMock(return_value={"output": ""} if connected else None), raising=False,
+        )
+        return await namespace["catalogue"](metadata, AsyncMock(return_value={"connected": connected}))
+
+    return catalogue
 
 
+@pytest.mark.parametrize("session_id", ["browser", None])
 @pytest.mark.parametrize("connected", [True, False])
 @pytest.mark.parametrize("is_terminal", [True, False])
-async def test_actual_core_consumed_servers_reach_nested_loader(core_direct_catalogue, connected, is_terminal):
+async def test_actual_core_consumed_servers_reach_nested_loader(core_direct_catalogue, connected, is_terminal, session_id):
     names = ("run_command", "read_user_terminal", "send_user_terminal_input") if is_terminal else ("lookup",)
     server = {
         **CONNECTION,
@@ -71,9 +98,10 @@ async def test_actual_core_consumed_servers_reach_nested_loader(core_direct_cata
     request = request_with_servers([server])
     metadata = {
         "tool_servers": [server], "terminal_id": CONNECTION["url"] if is_terminal else "",
-        "session_id": "browser", "chat_id": "chat",
+        "session_id": session_id, "chat_id": "chat",
     }
-    approved = await core_direct_catalogue(metadata, AsyncMock(return_value={"connected": connected}))
+    approved = await core_direct_catalogue(metadata, connected)
+    shells_offered = is_terminal and connected and (session_id is not None or SERVER_CHECKS_USER_SHELLS)
     # Core before 0.12.0 consumes these from metadata; later versions keep them.
     consumed = "specs" not in server
     assert ("system_prompt" not in server) is consumed
@@ -94,8 +122,10 @@ async def test_actual_core_consumed_servers_reach_nested_loader(core_direct_cata
     assert clients == {}
     assert set(loaded) == set(approved)
     assert ("run_command" if is_terminal else "lookup") in loaded
-    assert ("read_user_terminal" in loaded) is (is_terminal and connected)
-    assert ("send_user_terminal_input" in loaded) is (is_terminal and connected)
+    assert ("read_user_terminal" in loaded) is shells_offered
+    assert ("send_user_terminal_input" in loaded) is shells_offered
+    if shells_offered:
+        assert loaded["read_user_terminal"]["spec"] == approved["read_user_terminal"]["spec"]
     assert extra["__direct_tool_server_system_prompts__"] == ["Use the terminal workspace."]
     # A second wrapper uses the recovered metadata without another raw read.
     again = await sub_agent.resolve_direct_tool_servers_from_request_and_metadata(

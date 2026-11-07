@@ -396,6 +396,7 @@ async def resolve_mcp_tools(
                             "name": prefixed_name,
                         },
                         "callable": make_tool_function(client, tool_name, client_lock),
+                        "tool_id": f"server:mcp:{server_id}",
                         "type": "mcp",
                         "direct": False,
                     }

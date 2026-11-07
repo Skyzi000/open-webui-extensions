@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.28
+version: 0.1.29
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -556,12 +556,19 @@ class Tools:
                 "Off by default because they change saved skills. Requires ENABLE_SKILLS_TOOLS."
             ),
         )
+        ENABLE_TOOL_CREATION_TOOLS: bool = Field(
+            default=False,
+            description=(
+                "Enable the tool creation tool (create_tool; Open WebUI 0.13.0+). "
+                "Off by default because it saves a new workspace tool and runs its code on the server."
+            ),
+        )
         ENABLE_SUBAGENT_TOOLS: bool = Field(
             default=False,
             description=(
-                "Enable Core subagent tools (delegate_task, timer). Off by default because they use the "
-                "parent conversation's model and tools rather than this agent's restrictions, and timer "
-                "can schedule future work for the parent chat."
+                "Enable Core subagent tools (delegate_task, timer). Off by default because delegated "
+                "sub-agents use the parent conversation's tools rather than this agent's restrictions, "
+                "and timer can schedule future work for the parent chat."
             ),
         )
         ENABLE_TASK_TOOLS: bool = Field(

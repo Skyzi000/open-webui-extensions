@@ -91,7 +91,6 @@ MCP_RESOLVE_MODULES = [
     pytest.param(sub_agent, id="sub_agent"),
     pytest.param(multi_model_council, id="multi_model_council"),
     pytest.param(magi_decision_support, id="magi_decision_support"),
-    pytest.param(parallel_tools, id="parallel_tools"),
     pytest.param(llm_review, id="llm_review"),
 ]
 
@@ -122,7 +121,6 @@ def test_mcp_resolve_module_matrix_covers_generated_mcp_resolvers():
         sub_agent,
         multi_model_council,
         magi_decision_support,
-        parallel_tools,
         llm_review,
     }
 
@@ -1440,33 +1438,12 @@ async def test_magi_build_tools_dict_without_terminal_symbol_keeps_builtin(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("caller_holds_it", [True, False])
 async def test_parallel_tools_run_tools_parallel_resolves_terminal_tools(
-    monkeypatch, dummy_request, mock_user
+    dummy_request, mock_user, caller_holds_it
 ):
-    import open_webui.utils.tools as ow_tools
-
-    async def fake_get_tools(request, tool_ids, user, extra_params):
-        return {}
-
-    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
-        return {}
-
     async def run_command(command: str):
         return {"stdout": f"executed:{command}"}
-
-    async def fake_get_terminal_tools(request, terminal_id, user, extra_params):
-        return {
-            "run_command": {
-                "callable": run_command,
-                "spec": make_spec("command"),
-                "type": "terminal",
-                "tool_id": f"terminal:{terminal_id}",
-            }
-        }
-
-    monkeypatch.setattr(ow_tools, "get_tools", fake_get_tools)
-    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
-    monkeypatch.setattr(ow_tools, "get_terminal_tools", fake_get_terminal_tools)
 
     user_payload = {
         **mock_user,
@@ -1474,199 +1451,27 @@ async def test_parallel_tools_run_tools_parallel_resolves_terminal_tools(
         "updated_at": 0,
         "created_at": 0,
     }
+    terminal_tools = {"run_command": {
+        "callable": run_command,
+        "spec": make_spec("command"),
+        "type": "terminal",
+        "tool_id": "terminal:term-parallel",
+    }}
 
     tool = parallel_tools.Tools()
     result_json = await tool.run_tools_parallel(
         tool_calls=[{"name": "run_command", "args": {"command": "pwd"}}],
         __user__=user_payload,
         __request__=dummy_request,
-        __metadata__={"tool_ids": [], "features": {}, "terminal_id": "term-parallel"},
+        __metadata__={"terminal_id": "term-parallel", "tools": terminal_tools if caller_holds_it else {}},
     )
 
     payload = json.loads(result_json)
-    assert "results" in payload
     assert payload["results"][0]["tool_name"] == "run_command"
-    assert payload["results"][0]["result"]["stdout"] == "executed:pwd"
-
-
-@pytest.mark.asyncio
-async def test_parallel_tools_resolves_terminal_from_request_body(
-    monkeypatch, dummy_request, mock_user
-):
-    import open_webui.utils.tools as ow_tools
-
-    called_terminal_ids = []
-
-    async def fake_get_tools(request, tool_ids, user, extra_params):
-        return {}
-
-    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
-        return {}
-
-    async def run_command(command: str):
-        return {"stdout": f"executed:{command}"}
-
-    async def fake_get_terminal_tools(request, terminal_id, user, extra_params):
-        called_terminal_ids.append(terminal_id)
-        return {
-            "run_command": {
-                "callable": run_command,
-                "spec": make_spec("command"),
-                "type": "terminal",
-                "tool_id": f"terminal:{terminal_id}",
-            }
-        }
-
-    async def fake_request_body():
-        return b'{"terminal_id":"term-parallel-body"}'
-
-    monkeypatch.setattr(ow_tools, "get_tools", fake_get_tools)
-    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
-    monkeypatch.setattr(ow_tools, "get_terminal_tools", fake_get_terminal_tools)
-    setattr(dummy_request, "body", fake_request_body)
-
-    user_payload = {
-        **mock_user,
-        "last_active_at": 0,
-        "updated_at": 0,
-        "created_at": 0,
-    }
-
-    tool = parallel_tools.Tools()
-    result_json = await tool.run_tools_parallel(
-        tool_calls=[{"name": "run_command", "args": {"command": "pwd"}}],
-        __user__=user_payload,
-        __request__=dummy_request,
-        __metadata__={"tool_ids": [], "features": {}},
-    )
-
-    payload = json.loads(result_json)
-    assert called_terminal_ids == ["term-parallel-body"]
-    assert payload["results"][0]["result"]["stdout"] == "executed:pwd"
-
-
-@pytest.mark.asyncio
-async def test_parallel_tools_run_tools_parallel_resolves_mcp_tools(
-    monkeypatch, mock_user
-):
-    from types import ModuleType
-
-    import open_webui
-    import open_webui.env as ow_env
-    import open_webui.utils.tools as ow_tools
-
-    connected = []
-    disconnected = []
-    tool_calls = []
-
-    class FakeMCPClient:
-        async def connect(self, url: str, headers=None):
-            connected.append({"url": url, "headers": headers})
-
-        async def list_tool_specs(self):
-            return [
-                {
-                    "name": "lookup_docs",
-                    "description": "Lookup docs",
-                    "parameters": {
-                        "properties": {"query": {"type": "string"}},
-                    },
-                }
-            ]
-
-        async def call_tool(self, name: str, function_args=None):
-            tool_calls.append({"name": name, "args": function_args})
-            return {"answer": f"docs:{function_args['query']}"}
-
-        async def disconnect(self):
-            disconnected.append(True)
-
-    async def fake_get_tools(request, tool_ids, user, extra_params):
-        assert all(not tool_id.startswith("server:mcp:") for tool_id in tool_ids)
-        return {}
-
-    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
-        return {}
-
-    monkeypatch.setattr(ow_tools, "get_tools", fake_get_tools)
-    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
-    monkeypatch.setattr(ow_env, "ENABLE_FORWARD_USER_INFO_HEADERS", False, raising=False)
-
-    utils_package = open_webui.utils
-    fake_misc_module = ModuleType("open_webui.utils.misc")
-    fake_misc_module.is_string_allowed = lambda value, allowlist: True
-    monkeypatch.setitem(sys.modules, "open_webui.utils.misc", fake_misc_module)
-    monkeypatch.setattr(utils_package, "misc", fake_misc_module, raising=False)
-
-    fake_headers_module = ModuleType("open_webui.utils.headers")
-    fake_headers_module.include_user_info_headers = lambda headers, user: headers
-    monkeypatch.setitem(sys.modules, "open_webui.utils.headers", fake_headers_module)
-    monkeypatch.setattr(utils_package, "headers", fake_headers_module, raising=False)
-
-    fake_mcp_package = ModuleType("open_webui.utils.mcp")
-    fake_mcp_client_module = ModuleType("open_webui.utils.mcp.client")
-    fake_mcp_client_module.MCPClient = FakeMCPClient
-    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp", fake_mcp_package)
-    monkeypatch.setitem(sys.modules, "open_webui.utils.mcp.client", fake_mcp_client_module)
-    monkeypatch.setattr(utils_package, "mcp", fake_mcp_package, raising=False)
-
-    connections = [
-        {
-            "type": "mcp",
-            "url": "https://mcp.example.com",
-            "auth_type": "bearer",
-            "key": "mcp-token",
-            "headers": {"X-Test": "1"},
-            "config": {"enable": True},
-            "info": {"id": "suite:ctx7"},
-        }
-    ]
-    stub_open_webui_config_get(monkeypatch, tool_server_connections=connections)
-
-    request = SimpleNamespace(
-        app=SimpleNamespace(
-            state=SimpleNamespace(
-                config=SimpleNamespace(
-                    TERMINAL_SERVER_CONNECTIONS=[],
-                    TOOL_SERVER_CONNECTIONS=[],
-                ),
-            )
-        )
-    )
-    user_payload = {
-        **mock_user,
-        "last_active_at": 0,
-        "updated_at": 0,
-        "created_at": 0,
-    }
-
-    tool = parallel_tools.Tools()
-    result_json = await tool.run_tools_parallel(
-        tool_calls=[
-            {"name": "suite_ctx7_lookup_docs", "args": {"query": "parallel"}}
-        ],
-        __user__=user_payload,
-        __request__=request,
-        __metadata__={
-            "tool_ids": ["server:mcp:suite:ctx7"],
-            "features": {},
-        },
-    )
-
-    payload = json.loads(result_json)
-    assert payload["results"][0]["tool_name"] == "suite_ctx7_lookup_docs"
-    assert payload["results"][0]["result"]["answer"] == "docs:parallel"
-    assert connected == [
-        {
-            "url": "https://mcp.example.com",
-            "headers": {
-                "Authorization": "Bearer mcp-token",
-                "X-Test": "1",
-            },
-        }
-    ]
-    assert tool_calls == [{"name": "lookup_docs", "args": {"query": "parallel"}}]
-    assert disconnected == [True]
+    if caller_holds_it:
+        assert payload["results"][0]["result"]["stdout"] == "executed:pwd"
+    else:
+        assert "'run_command' not found" in payload["results"][0]["result"]
 
 
 @pytest.mark.asyncio
@@ -1864,7 +1669,6 @@ async def test_sub_agent_load_tools_includes_direct_tool_servers(monkeypatch, du
     ("module_name", "module"),
     [
         ("sub_agent", sub_agent),
-        ("parallel_tools", parallel_tools),
         ("multi_model_council", multi_model_council),
         ("magi_decision_support", magi_decision_support),
         ("llm_review", llm_review),
@@ -2540,24 +2344,13 @@ async def test_magi_build_tools_dict_ignores_unloaded_direct_tool_prompts(dummy_
 
 @pytest.mark.asyncio
 async def test_parallel_tools_executes_direct_tool_via_event_call(
-    monkeypatch, dummy_request, mock_user
+    dummy_request, mock_user
 ):
-    import open_webui.utils.tools as ow_tools
-
-    async def fake_get_tools(request, tool_ids, user, extra_params):
-        return {}
-
-    def fake_get_builtin_tools(request, extra_params, features=None, model=None):
-        return {}
-
     execute_calls = []
 
     async def event_call(payload: dict):
         execute_calls.append(payload)
         return [{"ok": True, "command": payload["data"]["params"]["command"]}, {}]
-
-    monkeypatch.setattr(ow_tools, "get_tools", fake_get_tools)
-    monkeypatch.setattr(ow_tools, "get_builtin_tools", fake_get_builtin_tools)
 
     tool = parallel_tools.Tools()
     user_payload = {
@@ -2566,25 +2359,16 @@ async def test_parallel_tools_executes_direct_tool_via_event_call(
         "updated_at": 0,
         "created_at": 0,
     }
+    spec = {"name": "direct_run", "parameters": {"properties": {"command": {"type": "string"}}}}
+    server = {"url": "https://direct-parallel.example.com"}
     result_json = await tool.run_tools_parallel(
         tool_calls=[{"name": "direct_run", "args": {"command": "pwd"}}],
         __user__=user_payload,
         __request__=dummy_request,
         __metadata__={
-            "tool_ids": [],
-            "features": {},
             "session_id": "sess-parallel",
-            "tool_servers": [
-                {
-                    "url": "https://direct-parallel.example.com",
-                    "specs": [
-                        {
-                            "name": "direct_run",
-                            "parameters": {"properties": {"command": {"type": "string"}}},
-                        }
-                    ],
-                }
-            ],
+            "tool_servers": [server],
+            "tools": {"direct_run": {"spec": spec, "direct": True, "server": server}},
         },
         __event_call__=event_call,
     )
@@ -3017,7 +2801,9 @@ async def test_build_tools_dict_classifies_note_knowledge_by_core_capability(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("module_name,module", BUILTIN_CATALOG_MODULES)
+@pytest.mark.parametrize("module_name,module", [
+    (name, module) for name, module in BUILTIN_CATALOG_MODULES if module is not parallel_tools
+])
 @pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize(
     "case",
@@ -3048,7 +2834,7 @@ async def test_user_shell_tools_inherit_parent_core_permission(
         if direct
         else {"type": "terminal", "tool_id": f"terminal:{selector}"}
     )
-    parent_tools = {name: dict(provenance) for name in names}
+    parent_tools = {name: {**provenance, "spec": {"name": name, "description": f"Parent {name}."}} for name in names}
     if case == "parent_missing":
         parent_tools = {}
     elif case == "parent_regular_tool":
@@ -3070,7 +2856,7 @@ async def test_user_shell_tools_inherit_parent_core_permission(
 
     async def get_terminal_tools(**kwargs):
         return {
-            name: {"type": "terminal", "tool_id": f"terminal:{child_selector}"}
+            name: {"type": "terminal", "tool_id": f"terminal:{child_selector}", "spec": {"name": name}}
             for name in names
         } if not direct else {}
 
@@ -3092,8 +2878,12 @@ async def test_user_shell_tools_inherit_parent_core_permission(
         resolved_direct_tool_servers=direct_servers,
     )
 
-    expected = set(names) if case == "allowed" else {"read_user_terminal"} if case == "only_read_allowed" else set()
+    # Core decides whether a session or chat is needed (0.13.0 confirms shells with the terminal server).
+    inherited = {"allowed", "session_missing", "chat_missing"}
+    expected = set(names) if case in inherited else {"read_user_terminal"} if case == "only_read_allowed" else set()
     assert set(tools_dict) == expected
+    for name in expected:
+        assert tools_dict[name]["spec"] == {"name": name, "description": f"Parent {name}."}
 
 
 @pytest.mark.asyncio
