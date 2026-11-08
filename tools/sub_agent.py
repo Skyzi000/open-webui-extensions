@@ -10039,6 +10039,7 @@ RESPONSE REQUIREMENTS:
         all_mcp_clients: list[dict] = []
 
         async def ensure_tools(filter_pipeline: dict):
+            """Load and cache sub-agent tools for the resolved model pipeline."""
             effective_model_id = filter_pipeline["model_id"]
             cached = tools_cache.get(effective_model_id)
             if cached is not None:
