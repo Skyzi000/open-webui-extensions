@@ -475,7 +475,7 @@ async def _skills_maybe_await(value: Any) -> Any:
 
 
 def _find_manifest_in_text(text: str) -> str:
-    """Return the <available_skills>…</available_skills> substring, or ""."""
+    """Return the <available_skills>â€¦</available_skills> substring, or ""."""
     start = text.find(_SKILLS_MANIFEST_START)
     if start == -1:
         return ""
@@ -486,7 +486,7 @@ def _find_manifest_in_text(text: str) -> str:
 
 
 def _find_skill_tags_in_text(text: str) -> list[str]:
-    """Return all ``<skill ... name="...">…</skill>`` blocks found in *text*."""
+    """Return all ``<skill ... name="...">â€¦</skill>`` blocks found in *text*."""
     return _SKILL_TAG_PATTERN.findall(text)
 
 
@@ -551,7 +551,7 @@ def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
         messages: The parent conversation messages (``__messages__``).
 
     Returns:
-        A list of ``<skill …>…</skill>`` strings, possibly empty.
+        A list of ``<skill â€¦>â€¦</skill>`` strings, possibly empty.
     """
     return _extract_from_system_messages(messages, _find_skill_tags_in_text)
 
@@ -6758,7 +6758,7 @@ async def execute_tool_call(
             else:
                 tool_function = tool["callable"]
 
-                # Only override per-call dynamic context — preserve __user__
+                # Only override per-call dynamic context â€” preserve __user__
                 # so tool-specific UserValves injected by get_tools() survive.
                 from open_webui.utils.tools import get_updated_tool_function
 
@@ -6911,6 +6911,7 @@ async def _build_mcp_headers_with_core(
     metadata: dict,
     extra_params: dict,
 ) -> Optional[dict[str, Any]]:
+    """Build MCP tool server headers using Open WebUI's core helper when available."""
     try:
         from open_webui.utils.tools import build_tool_server_headers
     except ImportError:
@@ -8393,7 +8394,7 @@ async def _project_form_data(
 async def _estimation_messages(run: _LoopRunState, messages: list[dict]) -> list[dict]:
     """Uses the same ``project_native_tool_texts`` + ``apply_ref_projection_plan``
     path as ``_ref_project_form_data`` (sharing its caches) but never
-    interns entries into the store — interning is send-time only.
+    interns entries into the store â€” interning is send-time only.
     """
     if run.effective_mode == "raw":
         return messages
@@ -9681,7 +9682,7 @@ class Tools:
                 "of the conversation, preserving prompt caching and avoiding 'System message must be at "
                 "the beginning' errors reported by some chat templates or inference APIs. "
                 "Set to 'system' to restore the pre-0.5.2 behaviour (the meta note is appended as a "
-                "standalone system message at the end of each request) — use this if the new default "
+                "standalone system message at the end of each request) â€” use this if the new default "
                 "causes any regression with your model; note that it may re-trigger the system-position error."
             ),
         )
@@ -9738,7 +9739,7 @@ RESPONSE REQUIREMENTS:
         Only handle simple 1-2 tool call tasks yourself. When in doubt, delegate.
 
         The sub-agent runs in a fresh context with NO access to the current
-        conversation history — include all necessary context in the prompt.
+        conversation history â€” include all necessary context in the prompt.
         It has the same tools and executes them in a loop until completion,
         returning only the final result to keep the main conversation clean.
 
