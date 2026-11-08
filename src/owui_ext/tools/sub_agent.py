@@ -523,7 +523,7 @@ async def _project_form_data(
 async def _estimation_messages(run: _LoopRunState, messages: list[dict]) -> list[dict]:
     """Uses the same ``project_native_tool_texts`` + ``apply_ref_projection_plan``
     path as ``_ref_project_form_data`` (sharing its caches) but never
-    interns entries into the store — interning is send-time only.
+    interns entries into the store â€” interning is send-time only.
     """
     if run.effective_mode == "raw":
         return messages
@@ -1813,7 +1813,7 @@ class Tools:
                 "of the conversation, preserving prompt caching and avoiding 'System message must be at "
                 "the beginning' errors reported by some chat templates or inference APIs. "
                 "Set to 'system' to restore the pre-0.5.2 behaviour (the meta note is appended as a "
-                "standalone system message at the end of each request) — use this if the new default "
+                "standalone system message at the end of each request) â€” use this if the new default "
                 "causes any regression with your model; note that it may re-trigger the system-position error."
             ),
         )
@@ -1870,7 +1870,7 @@ RESPONSE REQUIREMENTS:
         Only handle simple 1-2 tool call tasks yourself. When in doubt, delegate.
 
         The sub-agent runs in a fresh context with NO access to the current
-        conversation history — include all necessary context in the prompt.
+        conversation history â€” include all necessary context in the prompt.
         It has the same tools and executes them in a loop until completion,
         returning only the final result to keep the main conversation clean.
 
@@ -2170,6 +2170,7 @@ RESPONSE REQUIREMENTS:
         all_mcp_clients: list[dict] = []
 
         async def ensure_tools(filter_pipeline: dict):
+            """Load and cache sub-agent tools for the resolved model pipeline."""
             effective_model_id = filter_pipeline["model_id"]
             cached = tools_cache.get(effective_model_id)
             if cached is not None:
@@ -2346,4 +2347,3 @@ RESPONSE REQUIREMENTS:
             raise
         finally:
             await cleanup_mcp_clients(*all_mcp_clients)
-
