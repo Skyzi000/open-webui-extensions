@@ -26,6 +26,7 @@ below.
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import re
 from typing import Any, Callable, Optional
@@ -73,14 +74,27 @@ async def _build_mcp_headers_with_core(
     except ImportError:
         return None
 
+    sig = inspect.signature(build_tool_server_headers)
+    accepts_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    optional_kwargs = {
+        "server_id": server_id,
+        "metadata": metadata,
+        "extra_params": extra_params,
+    }
+    call_kwargs = {
+        k: v
+        for k, v in optional_kwargs.items()
+        if accepts_var_kw or k in sig.parameters
+    }
+
     result = await _mcp_maybe_await(
         build_tool_server_headers(
             connection,
             request,
             user,
-            server_id=server_id,
-            metadata=metadata,
-            extra_params=extra_params,
+            **call_kwargs,
         )
     )
     headers = result[0] if isinstance(result, tuple) else result
@@ -443,3 +457,4 @@ async def cleanup_mcp_clients(mcp_clients: dict | None = None, *more_clients: di
                 _mcp_tools_log.debug(f"Error cleaning up MCP client: {exc}")
     if cancelled is not None:
         raise cancelled
+

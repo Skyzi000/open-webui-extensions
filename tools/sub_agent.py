@@ -6916,14 +6916,27 @@ async def _build_mcp_headers_with_core(
     except ImportError:
         return None
 
+    sig = inspect.signature(build_tool_server_headers)
+    accepts_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    optional_kwargs = {
+        "server_id": server_id,
+        "metadata": metadata,
+        "extra_params": extra_params,
+    }
+    call_kwargs = {
+        k: v
+        for k, v in optional_kwargs.items()
+        if accepts_var_kw or k in sig.parameters
+    }
+
     result = await _mcp_maybe_await(
         build_tool_server_headers(
             connection,
             request,
             user,
-            server_id=server_id,
-            metadata=metadata,
-            extra_params=extra_params,
+            **call_kwargs,
         )
     )
     headers = result[0] if isinstance(result, tuple) else result
@@ -8884,7 +8897,7 @@ async def run_sub_agent_loop(
             apply_inlet_filters,
             request,
             model_id,
-            extra_params.get("__metadata__", {}).get("filter_ids", []),
+            extra_params.get("__metadata__", {}).get("filter_ids") or [],
         )
 
     custom_tools = await model_custom_tools(filter_pipeline)
@@ -8959,7 +8972,7 @@ async def run_sub_agent_loop(
             "metadata": {
                 "task": "sub_agent",
                 "sub_agent_iteration": 1,
-                "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
+                "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids") or [],
             },
         },
         skills,
@@ -8998,7 +9011,7 @@ async def run_sub_agent_loop(
         send_metadata = {
             "task": "sub_agent",
             "sub_agent_iteration": iteration,
-            "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
+            "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids") or [],
         }
 
         if run.compaction.enabled:
@@ -9254,7 +9267,7 @@ async def run_sub_agent_loop(
     final_metadata = {
         "task": "sub_agent",
         "sub_agent_iteration": max_iterations + 1,
-        "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
+        "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids") or [],
     }
     if run.compaction.enabled:
         volatile_tokens = (
@@ -9804,7 +9817,7 @@ RESPONSE REQUIREMENTS:
                 self.valves.APPLY_INLET_FILTERS,
                 __request__,
                 model_id,
-                common_extra_params["__metadata__"].get("filter_ids", []),
+                common_extra_params["__metadata__"].get("filter_ids") or [],
             )
             resolved_model = filter_pipeline["model"]
             common_extra_params["__model__"] = resolved_model
@@ -10063,7 +10076,7 @@ RESPONSE REQUIREMENTS:
                     self.valves.APPLY_INLET_FILTERS,
                     __request__,
                     model_id,
-                    common_extra_params["__metadata__"].get("filter_ids", []),
+                    common_extra_params["__metadata__"].get("filter_ids") or [],
                 )
                 prepared_tasks.append((filter_pipeline, await ensure_tools(filter_pipeline)))
 
