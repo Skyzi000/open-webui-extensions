@@ -69,6 +69,7 @@ async def _build_mcp_headers_with_core(
     metadata: dict,
     extra_params: dict,
 ) -> Optional[dict[str, Any]]:
+    """Build MCP tool server headers using Open WebUI's core helper when available."""
     try:
         from open_webui.utils.tools import build_tool_server_headers
     except ImportError:
@@ -457,4 +458,3 @@ async def cleanup_mcp_clients(mcp_clients: dict | None = None, *more_clients: di
                 _mcp_tools_log.debug(f"Error cleaning up MCP client: {exc}")
     if cancelled is not None:
         raise cancelled
-
