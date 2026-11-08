@@ -3193,3 +3193,44 @@ async def test_a_childs_model_changes_stay_in_its_own_loop(monkeypatch, entry):
     assert seen and all(model == child_before for model in seen)
     assert child == child_before
     assert parent_metadata == parent_before
+
+
+@pytest.mark.parametrize("valves", [None, {"STATUS_TRUNCATE_CHARS": 0}])
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_step_statuses_are_capped_while_the_model_still_sees_everything(monkeypatch, entry, valves):
+    import unicodedata
+
+    long_text = "あ" * 5000
+    statuses = []
+
+    async def emit(event):
+        if event.get("type") == "status":
+            statuses.append(event["data"]["description"])
+
+    def tools():
+        async def lookup(query: str = ""):
+            return long_text
+
+        tools = loop_tools()
+        tools["lookup"]["callable"] = lookup
+        return tools
+
+    def respond(body):
+        if not any(message["role"] == "tool" for message in body["messages"]) and "lookup" in body["tools"]:
+            response = tool_call("lookup", {"query": long_text})
+            response["choices"][0]["message"]["content"] = long_text
+            return response
+        return answer(body)
+
+    sent, _, _ = await run_entry(monkeypatch, entry, respond, regular_tools=tools, event_emitter=emit, valves=valves)
+
+    assert any(
+        message["role"] == "tool" and message["content"] == long_text
+        for body in sent for message in body["messages"]
+    )
+    assert any("lookup" in status for status in statuses)
+    if valves is None:
+        widths = [sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s) for s in statuses]
+        assert max(widths) <= 130
+    else:
+        assert any(long_text in status for status in statuses)

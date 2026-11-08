@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.17
+version: 0.5.18
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -1231,6 +1231,19 @@ async def emit_notification(
         _notifications_log.debug(
             f"Error emitting notification ({level}): {exc}"
         )
+
+# --- inlined from src/owui_ext/shared/status_text.py (owui_ext.shared.status_text) ---
+import unicodedata
+def truncate_status(description: str, limit: int) -> str:
+    """Cut ``description`` to ``limit`` display columns (full-width characters count as 2); 0 disables."""
+    if limit <= 0:
+        return description
+    width = 0
+    for index, char in enumerate(description):
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        if width > limit:
+            return description[:index] + "..."
+    return description
 
 # --- inlined from src/owui_ext/shared/tool_execution.py (owui_ext.shared.tool_execution) ---
 import ast
@@ -4489,7 +4502,9 @@ class EventEmitter:
         chat_id: Optional[str] = None,
         render_markdown: bool = True,
         force_theme: str = "auto",
+        status_truncate_chars: int = 0,
     ) -> None:
+        self._status_truncate_chars = status_truncate_chars
         # _raw_emitter is the pristine event_emitter given by Open WebUI.
         # self.event_emitter is what everything else (status emits, execute
         # pushes, downstream agent loops) uses — when rich mode is on it's a
@@ -5016,18 +5031,23 @@ class EventEmitter:
         rich_enabled = self._rich_enabled
 
         async def wrapped(event: dict) -> None:
+            is_status = isinstance(event, dict) and event.get("type") == "status"
+            data = (event.get("data") or {}) if is_status else {}
+            description = data.get("description") if isinstance(data, dict) else None
+            forwarded = event
+            if isinstance(description, str) and description.startswith(f"[{agent_name}]"):
+                forwarded = {
+                    **event,
+                    "data": {**data, "description": truncate_status(description, self._status_truncate_chars)},
+                }
             # Always forward so the regular chat status line keeps working.
             if original is not None:
                 try:
-                    await original(event)
+                    await original(forwarded)
                 except Exception as e:
                     log.warning(f"[LLMReview] underlying emitter failed: {e}")
             if not rich_enabled or not self._rich_initialized:
                 return
-            if not isinstance(event, dict) or event.get("type") != "status":
-                return
-            data = event.get("data") or {}
-            description = data.get("description")
             if not isinstance(description, str):
                 return
             parsed = _parse_agent_status(agent_name, description)
@@ -6639,6 +6659,17 @@ class Tools:
                 "with your model; note that it may re-trigger the system-position error."
             ),
         )
+        STATUS_TRUNCATE_CHARS: int = Field(
+            default=120,
+            ge=0,
+            description=(
+                "Maximum length of each review-agent status line (assistant text, tool calls, tool "
+                "arguments, tool results) sent to Open WebUI; full-width characters count as 2. "
+                "Open WebUI stores and renders every status in full, so long lines enlarge the "
+                "database and slow down the expanded status history. The rich progress view and "
+                "tool results sent to agents are not affected. 0 = no limit."
+            ),
+        )
         DEBUG: bool = Field(
             default=False,
             description="Enable debug logging.",
@@ -6957,6 +6988,7 @@ CRITICAL RULES:
             chat_id=__chat_id__,
             render_markdown=bool(getattr(user_valves, "RENDER_DRAFTS_AS_MARKDOWN", True)),
             force_theme=str(getattr(user_valves, "RICH_PROGRESS_THEME", "auto") or "auto"),
+            status_truncate_chars=self.valves.STATUS_TRUNCATE_CHARS,
         )
 
         # Extract skills from parent conversation messages.

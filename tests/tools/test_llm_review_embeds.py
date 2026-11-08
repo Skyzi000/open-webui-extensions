@@ -69,7 +69,7 @@ class RecordingEmitter:
 
 
 async def _make_initialized_emitter(
-    *, chat_id: str | None = None
+    *, chat_id: str | None = None, status_truncate_chars: int = 0
 ) -> tuple[llm_review.EventEmitter, RecordingEmitter]:
     raw = RecordingEmitter()
     ee = llm_review.EventEmitter(
@@ -79,6 +79,7 @@ async def _make_initialized_emitter(
         chat_id=chat_id,
         render_markdown=False,
         force_theme="auto",
+        status_truncate_chars=status_truncate_chars,
     )
     await ee.init_rich(
         topic="Test topic",
@@ -426,3 +427,18 @@ def test_is_rich_shell_embed_identifies_marker() -> None:
     assert not llm_review._is_rich_shell_embed("<div>x</div>", marker)
     assert not llm_review._is_rich_shell_embed({"html": marker}, marker)
     assert not llm_review._is_rich_shell_embed(None, marker)
+
+
+@pytest.mark.asyncio
+async def test_wrap_agent_caps_only_its_own_forwarded_status_lines() -> None:
+    ee, raw = await _make_initialized_emitter(status_truncate_chars=50)
+    wrapped = ee.wrap_agent("m1", "Alpha")
+    speech = "s" * 300
+    child_status = "Searching " + "q" * 300
+
+    await wrapped({"type": "status", "data": {"description": f"[Alpha] Step 1: {speech}", "done": False}})
+    await wrapped({"type": "status", "data": {"description": child_status, "done": False}})
+
+    forwarded = [event["data"]["description"] for event in raw.events if event.get("type") == "status"]
+    assert forwarded == [f"[Alpha] Step 1: {speech}"[:50] + "...", child_status]
+    assert ee._activities_by_id["m1"][-1] == {"kind": "speech", "text": speech}

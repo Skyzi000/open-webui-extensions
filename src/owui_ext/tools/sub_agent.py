@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.6.10
+version: 0.6.11
 license: MIT
 required_open_webui_version: 0.9.6
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -78,6 +78,7 @@ from owui_ext.shared.prompt_utils import (
     merge_prompt_sections,
     model_custom_tools,
 )
+from owui_ext.shared.status_text import truncate_status
 from owui_ext.shared.ref_exec import (
     REF_EXEC_TOOL_NAME,
     RefProjectionError,
@@ -987,6 +988,7 @@ async def run_sub_agent_loop(
     large_results: Optional[LargeToolResultOptions] = None,
     filter_pipeline: Optional[dict] = None,
     skills: list[str] = (),
+    status_truncate_chars: int = 0,
 ) -> str:
     """Run the sub-agent tool loop until completion.
 
@@ -1249,7 +1251,7 @@ async def run_sub_agent_loop(
                     {
                         "type": "status",
                         "data": {
-                            "description": f"[Step {iteration}] Assistant: {content.replace(chr(10), ' ')}",
+                            "description": truncate_status(f"[Step {iteration}] Assistant: {content.replace(chr(10), ' ')}", status_truncate_chars),
                             "done": False,
                         },
                     }
@@ -1287,7 +1289,7 @@ async def run_sub_agent_loop(
                     {
                         "type": "status",
                         "data": {
-                            "description": f"[Step {iteration}] Tool calls: {', '.join(tool_names)}",
+                            "description": truncate_status(f"[Step {iteration}] Tool calls: {', '.join(tool_names)}", status_truncate_chars),
                             "done": False,
                         },
                     }
@@ -1334,7 +1336,7 @@ async def run_sub_agent_loop(
                         {
                             "type": "status",
                             "data": {
-                                "description": f"[Step {iteration}] Args: {tool_args_display}",
+                                "description": truncate_status(f"[Step {iteration}] Args: {tool_args_display}", status_truncate_chars),
                                 "done": False,
                             },
                         }
@@ -1359,7 +1361,7 @@ async def run_sub_agent_loop(
                         {
                             "type": "status",
                             "data": {
-                                "description": f"[Step {iteration}] Result: {result_content}",
+                                "description": truncate_status(f"[Step {iteration}] Result: {result_content}", status_truncate_chars),
                                 "done": False,
                             },
                         }
@@ -1792,6 +1794,17 @@ class Tools:
                 "ignores this setting."
             ),
         )
+        STATUS_TRUNCATE_CHARS: int = Field(
+            default=120,
+            ge=0,
+            description=(
+                "Maximum length of each per-step status line (assistant text, tool calls, tool "
+                "arguments, tool results); full-width characters count as 2. Open WebUI stores and "
+                "renders every status in full, so long lines enlarge the database and slow down the "
+                "expanded status history. Tool results sent to the sub-agent are not affected. "
+                "0 = no limit."
+            ),
+        )
         ITERATION_NOTE_ROLE: Literal["user", "system"] = Field(
             default="user",
             description=(
@@ -2003,6 +2016,7 @@ RESPONSE REQUIREMENTS:
                         mode=self.valves.LARGE_TOOL_RESULT_MODE,
                         threshold_tokens=self.valves.LARGE_TOOL_RESULT_THRESHOLD_TOKENS,
                     ),
+                    status_truncate_chars=self.valves.STATUS_TRUNCATE_CHARS,
                 )
             except Exception as e:
                 log.exception(f"Error in sub-agent execution: {e}")
@@ -2278,6 +2292,7 @@ RESPONSE REQUIREMENTS:
                             mode=self.valves.LARGE_TOOL_RESULT_MODE,
                             threshold_tokens=self.valves.LARGE_TOOL_RESULT_THRESHOLD_TOKENS,
                         ),
+                        status_truncate_chars=self.valves.STATUS_TRUNCATE_CHARS,
                     )
                     return {"description": task_description, "result": result}
                 except Exception as e:

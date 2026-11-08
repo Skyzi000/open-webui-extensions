@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.23
+version: 0.2.24
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -1529,6 +1529,19 @@ def normalize_text(value: Optional[str]) -> str:
     if not value:
         return ""
     return str(value).strip()
+
+# --- inlined from src/owui_ext/shared/status_text.py (owui_ext.shared.status_text) ---
+import unicodedata
+def truncate_status(description: str, limit: int) -> str:
+    """Cut ``description`` to ``limit`` display columns (full-width characters count as 2); 0 disables."""
+    if limit <= 0:
+        return description
+    width = 0
+    for index, char in enumerate(description):
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        if width > limit:
+            return description[:index] + "..."
+    return description
 
 # --- inlined from src/owui_ext/shared/tool_execution.py (owui_ext.shared.tool_execution) ---
 import ast
@@ -3256,6 +3269,7 @@ async def run_agent_loop(
     event_emitter: Optional[Callable] = None,
     filter_pipeline: Optional[dict] = None,
     skills: list[str] = (),
+    status_truncate_chars: int = 0,
 ) -> str:
     from open_webui.models.users import UserModel
 
@@ -3349,12 +3363,14 @@ async def run_agent_loop(
 
             # Emit status with LLM response content
             if event_emitter and content:
-                truncated = content.replace(chr(10), ' ')[:100]
                 await event_emitter(
                     {
                         "type": "status",
                         "data": {
-                            "description": f"[{agent_name}] Step {iteration}: {truncated}...",
+                            "description": truncate_status(
+                                f"[{agent_name}] Step {iteration}: {content.replace(chr(10), ' ')}",
+                                status_truncate_chars,
+                            ),
                             "done": False,
                         },
                     }
@@ -3380,7 +3396,10 @@ async def run_agent_loop(
                     {
                         "type": "status",
                         "data": {
-                            "description": f"[{agent_name}] Step {iteration}: Calling {', '.join(tool_names)}",
+                            "description": truncate_status(
+                                f"[{agent_name}] Step {iteration}: Calling {', '.join(tool_names)}",
+                                status_truncate_chars,
+                            ),
                             "done": False,
                         },
                     }
@@ -3405,12 +3424,14 @@ async def run_agent_loop(
                         if tool_args_raw
                         else "{}"
                     )
-                    args_preview = tool_args_display[:80]
                     await event_emitter(
                         {
                             "type": "status",
                             "data": {
-                                "description": f"[{agent_name}] Executing {tool_name}({args_preview}...)",
+                                "description": truncate_status(
+                                    f"[{agent_name}] Executing {tool_name}({tool_args_display})",
+                                    status_truncate_chars,
+                                ),
                                 "done": False,
                             },
                         }
@@ -3430,12 +3451,15 @@ async def run_agent_loop(
                 # Emit status with tool result preview
                 tool_images.extend(result.get("images", []))
                 if event_emitter:
-                    result_preview = (result["content"] or "(empty)").replace(chr(10), ' ')[:80]
+                    result_text = (result["content"] or "(empty)").replace(chr(10), ' ')
                     await event_emitter(
                         {
                             "type": "status",
                             "data": {
-                                "description": f"[{agent_name}] {tool_name} returned: {result_preview}...",
+                                "description": truncate_status(
+                                    f"[{agent_name}] {tool_name} returned: {result_text}",
+                                    status_truncate_chars,
+                                ),
                                 "done": False,
                             },
                         }
@@ -3616,6 +3640,16 @@ class Tools:
             description=(
                 "Enable Core notification tools (notify), which send messages to the user's configured "
                 "notification target."
+            ),
+        )
+        STATUS_TRUNCATE_CHARS: int = Field(
+            default=120,
+            ge=0,
+            description=(
+                "Maximum length of each agent status line (assistant text, tool calls, tool "
+                "arguments, tool results); full-width characters count as 2. Open WebUI stores and "
+                "renders every status in full, so long lines enlarge the database and slow down the "
+                "expanded status history. Tool results sent to agents are not affected. 0 = no limit."
             ),
         )
         DEBUG: bool = Field(
@@ -3843,6 +3877,7 @@ class Tools:
                 skills=parent_skills,
                 agent_name=role_name,
                 event_emitter=__event_emitter__,
+                status_truncate_chars=self.valves.STATUS_TRUNCATE_CHARS,
             )
 
             parsed = safe_json_loads(content) or {
