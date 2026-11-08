@@ -2901,11 +2901,25 @@ async def test_parallel_tools_delegate_to_the_chat_models_sub_agent_models(monke
     assert created == [["worker"]]
 
 
+CURRENT_MODEL_CALLS = {
+    "sub_agent": ("sub_agent", "run_sub_agent", {"description": "Task", "prompt": "Task"}),
+    "parallel_sub_agents": (
+        "sub_agent", "run_parallel_sub_agents", {"tasks": [{"description": "Task", "prompt": "Task"}]},
+    ),
+    "llm_review": ("llm_review", "llm_review", {"topic": "Write the draft"}),
+    "magi_decision_support": (
+        "magi_decision_support", "magi_decide", {"proposition": "Choose", "option_a": "A", "option_b": "B"},
+    ),
+}
+
+
+@pytest.mark.parametrize("entry", list(CURRENT_MODEL_CALLS))
 @pytest.mark.parametrize("chat", ["single_model", "arena", "second_of_two_models"])
-async def test_magi_without_a_default_model_runs_on_the_model_the_response_is_sent_to(monkeypatch, chat):
+async def test_agents_without_a_default_model_run_on_the_model_the_response_is_sent_to(monkeypatch, entry, chat):
     import random
     from open_webui.utils import chat as core_chat
     from open_webui.utils import middleware
+    from open_webui.utils import models as core_models
 
     keep_core_config(monkeypatch, {"task.model.external": "task"})
     sent_to = {"id": "chat", "owned_by": "openai", "info": {"meta": {}}}
@@ -2916,11 +2930,13 @@ async def test_magi_without_a_default_model_runs_on_the_model_the_response_is_se
         monkeypatch.setattr(middleware, "random", SimpleNamespace(choice=lambda ids: ids[-1]))
         monkeypatch.setattr(random, "choice", lambda ids: ids[0])
     first = {"single_model": sent_to, "arena": arena, "second_of_two_models": other}[chat]
-    magi = Path(importlib.import_module("magi_decision_support").__file__).read_text()
+    module_name, method, arguments = CURRENT_MODEL_CALLS[entry]
+    source = Path(importlib.import_module(module_name).__file__).read_text()
+    request = parallel_request(sent_to, other, arena, {"id": "task", "owned_by": "openai", "info": {"meta": {}}})
+    monkeypatch.setattr(core_models, "get_all_models", AsyncMock(return_value=list(request.app.state.MODELS.values())))
     metadata = await core_chat_tools(
-        monkeypatch, parallel_request(sent_to, other, arena, {"id": "task", "owned_by": "openai", "info": {"meta": {}}}),
-        make_user("admin"), first, sent_to=arena if chat == "arena" else sent_to, workspace={"magi": magi},
-        chat_id="chat-1",
+        monkeypatch, request, make_user("admin"), first, sent_to=arena if chat == "arena" else sent_to,
+        workspace={module_name: source}, chat_id="chat-1",
     )
     requested = []
     generate = core_chat.generate_chat_completion
@@ -2929,12 +2945,13 @@ async def test_magi_without_a_default_model_runs_on_the_model_the_response_is_se
         requested.append(form_data["model"])
         return await generate(request, form_data, *args, **kwargs)
 
-    monkeypatch.setattr(core_chat, "generate_chat_completion", generate_chat_completion)
-    monkeypatch.setattr(core_chat, "generate_openai_chat_completion", AsyncMock(return_value={
-        "choices": [{"message": {"content": json.dumps({"vote": "A", "reasoning": "done"})}}],
-    }))
+    async def provider(*, form_data, **_):
+        return answer({"tools": tool_names(form_data)})
 
-    await metadata["tools"]["magi_decide"]["callable"](proposition="Choose", option_a="A", option_b="B")
+    monkeypatch.setattr(core_chat, "generate_chat_completion", generate_chat_completion)
+    monkeypatch.setattr(core_chat, "generate_openai_chat_completion", provider)
+
+    await metadata["tools"][method]["callable"](**arguments)
 
     assert requested and set(requested) == {"chat"}
 

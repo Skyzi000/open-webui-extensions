@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.6.9
+version: 0.6.10
 license: MIT
 required_open_webui_version: 0.9.6
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -1891,10 +1891,11 @@ RESPONSE REQUIREMENTS:
         user_skill_tags = extract_user_skill_tags(__messages__)
 
         # Determine model ID
-        # Priority: DEFAULT_MODEL (valve) > chat model (metadata) > task model (__model__)
+        # Priority: DEFAULT_MODEL (valve) > current model, as Core's delegate_task takes it
+        # (the model this response is sent to, then the chat's model) > task model (__model__)
         model_id = self.valves.DEFAULT_MODEL
         if not model_id and __metadata__:
-            model_id = (__metadata__.get("model") or {}).get("id", "")
+            model_id = __metadata__.get("model_id") or (__metadata__.get("model") or {}).get("id", "")
         if not model_id and __model__:
             model_id = __model__.get("id", "")
 
@@ -2112,10 +2113,11 @@ RESPONSE REQUIREMENTS:
         user_skill_tags = extract_user_skill_tags(__messages__)
 
         # Determine model ID
-        # Priority: DEFAULT_MODEL (valve) > chat model (metadata) > task model (__model__)
+        # Priority: DEFAULT_MODEL (valve) > current model, as Core's delegate_task takes it
+        # (the model this response is sent to, then the chat's model) > task model (__model__)
         model_id = self.valves.DEFAULT_MODEL
         if not model_id and __metadata__:
-            model_id = (__metadata__.get("model") or {}).get("id", "")
+            model_id = __metadata__.get("model_id") or (__metadata__.get("model") or {}).get("id", "")
         if not model_id and __model__:
             model_id = __model__.get("id", "")
 

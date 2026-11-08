@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.16
+version: 0.5.17
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -6403,11 +6403,11 @@ def resolve_chat_model_id(
     metadata: Optional[dict], model_dict: Optional[dict]
 ) -> str:
     # Open WebUI injects the lightweight task model into __model__, NOT the
-    # user's chat model. The real chat model lives in __metadata__["model"]["id"].
-    # See sub_agent.py for the same pattern.
+    # user's chat model. Core's delegate_task takes the current model from
+    # metadata: the model this response is sent to, then the chat's model.
     chat_model_id = ""
     if metadata:
-        chat_model_id = (metadata.get("model") or {}).get("id", "") or ""
+        chat_model_id = metadata.get("model_id") or (metadata.get("model") or {}).get("id", "") or ""
     if not chat_model_id and model_dict:
         chat_model_id = model_dict.get("id", "") or ""
     return chat_model_id
