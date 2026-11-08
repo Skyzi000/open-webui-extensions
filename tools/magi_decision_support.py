@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.22
+version: 0.2.23
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -3719,7 +3719,13 @@ class Tools:
                 ensure_ascii=False,
             )
 
-        model_id = self.valves.DEFAULT_MODEL or (__model__ or {}).get("id", "")
+        # Core's delegate_task runs on the same current model: the one this response is sent to.
+        model_id = (
+            self.valves.DEFAULT_MODEL
+            or (__metadata__ or {}).get("model_id")
+            or ((__metadata__ or {}).get("model") or {}).get("id", "")
+            or (__model__ or {}).get("id", "")
+        )
         if not model_id:
             return json.dumps(
                 {

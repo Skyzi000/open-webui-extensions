@@ -2842,12 +2842,14 @@ async def save_workspace_tools(monkeypatch, user, sources, valves=None):
 
 
 async def core_chat_tools(
-    monkeypatch, request, user, model, *, workspace=None, unattached=None, valves=None, tool_ids=(), form=None,
-    **metadata,
+    monkeypatch, request, user, model, *, sent_to=None, workspace=None, unattached=None, valves=None, tool_ids=(),
+    form=None, **metadata,
 ):
     """Send a chat with Parallel Tools and *workspace* tools attached through Core.
 
-    *unattached* tools are saved but not attached. Returns the metadata Core gives the chat's tools.
+    *unattached* tools are saved but not attached. *sent_to* is the model this response goes to when it is not
+    the chat's first model, as for the other models of a multi-model message. Returns the metadata Core gives the
+    chat's tools.
     """
     from open_webui.utils import chat as core_chat
     from open_webui.utils.middleware import process_chat_payload
@@ -2861,12 +2863,13 @@ async def core_chat_tools(
         "user_id": user.id, "tool_ids": tool_ids, "files": None, "features": {},
         "params": {"function_calling": "native"}, "tool_servers": [], **metadata,
     }
+    sent_to = sent_to or model
     form_data = {
-        "model": model["id"], "messages": [{"role": "user", "content": "Go"}], "tool_ids": tool_ids,
+        "model": sent_to["id"], "messages": [{"role": "user", "content": "Go"}], "tool_ids": tool_ids,
         "metadata": metadata, **(form or {}),
     }
     request.state.metadata = metadata
-    form_data, metadata = (await process_chat_payload(request, form_data, user, metadata, model))[:2]
+    form_data, metadata = (await process_chat_payload(request, form_data, user, metadata, sent_to))[:2]
     await core_chat.generate_chat_completion(request, form_data, user)
     return metadata
 
@@ -2896,6 +2899,44 @@ async def test_parallel_tools_delegate_to_the_chat_models_sub_agent_models(monke
     await call_parallel(metadata, ("delegate_task", {"task": "Check", "model_id": "worker"}))
 
     assert created == [["worker"]]
+
+
+@pytest.mark.parametrize("chat", ["single_model", "arena", "second_of_two_models"])
+async def test_magi_without_a_default_model_runs_on_the_model_the_response_is_sent_to(monkeypatch, chat):
+    import random
+    from open_webui.utils import chat as core_chat
+    from open_webui.utils import middleware
+
+    keep_core_config(monkeypatch, {"task.model.external": "task"})
+    sent_to = {"id": "chat", "owned_by": "openai", "info": {"meta": {}}}
+    other = {"id": "other", "owned_by": "openai", "info": {"meta": {}}}
+    arena = {"id": "arena", "owned_by": "arena", "info": {"meta": {"model_ids": ["other", "chat"]}}}
+    if chat == "arena":
+        # Core picks "chat" for the response; any later pick from the Arena would be "other".
+        monkeypatch.setattr(middleware, "random", SimpleNamespace(choice=lambda ids: ids[-1]))
+        monkeypatch.setattr(random, "choice", lambda ids: ids[0])
+    first = {"single_model": sent_to, "arena": arena, "second_of_two_models": other}[chat]
+    magi = Path(importlib.import_module("magi_decision_support").__file__).read_text()
+    metadata = await core_chat_tools(
+        monkeypatch, parallel_request(sent_to, other, arena, {"id": "task", "owned_by": "openai", "info": {"meta": {}}}),
+        make_user("admin"), first, sent_to=arena if chat == "arena" else sent_to, workspace={"magi": magi},
+        chat_id="chat-1",
+    )
+    requested = []
+    generate = core_chat.generate_chat_completion
+
+    async def generate_chat_completion(request, form_data, *args, **kwargs):
+        requested.append(form_data["model"])
+        return await generate(request, form_data, *args, **kwargs)
+
+    monkeypatch.setattr(core_chat, "generate_chat_completion", generate_chat_completion)
+    monkeypatch.setattr(core_chat, "generate_openai_chat_completion", AsyncMock(return_value={
+        "choices": [{"message": {"content": json.dumps({"vote": "A", "reasoning": "done"})}}],
+    }))
+
+    await metadata["tools"]["magi_decide"]["callable"](proposition="Choose", option_a="A", option_b="B")
+
+    assert requested and set(requested) == {"chat"}
 
 
 @needs_create_tool
