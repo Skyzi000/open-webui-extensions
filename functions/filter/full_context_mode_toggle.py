@@ -2,8 +2,8 @@
 title: Full Context Mode
 author: Skyzi000
 author_url: https://github.com/Skyzi000/open-webui-extensions
-description: Toggle full context mode for user-attached files at once. Sets the "context": "full" flag to leverage Open WebUI's native full context processing (RAG template with citations, etc.). Auto-injected model/folder knowledge entries are left untouched so large knowledge bases keep their normal chunk-based retrieval. Note: if the global RAG_FULL_CONTEXT setting is already enabled, this filter has no additional effect.
-version: 1.1.3
+description: Toggle full context mode for user-attached files at once. Sets the "context": "full" flag to leverage Open WebUI's native full context processing (RAG template with citations, etc.). Auto-injected model/folder knowledge entries are left untouched so large knowledge bases keep their normal chunk-based retrieval. Note: if the global RAG_FULL_CONTEXT setting is already enabled, this filter has no additional effect. Since Open WebUI 0.13.1, a web UI chat with native function calling adds attached files to the conversation only when the model's Preload files capability is on (legacy function calling and API requests from outside a web UI chat still add them); otherwise the flag makes the model's file search tool return whole files.
+version: 1.1.4
 license: MIT
 """
 

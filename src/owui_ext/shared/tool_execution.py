@@ -41,12 +41,158 @@ import json
 import logging
 import re
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from fastapi import Request
 
 _tool_execution_log = logging.getLogger("owui_ext.shared.tool_execution")
 _core_process_tool_result = None
+_INCOMPLETE_FINISH_REASONS = {"length", "content_filter", "incomplete", "failed"}
+_NOT_APPROVED = "Error: tool call was not approved."
+
+
+@dataclass
+class ToolCallState:
+    """One agent loop's tool calls, judged the way Core 0.13.1+ judges a chat's.
+
+    ``own_tools`` are the loop's own tools, which need no approval.
+    ``review_approval`` is False when approving the agent tool's call also approved its agents' calls.
+    """
+
+    own_tools: frozenset = frozenset()
+    review_approval: bool = True
+    history: list = field(default_factory=list)
+    round_error: Optional[str] = None
+    stop_reason: Optional[str] = None
+
+
+def _core_tool_calling():
+    try:
+        from open_webui.utils import tool_calling
+    except ImportError:
+        return None
+    return tool_calling
+
+
+def _is_tool_result_error(content: Any) -> bool:
+    try:
+        from open_webui.utils.middleware import _is_tool_result_error as is_error
+    except ImportError:
+        return False
+    return is_error(content)
+
+
+def _well_formed_calls(tool_calls: Any) -> bool:
+    return isinstance(tool_calls, list) and all(
+        isinstance(call, dict) and isinstance(call.get("function"), dict) for call in tool_calls
+    )
+
+
+def take_tool_calls(choice: dict, form_data: dict, state: Optional[ToolCallState]) -> tuple[Any, Any]:
+    """Return a response's text and tool calls the way Core's tool loop takes them.
+
+    Core recovers calls a model wrote as its whole text, splits arguments holding several
+    objects into calls, and executes none of the calls of a response cut off before its end.
+    """
+    message = choice.get("message", {})
+    content = message.get("content", "")
+    tool_calls = message.get("tool_calls", [])
+    calling = _core_tool_calling()
+    if calling is None or state is None:
+        return content, tool_calls
+    incomplete = choice.get("finish_reason") in _INCOMPLETE_FINISH_REASONS
+    state.round_error = calling.INCOMPLETE_CALL_ERROR if incomplete and tool_calls else None
+    if tool_calls:
+        if incomplete or not _well_formed_calls(tool_calls):
+            return content, tool_calls
+        return content, calling.split_tool_calls(tool_calls)
+    tool_choice = form_data.get("tool_choice")
+    if incomplete or tool_choice == "none" or form_data.get("response_format") not in (None, {"type": "text"}):
+        return content, tool_calls
+    allowed = {
+        spec.get("function", spec).get("name")
+        for spec in form_data.get("tools") or []
+        if isinstance(spec, dict) and isinstance(spec.get("function", spec), dict)
+    }
+    if isinstance(tool_choice, dict):
+        chosen = tool_choice.get("function") or tool_choice
+        allowed &= {chosen.get("name") if isinstance(chosen, dict) else None}
+    recovered = calling.recover_tool_calls(content, allowed)
+    return ("", recovered) if recovered else (content, tool_calls)
+
+
+def final_answer_instruction(state: Optional[ToolCallState], at_iteration_limit: str) -> str:
+    """The instruction for a loop's last request: Core's when its tool loop stopped tool use, else *at_iteration_limit*."""
+    if state is None or not state.stop_reason:
+        return at_iteration_limit
+    from open_webui.utils.tool_calling import FINAL_ANSWER_PROMPT
+
+    return FINAL_ANSWER_PROMPT
+
+
+async def model_reviews_approval(metadata: Optional[dict]) -> bool:
+    """Whether Core asks the model itself if each call needs approval (Auto mode without a review engine)."""
+    try:
+        from open_webui.models.config import Config
+        from open_webui.utils.tool_calling import add_tool_call_metadata  # noqa: F401
+    except ImportError:
+        return False
+    if ((metadata or {}).get("params") or {}).get("tool_approval_mode") != "auto":
+        return False
+    settings = await Config.get_many(
+        "chat.tool_permissions.enable",
+        "chat.tool_permissions.auto.enable",
+        "chat.tool_permissions.auto.engine",
+    )
+    return bool(
+        settings.get("chat.tool_permissions.enable")
+        and settings.get("chat.tool_permissions.auto.enable")
+        and settings.get("chat.tool_permissions.auto.engine", "") == ""
+    )
+
+
+def add_approval_review(tools: dict, own_tools, listed: Optional[dict]) -> dict:
+    """Add Core's ``__approval__`` argument to the loop's tools, and to the *listed* ones Tool Search returns."""
+    from open_webui.utils.tool_calling import add_tool_call_metadata
+
+    reviewed = {name: tool for name, tool in tools.items() if name not in own_tools}
+    add_tool_call_metadata(reviewed, approval=True)
+    if isinstance(listed, dict):
+        listed.update({name: reviewed[name] for name in listed if name in reviewed})
+    return {**tools, **reviewed}
+
+
+async def set_approval_policy(messages: list, review: bool) -> list:
+    """Apply Core's approval instructions to *messages*: the Auto policy when the model reviews its calls, else none."""
+    try:
+        from open_webui.utils.tool_permissions import (
+            get_tool_permissions_auto_config,
+            set_tool_approval_prompt,
+        )
+    except ImportError:
+        return messages
+    policy = (await get_tool_permissions_auto_config())["prompt"] if review else None
+    return set_tool_approval_prompt(messages, policy)
+
+
+def input_request_lock(event_call: Any) -> asyncio.Lock:
+    """The lock of a chat request's input requests, kept on Core's event caller, which all tools of it share."""
+    try:
+        return vars(event_call).setdefault("input_request_lock", asyncio.Lock())
+    except TypeError:
+        return asyncio.Lock()
+
+
+async def _approved_by_user(extra_params: dict, call_id: Any, name: str, params: dict) -> bool:
+    """Ask in the browser as Core does for a chat it cannot pause."""
+    event_call = extra_params.get("__event_call__")
+    if not callable(event_call):
+        return False
+    reply = await event_call(
+        {"type": "confirmation", "data": {"tool_call": {"id": call_id, "name": name, "arguments": params}}}
+    )
+    return reply is True
 
 
 CITATION_TOOLS: set[str] = {
@@ -466,13 +612,84 @@ def resolve_call_tool(tool_call: dict, tools_dict: dict) -> tuple[dict, Optional
     return resolved, resolve_tool_call(resolved, tools_dict)
 
 
+def call_targets(tool_call: dict, tools_dict: dict) -> list[str]:
+    """Return the names of the tools *tool_call* runs: each one a ``call_tool`` batch names, else its one tool."""
+    members = _call_tool_batch(tool_call, tools_dict) if isinstance(tool_call.get("function"), dict) else None
+    if members is None:
+        names = [resolve_call_tool(tool_call, tools_dict)[0].get("function", {}).get("name", "")]
+    else:
+        names = [member["provider_batch"]["tool_name"] for member in members if "provider_batch" in member]
+    return [name for name in names if isinstance(name, str)]
+
+
+def _call_tool_batch(tool_call: dict, tools: dict) -> Optional[list]:
+    """Return the calls a Core 0.13.1+ ``call_tool(calls=[...])`` batch stages, or None for any other call."""
+    try:
+        from open_webui.utils.tool_search import split_tool_call_batches
+    except ImportError:
+        return None
+    members = split_tool_call_batches([tool_call], tools)
+    if members == [tool_call]:
+        return None
+    return members
+
+
+def _replay_like_core(function: dict) -> None:
+    """Rewrite a model's call the way Core 0.13.1+ replays it: arguments it cannot read become an error object."""
+    if _core_tool_calling() is None:
+        return
+    from open_webui.utils.misc import get_provider_function
+
+    function["arguments"] = get_provider_function(
+        {"name": function.get("name", ""), "arguments": function.get("arguments", "{}")}
+    )["arguments"]
+
+
+def quote_arguments_core_raises_on(function: dict) -> None:
+    """Make Core reject, as unreadable text, the arguments Core 0.13.2 raises on: a literal with an unhashable member."""
+    calling = _core_tool_calling()
+    if calling is None:
+        return
+    try:
+        calling.parse_arguments(function.get("arguments", "{}"))
+    except ValueError:
+        pass
+    except TypeError:
+        function["arguments"] = json.dumps(function["arguments"])
+
+
+def _record_call(state: Optional[ToolCallState], item: dict) -> Optional[str]:
+    """Record a call of this response and return Core's error when it repeats failed ones, stopping tool use."""
+    if state is None:
+        return None
+    calling = _core_tool_calling()
+    blocked = calling.tool_repetition_error(item, state.history) if calling is not None else None
+    if blocked:
+        state.stop_reason = state.stop_reason or blocked
+    state.history.append(item)
+    return blocked
+
+
+def _record_failed_call(state: Optional[ToolCallState], function: dict) -> None:
+    """Record a call that failed before it ran."""
+    _record_call(
+        state, {"name": function.get("name", ""), "arguments": function.get("arguments", "{}"), "status": "failed"}
+    )
+
+
 async def execute_tool_call(
     tool_call: dict,
     tools_dict: dict,
     extra_params: dict,
     event_emitter: Optional[Callable] = None,
+    state: Optional[ToolCallState] = None,
+    stop_after: frozenset = frozenset(),
 ) -> dict:
-    """Execute a single tool call and return ``{tool_call_id, content}``."""
+    """Execute a model's tool call and return ``{tool_call_id, content}``.
+
+    A ``call_tool`` batch runs each call it names, up to one of *stop_after*, and answers with Core's
+    combined ``{"results": [...]}``. The call itself is left as Core replays it to the model.
+    """
     if not isinstance(tool_call, dict):
         return {
             "tool_call_id": str(uuid.uuid4()),
@@ -484,17 +701,108 @@ async def execute_tool_call(
             "tool_call_id": tool_call_id,
             "content": f"Malformed tool_call: 'function' is {type(tool_call.get('function')).__name__}, not dict",
         }
+    try:
+        return await _execute_model_call(
+            tool_call, tool_call_id, tools_dict, extra_params, event_emitter, state, stop_after
+        )
+    finally:
+        _replay_like_core(tool_call["function"])
+
+
+async def _execute_model_call(
+    tool_call: dict,
+    tool_call_id: Any,
+    tools_dict: dict,
+    extra_params: dict,
+    event_emitter: Optional[Callable],
+    state: Optional[ToolCallState],
+    stop_after: frozenset,
+) -> dict:
+    quote_arguments_core_raises_on(tool_call["function"])
+    if state is not None and state.round_error:
+        state.stop_reason = state.stop_reason or state.round_error
+        _record_failed_call(state, tool_call["function"])
+        return {"tool_call_id": tool_call_id, "content": state.round_error}
+    members = _call_tool_batch(tool_call, tools_dict)
+    if members is None:
+        result = await _execute_single_call(
+            tool_call, tool_call_id, tools_dict, extra_params, event_emitter, state
+        )
+        result.pop("status", None)
+        return result
+    if "provider_batch" not in members[0]:
+        _record_failed_call(state, tool_call["function"])
+        return {"tool_call_id": tool_call_id, "content": members[0]["execution_error"]}
+    entries, images = [], []
+    for member in members:
+        result = await _execute_single_call(
+            member, member["id"], tools_dict, extra_params, event_emitter, state
+        )
+        entries.append(
+            {
+                "tool_name": member["provider_batch"]["tool_name"],
+                "status": result.get("status", "failed"),
+                "output": [{"type": "input_text", "text": result["content"]}],
+            }
+        )
+        images.extend(result.get("images", []))
+        name = member["provider_batch"]["tool_name"]
+        if isinstance(name, str) and name in stop_after:
+            break
+    return {
+        "tool_call_id": tool_call_id,
+        "content": json.dumps({"results": entries}, ensure_ascii=False, separators=(",", ":")),
+        **({"images": images} if images else {}),
+    }
+
+
+async def _execute_single_call(
+    tool_call: dict,
+    tool_call_id: Any,
+    tools_dict: dict,
+    extra_params: dict,
+    event_emitter: Optional[Callable],
+    state: Optional[ToolCallState],
+) -> dict:
     tool_call, error = resolve_call_tool(tool_call, tools_dict)
     if error:
-        return {"tool_call_id": tool_call_id, "content": error}
+        _record_failed_call(state, tool_call["function"])
+        return {"tool_call_id": tool_call_id, "content": error, "status": "failed"}
     func = tool_call["function"]
     tool_function_name = func.get("name", "")
     tool_args_raw = func.get("arguments", "{}")
 
-    tool_function_params = tool_args_raw
-    if isinstance(tool_args_raw, str):
+    calling = _core_tool_calling()
+    item = None
+    if calling is not None:
+        tool = tools_dict.get(tool_function_name)
+        item = {
+            "name": tool_function_name,
+            "arguments": tool_args_raw if isinstance(tool_args_raw, str) else json.dumps(tool_args_raw),
+            "status": "in_progress",
+        }
+        error = (
+            calling.prepare_tool_call(
+                item,
+                tool.get("spec", {}).get("parameters"),
+                display_labels=tool.get("display_labels", False),
+                approval_review=tool.get("approval_review", False),
+            )
+            if tool
+            else f'Error: Tool "{tool_function_name}" not found.'
+        )
+        blocked = _record_call(state, item)
+        if "provider_function" not in tool_call:
+            func["arguments"] = item["arguments"]
+        if error or blocked:
+            item["status"] = "failed"
+            return {"tool_call_id": tool_call_id, "content": error or blocked, "status": "failed"}
+        tool_function_params = json.loads(item["arguments"])
+    else:
+        tool_function_params = tool_args_raw
+    if isinstance(tool_function_params, str):
         try:
-            tool_function_params = ast.literal_eval(tool_args_raw)
+            tool_function_params = ast.literal_eval(tool_function_params)
         except Exception:
             try:
                 tool_function_params = json.loads(tool_args_raw)
@@ -523,7 +831,9 @@ async def execute_tool_call(
         if tool_function_name == "display_file":
             tool, error = resolve_display_file_tool(tool, tool_function_params)
             if error:
-                return {"tool_call_id": tool_call_id, "content": error}
+                if item is not None:
+                    item["status"] = "failed"
+                return {"tool_call_id": tool_call_id, "content": error, "status": "failed"}
         direct_tool = bool(tool.get("direct", False))
         metadata = extra_params.get("__metadata__")
         core_metadata = getattr(extra_params.get("__event_call__"), "core_metadata", None)
@@ -532,6 +842,11 @@ async def execute_tool_call(
 
         try:
             tool_function_params = filter_tool_arguments(tool, tool_function_params)
+            if not await _call_allowed(
+                item, tool, tool_function_params, tool_call_id, extra_params, state
+            ):
+                item["status"] = "failed"
+                return {"tool_call_id": tool_call_id, "content": _NOT_APPROVED, "status": "failed"}
 
             if direct_tool:
                 tool_result = await execute_direct_tool_call(
@@ -647,8 +962,37 @@ async def execute_tool_call(
         tool_result += "\n[image]" * len(tool_result_images)
         tool_result_images = []
 
+    status = "failed" if _is_tool_result_error(tool_result) else "completed"
+    if item is not None:
+        item["status"] = status
     return {
         "tool_call_id": tool_call_id,
         "content": tool_result,
+        "status": status,
         **({"images": tool_result_images} if tool_result_images else {}),
     }
+
+
+async def _call_allowed(
+    item: Optional[dict],
+    tool: dict,
+    params: dict,
+    call_id: Any,
+    extra_params: dict,
+    state: Optional[ToolCallState],
+) -> bool:
+    """Judge an agent's call by the chat's tool approval mode, as Core 0.13.1+ judges the child of a delegated task."""
+    if item is None or state is None or not state.review_approval or item["name"] in state.own_tools:
+        return True
+    from open_webui.utils.tool_permissions import requires_tool_approval
+
+    metadata = extra_params.get("__metadata__")
+    if not await requires_tool_approval(
+        {"messages": extra_params.get("__messages__") or []},
+        metadata if isinstance(metadata, dict) else {},
+        item,
+        tool,
+        params,
+    ):
+        return True
+    return await _approved_by_user(extra_params, call_id, item["name"], params)

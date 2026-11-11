@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.18
+version: 0.5.19
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -21,6 +21,7 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 
 from owui_ext.shared.agent_requests import (
+    APPROVE_ONCE_PARAM,
     AgentRequests,
     core_chat_completion,
     follow_core_session,
@@ -42,12 +43,15 @@ from owui_ext.shared.prompt_utils import (
 from owui_ext.shared.status_text import truncate_status
 from owui_ext.shared.tool_execution import (
     append_tool_result_images,
+    call_targets,
     execute_direct_tool_call,
     execute_tool_call,
+    final_answer_instruction,
     normalize_terminal_tools_result,
     order_file_events,
     process_tool_result,
     resolve_call_tool,
+    take_tool_calls,
 )
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients, resolve_mcp_tools
 from owui_ext.shared.models import extract_model_ids, get_available_models
@@ -1531,7 +1535,7 @@ def _parse_agent_status(agent_name: str, description: str) -> Optional[dict]:
             return None
         result = _truncate(returned_match.group(2), 2000)
         return {"kind": "result", "name": name, "result": result}
-    if "Max iterations" in rest and "reached" in rest:
+    if ("Max iterations" in rest and "reached" in rest) or rest.startswith("Tool use stopped"):
         return {"kind": "info", "text": rest}
     parsed_final = safe_json_loads(rest, expect_keys=("draft", "key_feedback"))
     if isinstance(parsed_final, dict) and (
@@ -3089,8 +3093,7 @@ async def run_agent_loop(
             if not isinstance(message, Mapping):
                 return f"API returned malformed response: message is {type(message).__name__}, not a mapping"
 
-            content = message.get("content", "")
-            tool_calls = message.get("tool_calls", [])
+            content, tool_calls = take_tool_calls(choice, form_data, agent_requests.tool_state)
 
             # Emit status with LLM response content
             if event_emitter and content:
@@ -3260,6 +3263,8 @@ async def run_agent_loop(
                         "__request__": tool_request,
                     },
                     event_emitter=event_emitter,
+                    state=agent_requests.tool_state,
+                    stop_after=frozenset(submission_tool_names or ()),
                 )
 
                 # Emit status with tool result preview
@@ -3285,7 +3290,11 @@ async def run_agent_loop(
                     }
                 )
 
-                if submission_tool_names and tool_name in submission_tool_names:
+                if (
+                    submission_tool_names
+                    and submission_tool_names.intersection(call_targets(tool_call, tools_dict))
+                    and not agent_requests.tool_state.round_error
+                ):
                     submission_tool_fired = True
                     break
 
@@ -3296,14 +3305,20 @@ async def run_agent_loop(
                 return content or ""
 
             append_tool_result_images(current_messages, tool_images)
+            if agent_requests.tool_state.stop_reason:
+                break
 
-    # Max iterations reached
+    stopped = bool(agent_requests.tool_state.stop_reason)
     if event_emitter:
         await event_emitter(
             {
                 "type": "status",
                 "data": {
-                    "description": f"[{agent_name}] Max iterations ({max_iterations}) reached, finalizing...",
+                    "description": (
+                        f"[{agent_name}] Tool use stopped, finalizing..."
+                        if stopped
+                        else f"[{agent_name}] Max iterations ({max_iterations}) reached, finalizing..."
+                    ),
                     "done": False,
                 },
             }
@@ -3346,15 +3361,16 @@ async def run_agent_loop(
     if final_tools_param:
         names = ", ".join(sorted(f"``{n}``" for n in submission_tool_names or ()))
         final_user_content = (
-            "Maximum tool iterations reached. Call "
-            f"{names} NOW with your complete payload to submit your final "
+            ("Tool use has stopped for this response." if stopped else "Maximum tool iterations reached.")
+            + f" Call {names} NOW with your complete payload to submit your final "
             "response. No other tools are available — submission is your "
             "only remaining action. Do not emit any additional text."
         )
     else:
-        final_user_content = (
+        final_user_content = final_answer_instruction(
+            agent_requests.tool_state,
             "Maximum tool iterations reached. Please provide your final "
-            "answer based on the information gathered so far."
+            "answer based on the information gathered so far.",
         )
 
     final_messages = list(current_messages)
@@ -3368,7 +3384,7 @@ async def run_agent_loop(
     else:
         final_messages.append({"role": "user", "content": final_user_content})
 
-    agent_requests.metadata["sub_agent_iteration"] = max_iterations + 1
+    agent_requests.metadata["sub_agent_iteration"] = iteration + 1
     form_data = await agent_requests.next_form(
         filter_pipeline,
         copy.deepcopy(final_messages),
@@ -3392,8 +3408,11 @@ async def run_agent_loop(
                 if isinstance(choice, Mapping):
                     message = choice.get("message", {})
                     if isinstance(message, Mapping):
-                        final_content = message.get("content", "") or ""
-                        final_tool_calls = message.get("tool_calls", []) or []
+                        final_content, final_tool_calls = take_tool_calls(
+                            choice, form_data, agent_requests.tool_state
+                        )
+                        final_content = final_content or ""
+                        final_tool_calls = final_tool_calls or []
                         # Process a submission if the agent took the hint
                         # and called submit_*. This is the whole point of
                         # exposing the submission tools here — without
@@ -3456,6 +3475,7 @@ async def run_agent_loop(
                                             "__request__": tool_request,
                                         },
                                         event_emitter=event_emitter,
+                                        state=agent_requests.tool_state,
                                     )
                                 except Exception as exec_exc:
                                     log.warning(
@@ -3472,6 +3492,8 @@ async def run_agent_loop(
     except Exception as e:
         log.exception(f"Error getting final review agent response: {e}")
 
+    if stopped:
+        return "Review agent stopped using tools without providing a final response."
     return "Review agent reached maximum iterations without providing a final response."
 
 
@@ -3659,7 +3681,7 @@ class Tools:
         )
         ENABLE_SKILLS_TOOLS: bool = Field(
             default=True,
-            description="Pass the parent conversation's skills to review agents and allow the skill reading tools (view_skill, read_skill_file, grep_skill_files). Each agent gets the parent's <skill> blocks and <available_skills> list. An agent whose model has no skill tools gets the chat's skills inlined the way Open WebUI does for such a model instead (Open WebUI 0.12.1+; older versions pass only the <skill> blocks). When off, agents get no skills or skill tools.",
+            description="Pass the parent conversation's skills to review agents and allow the skill reading tools (view_skill, read_skill_file, grep_skill_files). Each agent gets the parent's <skill> blocks and <available_skills> list; on Open WebUI 0.13.1+, when the parent's model has skill tools and so got only the list, an agent whose model has skill tools gets the list and the skills the chat activated as tool results instead, as Open WebUI gives them to a delegated task. An agent whose model has no skill tools gets the chat's skills inlined the way Open WebUI does for such a model instead (Open WebUI 0.12.1+; older versions pass only the <skill> blocks). When off, agents get no skills or skill tools.",
         )
         ENABLE_SKILLS_WRITE_TOOLS: bool = Field(
             default=False,
@@ -3865,6 +3887,16 @@ CRITICAL RULES:
                 "You excel at considering implementation challenges and stakeholder perspectives."
             ),
             description="Persona 3 description (drives the agent's voice and priorities).",
+        )
+        APPROVE_AGENT_TOOL_CALLS_ONCE: bool = Field(
+            default=False,
+            description=(
+                "Let approving this tool's call also approve the tool calls its agents make (Open WebUI 0.13.1+). "
+                "Off: each of their tool calls follows the chat's tool permissions, so Ask asks about each and Auto checks each. "
+                "On: once this tool's call is approved, or passes the Auto check without asking, its agents run their tool calls without asking; "
+                "the next call of this tool and the chat's other tool calls are still checked. "
+                "Stays on for your later chats until you turn it off."
+            ),
         )
         pass
 
@@ -4239,6 +4271,7 @@ CRITICAL RULES:
             "__oauth_token__": __oauth_token__,
             "__files__": metadata.get("files") or [],
             "__skill_ids__": extract_skill_ids(__messages__),
+            APPROVE_ONCE_PARAM: user_valves.APPROVE_AGENT_TOOL_CALLS_ONCE,
         }
 
         # Build tool IDs

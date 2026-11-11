@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.24
+version: 0.2.25
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -26,6 +26,7 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 
 from owui_ext.shared.agent_requests import (
+    APPROVE_ONCE_PARAM,
     AgentRequests,
     core_chat_completion,
     follow_core_session,
@@ -55,8 +56,10 @@ from owui_ext.shared.tool_execution import (
     append_tool_result_images,
     execute_direct_tool_call,
     execute_tool_call,
+    final_answer_instruction,
     order_file_events,
     process_tool_result,
+    take_tool_calls,
 )
 from owui_ext.shared.tool_loader import build_tools_dict
 from owui_ext.shared.valves import coerce_user_valves
@@ -371,9 +374,7 @@ async def run_agent_loop(
             if not choices:
                 return "No response from model"
 
-            message = choices[0].get("message", {})
-            content = message.get("content", "")
-            tool_calls = message.get("tool_calls", [])
+            content, tool_calls = take_tool_calls(choices[0], form_data, agent_requests.tool_state)
 
             # Emit status with LLM response content
             if event_emitter and content:
@@ -460,6 +461,7 @@ async def run_agent_loop(
                         "__request__": tool_request,
                     },
                     event_emitter=event_emitter,
+                    state=agent_requests.tool_state,
                 )
 
                 # Emit status with tool result preview
@@ -488,14 +490,19 @@ async def run_agent_loop(
                 )
 
             append_tool_result_images(current_messages, tool_images)
+            if agent_requests.tool_state.stop_reason:
+                break
 
-    # Max iterations reached
     if event_emitter:
         await event_emitter(
             {
                 "type": "status",
                 "data": {
-                    "description": f"[{agent_name}] Max iterations ({max_iterations}) reached, finalizing...",
+                    "description": (
+                        f"[{agent_name}] Tool use stopped, finalizing..."
+                        if agent_requests.tool_state.stop_reason
+                        else f"[{agent_name}] Max iterations ({max_iterations}) reached, finalizing..."
+                    ),
                     "done": False,
                 },
             }
@@ -507,7 +514,10 @@ async def run_agent_loop(
         + [
             {
                 "role": "user",
-                "content": "Maximum tool iterations reached. Provide your final answer based on gathered information.",
+                "content": final_answer_instruction(
+                    agent_requests.tool_state,
+                    "Maximum tool iterations reached. Provide your final answer based on gathered information.",
+                ),
             }
         ],
         tools=None,
@@ -530,6 +540,8 @@ async def run_agent_loop(
     except Exception as exc:
         log.exception(f"Error getting final MAGI agent response: {exc}")
 
+    if agent_requests.tool_state.stop_reason:
+        return "MAGI agent stopped using tools without providing a final response."
     return "MAGI agent reached maximum iterations without providing a final response."
 
 
@@ -608,7 +620,11 @@ class Tools:
                 "Pass the parent conversation's skills to MAGI agents and allow "
                 "the skill reading tools (view_skill, read_skill_file, "
                 "grep_skill_files). Each agent gets the parent's <skill> blocks "
-                "and <available_skills> list. An agent whose model has no skill "
+                "and <available_skills> list; on Open WebUI 0.13.1+, when the parent's "
+                "model has skill tools and so got only the list, an agent whose "
+                "model has skill tools gets the list and the skills the chat "
+                "activated as tool results instead, as Open WebUI gives them to a "
+                "delegated task. An agent whose model has no skill "
                 "tools gets the chat's skills inlined the way Open WebUI does for "
                 "such a model instead (Open WebUI 0.12.1+; older versions pass "
                 "only the <skill> blocks). When off, agents get no skills or "
@@ -676,6 +692,16 @@ class Tools:
         INCLUDE_SOURCES: bool = Field(
             default=True,
             description="Include sources in agent outputs when web research is used.",
+        )
+        APPROVE_AGENT_TOOL_CALLS_ONCE: bool = Field(
+            default=False,
+            description=(
+                "Let approving this tool's call also approve the tool calls its agents make (Open WebUI 0.13.1+). "
+                "Off: each of their tool calls follows the chat's tool permissions, so Ask asks about each and Auto checks each. "
+                "On: once this tool's call is approved, or passes the Auto check without asking, its agents run their tool calls without asking; "
+                "the next call of this tool and the chat's other tool calls are still checked. "
+                "Stays on for your later chats until you turn it off."
+            ),
         )
         pass
 
@@ -794,6 +820,7 @@ class Tools:
             "__oauth_token__": __oauth_token__,
             "__files__": (__metadata__ or {}).get("files") or [],
             "__skill_ids__": extract_skill_ids(__messages__),
+            APPROVE_ONCE_PARAM: user_valves.APPROVE_AGENT_TOOL_CALLS_ONCE,
         }
 
         tool_id_list = []

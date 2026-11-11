@@ -60,6 +60,26 @@ def extract_direct_tool_server_prompts(direct_tools: Mapping[str, dict]) -> list
     return prompts
 
 
+def spec_without_call_metadata(tool: dict) -> dict:
+    """Copy *tool*'s spec without the arguments Core 0.13.1+ adds to the chat's tools for its own use."""
+    spec = dict(tool["spec"])
+    added = [
+        name
+        for name, marker in (("__labels__", "display_labels"), ("__approval__", "approval_review"))
+        if tool.get(marker)
+    ]
+    parameters = spec.get("parameters")
+    if added and isinstance(parameters, dict):
+        spec["parameters"] = {
+            **parameters,
+            "properties": {
+                key: value for key, value in (parameters.get("properties") or {}).items() if key not in added
+            },
+            "required": [key for key in parameters.get("required") or [] if key not in added],
+        }
+    return spec
+
+
 async def resolve_direct_tool_servers_from_request_and_metadata(
     *,
     request: Optional[Request],
@@ -86,7 +106,7 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
                 continue
             settings = connection_settings(server)
             approved_specs = [
-                dict(tool["spec"])
+                spec_without_call_metadata(tool)
                 for tool in parent_tools.values()
                 if isinstance(tool, dict)
                 and tool.get("direct") is True

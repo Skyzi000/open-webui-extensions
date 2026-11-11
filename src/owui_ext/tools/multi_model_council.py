@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.30
+version: 0.1.31
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from owui_ext.shared.async_utils import maybe_await
 from owui_ext.shared.agent_requests import (
+    APPROVE_ONCE_PARAM,
     AgentRequests,
     core_chat_completion,
     follow_core_session,
@@ -43,8 +44,10 @@ from owui_ext.shared.tool_execution import (
     append_tool_result_images,
     execute_direct_tool_call,
     execute_tool_call,
+    final_answer_instruction,
     order_file_events,
     process_tool_result,
+    take_tool_calls,
 )
 from owui_ext.shared.tool_loader import build_tools_dict
 from owui_ext.shared.tool_servers import (
@@ -290,8 +293,9 @@ async def run_agent_loop(
             if not isinstance(message, dict):
                 message = {}
 
-            content = message.get("content", "")
-            tool_calls = message.get("tool_calls", [])
+            content, tool_calls = take_tool_calls(
+                {**first_choice, "message": message}, form_data, agent_requests.tool_state
+            )
             if not isinstance(tool_calls, list):
                 tool_calls = []
 
@@ -380,6 +384,7 @@ async def run_agent_loop(
                         "__request__": tool_request,
                     },
                     event_emitter=event_emitter,
+                    state=agent_requests.tool_state,
                 )
 
                 # Emit status with tool result preview
@@ -408,14 +413,19 @@ async def run_agent_loop(
                 )
 
             append_tool_result_images(current_messages, tool_images)
+            if agent_requests.tool_state.stop_reason:
+                break
 
-    # Max iterations reached
     if event_emitter:
         await event_emitter(
             {
                 "type": "status",
                 "data": {
-                    "description": f"[{agent_name}] Max iterations ({max_iterations}) reached, finalizing...",
+                    "description": (
+                        f"[{agent_name}] Tool use stopped, finalizing..."
+                        if agent_requests.tool_state.stop_reason
+                        else f"[{agent_name}] Max iterations ({max_iterations}) reached, finalizing..."
+                    ),
                     "done": False,
                 },
             }
@@ -427,7 +437,10 @@ async def run_agent_loop(
         + [
             {
                 "role": "user",
-                "content": "Maximum tool iterations reached. Provide your final answer based on gathered information.",
+                "content": final_answer_instruction(
+                    agent_requests.tool_state,
+                    "Maximum tool iterations reached. Provide your final answer based on gathered information.",
+                ),
             }
         ],
         tools=None,
@@ -454,6 +467,8 @@ async def run_agent_loop(
     except Exception as exc:
         log.exception(f"Error getting final council agent response: {exc}")
 
+    if agent_requests.tool_state.stop_reason:
+        return "Council agent stopped using tools without providing a final response."
     return "Council agent reached maximum iterations without providing a final response."
 
 
@@ -554,7 +569,11 @@ class Tools:
                 "Pass the parent conversation's skills to council members and "
                 "allow the skill reading tools (view_skill, read_skill_file, "
                 "grep_skill_files). Each member gets the parent's <skill> blocks "
-                "and <available_skills> list. A member whose model has no skill "
+                "and <available_skills> list; on Open WebUI 0.13.1+, when the parent's "
+                "model has skill tools and so got only the list, a member whose "
+                "model has skill tools gets the list and the skills the chat "
+                "activated as tool results instead, as Open WebUI gives them to a "
+                "delegated task. A member whose model has no skill "
                 "tools gets the chat's skills inlined the way Open WebUI does for "
                 "such a model instead (Open WebUI 0.12.1+; older versions pass "
                 "only the <skill> blocks). When off, members get no skills or "
@@ -633,6 +652,16 @@ CRITICAL RULES:
         INCLUDE_SOURCES: bool = Field(
             default=True,
             description="Include sources in member outputs when web research is used.",
+        )
+        APPROVE_AGENT_TOOL_CALLS_ONCE: bool = Field(
+            default=False,
+            description=(
+                "Let approving this tool's call also approve the tool calls its council members make (Open WebUI 0.13.1+). "
+                "Off: each of their tool calls follows the chat's tool permissions, so Ask asks about each and Auto checks each. "
+                "On: once this tool's call is approved, or passes the Auto check without asking, its council members run their tool calls without asking; "
+                "the next call of this tool and the chat's other tool calls are still checked. "
+                "Stays on for your later chats until you turn it off."
+            ),
         )
         pass
 
@@ -884,6 +913,7 @@ CRITICAL RULES:
             "__oauth_token__": __oauth_token__,
             "__files__": metadata.get("files") or [],
             "__skill_ids__": extract_skill_ids(__messages__),
+            APPROVE_ONCE_PARAM: user_valves.APPROVE_AGENT_TOOL_CALLS_ONCE,
         }
 
         # Determine tool IDs (same flow as sub_agent, but MAGI-style execution)

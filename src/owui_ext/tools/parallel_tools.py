@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.12
+version: 0.2.13
 license: MIT
 required_open_webui_version: 0.11.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -18,6 +18,7 @@ Limitations:
 
 import asyncio
 import ast
+import importlib.util
 import json
 import logging
 from typing import Any, Callable, List, Optional
@@ -37,6 +38,7 @@ from owui_ext.shared.tool_execution import (
     mark_saved_image_files,
     order_file_events,
     process_tool_result,
+    quote_arguments_core_raises_on,
     resolve_call_tool,
     resolve_display_file_tool,
     split_tool_result_files,
@@ -101,6 +103,60 @@ def select_caller_tools(
     return selected
 
 
+def prepare_caller_arguments(tool_name: str, tool_args: Any, tool: dict) -> tuple[Any, Optional[str]]:
+    """Normalize a call's arguments as Core 0.13.1+ does before it runs the caller's tool.
+
+    Core also removes the arguments it added to the caller's tools for its own labels and approvals.
+    """
+    try:
+        from open_webui.utils.tool_calling import prepare_tool_call
+    except ImportError:
+        return tool_args, None
+    call = {"name": tool_name, "arguments": tool_args if isinstance(tool_args, str) else json.dumps(tool_args)}
+    quote_arguments_core_raises_on(call)
+    error = prepare_tool_call(
+        call,
+        tool.get("spec", {}).get("parameters"),
+        display_labels=tool.get("display_labels", False),
+        approval_review=tool.get("approval_review", False),
+    )
+    return (None, error) if error else (json.loads(call["arguments"]), None)
+
+
+def expand_call_tool_batches(calls: list[dict], tools_dict: dict) -> list[dict]:
+    """Split each Core 0.13.1+ ``call_tool(calls=[...])`` batch into one ``call_tool`` call per tool it names."""
+    try:
+        from open_webui.utils.tool_search import split_tool_call_batches
+    except ImportError:
+        return calls
+    expanded = []
+    for call in calls:
+        if call.get("name") not in ("call_tool", "functions.call_tool"):
+            expanded.append(call)
+            continue
+        arguments = call.get("arguments")
+        members = split_tool_call_batches(
+            [
+                {
+                    "id": "call_tool",
+                    "function": {
+                        "name": "call_tool",
+                        "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments),
+                    },
+                }
+            ],
+            tools_dict,
+        )
+        for member in members:
+            if member.get("execution_error"):
+                expanded.append({"name": "call_tool", "error": member["execution_error"]})
+            elif "provider_batch" in member:
+                expanded.append({"name": "call_tool", "arguments": json.loads(member["function"]["arguments"])})
+            else:
+                expanded.append(call)
+    return expanded
+
+
 async def execute_single_tool(
     tool_name: str,
     tool_args: dict,
@@ -124,9 +180,8 @@ async def execute_single_tool(
     if tool_name.startswith("functions."):
         tool_name = tool_name[len("functions.") :]
 
-    resolved, error = resolve_call_tool(
-        {"function": {"name": tool_name, "arguments": json.dumps(tool_args)}}, tools_dict
-    )
+    arguments = tool_args if isinstance(tool_args, str) else json.dumps(tool_args)
+    resolved, error = resolve_call_tool({"function": {"name": tool_name, "arguments": arguments}}, tools_dict)
     if error:
         return {"tool_name": tool_name, "result": error}
     if "provider_function" in resolved:
@@ -140,6 +195,9 @@ async def execute_single_tool(
         }
 
     tool = tools_dict[tool_name]
+    tool_args, error = prepare_caller_arguments(tool_name, tool_args, tool)
+    if error:
+        return {"tool_name": tool_name, "result": error}
     if tool_name == "display_file":
         tool, error = resolve_display_file_tool(tool, tool_args)
         if error:
@@ -405,6 +463,7 @@ class Tools:
         if not calls:
             return json.dumps({"error": "tool_calls array is empty"})
 
+        core_parses_arguments = importlib.util.find_spec("open_webui.utils.tool_calling") is not None
         # Validate each call
         for i, call in enumerate(calls):
             # Fallback: parse JSON strings (some LLMs pass stringified objects
@@ -438,8 +497,10 @@ class Tools:
                 except json.JSONDecodeError:
                     pass  # Keep as-is if not valid JSON
 
-            # Ensure arguments is a dict (handle null/None and other invalid types)
-            if not isinstance(calls[i].get("arguments"), dict):
+            # Ensure arguments is a dict (handle null/None and other invalid types);
+            # Core 0.13.1+ parses the strings left (code fences, double encoding).
+            arguments = calls[i].get("arguments")
+            if not isinstance(arguments, dict) and not (isinstance(arguments, str) and core_parses_arguments):
                 calls[i]["arguments"] = {}
 
         __metadata__ = __metadata__ or {}
@@ -494,17 +555,21 @@ class Tools:
             "__defer_artifact_events__": True,
         }
 
-        # Execute all tools in parallel
-        tasks = [
-            execute_single_tool(
+        calls = expand_call_tool_batches(calls, tools_dict)
+
+        async def run_call(call: dict) -> dict:
+            if "error" in call:
+                return {"tool_name": call["name"], "result": call["error"]}
+            return await execute_single_tool(
                 tool_name=call.get("name", ""),
                 tool_args=call.get("arguments", {}),
                 tools_dict=tools_dict,
                 extra_params=exec_extra_params,
                 event_emitter=__event_emitter__,
             )
-            for call in calls
-        ]
+
+        # Execute all tools in parallel
+        tasks = [run_call(call) for call in calls]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 

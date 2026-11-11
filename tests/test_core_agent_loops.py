@@ -34,6 +34,7 @@ HAS_CALL_TOOL = importlib.util.find_spec("open_webui.utils.tool_search") is not 
     importlib.import_module("open_webui.utils.tool_search"), "resolve_tool_call"
 )
 needs_call_tool = pytest.mark.skipif(not HAS_CALL_TOOL, reason="Core before 0.12.2 has no call_tool")
+HIDDEN_SKILL_CONTEXT = hasattr(importlib.import_module("open_webui.utils.middleware"), "preload_skills")
 SKILL_READ_TOOLS = {name for name in ("view_skill", "read_skill_file", "grep_skill_files") if hasattr(builtin, name)}
 SKILL_MANIFEST = (
     "<available_skills>\n<skill>\n<id>skill</id>\n<name>Writer</name>\n"
@@ -219,7 +220,7 @@ async def test_agent_loops_apply_core_tool_search(monkeypatch, tool_search, modu
     for form_data in sent:
         assert {"ping", "search_tools"} <= tool_names(form_data)
         assert "lookup" not in tool_names(form_data)
-        assert system_text(form_data).count("<name>lookup</name>") == 1
+        assert system_text(form_data).count("<available_tools>") == 1
     tool_results = [message["content"] for message in sent[2]["messages"] if message["role"] == "tool"]
     assert LOOKUP_DESCRIPTION.strip() in tool_results[0]
     assert tool_results[1] == "found"
@@ -245,7 +246,7 @@ async def test_llm_review_submission_tools_stay_loaded_and_final_request_has_no_
     )
 
     assert tool_names(sent[0]) == {"ping", "search_tools", "submit_draft", *["call_tool"] * HAS_CALL_TOOL}
-    assert "<name>lookup</name>" in system_text(sent[0])
+    assert "<available_tools>" in system_text(sent[0])
     assert "<name>submit_draft</name>" not in system_text(sent[0])
     assert tool_names(sent[1]) == {"submit_draft"}
     assert "<available_tools>" not in system_text(sent[1])
@@ -289,10 +290,12 @@ async def test_sub_agent_final_retry_without_tools_has_no_tool_search_manifest(m
 
 @needs_tool_search
 @pytest.mark.parametrize("as_parts", [False, True])
-async def test_sub_agent_summary_retry_without_tools_has_no_tool_search_manifest(as_parts):
-    from open_webui.utils.tool_search import build_deferred_tools_manifest
+async def test_sub_agent_summary_retry_without_tools_has_no_tool_search_manifest(tool_search, as_parts):
+    from open_webui.utils.tool_search import apply_tool_search
 
-    system = f"Be brief.\n\n{build_deferred_tools_manifest(loop_tools(), ['lookup'])}"
+    searched = {"messages": []}
+    await apply_tool_search(searched, {}, loop_tools())
+    system = f"Be brief.\n\n{searched['messages'][0]['content']}"
     body = {
         "model": "model",
         "metadata": {"model_id": "model"},
@@ -539,7 +542,7 @@ TOOL_SEARCH_SETTINGS = {
 
 
 async def run_entry(
-    monkeypatch, entry, respond, *, regular_tools=dict, settings=None, skill_context=SKILL_MANIFEST, child_params=None,
+    monkeypatch, entry, respond, *, regular_tools=dict, settings=None, skill_context="", child_params=None,
     inlet=None, request_filter=None, observe=None, parent_metadata=None, valves=None, bound_tools=None,
     extra_models=None, event_call=None, direct=False, user_valves=None, event_emitter=None, request_state=None,
     entry_kwargs=None,
@@ -662,7 +665,11 @@ async def test_nested_requests_carry_the_child_model_and_the_parent_skills(monke
     assert any("submit_review" in body["tools"] for body in agent_requests) == (entry == "llm_review")
     for body in agent_requests:
         assert SKILL_READ_TOOLS <= body["tools"]
-        assert skill_context in body["system"]
+        if HIDDEN_SKILL_CONTEXT and skill_context == SKILL_MANIFEST:
+            assert skill_context not in body["system"]
+            assert skill_context in [message["content"] for message in body["messages"] if message["role"] == "tool"]
+        else:
+            assert skill_context in body["system"]
 
 
 @needs_core_skill_tools
@@ -1650,7 +1657,7 @@ async def test_a_regular_view_skill_keeps_the_skill_list_where_core_cannot_inlin
         monkeypatch.delattr(importlib.import_module("open_webui.utils.skill_files"), "skill_overview", raising=False)
 
     sent, _, _ = await run_entry(
-        monkeypatch, entry, answer, regular_tools=tools_with_a_regular_view_skill,
+        monkeypatch, entry, answer, regular_tools=tools_with_a_regular_view_skill, skill_context=SKILL_MANIFEST,
         extra_models={"child": NO_SKILL_TOOLS_CHILD},
     )
 

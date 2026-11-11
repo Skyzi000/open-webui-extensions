@@ -2,6 +2,8 @@
 
 import asyncio
 import copy
+import importlib
+import importlib.util
 import inspect
 import sys
 from pathlib import Path
@@ -115,6 +117,11 @@ class TestGraphitiMemoryFilterInstantiation:
 
 FACT = "User likes tea"
 QUESTION = "What do I like?"
+needs_core_memory_in_the_prompt = pytest.mark.skipif(
+    importlib.util.find_spec("open_webui.utils.memory") is None
+    or not hasattr(importlib.import_module("open_webui.utils.memory"), "recall_memories"),
+    reason="Open WebUI before 0.13.1 adds its memory to the system message",
+)
 
 
 def filter_with_one_fact(memory_message_role: str | None = None):
@@ -159,19 +166,27 @@ async def run_inlet(
     return result["messages"]
 
 
-async def as_open_webui_leaves_them(messages: list[dict], rag_template_text: str) -> tuple[list[dict], str]:
-    """What Open WebUI does to the messages after inlet, and the prompt it records on the way."""
+async def as_open_webui_leaves_them(
+    messages: list[dict], rag_template_text: str, code_interpreter: bool = False
+) -> tuple[list[dict], str]:
+    """What Open WebUI does to the messages after inlet and its memory, and the prompt it records on the way."""
     from open_webui.utils.misc import add_or_update_user_message, get_last_user_message
     from open_webui.utils.skills import strip_skill_mentions
     from open_webui.utils.task import rag_template
 
+    if code_interpreter:
+        from open_webui.config import CODE_INTERPRETER_PYODIDE_PROMPT, DEFAULT_CODE_INTERPRETER_PROMPT
+
+        add_or_update_user_message(DEFAULT_CODE_INTERPRETER_PROMPT + CODE_INTERPRETER_PYODIDE_PROMPT, messages)
     strip_skill_mentions(messages, {"tea"})
     prompt = get_last_user_message(messages)
     rag = await rag_template(rag_template_text, "doc", prompt)
     return add_or_update_user_message(rag, messages, append=False), prompt
 
 
-async def saved_episode_body(f, messages: list[dict], request=None, emitter=None, **metadata) -> str | None:
+async def saved_episode_body(
+    f, messages: list[dict], request=None, emitter=None, filter_id=None, **metadata
+) -> str | None:
     """Run outlet the way Open WebUI does for a chat it does not store and return what gets saved, if anything."""
     f.valves.previous_episodes_from_chat = -1
     f.graphiti.add_episode = AsyncMock(return_value=None)
@@ -196,6 +211,7 @@ async def saved_episode_body(f, messages: list[dict], request=None, emitter=None
         __user__=user,
         __metadata__={"chat_id": "", "message_id": "m1", **metadata},
         __request__=request,
+        __id__=filter_id,
     )
     await asyncio.gather(*f._background_tasks)
     saved = f.graphiti.add_episode.await_args
@@ -274,6 +290,41 @@ class TestGraphitiMemoryInjectionPlacement:
         saved = await saved_episode_body(filter_with_one_fact(), messages, new_request())
 
         assert saved == f"Assistant: Hello\n\n---\n\nU: {own_text}"
+
+    @needs_core_memory_in_the_prompt
+    @pytest.mark.parametrize("template", ["", "{{CONTEXT}}\n\n{{QUERY}}"], ids=["template", "query placeholder"])
+    @pytest.mark.parametrize("tags_in_memory", [False, True], ids=["memory", "memory with the tags"])
+    @pytest.mark.parametrize("own_block", [False, True], ids=["prompt", "prompt with the tags"])
+    @pytest.mark.parametrize("code_interpreter", [False, True], ids=["memory last", "code interpreter prompt last"])
+    @pytest.mark.asyncio
+    async def test_outlet_does_not_save_the_memory_open_webui_appends_after_inlet(
+        self, monkeypatch, code_interpreter, own_block, tags_in_memory, template
+    ):
+        """Open WebUI 0.13.1+ appends its own memory to the user message when the model gets no builtin tools."""
+        from open_webui.models.memories import Memories
+        from open_webui.routers import memories
+        from open_webui.utils import memory
+
+        question = f"{QUESTION}\n<memory_context>\nmy own notes\n</memory_context>" if own_block else QUESTION
+        content = "OPEN_WEBUI_FACT" + ("\n<memory_context>\nnotes\n</memory_context>\nmore" if tags_in_memory else "")
+        stored = SimpleNamespace(id="m", type="user", path="profile", content=content, updated_at=0)
+        monkeypatch.setattr(Memories, "get_memories_by_user_id", AsyncMock(return_value=[stored]))
+        monkeypatch.setattr(memories, "query_memory", AsyncMock(return_value=None))
+        f = filter_with_one_fact()
+        f.graphiti.search_.return_value.edges[0].fact = f"{FACT}\n<memory_context>\n" if tags_in_memory else FACT
+        request = new_request()
+        form_data = {"messages": await run_inlet(f, question, chat_id="", request=request)}
+        await memory.add_memory_context(request, form_data, SimpleNamespace(id="u1"), None)
+        sent, prompt = await as_open_webui_leaves_them(form_data["messages"], template, code_interpreter)
+        without_memory = (
+            await as_open_webui_leaves_them([{"role": "user", "content": question}], template, code_interpreter)
+        )[0][0]["content"]
+
+        assert sent[2]["content"].count("OPEN_WEBUI_FACT") == (2 if template else 1)
+        assert ("<code_interpreter" in without_memory) == code_interpreter
+        assert await saved_episode_body(f, sent, request, base_user_prompt=prompt) == (
+            f"Assistant: Hello\n\n---\n\nU: {without_memory}"
+        )
 
     @pytest.mark.asyncio
     async def test_outlet_ignores_memory_appended_in_another_request(self):
@@ -450,6 +501,39 @@ class TestGraphitiMemoryInjectionPlacement:
         assert prompt.count(FACT) + prompt.count("User likes coffee") == 2
         for f in (first, second):
             assert await saved_episode_body(f, sent, request, user_prompt=prompt) == (
+                f"Assistant: Hello\n\n---\n\nU: {without_memory}"
+            )
+
+    @needs_core_memory_in_the_prompt
+    @pytest.mark.parametrize("template", ["", "{{CONTEXT}}\n\n{{QUERY}}"], ids=["template", "query placeholder"])
+    @pytest.mark.parametrize("tagged", ["first", "second"])
+    @pytest.mark.asyncio
+    async def test_every_copy_of_the_filter_saves_the_turn_without_the_memory_open_webui_appends(
+        self, monkeypatch, tagged, template
+    ):
+        """Open WebUI appends its memory after the inlets of all copies, whose own memory can hold its tags."""
+        from open_webui.models.memories import Memories
+        from open_webui.routers import memories
+        from open_webui.utils import memory
+
+        stored = SimpleNamespace(id="m", type="user", path="profile", content="OPEN_WEBUI_FACT", updated_at=0)
+        monkeypatch.setattr(Memories, "get_memories_by_user_id", AsyncMock(return_value=[stored]))
+        monkeypatch.setattr(memories, "query_memory", AsyncMock(return_value=None))
+        copies = {"first": filter_with_one_fact(), "second": filter_with_one_fact()}
+        copies[tagged].graphiti.search_.return_value.edges[0].fact = f"{FACT}\n<memory_context>\n"
+        request = new_request()
+        sent = [None, None, {"content": QUESTION}]
+        for filter_id, f in copies.items():
+            sent = await run_inlet(f, sent[2]["content"], chat_id="", request=request, filter_id=filter_id)
+        await memory.add_memory_context(request, {"messages": sent}, SimpleNamespace(id="u1"), None)
+        sent, prompt = await as_open_webui_leaves_them(sent, template)
+        without_memory = (await as_open_webui_leaves_them([{"role": "user", "content": QUESTION}], template))[0][0][
+            "content"
+        ]
+
+        assert "OPEN_WEBUI_FACT" in sent[2]["content"]
+        for filter_id, f in copies.items():
+            assert await saved_episode_body(f, sent, request, filter_id=filter_id, base_user_prompt=prompt) == (
                 f"Assistant: Hello\n\n---\n\nU: {without_memory}"
             )
 

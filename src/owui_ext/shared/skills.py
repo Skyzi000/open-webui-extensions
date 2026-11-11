@@ -99,12 +99,32 @@ def _extract_from_system_messages(
     return results
 
 
-def extract_skill_manifest(messages: Optional[list]) -> str:
-    """Extract the ``<available_skills>`` manifest from the parent
-    conversation's system messages.
+def _hidden_tool_results(messages: Optional[list], name: str) -> list[str]:
+    """Return the text results of the *name* calls in *messages*, which Core 0.13.1+ adds as hidden tool history."""
+    call_ids = {
+        call.get("id")
+        for message in messages or []
+        if isinstance(message, dict) and message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+        if isinstance(call, dict) and (call.get("function") or {}).get("name") == name
+    }
+    return [
+        message["content"]
+        for message in messages or []
+        if isinstance(message, dict)
+        and message.get("role") == "tool"
+        and message.get("tool_call_id") in call_ids
+        and isinstance(message.get("content"), str)
+    ]
 
-    Core can list model-attached, accessible workspace, and terminal skills.
-    Inline skills may also appear as ``<skill>`` tags
+
+def extract_skill_manifest(messages: Optional[list]) -> str:
+    """Extract the ``<available_skills>`` manifest from the parent conversation.
+
+    Core lists it in a system message, or for a model with skill tools (0.13.1+)
+    as the result of a hidden ``list_available_skills`` call; the latest one is
+    current. Core can list model-attached, accessible workspace, and terminal
+    skills. Inline skills may also appear as ``<skill>`` tags
     (see :func:`extract_user_skill_tags`).
 
     Args:
@@ -114,7 +134,14 @@ def extract_skill_manifest(messages: Optional[list]) -> str:
         The manifest XML string, or empty string if not found.
     """
     results = _extract_from_system_messages(messages, _find_manifest_in_text)
-    return results[0] if results else ""
+    if results:
+        return results[0]
+    listed = [
+        manifest
+        for manifest in map(_find_manifest_in_text, _hidden_tool_results(messages, "list_available_skills"))
+        if manifest
+    ]
+    return listed[-1] if listed else ""
 
 
 def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
@@ -130,15 +157,22 @@ def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
     return _extract_from_system_messages(messages, _find_skill_tags_in_text)
 
 
-def extract_skill_ids(messages: Optional[list]) -> list[str]:
-    """Return the IDs of the skills the parent lists or inlines, as Core's ``__skill_ids__``."""
-    ids = set(re.findall(r"<id>(.*?)</id>", extract_skill_manifest(messages)))
-    for tag in extract_user_skill_tags(messages):
-        match = re.match(r'<skill (?:id="([^"]+)"|name="([^"]*)")', tag)
+def _skill_ids_in(skills: list[str]) -> set[str]:
+    ids = set()
+    for skill in skills:
+        if skill.startswith(_SKILLS_MANIFEST_START):
+            ids.update(re.findall(r"<id>(.*?)</id>", skill))
+            continue
+        match = re.match(r'<skill (?:id="([^"]+)"|name="([^"]*)")', skill)
         if match:
             # Core inlines terminal skills without an id attribute.
             ids.add(match.group(1) or f'terminal:{quote(match.group(2), safe="")}')
-    return sorted(ids)
+    return ids
+
+
+def extract_skill_ids(messages: Optional[list]) -> list[str]:
+    """Return the IDs of the skills the parent lists or inlines, as Core's ``__skill_ids__``."""
+    return sorted(_skill_ids_in([extract_skill_manifest(messages), *extract_user_skill_tags(messages)]))
 
 
 async def _core_inline_skill_tags(
@@ -229,11 +263,19 @@ async def add_skills(
 
     A child without Core's skill reading tools gets the chat's skills (``metadata["skill_ids"]``) as Core inlines
     them for a model without skill tools. When Core cannot render them, it keeps the parent's skills and drops
-    the ``<available_skills>`` list unless a ``view_skill`` tool can load it.
+    the ``<available_skills>`` list unless a ``view_skill`` tool can load it. A child with them on Core 0.13.1+,
+    of a parent Core gave the skills only as a list, gets what Core gives the child of a delegated task: the list
+    as a hidden tool result after the messages, and the skills the chat activated loaded by hidden ``view_skill``
+    calls. A parent's inlined ``<skill>`` blocks reach the child as they are.
     """
     if not skills:
         return messages
     tools_dict = tools_dict or {}
+    view_skill = tools_dict.get("view_skill") or {}
+    if view_skill.get("type") == "builtin" and all(skill.startswith(_SKILLS_MANIFEST_START) for skill in skills):
+        hidden = await _add_hidden_skills(messages, skills, view_skill, request, extra_params)
+        if hidden is not None:
+            return hidden
     if not any(tools_dict.get(name, {}).get("type") == "builtin" for name in _SKILL_READ_TOOLS):
         skill_ids = (extra_params.get("__metadata__") or {}).get("skill_ids") or []
         rendered = await _core_inline_skill_tags(skill_ids, request, extra_params)
@@ -246,6 +288,32 @@ async def add_skills(
     for skill in skills:
         messages = add_or_update_system_message(skill, messages, append=True)
     return messages
+
+
+async def _add_hidden_skills(
+    messages: list, skills: list[str], view_skill: dict, request: Request, extra_params: dict
+) -> Optional[list]:
+    try:
+        from open_webui.models.config import Config
+        from open_webui.utils.middleware import hidden_tool_result, preload_skills
+        from open_webui.utils.misc import convert_output_to_messages
+        from open_webui.utils.tools import get_updated_tool_function
+    except ImportError:
+        return None
+    metadata = extra_params.get("__metadata__") or {}
+    # view_skill records the version it loaded in the chat_context its read_skill_file reads later.
+    bound = {"__metadata__": metadata, **({"__request__": request} if request is not None else {})}
+    view_skill = {**view_skill, "callable": await get_updated_tool_function(view_skill["callable"], bound)}
+    mentioned = set((metadata.get("chat_context") or {}).get("mentioned_skill_ids") or [])
+    activated = (
+        mentioned
+        if await Config.get("skills.lazy_loading.enable", False)
+        else set(metadata.get("skill_ids") or []) | mentioned
+    )
+    manifest = next((skill for skill in skills if skill.startswith(_SKILLS_MANIFEST_START)), "")
+    output = hidden_tool_result("list_available_skills", manifest) if manifest else []
+    output += await preload_skills(messages, activated & _skill_ids_in(skills), view_skill)
+    return [*messages, *convert_output_to_messages(output, raw=True)] if output else messages
 
 
 def isolate_chat_context(metadata: Optional[dict]) -> dict:

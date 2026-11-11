@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.18
+version: 0.5.19
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -408,9 +408,15 @@ async def apply_agent_tool_search(
     if not isinstance(metadata, dict):
         metadata = {}
     form_data: dict = {"messages": []}
-    if "extra_tools" in inspect.signature(apply_tool_search).parameters:
+    parameters = inspect.signature(apply_tool_search).parameters
+    if "extra_tools" in parameters:
+        # Core 0.13.1+ binds the request and user its embeddings search needs.
         deferred = await apply_tool_search(
-            form_data, metadata, loop_tools, list(extra_tools)
+            form_data,
+            metadata,
+            loop_tools,
+            list(extra_tools),
+            **({"extra_params": extra_params} if "extra_params" in parameters else {}),
         )
     elif any(
         (tool.get("function") or tool).get("name") == SEARCH_TOOL_NAME
@@ -510,12 +516,32 @@ def _extract_from_system_messages(
     return results
 
 
-def extract_skill_manifest(messages: Optional[list]) -> str:
-    """Extract the ``<available_skills>`` manifest from the parent
-    conversation's system messages.
+def _hidden_tool_results(messages: Optional[list], name: str) -> list[str]:
+    """Return the text results of the *name* calls in *messages*, which Core 0.13.1+ adds as hidden tool history."""
+    call_ids = {
+        call.get("id")
+        for message in messages or []
+        if isinstance(message, dict) and message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+        if isinstance(call, dict) and (call.get("function") or {}).get("name") == name
+    }
+    return [
+        message["content"]
+        for message in messages or []
+        if isinstance(message, dict)
+        and message.get("role") == "tool"
+        and message.get("tool_call_id") in call_ids
+        and isinstance(message.get("content"), str)
+    ]
 
-    Core can list model-attached, accessible workspace, and terminal skills.
-    Inline skills may also appear as ``<skill>`` tags
+
+def extract_skill_manifest(messages: Optional[list]) -> str:
+    """Extract the ``<available_skills>`` manifest from the parent conversation.
+
+    Core lists it in a system message, or for a model with skill tools (0.13.1+)
+    as the result of a hidden ``list_available_skills`` call; the latest one is
+    current. Core can list model-attached, accessible workspace, and terminal
+    skills. Inline skills may also appear as ``<skill>`` tags
     (see :func:`extract_user_skill_tags`).
 
     Args:
@@ -525,7 +551,14 @@ def extract_skill_manifest(messages: Optional[list]) -> str:
         The manifest XML string, or empty string if not found.
     """
     results = _extract_from_system_messages(messages, _find_manifest_in_text)
-    return results[0] if results else ""
+    if results:
+        return results[0]
+    listed = [
+        manifest
+        for manifest in map(_find_manifest_in_text, _hidden_tool_results(messages, "list_available_skills"))
+        if manifest
+    ]
+    return listed[-1] if listed else ""
 
 
 def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
@@ -541,15 +574,22 @@ def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
     return _extract_from_system_messages(messages, _find_skill_tags_in_text)
 
 
-def extract_skill_ids(messages: Optional[list]) -> list[str]:
-    """Return the IDs of the skills the parent lists or inlines, as Core's ``__skill_ids__``."""
-    ids = set(re.findall(r"<id>(.*?)</id>", extract_skill_manifest(messages)))
-    for tag in extract_user_skill_tags(messages):
-        match = re.match(r'<skill (?:id="([^"]+)"|name="([^"]*)")', tag)
+def _skill_ids_in(skills: list[str]) -> set[str]:
+    ids = set()
+    for skill in skills:
+        if skill.startswith(_SKILLS_MANIFEST_START):
+            ids.update(re.findall(r"<id>(.*?)</id>", skill))
+            continue
+        match = re.match(r'<skill (?:id="([^"]+)"|name="([^"]*)")', skill)
         if match:
             # Core inlines terminal skills without an id attribute.
             ids.add(match.group(1) or f'terminal:{quote(match.group(2), safe="")}')
-    return sorted(ids)
+    return ids
+
+
+def extract_skill_ids(messages: Optional[list]) -> list[str]:
+    """Return the IDs of the skills the parent lists or inlines, as Core's ``__skill_ids__``."""
+    return sorted(_skill_ids_in([extract_skill_manifest(messages), *extract_user_skill_tags(messages)]))
 
 
 async def _core_inline_skill_tags(
@@ -640,11 +680,19 @@ async def add_skills(
 
     A child without Core's skill reading tools gets the chat's skills (``metadata["skill_ids"]``) as Core inlines
     them for a model without skill tools. When Core cannot render them, it keeps the parent's skills and drops
-    the ``<available_skills>`` list unless a ``view_skill`` tool can load it.
+    the ``<available_skills>`` list unless a ``view_skill`` tool can load it. A child with them on Core 0.13.1+,
+    of a parent Core gave the skills only as a list, gets what Core gives the child of a delegated task: the list
+    as a hidden tool result after the messages, and the skills the chat activated loaded by hidden ``view_skill``
+    calls. A parent's inlined ``<skill>`` blocks reach the child as they are.
     """
     if not skills:
         return messages
     tools_dict = tools_dict or {}
+    view_skill = tools_dict.get("view_skill") or {}
+    if view_skill.get("type") == "builtin" and all(skill.startswith(_SKILLS_MANIFEST_START) for skill in skills):
+        hidden = await _add_hidden_skills(messages, skills, view_skill, request, extra_params)
+        if hidden is not None:
+            return hidden
     if not any(tools_dict.get(name, {}).get("type") == "builtin" for name in _SKILL_READ_TOOLS):
         skill_ids = (extra_params.get("__metadata__") or {}).get("skill_ids") or []
         rendered = await _core_inline_skill_tags(skill_ids, request, extra_params)
@@ -657,6 +705,32 @@ async def add_skills(
     for skill in skills:
         messages = add_or_update_system_message(skill, messages, append=True)
     return messages
+
+
+async def _add_hidden_skills(
+    messages: list, skills: list[str], view_skill: dict, request: Request, extra_params: dict
+) -> Optional[list]:
+    try:
+        from open_webui.models.config import Config
+        from open_webui.utils.middleware import hidden_tool_result, preload_skills
+        from open_webui.utils.misc import convert_output_to_messages
+        from open_webui.utils.tools import get_updated_tool_function
+    except ImportError:
+        return None
+    metadata = extra_params.get("__metadata__") or {}
+    # view_skill records the version it loaded in the chat_context its read_skill_file reads later.
+    bound = {"__metadata__": metadata, **({"__request__": request} if request is not None else {})}
+    view_skill = {**view_skill, "callable": await get_updated_tool_function(view_skill["callable"], bound)}
+    mentioned = set((metadata.get("chat_context") or {}).get("mentioned_skill_ids") or [])
+    activated = (
+        mentioned
+        if await Config.get("skills.lazy_loading.enable", False)
+        else set(metadata.get("skill_ids") or []) | mentioned
+    )
+    manifest = next((skill for skill in skills if skill.startswith(_SKILLS_MANIFEST_START)), "")
+    output = hidden_tool_result("list_available_skills", manifest) if manifest else []
+    output += await preload_skills(messages, activated & _skill_ids_in(skills), view_skill)
+    return [*messages, *convert_output_to_messages(output, raw=True)] if output else messages
 
 
 def isolate_chat_context(metadata: Optional[dict]) -> dict:
@@ -728,523 +802,6 @@ async def register_view_skill(
     except Exception as e:
         _skills_log.warning(f"Failed to register view_skill: {e}")
 
-# --- inlined from src/owui_ext/shared/agent_requests.py (owui_ext.shared.agent_requests) ---
-def strip_tool_search_manifest(messages: list) -> list:
-    """Drop Core's Tool Search manifest from system messages, for requests sent without its tools."""
-    try:
-        from open_webui.utils.tool_search import strip_deferred_tools_manifest
-    except ImportError:
-        return messages
-
-    def without_manifest(message):
-        if not isinstance(message, dict) or message.get("role") != "system":
-            return message
-        content = message.get("content")
-        if isinstance(content, str):
-            return {**message, "content": strip_deferred_tools_manifest(content)}
-        if isinstance(content, list):
-            return {
-                **message,
-                "content": [
-                    {**part, "text": strip_deferred_tools_manifest(part["text"])}
-                    if isinstance(part, dict) and isinstance(part.get("text"), str)
-                    else part
-                    for part in content
-                ],
-            }
-        return message
-
-    return [without_manifest(message) for message in messages]
-
-
-TOOL_REQUEST_KEYS = (
-    "tools",
-    "tool_choice",
-    "functions",
-    "function_call",
-    "parallel_tool_calls",
-)
-
-
-def strip_tool_request_keys(body: dict) -> dict:
-    """Copy *body* without its tools, tool selection or Tool Search manifest."""
-    body = {key: value for key, value in body.items() if key not in TOOL_REQUEST_KEYS}
-    if isinstance(body.get("messages"), list):
-        body["messages"] = strip_tool_search_manifest(body["messages"])
-    return body
-
-
-def follow_core_session(event_call, core_metadata):
-    """Return *event_call* sending with the browser session Core holds in *core_metadata*.
-
-    Core 0.12.4+ points its chat metadata at the browser's new session when it
-    reconnects during an input request; nested agents send from their own copies.
-    """
-    if (
-        not callable(event_call)
-        or not isinstance(core_metadata, dict)
-        or isinstance(getattr(event_call, "core_metadata", None), dict)
-    ):
-        return event_call
-
-    async def call(event_data):
-        data = event_data.get("data") if isinstance(event_data, dict) else None
-        # Core resumes an input request only when its data has no session_id.
-        if isinstance(data, dict) and "session_id" in data:
-            event_data = {**event_data, "data": {**data, "session_id": core_metadata.get("session_id")}}
-        return await event_call(event_data)
-
-    call.core_metadata = core_metadata
-    return call
-
-
-def core_chat_completion(extra_params: dict):
-    """Core's ``generate_chat_completion``, sent with the browser session Core holds now.
-
-    Core calls a direct connection model through the session in the request's metadata.
-    """
-    from open_webui.utils.chat import generate_chat_completion
-
-    core_metadata = getattr((extra_params or {}).get("__event_call__"), "core_metadata", None)
-    if not isinstance(core_metadata, dict):
-        return generate_chat_completion
-
-    async def send(request, form_data, *args, **kwargs):
-        state = getattr(request, "state", None)
-        for metadata in (form_data.get("metadata"), getattr(state, "metadata", None)):
-            if isinstance(metadata, dict) and "session_id" in metadata:
-                metadata["session_id"] = core_metadata.get("session_id")
-        return await generate_chat_completion(request, form_data, *args, **kwargs)
-
-    return send
-
-
-def own_metadata(metadata: dict) -> dict:
-    """Copy inherited metadata so a nested request can change it without touching its parent."""
-    import copy
-
-    owned = {}
-    for key, value in metadata.items():
-        # Core keeps live objects (tool callables, MCP clients) in metadata.
-        if key in ("tools", "mcp_clients"):
-            owned[key] = dict(value) if isinstance(value, dict) else value
-            continue
-        try:
-            owned[key] = copy.deepcopy(value)
-        except Exception:
-            owned[key] = value
-    return owned
-
-
-class AgentRequests:
-    """One agent loop's requests, assembled the way Core assembles a chat request.
-
-    ``prepare`` runs the inlet filters once with only the model's custom tools and no
-    skills in the request, then adds the skills, Tool Search with the tools the filters
-    left, and the tool prompts. Every
-    request of the loop starts from that form and runs the request filters. Body,
-    ``__metadata__`` and request state share one dict, and ``chat_request`` carries
-    that state through the filters and every send.
-    """
-
-    def __init__(
-        self,
-        tools_dict: dict,
-        extra_params: dict,
-        custom_tools: list = (),
-        always_loaded=(),
-    ):
-        metadata = extra_params.get("__metadata__")
-        metadata = own_metadata(metadata) if isinstance(metadata, dict) else {}
-        extra_params = {**extra_params, "__metadata__": metadata}
-        self.tools_dict = tools_dict
-        self.extra_params = extra_params
-        self.metadata = metadata
-        self.custom_tools = list(custom_tools)
-        self.always_loaded = tuple(always_loaded)
-        self.base: dict = {}
-        self.chat_request = None
-
-    @property
-    def tools_param(self) -> list | None:
-        return self.base.get("tools")
-
-    async def prepare(self, filter_pipeline, request, form_data: dict, skills: list[str] = ()) -> list:
-        """Run the loop's inlet filters once, add the parent's *skills*, and return the messages the loop starts from."""
-        import copy
-
-        self.chat_request = isolate_request_state(request, self.metadata)
-        request = self.chat_request
-        filter_params = self._filter_params()
-        self.metadata.update(own_metadata(form_data.get("metadata") or {}))
-        # Core's delegate_task accepts the sub-agent models of metadata["model"], the model the tools were loaded for.
-        if (filter_pipeline or {}).get("model"):
-            self.metadata.update(own_metadata({"model": filter_pipeline["model"]}))
-        form_data["metadata"] = self.metadata
-        if self.custom_tools:
-            form_data["tools"] = self.custom_tools
-        form_data = await apply_inlet_filters_if_enabled(
-            filter_pipeline, request, form_data, filter_params
-        )
-        form_data["metadata"] = self.metadata
-        form_data["messages"] = await add_skills(
-            form_data["messages"], list(skills), self.tools_dict, request, self.extra_params
-        )
-        self._sync_model_id(form_data)
-        filter_tools = form_data.get("tools") or []
-        (
-            self.tools_dict,
-            self.extra_params,
-            deferred,
-        ) = await apply_agent_tool_search(
-            self.tools_dict, self.extra_params, self.always_loaded, filter_tools
-        )
-        if not deferred:
-            # As with Tool Search, leave out the tools the loop handles itself (a submission ends it).
-            listed = {
-                name: tool
-                for name, tool in self.tools_dict.items()
-                if name not in self.always_loaded
-            }
-            if listed:
-                self.metadata["tools"] = listed
-            else:
-                self.metadata.pop("tools", None)
-        tools = build_agent_tools_param(self.tools_dict, deferred, filter_tools)
-        if tools:
-            form_data["tools"] = tools
-        else:
-            form_data.pop("tools", None)
-        form_data = _append_tool_server_prompts(form_data, self.extra_params)
-        self.base = {
-            key: value
-            for key, value in form_data.items()
-            if key not in ("messages", "metadata")
-        }
-        return copy.deepcopy(form_data["messages"])
-
-    async def next_form(
-        self,
-        filter_pipeline,
-        messages: list,
-        tools=...,
-    ) -> dict:
-        """Return the loop's next request; ``tools`` replaces the loop's tools when given."""
-        import copy
-
-        form_data = {
-            **copy.deepcopy(self.base),
-            "messages": messages,
-            "stream": False,
-            "metadata": self.metadata,
-        }
-        if tools is not ...:
-            choice = form_data.get("tool_choice")
-            parallel = form_data.get("parallel_tool_calls")
-            form_data = strip_tool_request_keys(form_data)
-            if tools:
-                form_data["tools"] = tools
-                if parallel is not None:
-                    form_data["parallel_tool_calls"] = parallel
-                names = {(tool.get("function") or {}).get("name") for tool in tools}
-                if isinstance(choice, str) or (
-                    isinstance(choice, dict)
-                    and ((choice.get("function") or {}).get("name") or choice.get("name"))
-                    in names
-                ):
-                    form_data["tool_choice"] = choice
-        form_data = await finalize_model_request(
-            filter_pipeline,
-            self.chat_request,
-            form_data,
-            self._filter_params(),
-        )
-        self._sync_model_id(form_data)
-        return form_data
-
-    def _filter_params(self) -> dict:
-        return {
-            **self.extra_params,
-            "__metadata__": self.metadata,
-        }
-
-    def _sync_model_id(self, form_data: dict) -> None:
-        if form_data.get("model"):
-            self.metadata["model_id"] = form_data["model"]
-
-# --- inlined from src/owui_ext/shared/async_utils.py (owui_ext.shared.async_utils) ---
-async def maybe_await(value):
-    if hasattr(value, "__await__"):
-        return await value
-    return value
-
-# --- inlined from src/owui_ext/shared/builtin_tools.py (owui_ext.shared.builtin_tools) ---
-BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
-    "time": {"get_current_timestamp", "calculate_timestamp"},
-    "user_input": {"ask_user"},
-    "web": {"search_web", "fetch_url"},
-    "image": {"generate_image", "edit_image"},
-    "files": {
-        "list_chat_files",
-        "query_chat_files",
-        "grep_chat_files",
-        "view_file",
-        "display_file",
-    },
-    "knowledge": {
-        "list_knowledge",
-        "list_knowledge_bases",
-        "search_knowledge_bases",
-        "query_knowledge_bases",
-        "search_knowledge_files",
-        "query_knowledge_files",
-        "grep_knowledge_files",
-        "kb_exec",
-        "view_file",
-        "view_knowledge_file",
-        "display_file",
-    },
-    "chat": {"search_chats", "view_chat"},
-    "memory": {
-        "search_memories",
-        "list_memory_paths",
-        "read_memory_path",
-        "list_memories",
-        "update_memory",
-        "add_memory",
-        "replace_memory_content",
-        "delete_memory",
-    },
-    "notes": {
-        "search_notes",
-        "view_note",
-        "write_note",
-        "replace_note_content",
-    },
-    "channels": {
-        "search_channels",
-        "search_channel_messages",
-        "view_channel_thread",
-        "view_channel_message",
-    },
-    "code_interpreter": {"execute_code"},
-    "skills": {"view_skill", "read_skill_file", "grep_skill_files"},
-    "skills_write": {"update_skill_files", "create_skill"},
-    "tool_creation": {"create_tool"},
-    "subagents": {"delegate_task", "timer"},
-    "tasks": {"create_tasks", "update_task"},
-    "automations": {
-        "create_automation",
-        "update_automation",
-        "list_automations",
-        "toggle_automation",
-        "delete_automation",
-    },
-    "calendar": {
-        "search_calendar_events",
-        "create_calendar_event",
-        "update_calendar_event",
-        "delete_calendar_event",
-    },
-    "notifications": {"notify"},
-}
-
-
-VALVE_TO_CATEGORY: dict[str, str] = {
-    "ENABLE_TIME_TOOLS": "time",
-    "ENABLE_WEB_TOOLS": "web",
-    "ENABLE_IMAGE_TOOLS": "image",
-    "ENABLE_FILE_TOOLS": "files",
-    "ENABLE_KNOWLEDGE_TOOLS": "knowledge",
-    "ENABLE_CHAT_TOOLS": "chat",
-    "ENABLE_MEMORY_TOOLS": "memory",
-    "ENABLE_NOTES_TOOLS": "notes",
-    "ENABLE_CHANNELS_TOOLS": "channels",
-    "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
-    "ENABLE_SKILLS_TOOLS": "skills",
-    "ENABLE_SKILLS_WRITE_TOOLS": "skills_write",
-    "ENABLE_TOOL_CREATION_TOOLS": "tool_creation",
-    "ENABLE_SUBAGENT_TOOLS": "subagents",
-    "ENABLE_TASK_TOOLS": "tasks",
-    "ENABLE_AUTOMATION_TOOLS": "automations",
-    "ENABLE_CALENDAR_TOOLS": "calendar",
-    "ENABLE_NOTIFICATION_TOOLS": "notifications",
-}
-
-# --- inlined from src/owui_ext/shared/completion_response.py (owui_ext.shared.completion_response) ---
-import json
-from typing import Any, Optional
-from starlette.responses import JSONResponse, Response
-_RESPONSE_BODY_PREVIEW_CHARS = 1024
-
-
-def _truncate_preview(text: str) -> str:
-    if len(text) > _RESPONSE_BODY_PREVIEW_CHARS:
-        return text[:_RESPONSE_BODY_PREVIEW_CHARS] + "...[truncated]"
-    return text
-
-
-def _decode_response_body(response: Response) -> str:
-    body = getattr(response, "body", None)
-    if body is None:
-        return ""
-    if isinstance(body, (bytes, bytearray)):
-        try:
-            text = bytes(body).decode("utf-8", errors="replace")
-        except Exception:
-            text = repr(body)
-    else:
-        text = str(body)
-    return _truncate_preview(text.strip())
-
-
-def _extract_json_response_error(response: JSONResponse) -> str:
-    status = getattr(response, "status_code", "unknown")
-    try:
-        error_data = json.loads(bytes(response.body).decode("utf-8"))
-    except Exception:
-        return f"API error (status {status}): Failed to parse response"
-    if isinstance(error_data, dict):
-        error_field = error_data.get("error")
-        if isinstance(error_field, dict):
-            msg = error_field.get("message")
-            if isinstance(msg, str) and msg:
-                return f"API error: {_truncate_preview(msg)}"
-            return f"API error: {_truncate_preview(str(error_data))}"
-        if isinstance(error_field, str) and error_field:
-            return f"API error: {_truncate_preview(error_field)}"
-        msg = error_data.get("message")
-        if isinstance(msg, str) and msg:
-            return f"API error: {_truncate_preview(msg)}"
-        return f"API error: {_truncate_preview(str(error_data))}"
-    return f"API error: {_truncate_preview(str(error_data))}"
-
-
-def format_chat_completion_error(response: Any) -> Optional[str]:
-    """Classify a ``generate_chat_completion`` response.
-
-    Returns:
-        ``None`` when ``response`` is a ``dict`` (success path); the
-        caller should proceed to read ``response['choices']``.
-
-        ``str`` describing the upstream failure for any other shape.
-        ``JSONResponse`` bodies are unwrapped to surface the provider's
-        error message; other ``Response`` subclasses (notably
-        ``PlainTextResponse`` returned by Open WebUI core when the
-        provider replies with non-JSON 400+ content) are reported with
-        their status code and a truncated body preview so the caller
-        can show the real cause to the parent loop.
-    """
-    if isinstance(response, dict):
-        return None
-    if isinstance(response, JSONResponse):
-        return _extract_json_response_error(response)
-    if isinstance(response, Response):
-        status = getattr(response, "status_code", "unknown")
-        body_text = _decode_response_body(response)
-        type_name = type(response).__name__
-        if body_text:
-            return f"API error (status {status}, {type_name}): {body_text}"
-        return f"API error (status {status}, {type_name}): empty body"
-    return f"Unexpected response type: {type(response).__name__}"
-
-# --- inlined from src/owui_ext/shared/model_features.py (owui_ext.shared.model_features) ---
-from typing import Optional
-def _attached_knowledge_types(
-    model: Optional[dict],
-    metadata: Optional[dict] = None,
-) -> set[str]:
-    if not isinstance(model, dict):
-        model = {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-
-    model_meta = model.get("info", {}).get("meta", {})
-    knowledge_items = list(model_meta.get("knowledge") or [])
-    knowledge_items.extend(metadata.get("folder_knowledge") or [])
-    if not (model_meta.get("capabilities") or {}).get("file_context", True):
-        knowledge_items.extend(
-            item
-            for item in metadata.get("files") or []
-            if isinstance(item, dict)
-            and item.get("type") in ("collection", "note")
-        )
-
-    return {
-        item["type"]
-        for item in knowledge_items
-        if isinstance(item, dict)
-        and isinstance(item.get("type"), str)
-        and item.get("id")
-    }
-
-
-def model_has_note_knowledge(
-    model: Optional[dict],
-    metadata: Optional[dict] = None,
-) -> bool:
-    """Return True if Core can expose view_note for attached knowledge."""
-    return "note" in _attached_knowledge_types(model, metadata)
-
-
-def model_has_file_knowledge(
-    model: Optional[dict],
-    metadata: Optional[dict] = None,
-) -> bool:
-    """Return True if Core can expose view_file for attached knowledge."""
-    return not _attached_knowledge_types(model, metadata).isdisjoint(
-        {"file", "collection"}
-    )
-
-
-def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
-    """Return True if model-level builtin knowledge tools are enabled."""
-    if not isinstance(model, dict):
-        return True
-    builtin_tools = model.get("info", {}).get("meta", {}).get("builtinTools", {})
-    if not isinstance(builtin_tools, dict):
-        return True
-    return bool(builtin_tools.get("knowledge", True))
-
-# --- inlined from src/owui_ext/shared/notifications.py (owui_ext.shared.notifications) ---
-import logging
-from typing import Callable, Optional
-_notifications_log = logging.getLogger("owui_ext.shared.notifications")
-
-
-async def emit_notification(
-    event_emitter: Optional[Callable], *, level: str, content: str
-) -> None:
-    """Emit a frontend notification toast when the current chat supports it."""
-    if not callable(event_emitter):
-        return
-    if not isinstance(content, str) or not content.strip():
-        return
-    try:
-        await event_emitter(
-            {
-                "type": "notification",
-                "data": {"type": level, "content": content.strip()},
-            }
-        )
-    except Exception as exc:
-        _notifications_log.debug(
-            f"Error emitting notification ({level}): {exc}"
-        )
-
-# --- inlined from src/owui_ext/shared/status_text.py (owui_ext.shared.status_text) ---
-import unicodedata
-def truncate_status(description: str, limit: int) -> str:
-    """Cut ``description`` to ``limit`` display columns (full-width characters count as 2); 0 disables."""
-    if limit <= 0:
-        return description
-    width = 0
-    for index, char in enumerate(description):
-        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-        if width > limit:
-            return description[:index] + "..."
-    return description
-
 # --- inlined from src/owui_ext/shared/tool_execution.py (owui_ext.shared.tool_execution) ---
 import ast
 import asyncio
@@ -1252,10 +809,156 @@ import json
 import logging
 import re
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 from fastapi import Request
 _tool_execution_log = logging.getLogger("owui_ext.shared.tool_execution")
 _core_process_tool_result = None
+_INCOMPLETE_FINISH_REASONS = {"length", "content_filter", "incomplete", "failed"}
+_NOT_APPROVED = "Error: tool call was not approved."
+
+
+@dataclass
+class ToolCallState:
+    """One agent loop's tool calls, judged the way Core 0.13.1+ judges a chat's.
+
+    ``own_tools`` are the loop's own tools, which need no approval.
+    ``review_approval`` is False when approving the agent tool's call also approved its agents' calls.
+    """
+
+    own_tools: frozenset = frozenset()
+    review_approval: bool = True
+    history: list = field(default_factory=list)
+    round_error: Optional[str] = None
+    stop_reason: Optional[str] = None
+
+
+def _core_tool_calling():
+    try:
+        from open_webui.utils import tool_calling
+    except ImportError:
+        return None
+    return tool_calling
+
+
+def _is_tool_result_error(content: Any) -> bool:
+    try:
+        from open_webui.utils.middleware import _is_tool_result_error as is_error
+    except ImportError:
+        return False
+    return is_error(content)
+
+
+def _well_formed_calls(tool_calls: Any) -> bool:
+    return isinstance(tool_calls, list) and all(
+        isinstance(call, dict) and isinstance(call.get("function"), dict) for call in tool_calls
+    )
+
+
+def take_tool_calls(choice: dict, form_data: dict, state: Optional[ToolCallState]) -> tuple[Any, Any]:
+    """Return a response's text and tool calls the way Core's tool loop takes them.
+
+    Core recovers calls a model wrote as its whole text, splits arguments holding several
+    objects into calls, and executes none of the calls of a response cut off before its end.
+    """
+    message = choice.get("message", {})
+    content = message.get("content", "")
+    tool_calls = message.get("tool_calls", [])
+    calling = _core_tool_calling()
+    if calling is None or state is None:
+        return content, tool_calls
+    incomplete = choice.get("finish_reason") in _INCOMPLETE_FINISH_REASONS
+    state.round_error = calling.INCOMPLETE_CALL_ERROR if incomplete and tool_calls else None
+    if tool_calls:
+        if incomplete or not _well_formed_calls(tool_calls):
+            return content, tool_calls
+        return content, calling.split_tool_calls(tool_calls)
+    tool_choice = form_data.get("tool_choice")
+    if incomplete or tool_choice == "none" or form_data.get("response_format") not in (None, {"type": "text"}):
+        return content, tool_calls
+    allowed = {
+        spec.get("function", spec).get("name")
+        for spec in form_data.get("tools") or []
+        if isinstance(spec, dict) and isinstance(spec.get("function", spec), dict)
+    }
+    if isinstance(tool_choice, dict):
+        chosen = tool_choice.get("function") or tool_choice
+        allowed &= {chosen.get("name") if isinstance(chosen, dict) else None}
+    recovered = calling.recover_tool_calls(content, allowed)
+    return ("", recovered) if recovered else (content, tool_calls)
+
+
+def final_answer_instruction(state: Optional[ToolCallState], at_iteration_limit: str) -> str:
+    """The instruction for a loop's last request: Core's when its tool loop stopped tool use, else *at_iteration_limit*."""
+    if state is None or not state.stop_reason:
+        return at_iteration_limit
+    from open_webui.utils.tool_calling import FINAL_ANSWER_PROMPT
+
+    return FINAL_ANSWER_PROMPT
+
+
+async def model_reviews_approval(metadata: Optional[dict]) -> bool:
+    """Whether Core asks the model itself if each call needs approval (Auto mode without a review engine)."""
+    try:
+        from open_webui.models.config import Config
+        from open_webui.utils.tool_calling import add_tool_call_metadata  # noqa: F401
+    except ImportError:
+        return False
+    if ((metadata or {}).get("params") or {}).get("tool_approval_mode") != "auto":
+        return False
+    settings = await Config.get_many(
+        "chat.tool_permissions.enable",
+        "chat.tool_permissions.auto.enable",
+        "chat.tool_permissions.auto.engine",
+    )
+    return bool(
+        settings.get("chat.tool_permissions.enable")
+        and settings.get("chat.tool_permissions.auto.enable")
+        and settings.get("chat.tool_permissions.auto.engine", "") == ""
+    )
+
+
+def add_approval_review(tools: dict, own_tools, listed: Optional[dict]) -> dict:
+    """Add Core's ``__approval__`` argument to the loop's tools, and to the *listed* ones Tool Search returns."""
+    from open_webui.utils.tool_calling import add_tool_call_metadata
+
+    reviewed = {name: tool for name, tool in tools.items() if name not in own_tools}
+    add_tool_call_metadata(reviewed, approval=True)
+    if isinstance(listed, dict):
+        listed.update({name: reviewed[name] for name in listed if name in reviewed})
+    return {**tools, **reviewed}
+
+
+async def set_approval_policy(messages: list, review: bool) -> list:
+    """Apply Core's approval instructions to *messages*: the Auto policy when the model reviews its calls, else none."""
+    try:
+        from open_webui.utils.tool_permissions import (
+            get_tool_permissions_auto_config,
+            set_tool_approval_prompt,
+        )
+    except ImportError:
+        return messages
+    policy = (await get_tool_permissions_auto_config())["prompt"] if review else None
+    return set_tool_approval_prompt(messages, policy)
+
+
+def input_request_lock(event_call: Any) -> asyncio.Lock:
+    """The lock of a chat request's input requests, kept on Core's event caller, which all tools of it share."""
+    try:
+        return vars(event_call).setdefault("input_request_lock", asyncio.Lock())
+    except TypeError:
+        return asyncio.Lock()
+
+
+async def _approved_by_user(extra_params: dict, call_id: Any, name: str, params: dict) -> bool:
+    """Ask in the browser as Core does for a chat it cannot pause."""
+    event_call = extra_params.get("__event_call__")
+    if not callable(event_call):
+        return False
+    reply = await event_call(
+        {"type": "confirmation", "data": {"tool_call": {"id": call_id, "name": name, "arguments": params}}}
+    )
+    return reply is True
 
 
 CITATION_TOOLS: set[str] = {
@@ -1675,13 +1378,84 @@ def resolve_call_tool(tool_call: dict, tools_dict: dict) -> tuple[dict, Optional
     return resolved, resolve_tool_call(resolved, tools_dict)
 
 
+def call_targets(tool_call: dict, tools_dict: dict) -> list[str]:
+    """Return the names of the tools *tool_call* runs: each one a ``call_tool`` batch names, else its one tool."""
+    members = _call_tool_batch(tool_call, tools_dict) if isinstance(tool_call.get("function"), dict) else None
+    if members is None:
+        names = [resolve_call_tool(tool_call, tools_dict)[0].get("function", {}).get("name", "")]
+    else:
+        names = [member["provider_batch"]["tool_name"] for member in members if "provider_batch" in member]
+    return [name for name in names if isinstance(name, str)]
+
+
+def _call_tool_batch(tool_call: dict, tools: dict) -> Optional[list]:
+    """Return the calls a Core 0.13.1+ ``call_tool(calls=[...])`` batch stages, or None for any other call."""
+    try:
+        from open_webui.utils.tool_search import split_tool_call_batches
+    except ImportError:
+        return None
+    members = split_tool_call_batches([tool_call], tools)
+    if members == [tool_call]:
+        return None
+    return members
+
+
+def _replay_like_core(function: dict) -> None:
+    """Rewrite a model's call the way Core 0.13.1+ replays it: arguments it cannot read become an error object."""
+    if _core_tool_calling() is None:
+        return
+    from open_webui.utils.misc import get_provider_function
+
+    function["arguments"] = get_provider_function(
+        {"name": function.get("name", ""), "arguments": function.get("arguments", "{}")}
+    )["arguments"]
+
+
+def quote_arguments_core_raises_on(function: dict) -> None:
+    """Make Core reject, as unreadable text, the arguments Core 0.13.2 raises on: a literal with an unhashable member."""
+    calling = _core_tool_calling()
+    if calling is None:
+        return
+    try:
+        calling.parse_arguments(function.get("arguments", "{}"))
+    except ValueError:
+        pass
+    except TypeError:
+        function["arguments"] = json.dumps(function["arguments"])
+
+
+def _record_call(state: Optional[ToolCallState], item: dict) -> Optional[str]:
+    """Record a call of this response and return Core's error when it repeats failed ones, stopping tool use."""
+    if state is None:
+        return None
+    calling = _core_tool_calling()
+    blocked = calling.tool_repetition_error(item, state.history) if calling is not None else None
+    if blocked:
+        state.stop_reason = state.stop_reason or blocked
+    state.history.append(item)
+    return blocked
+
+
+def _record_failed_call(state: Optional[ToolCallState], function: dict) -> None:
+    """Record a call that failed before it ran."""
+    _record_call(
+        state, {"name": function.get("name", ""), "arguments": function.get("arguments", "{}"), "status": "failed"}
+    )
+
+
 async def execute_tool_call(
     tool_call: dict,
     tools_dict: dict,
     extra_params: dict,
     event_emitter: Optional[Callable] = None,
+    state: Optional[ToolCallState] = None,
+    stop_after: frozenset = frozenset(),
 ) -> dict:
-    """Execute a single tool call and return ``{tool_call_id, content}``."""
+    """Execute a model's tool call and return ``{tool_call_id, content}``.
+
+    A ``call_tool`` batch runs each call it names, up to one of *stop_after*, and answers with Core's
+    combined ``{"results": [...]}``. The call itself is left as Core replays it to the model.
+    """
     if not isinstance(tool_call, dict):
         return {
             "tool_call_id": str(uuid.uuid4()),
@@ -1693,17 +1467,108 @@ async def execute_tool_call(
             "tool_call_id": tool_call_id,
             "content": f"Malformed tool_call: 'function' is {type(tool_call.get('function')).__name__}, not dict",
         }
+    try:
+        return await _execute_model_call(
+            tool_call, tool_call_id, tools_dict, extra_params, event_emitter, state, stop_after
+        )
+    finally:
+        _replay_like_core(tool_call["function"])
+
+
+async def _execute_model_call(
+    tool_call: dict,
+    tool_call_id: Any,
+    tools_dict: dict,
+    extra_params: dict,
+    event_emitter: Optional[Callable],
+    state: Optional[ToolCallState],
+    stop_after: frozenset,
+) -> dict:
+    quote_arguments_core_raises_on(tool_call["function"])
+    if state is not None and state.round_error:
+        state.stop_reason = state.stop_reason or state.round_error
+        _record_failed_call(state, tool_call["function"])
+        return {"tool_call_id": tool_call_id, "content": state.round_error}
+    members = _call_tool_batch(tool_call, tools_dict)
+    if members is None:
+        result = await _execute_single_call(
+            tool_call, tool_call_id, tools_dict, extra_params, event_emitter, state
+        )
+        result.pop("status", None)
+        return result
+    if "provider_batch" not in members[0]:
+        _record_failed_call(state, tool_call["function"])
+        return {"tool_call_id": tool_call_id, "content": members[0]["execution_error"]}
+    entries, images = [], []
+    for member in members:
+        result = await _execute_single_call(
+            member, member["id"], tools_dict, extra_params, event_emitter, state
+        )
+        entries.append(
+            {
+                "tool_name": member["provider_batch"]["tool_name"],
+                "status": result.get("status", "failed"),
+                "output": [{"type": "input_text", "text": result["content"]}],
+            }
+        )
+        images.extend(result.get("images", []))
+        name = member["provider_batch"]["tool_name"]
+        if isinstance(name, str) and name in stop_after:
+            break
+    return {
+        "tool_call_id": tool_call_id,
+        "content": json.dumps({"results": entries}, ensure_ascii=False, separators=(",", ":")),
+        **({"images": images} if images else {}),
+    }
+
+
+async def _execute_single_call(
+    tool_call: dict,
+    tool_call_id: Any,
+    tools_dict: dict,
+    extra_params: dict,
+    event_emitter: Optional[Callable],
+    state: Optional[ToolCallState],
+) -> dict:
     tool_call, error = resolve_call_tool(tool_call, tools_dict)
     if error:
-        return {"tool_call_id": tool_call_id, "content": error}
+        _record_failed_call(state, tool_call["function"])
+        return {"tool_call_id": tool_call_id, "content": error, "status": "failed"}
     func = tool_call["function"]
     tool_function_name = func.get("name", "")
     tool_args_raw = func.get("arguments", "{}")
 
-    tool_function_params = tool_args_raw
-    if isinstance(tool_args_raw, str):
+    calling = _core_tool_calling()
+    item = None
+    if calling is not None:
+        tool = tools_dict.get(tool_function_name)
+        item = {
+            "name": tool_function_name,
+            "arguments": tool_args_raw if isinstance(tool_args_raw, str) else json.dumps(tool_args_raw),
+            "status": "in_progress",
+        }
+        error = (
+            calling.prepare_tool_call(
+                item,
+                tool.get("spec", {}).get("parameters"),
+                display_labels=tool.get("display_labels", False),
+                approval_review=tool.get("approval_review", False),
+            )
+            if tool
+            else f'Error: Tool "{tool_function_name}" not found.'
+        )
+        blocked = _record_call(state, item)
+        if "provider_function" not in tool_call:
+            func["arguments"] = item["arguments"]
+        if error or blocked:
+            item["status"] = "failed"
+            return {"tool_call_id": tool_call_id, "content": error or blocked, "status": "failed"}
+        tool_function_params = json.loads(item["arguments"])
+    else:
+        tool_function_params = tool_args_raw
+    if isinstance(tool_function_params, str):
         try:
-            tool_function_params = ast.literal_eval(tool_args_raw)
+            tool_function_params = ast.literal_eval(tool_function_params)
         except Exception:
             try:
                 tool_function_params = json.loads(tool_args_raw)
@@ -1732,7 +1597,9 @@ async def execute_tool_call(
         if tool_function_name == "display_file":
             tool, error = resolve_display_file_tool(tool, tool_function_params)
             if error:
-                return {"tool_call_id": tool_call_id, "content": error}
+                if item is not None:
+                    item["status"] = "failed"
+                return {"tool_call_id": tool_call_id, "content": error, "status": "failed"}
         direct_tool = bool(tool.get("direct", False))
         metadata = extra_params.get("__metadata__")
         core_metadata = getattr(extra_params.get("__event_call__"), "core_metadata", None)
@@ -1741,6 +1608,11 @@ async def execute_tool_call(
 
         try:
             tool_function_params = filter_tool_arguments(tool, tool_function_params)
+            if not await _call_allowed(
+                item, tool, tool_function_params, tool_call_id, extra_params, state
+            ):
+                item["status"] = "failed"
+                return {"tool_call_id": tool_call_id, "content": _NOT_APPROVED, "status": "failed"}
 
             if direct_tool:
                 tool_result = await execute_direct_tool_call(
@@ -1856,11 +1728,586 @@ async def execute_tool_call(
         tool_result += "\n[image]" * len(tool_result_images)
         tool_result_images = []
 
+    status = "failed" if _is_tool_result_error(tool_result) else "completed"
+    if item is not None:
+        item["status"] = status
     return {
         "tool_call_id": tool_call_id,
         "content": tool_result,
+        "status": status,
         **({"images": tool_result_images} if tool_result_images else {}),
     }
+
+
+async def _call_allowed(
+    item: Optional[dict],
+    tool: dict,
+    params: dict,
+    call_id: Any,
+    extra_params: dict,
+    state: Optional[ToolCallState],
+) -> bool:
+    """Judge an agent's call by the chat's tool approval mode, as Core 0.13.1+ judges the child of a delegated task."""
+    if item is None or state is None or not state.review_approval or item["name"] in state.own_tools:
+        return True
+    from open_webui.utils.tool_permissions import requires_tool_approval
+
+    metadata = extra_params.get("__metadata__")
+    if not await requires_tool_approval(
+        {"messages": extra_params.get("__messages__") or []},
+        metadata if isinstance(metadata, dict) else {},
+        item,
+        tool,
+        params,
+    ):
+        return True
+    return await _approved_by_user(extra_params, call_id, item["name"], params)
+
+# --- inlined from src/owui_ext/shared/agent_requests.py (owui_ext.shared.agent_requests) ---
+APPROVE_ONCE_PARAM = "__approve_agent_tool_calls_once__"
+_INPUT_REQUESTS = frozenset({"confirmation", "input", "request:user_input", "request:elicitation"})
+
+
+def strip_tool_search_manifest(messages: list) -> list:
+    """Drop Core's Tool Search manifest from system messages, for requests sent without its tools."""
+    try:
+        from open_webui.utils.tool_search import strip_deferred_tools_manifest
+    except ImportError:
+        return messages
+
+    def without_manifest(message):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            return message
+        content = message.get("content")
+        if isinstance(content, str):
+            return {**message, "content": strip_deferred_tools_manifest(content)}
+        if isinstance(content, list):
+            return {
+                **message,
+                "content": [
+                    {**part, "text": strip_deferred_tools_manifest(part["text"])}
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    else part
+                    for part in content
+                ],
+            }
+        return message
+
+    return [without_manifest(message) for message in messages]
+
+
+TOOL_REQUEST_KEYS = (
+    "tools",
+    "tool_choice",
+    "functions",
+    "function_call",
+    "parallel_tool_calls",
+)
+
+
+def strip_tool_request_keys(body: dict) -> dict:
+    """Copy *body* without its tools, tool selection or Tool Search manifest."""
+    body = {key: value for key, value in body.items() if key not in TOOL_REQUEST_KEYS}
+    if isinstance(body.get("messages"), list):
+        body["messages"] = strip_tool_search_manifest(body["messages"])
+    return body
+
+
+def follow_core_session(event_call, core_metadata):
+    """Return *event_call* sending with the browser session Core holds in *core_metadata*.
+
+    Core 0.12.4+ points its chat metadata at the browser's new session when it
+    reconnects during an input request; nested agents send from their own copies.
+    Agents of a request send input requests in turn: Core 0.12.0+ times each from when it is sent, while the
+    browser shows one at a time.
+    """
+    if (
+        not callable(event_call)
+        or not isinstance(core_metadata, dict)
+        or isinstance(getattr(event_call, "core_metadata", None), dict)
+    ):
+        return event_call
+    lock = input_request_lock(event_call)
+
+    async def send(event_data):
+        data = event_data.get("data") if isinstance(event_data, dict) else None
+        # Core resumes an input request only when its data has no session_id.
+        if isinstance(data, dict) and "session_id" in data:
+            event_data = {**event_data, "data": {**data, "session_id": core_metadata.get("session_id")}}
+        return await event_call(event_data)
+
+    async def call(event_data):
+        if isinstance(event_data, dict) and event_data.get("type") in _INPUT_REQUESTS:
+            async with lock:
+                return await send(event_data)
+        return await send(event_data)
+
+    call.core_metadata = core_metadata
+    return call
+
+
+def core_chat_completion(extra_params: dict):
+    """Core's ``generate_chat_completion``, sent with the browser session Core holds now.
+
+    Core calls a direct connection model through the session in the request's metadata.
+    """
+    from open_webui.utils.chat import generate_chat_completion
+
+    core_metadata = getattr((extra_params or {}).get("__event_call__"), "core_metadata", None)
+    if not isinstance(core_metadata, dict):
+        return generate_chat_completion
+
+    async def send(request, form_data, *args, **kwargs):
+        state = getattr(request, "state", None)
+        for metadata in (form_data.get("metadata"), getattr(state, "metadata", None)):
+            if isinstance(metadata, dict) and "session_id" in metadata:
+                metadata["session_id"] = core_metadata.get("session_id")
+        return await generate_chat_completion(request, form_data, *args, **kwargs)
+
+    return send
+
+
+def own_metadata(metadata: dict) -> dict:
+    """Copy inherited metadata so a nested request can change it without touching its parent."""
+    import copy
+
+    owned = {}
+    for key, value in metadata.items():
+        # Core keeps live objects (tool callables, MCP clients) in metadata.
+        if key in ("tools", "mcp_clients"):
+            owned[key] = dict(value) if isinstance(value, dict) else value
+            continue
+        try:
+            owned[key] = copy.deepcopy(value)
+        except Exception:
+            owned[key] = value
+    return owned
+
+
+class AgentRequests:
+    """One agent loop's requests, assembled the way Core assembles a chat request.
+
+    ``prepare`` runs the inlet filters once with only the model's custom tools and no
+    skills in the request, then adds the skills, Tool Search with the tools the filters
+    left, and the tool prompts. Every
+    request of the loop starts from that form and runs the request filters. Body,
+    ``__metadata__`` and request state share one dict, and ``chat_request`` carries
+    that state through the filters and every send.
+    """
+
+    def __init__(
+        self,
+        tools_dict: dict,
+        extra_params: dict,
+        custom_tools: list = (),
+        always_loaded=(),
+    ):
+        metadata = extra_params.get("__metadata__")
+        metadata = own_metadata(metadata) if isinstance(metadata, dict) else {}
+        extra_params = {**extra_params, "__metadata__": metadata}
+        self.tools_dict = tools_dict
+        self.extra_params = extra_params
+        self.metadata = metadata
+        self.custom_tools = list(custom_tools)
+        self.always_loaded = tuple(always_loaded)
+        self.base: dict = {}
+        self.chat_request = None
+        self.tool_state = ToolCallState(
+            own_tools=frozenset(self.always_loaded),
+            review_approval=not extra_params.get(APPROVE_ONCE_PARAM),
+        )
+
+    @property
+    def tools_param(self) -> list | None:
+        return self.base.get("tools")
+
+    async def prepare(self, filter_pipeline, request, form_data: dict, skills: list[str] = ()) -> list:
+        """Run the loop's inlet filters once, add the parent's *skills*, and return the messages the loop starts from."""
+        import copy
+
+        self.chat_request = isolate_request_state(request, self.metadata)
+        request = self.chat_request
+        filter_params = self._filter_params()
+        self.metadata.update(own_metadata(form_data.get("metadata") or {}))
+        # Core's delegate_task accepts the sub-agent models of metadata["model"], the model the tools were loaded for.
+        if (filter_pipeline or {}).get("model"):
+            self.metadata.update(own_metadata({"model": filter_pipeline["model"]}))
+        form_data["metadata"] = self.metadata
+        if self.custom_tools:
+            form_data["tools"] = self.custom_tools
+        form_data = await apply_inlet_filters_if_enabled(
+            filter_pipeline, request, form_data, filter_params
+        )
+        form_data["metadata"] = self.metadata
+        form_data["messages"] = await add_skills(
+            form_data["messages"], list(skills), self.tools_dict, request, self.extra_params
+        )
+        self._sync_model_id(form_data)
+        filter_tools = form_data.get("tools") or []
+        (
+            self.tools_dict,
+            self.extra_params,
+            deferred,
+        ) = await apply_agent_tool_search(
+            self.tools_dict, self.extra_params, self.always_loaded, filter_tools
+        )
+        review = self.tool_state.review_approval and await model_reviews_approval(self.metadata)
+        if review:
+            self.tools_dict = add_approval_review(
+                self.tools_dict, self.always_loaded, self.metadata.get("tools") if deferred else None
+            )
+        if not deferred:
+            # As with Tool Search, leave out the tools the loop handles itself (a submission ends it).
+            listed = {
+                name: tool
+                for name, tool in self.tools_dict.items()
+                if name not in self.always_loaded
+            }
+            if listed:
+                self.metadata["tools"] = listed
+            else:
+                self.metadata.pop("tools", None)
+        tools = build_agent_tools_param(self.tools_dict, deferred, filter_tools)
+        if tools:
+            form_data["tools"] = tools
+        else:
+            form_data.pop("tools", None)
+        form_data = _append_tool_server_prompts(form_data, self.extra_params)
+        form_data["messages"] = await set_approval_policy(form_data["messages"], review)
+        self.base = {
+            key: value
+            for key, value in form_data.items()
+            if key not in ("messages", "metadata")
+        }
+        return copy.deepcopy(form_data["messages"])
+
+    async def next_form(
+        self,
+        filter_pipeline,
+        messages: list,
+        tools=...,
+    ) -> dict:
+        """Return the loop's next request; ``tools`` replaces the loop's tools when given."""
+        import copy
+
+        form_data = {
+            **copy.deepcopy(self.base),
+            "messages": messages,
+            "stream": False,
+            "metadata": self.metadata,
+        }
+        if tools is not ...:
+            choice = form_data.get("tool_choice")
+            parallel = form_data.get("parallel_tool_calls")
+            form_data = strip_tool_request_keys(form_data)
+            if tools:
+                form_data["tools"] = tools
+                if parallel is not None:
+                    form_data["parallel_tool_calls"] = parallel
+                names = {(tool.get("function") or {}).get("name") for tool in tools}
+                if isinstance(choice, str) or (
+                    isinstance(choice, dict)
+                    and ((choice.get("function") or {}).get("name") or choice.get("name"))
+                    in names
+                ):
+                    form_data["tool_choice"] = choice
+        form_data = await finalize_model_request(
+            filter_pipeline,
+            self.chat_request,
+            form_data,
+            self._filter_params(),
+        )
+        self._sync_model_id(form_data)
+        return form_data
+
+    def _filter_params(self) -> dict:
+        return {
+            **self.extra_params,
+            "__metadata__": self.metadata,
+        }
+
+    def _sync_model_id(self, form_data: dict) -> None:
+        if form_data.get("model"):
+            self.metadata["model_id"] = form_data["model"]
+
+# --- inlined from src/owui_ext/shared/async_utils.py (owui_ext.shared.async_utils) ---
+async def maybe_await(value):
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+# --- inlined from src/owui_ext/shared/builtin_tools.py (owui_ext.shared.builtin_tools) ---
+BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
+    "time": {"get_current_timestamp", "calculate_timestamp"},
+    "user_input": {"ask_user"},
+    "web": {"search_web", "fetch_url"},
+    "image": {"generate_image", "edit_image"},
+    "files": {
+        "list_chat_files",
+        "query_chat_files",
+        "grep_chat_files",
+        "view_file",
+        "display_file",
+    },
+    "knowledge": {
+        "list_knowledge",
+        "list_knowledge_bases",
+        "search_knowledge_bases",
+        "query_knowledge_bases",
+        "search_knowledge_files",
+        "query_knowledge_files",
+        "grep_knowledge_files",
+        "kb_exec",
+        "view_file",
+        "view_knowledge_file",
+        "display_file",
+    },
+    "chat": {"search_chats", "view_chat"},
+    "memory": {
+        "search_memories",
+        "list_memory_paths",
+        "read_memory_path",
+        "list_memories",
+        "update_memory",
+        "add_memory",
+        "replace_memory_content",
+        "delete_memory",
+    },
+    "notes": {
+        "search_notes",
+        "view_note",
+        "write_note",
+        "replace_note_content",
+    },
+    "channels": {
+        "search_channels",
+        "search_channel_messages",
+        "view_channel_thread",
+        "view_channel_message",
+    },
+    "code_interpreter": {"execute_code"},
+    "skills": {"view_skill", "read_skill_file", "grep_skill_files"},
+    "skills_write": {"update_skill_files", "create_skill"},
+    "tool_creation": {"create_tool"},
+    "subagents": {"delegate_task", "timer"},
+    "tasks": {"create_tasks", "update_task"},
+    "automations": {
+        "create_automation",
+        "update_automation",
+        "list_automations",
+        "toggle_automation",
+        "delete_automation",
+    },
+    "calendar": {
+        "search_calendar_events",
+        "create_calendar_event",
+        "update_calendar_event",
+        "delete_calendar_event",
+    },
+    "notifications": {"notify"},
+}
+
+
+VALVE_TO_CATEGORY: dict[str, str] = {
+    "ENABLE_TIME_TOOLS": "time",
+    "ENABLE_WEB_TOOLS": "web",
+    "ENABLE_IMAGE_TOOLS": "image",
+    "ENABLE_FILE_TOOLS": "files",
+    "ENABLE_KNOWLEDGE_TOOLS": "knowledge",
+    "ENABLE_CHAT_TOOLS": "chat",
+    "ENABLE_MEMORY_TOOLS": "memory",
+    "ENABLE_NOTES_TOOLS": "notes",
+    "ENABLE_CHANNELS_TOOLS": "channels",
+    "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
+    "ENABLE_SKILLS_TOOLS": "skills",
+    "ENABLE_SKILLS_WRITE_TOOLS": "skills_write",
+    "ENABLE_TOOL_CREATION_TOOLS": "tool_creation",
+    "ENABLE_SUBAGENT_TOOLS": "subagents",
+    "ENABLE_TASK_TOOLS": "tasks",
+    "ENABLE_AUTOMATION_TOOLS": "automations",
+    "ENABLE_CALENDAR_TOOLS": "calendar",
+    "ENABLE_NOTIFICATION_TOOLS": "notifications",
+}
+
+# --- inlined from src/owui_ext/shared/completion_response.py (owui_ext.shared.completion_response) ---
+import json
+from typing import Any, Optional
+from starlette.responses import JSONResponse, Response
+_RESPONSE_BODY_PREVIEW_CHARS = 1024
+
+
+def _truncate_preview(text: str) -> str:
+    if len(text) > _RESPONSE_BODY_PREVIEW_CHARS:
+        return text[:_RESPONSE_BODY_PREVIEW_CHARS] + "...[truncated]"
+    return text
+
+
+def _decode_response_body(response: Response) -> str:
+    body = getattr(response, "body", None)
+    if body is None:
+        return ""
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            text = bytes(body).decode("utf-8", errors="replace")
+        except Exception:
+            text = repr(body)
+    else:
+        text = str(body)
+    return _truncate_preview(text.strip())
+
+
+def _extract_json_response_error(response: JSONResponse) -> str:
+    status = getattr(response, "status_code", "unknown")
+    try:
+        error_data = json.loads(bytes(response.body).decode("utf-8"))
+    except Exception:
+        return f"API error (status {status}): Failed to parse response"
+    if isinstance(error_data, dict):
+        error_field = error_data.get("error")
+        if isinstance(error_field, dict):
+            msg = error_field.get("message")
+            if isinstance(msg, str) and msg:
+                return f"API error: {_truncate_preview(msg)}"
+            return f"API error: {_truncate_preview(str(error_data))}"
+        if isinstance(error_field, str) and error_field:
+            return f"API error: {_truncate_preview(error_field)}"
+        msg = error_data.get("message")
+        if isinstance(msg, str) and msg:
+            return f"API error: {_truncate_preview(msg)}"
+        return f"API error: {_truncate_preview(str(error_data))}"
+    return f"API error: {_truncate_preview(str(error_data))}"
+
+
+def format_chat_completion_error(response: Any) -> Optional[str]:
+    """Classify a ``generate_chat_completion`` response.
+
+    Returns:
+        ``None`` when ``response`` is a ``dict`` (success path); the
+        caller should proceed to read ``response['choices']``.
+
+        ``str`` describing the upstream failure for any other shape.
+        ``JSONResponse`` bodies are unwrapped to surface the provider's
+        error message; other ``Response`` subclasses (notably
+        ``PlainTextResponse`` returned by Open WebUI core when the
+        provider replies with non-JSON 400+ content) are reported with
+        their status code and a truncated body preview so the caller
+        can show the real cause to the parent loop.
+    """
+    if isinstance(response, dict):
+        return None
+    if isinstance(response, JSONResponse):
+        return _extract_json_response_error(response)
+    if isinstance(response, Response):
+        status = getattr(response, "status_code", "unknown")
+        body_text = _decode_response_body(response)
+        type_name = type(response).__name__
+        if body_text:
+            return f"API error (status {status}, {type_name}): {body_text}"
+        return f"API error (status {status}, {type_name}): empty body"
+    return f"Unexpected response type: {type(response).__name__}"
+
+# --- inlined from src/owui_ext/shared/model_features.py (owui_ext.shared.model_features) ---
+from typing import Optional
+def _attached_knowledge_types(
+    model: Optional[dict],
+    metadata: Optional[dict] = None,
+) -> set[str]:
+    if not isinstance(model, dict):
+        model = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    model_meta = model.get("info", {}).get("meta", {})
+    knowledge_items = list(model_meta.get("knowledge") or [])
+    knowledge_items.extend(metadata.get("folder_knowledge") or [])
+    try:
+        from open_webui.utils.tools import is_file_context_enabled
+    except ImportError:
+        file_context = (model_meta.get("capabilities") or {}).get("file_context", True)
+    else:
+        file_context = is_file_context_enabled(model, metadata)
+    if not file_context:
+        knowledge_items.extend(
+            item
+            for item in metadata.get("files") or []
+            if isinstance(item, dict)
+            and item.get("type") in ("collection", "note")
+        )
+
+    return {
+        item["type"]
+        for item in knowledge_items
+        if isinstance(item, dict)
+        and isinstance(item.get("type"), str)
+        and item.get("id")
+    }
+
+
+def model_has_note_knowledge(
+    model: Optional[dict],
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Return True if Core can expose view_note for attached knowledge."""
+    return "note" in _attached_knowledge_types(model, metadata)
+
+
+def model_has_file_knowledge(
+    model: Optional[dict],
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Return True if Core can expose view_file for attached knowledge."""
+    return not _attached_knowledge_types(model, metadata).isdisjoint(
+        {"file", "collection"}
+    )
+
+
+def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
+    """Return True if model-level builtin knowledge tools are enabled."""
+    if not isinstance(model, dict):
+        return True
+    builtin_tools = model.get("info", {}).get("meta", {}).get("builtinTools", {})
+    if not isinstance(builtin_tools, dict):
+        return True
+    return bool(builtin_tools.get("knowledge", True))
+
+# --- inlined from src/owui_ext/shared/notifications.py (owui_ext.shared.notifications) ---
+import logging
+from typing import Callable, Optional
+_notifications_log = logging.getLogger("owui_ext.shared.notifications")
+
+
+async def emit_notification(
+    event_emitter: Optional[Callable], *, level: str, content: str
+) -> None:
+    """Emit a frontend notification toast when the current chat supports it."""
+    if not callable(event_emitter):
+        return
+    if not isinstance(content, str) or not content.strip():
+        return
+    try:
+        await event_emitter(
+            {
+                "type": "notification",
+                "data": {"type": level, "content": content.strip()},
+            }
+        )
+    except Exception as exc:
+        _notifications_log.debug(
+            f"Error emitting notification ({level}): {exc}"
+        )
+
+# --- inlined from src/owui_ext/shared/status_text.py (owui_ext.shared.status_text) ---
+import unicodedata
+def truncate_status(description: str, limit: int) -> str:
+    """Cut ``description`` to ``limit`` display columns (full-width characters count as 2); 0 disables."""
+    if limit <= 0:
+        return description
+    width = 0
+    for index, char in enumerate(description):
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        if width > limit:
+            return description[:index] + "..."
+    return description
 
 # --- inlined from src/owui_ext/shared/mcp_tools.py (owui_ext.shared.mcp_tools) ---
 import asyncio
@@ -2365,6 +2812,26 @@ def extract_direct_tool_server_prompts(direct_tools: Mapping[str, dict]) -> list
     return prompts
 
 
+def spec_without_call_metadata(tool: dict) -> dict:
+    """Copy *tool*'s spec without the arguments Core 0.13.1+ adds to the chat's tools for its own use."""
+    spec = dict(tool["spec"])
+    added = [
+        name
+        for name, marker in (("__labels__", "display_labels"), ("__approval__", "approval_review"))
+        if tool.get(marker)
+    ]
+    parameters = spec.get("parameters")
+    if added and isinstance(parameters, dict):
+        spec["parameters"] = {
+            **parameters,
+            "properties": {
+                key: value for key, value in (parameters.get("properties") or {}).items() if key not in added
+            },
+            "required": [key for key in parameters.get("required") or [] if key not in added],
+        }
+    return spec
+
+
 async def resolve_direct_tool_servers_from_request_and_metadata(
     *,
     request: Optional[Request],
@@ -2391,7 +2858,7 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
                 continue
             settings = connection_settings(server)
             approved_specs = [
-                dict(tool["spec"])
+                spec_without_call_metadata(tool)
                 for tool in parent_tools.values()
                 if isinstance(tool, dict)
                 and tool.get("direct") is True
@@ -2626,20 +3093,28 @@ async def build_tools_dict(
             extra_params["__metadata__"] = metadata
             extra_metadata = metadata
 
-    is_admin_terminal = True
+    is_terminal_connection = True
     if terminal_id and terminal_context_enabled:
         try:
-            from open_webui.models.config import Config
+            from open_webui.utils.tether import get_terminal_connections
         except ImportError:
-            pass
+            # Core before 0.13.1 serves only the admin's terminal connections.
+            try:
+                from open_webui.models.config import Config
+            except ImportError:
+                pass
+            else:
+                terminal_connections = await maybe_await(
+                    Config.get("terminal_server.connections", None)
+                )
+                if terminal_connections is not None:
+                    is_terminal_connection = terminal_id in {
+                        connection.get("id") for connection in terminal_connections
+                    }
         else:
-            terminal_connections = await maybe_await(
-                Config.get("terminal_server.connections", None)
-            )
-            if terminal_connections is not None:
-                is_admin_terminal = terminal_id in {
-                    connection.get("id") for connection in terminal_connections
-                }
+            is_terminal_connection = terminal_id in {
+                connection.get("id") for connection in await get_terminal_connections(user)
+            }
 
     if resolved_direct_tool_servers is None:
         direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
@@ -2738,7 +3213,7 @@ async def build_tools_dict(
                     content=f"Could not load MCP tools: {e}",
                 )
 
-        if terminal_id and terminal_context_enabled and is_admin_terminal:
+        if terminal_id and terminal_context_enabled and is_terminal_connection:
             if get_terminal_tools is None:
                 if debug:
                     log.info("get_terminal_tools is unavailable in this Open WebUI version")
@@ -4475,7 +4950,7 @@ def _parse_agent_status(agent_name: str, description: str) -> Optional[dict]:
             return None
         result = _truncate(returned_match.group(2), 2000)
         return {"kind": "result", "name": name, "result": result}
-    if "Max iterations" in rest and "reached" in rest:
+    if ("Max iterations" in rest and "reached" in rest) or rest.startswith("Tool use stopped"):
         return {"kind": "info", "text": rest}
     parsed_final = safe_json_loads(rest, expect_keys=("draft", "key_feedback"))
     if isinstance(parsed_final, dict) and (
@@ -6033,8 +6508,7 @@ async def run_agent_loop(
             if not isinstance(message, Mapping):
                 return f"API returned malformed response: message is {type(message).__name__}, not a mapping"
 
-            content = message.get("content", "")
-            tool_calls = message.get("tool_calls", [])
+            content, tool_calls = take_tool_calls(choice, form_data, agent_requests.tool_state)
 
             # Emit status with LLM response content
             if event_emitter and content:
@@ -6204,6 +6678,8 @@ async def run_agent_loop(
                         "__request__": tool_request,
                     },
                     event_emitter=event_emitter,
+                    state=agent_requests.tool_state,
+                    stop_after=frozenset(submission_tool_names or ()),
                 )
 
                 # Emit status with tool result preview
@@ -6229,7 +6705,11 @@ async def run_agent_loop(
                     }
                 )
 
-                if submission_tool_names and tool_name in submission_tool_names:
+                if (
+                    submission_tool_names
+                    and submission_tool_names.intersection(call_targets(tool_call, tools_dict))
+                    and not agent_requests.tool_state.round_error
+                ):
                     submission_tool_fired = True
                     break
 
@@ -6240,14 +6720,20 @@ async def run_agent_loop(
                 return content or ""
 
             append_tool_result_images(current_messages, tool_images)
+            if agent_requests.tool_state.stop_reason:
+                break
 
-    # Max iterations reached
+    stopped = bool(agent_requests.tool_state.stop_reason)
     if event_emitter:
         await event_emitter(
             {
                 "type": "status",
                 "data": {
-                    "description": f"[{agent_name}] Max iterations ({max_iterations}) reached, finalizing...",
+                    "description": (
+                        f"[{agent_name}] Tool use stopped, finalizing..."
+                        if stopped
+                        else f"[{agent_name}] Max iterations ({max_iterations}) reached, finalizing..."
+                    ),
                     "done": False,
                 },
             }
@@ -6290,15 +6776,16 @@ async def run_agent_loop(
     if final_tools_param:
         names = ", ".join(sorted(f"``{n}``" for n in submission_tool_names or ()))
         final_user_content = (
-            "Maximum tool iterations reached. Call "
-            f"{names} NOW with your complete payload to submit your final "
+            ("Tool use has stopped for this response." if stopped else "Maximum tool iterations reached.")
+            + f" Call {names} NOW with your complete payload to submit your final "
             "response. No other tools are available — submission is your "
             "only remaining action. Do not emit any additional text."
         )
     else:
-        final_user_content = (
+        final_user_content = final_answer_instruction(
+            agent_requests.tool_state,
             "Maximum tool iterations reached. Please provide your final "
-            "answer based on the information gathered so far."
+            "answer based on the information gathered so far.",
         )
 
     final_messages = list(current_messages)
@@ -6312,7 +6799,7 @@ async def run_agent_loop(
     else:
         final_messages.append({"role": "user", "content": final_user_content})
 
-    agent_requests.metadata["sub_agent_iteration"] = max_iterations + 1
+    agent_requests.metadata["sub_agent_iteration"] = iteration + 1
     form_data = await agent_requests.next_form(
         filter_pipeline,
         copy.deepcopy(final_messages),
@@ -6336,8 +6823,11 @@ async def run_agent_loop(
                 if isinstance(choice, Mapping):
                     message = choice.get("message", {})
                     if isinstance(message, Mapping):
-                        final_content = message.get("content", "") or ""
-                        final_tool_calls = message.get("tool_calls", []) or []
+                        final_content, final_tool_calls = take_tool_calls(
+                            choice, form_data, agent_requests.tool_state
+                        )
+                        final_content = final_content or ""
+                        final_tool_calls = final_tool_calls or []
                         # Process a submission if the agent took the hint
                         # and called submit_*. This is the whole point of
                         # exposing the submission tools here — without
@@ -6400,6 +6890,7 @@ async def run_agent_loop(
                                             "__request__": tool_request,
                                         },
                                         event_emitter=event_emitter,
+                                        state=agent_requests.tool_state,
                                     )
                                 except Exception as exec_exc:
                                     log.warning(
@@ -6416,6 +6907,8 @@ async def run_agent_loop(
     except Exception as e:
         log.exception(f"Error getting final review agent response: {e}")
 
+    if stopped:
+        return "Review agent stopped using tools without providing a final response."
     return "Review agent reached maximum iterations without providing a final response."
 
 
@@ -6603,7 +7096,7 @@ class Tools:
         )
         ENABLE_SKILLS_TOOLS: bool = Field(
             default=True,
-            description="Pass the parent conversation's skills to review agents and allow the skill reading tools (view_skill, read_skill_file, grep_skill_files). Each agent gets the parent's <skill> blocks and <available_skills> list. An agent whose model has no skill tools gets the chat's skills inlined the way Open WebUI does for such a model instead (Open WebUI 0.12.1+; older versions pass only the <skill> blocks). When off, agents get no skills or skill tools.",
+            description="Pass the parent conversation's skills to review agents and allow the skill reading tools (view_skill, read_skill_file, grep_skill_files). Each agent gets the parent's <skill> blocks and <available_skills> list; on Open WebUI 0.13.1+, when the parent's model has skill tools and so got only the list, an agent whose model has skill tools gets the list and the skills the chat activated as tool results instead, as Open WebUI gives them to a delegated task. An agent whose model has no skill tools gets the chat's skills inlined the way Open WebUI does for such a model instead (Open WebUI 0.12.1+; older versions pass only the <skill> blocks). When off, agents get no skills or skill tools.",
         )
         ENABLE_SKILLS_WRITE_TOOLS: bool = Field(
             default=False,
@@ -6809,6 +7302,16 @@ CRITICAL RULES:
                 "You excel at considering implementation challenges and stakeholder perspectives."
             ),
             description="Persona 3 description (drives the agent's voice and priorities).",
+        )
+        APPROVE_AGENT_TOOL_CALLS_ONCE: bool = Field(
+            default=False,
+            description=(
+                "Let approving this tool's call also approve the tool calls its agents make (Open WebUI 0.13.1+). "
+                "Off: each of their tool calls follows the chat's tool permissions, so Ask asks about each and Auto checks each. "
+                "On: once this tool's call is approved, or passes the Auto check without asking, its agents run their tool calls without asking; "
+                "the next call of this tool and the chat's other tool calls are still checked. "
+                "Stays on for your later chats until you turn it off."
+            ),
         )
         pass
 
@@ -7183,6 +7686,7 @@ CRITICAL RULES:
             "__oauth_token__": __oauth_token__,
             "__files__": metadata.get("files") or [],
             "__skill_ids__": extract_skill_ids(__messages__),
+            APPROVE_ONCE_PARAM: user_valves.APPROVE_AGENT_TOOL_CALLS_ONCE,
         }
 
         # Build tool IDs

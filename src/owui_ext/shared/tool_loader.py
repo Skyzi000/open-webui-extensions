@@ -140,20 +140,28 @@ async def build_tools_dict(
             extra_params["__metadata__"] = metadata
             extra_metadata = metadata
 
-    is_admin_terminal = True
+    is_terminal_connection = True
     if terminal_id and terminal_context_enabled:
         try:
-            from open_webui.models.config import Config
+            from open_webui.utils.tether import get_terminal_connections
         except ImportError:
-            pass
+            # Core before 0.13.1 serves only the admin's terminal connections.
+            try:
+                from open_webui.models.config import Config
+            except ImportError:
+                pass
+            else:
+                terminal_connections = await maybe_await(
+                    Config.get("terminal_server.connections", None)
+                )
+                if terminal_connections is not None:
+                    is_terminal_connection = terminal_id in {
+                        connection.get("id") for connection in terminal_connections
+                    }
         else:
-            terminal_connections = await maybe_await(
-                Config.get("terminal_server.connections", None)
-            )
-            if terminal_connections is not None:
-                is_admin_terminal = terminal_id in {
-                    connection.get("id") for connection in terminal_connections
-                }
+            is_terminal_connection = terminal_id in {
+                connection.get("id") for connection in await get_terminal_connections(user)
+            }
 
     if resolved_direct_tool_servers is None:
         direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
@@ -252,7 +260,7 @@ async def build_tools_dict(
                     content=f"Could not load MCP tools: {e}",
                 )
 
-        if terminal_id and terminal_context_enabled and is_admin_terminal:
+        if terminal_id and terminal_context_enabled and is_terminal_connection:
             if get_terminal_tools is None:
                 if debug:
                     log.info("get_terminal_tools is unavailable in this Open WebUI version")

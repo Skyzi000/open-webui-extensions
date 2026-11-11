@@ -15,7 +15,13 @@ def _attached_knowledge_types(
     model_meta = model.get("info", {}).get("meta", {})
     knowledge_items = list(model_meta.get("knowledge") or [])
     knowledge_items.extend(metadata.get("folder_knowledge") or [])
-    if not (model_meta.get("capabilities") or {}).get("file_context", True):
+    try:
+        from open_webui.utils.tools import is_file_context_enabled
+    except ImportError:
+        file_context = (model_meta.get("capabilities") or {}).get("file_context", True)
+    else:
+        file_context = is_file_context_enabled(model, metadata)
+    if not file_context:
         knowledge_items.extend(
             item
             for item in metadata.get("files") or []

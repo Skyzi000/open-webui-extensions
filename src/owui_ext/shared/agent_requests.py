@@ -11,6 +11,16 @@ from owui_ext.shared.prompt_utils import (
     build_agent_tools_param,
 )
 from owui_ext.shared.skills import add_skills
+from owui_ext.shared.tool_execution import (
+    ToolCallState,
+    add_approval_review,
+    input_request_lock,
+    model_reviews_approval,
+    set_approval_policy,
+)
+
+APPROVE_ONCE_PARAM = "__approve_agent_tool_calls_once__"
+_INPUT_REQUESTS = frozenset({"confirmation", "input", "request:user_input", "request:elicitation"})
 
 
 def strip_tool_search_manifest(messages: list) -> list:
@@ -63,6 +73,8 @@ def follow_core_session(event_call, core_metadata):
 
     Core 0.12.4+ points its chat metadata at the browser's new session when it
     reconnects during an input request; nested agents send from their own copies.
+    Agents of a request send input requests in turn: Core 0.12.0+ times each from when it is sent, while the
+    browser shows one at a time.
     """
     if (
         not callable(event_call)
@@ -70,13 +82,20 @@ def follow_core_session(event_call, core_metadata):
         or isinstance(getattr(event_call, "core_metadata", None), dict)
     ):
         return event_call
+    lock = input_request_lock(event_call)
 
-    async def call(event_data):
+    async def send(event_data):
         data = event_data.get("data") if isinstance(event_data, dict) else None
         # Core resumes an input request only when its data has no session_id.
         if isinstance(data, dict) and "session_id" in data:
             event_data = {**event_data, "data": {**data, "session_id": core_metadata.get("session_id")}}
         return await event_call(event_data)
+
+    async def call(event_data):
+        if isinstance(event_data, dict) and event_data.get("type") in _INPUT_REQUESTS:
+            async with lock:
+                return await send(event_data)
+        return await send(event_data)
 
     call.core_metadata = core_metadata
     return call
@@ -148,6 +167,10 @@ class AgentRequests:
         self.always_loaded = tuple(always_loaded)
         self.base: dict = {}
         self.chat_request = None
+        self.tool_state = ToolCallState(
+            own_tools=frozenset(self.always_loaded),
+            review_approval=not extra_params.get(APPROVE_ONCE_PARAM),
+        )
 
     @property
     def tools_param(self) -> list | None:
@@ -183,6 +206,11 @@ class AgentRequests:
         ) = await apply_agent_tool_search(
             self.tools_dict, self.extra_params, self.always_loaded, filter_tools
         )
+        review = self.tool_state.review_approval and await model_reviews_approval(self.metadata)
+        if review:
+            self.tools_dict = add_approval_review(
+                self.tools_dict, self.always_loaded, self.metadata.get("tools") if deferred else None
+            )
         if not deferred:
             # As with Tool Search, leave out the tools the loop handles itself (a submission ends it).
             listed = {
@@ -200,6 +228,7 @@ class AgentRequests:
         else:
             form_data.pop("tools", None)
         form_data = _append_tool_server_prompts(form_data, self.extra_params)
+        form_data["messages"] = await set_approval_policy(form_data["messages"], review)
         self.base = {
             key: value
             for key, value in form_data.items()

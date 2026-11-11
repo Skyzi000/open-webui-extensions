@@ -136,9 +136,15 @@ async def apply_agent_tool_search(
     if not isinstance(metadata, dict):
         metadata = {}
     form_data: dict = {"messages": []}
-    if "extra_tools" in inspect.signature(apply_tool_search).parameters:
+    parameters = inspect.signature(apply_tool_search).parameters
+    if "extra_tools" in parameters:
+        # Core 0.13.1+ binds the request and user its embeddings search needs.
         deferred = await apply_tool_search(
-            form_data, metadata, loop_tools, list(extra_tools)
+            form_data,
+            metadata,
+            loop_tools,
+            list(extra_tools),
+            **({"extra_params": extra_params} if "extra_params" in parameters else {}),
         )
     elif any(
         (tool.get("function") or tool).get("name") == SEARCH_TOOL_NAME

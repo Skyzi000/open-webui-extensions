@@ -54,6 +54,9 @@ def install_open_webui_tool_stubs(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "open_webui.utils.tools", tools_module)
     monkeypatch.setattr(utils_package, "tools", tools_module, raising=False)
+    # Real modules another test imported would otherwise switch these tests to the Core 0.13.1+ paths.
+    for core_0131_module in ("tool_calling", "tool_permissions", "tether"):
+        monkeypatch.setitem(sys.modules, f"open_webui.utils.{core_0131_module}", None)
 
     # Unit tests in tests/tools/ should not depend on a real Open WebUI DB or
     # access-control configuration. Real helper-path compatibility is checked by

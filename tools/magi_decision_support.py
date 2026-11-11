@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.24
+version: 0.2.25
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -413,9 +413,15 @@ async def apply_agent_tool_search(
     if not isinstance(metadata, dict):
         metadata = {}
     form_data: dict = {"messages": []}
-    if "extra_tools" in inspect.signature(apply_tool_search).parameters:
+    parameters = inspect.signature(apply_tool_search).parameters
+    if "extra_tools" in parameters:
+        # Core 0.13.1+ binds the request and user its embeddings search needs.
         deferred = await apply_tool_search(
-            form_data, metadata, loop_tools, list(extra_tools)
+            form_data,
+            metadata,
+            loop_tools,
+            list(extra_tools),
+            **({"extra_params": extra_params} if "extra_params" in parameters else {}),
         )
     elif any(
         (tool.get("function") or tool).get("name") == SEARCH_TOOL_NAME
@@ -515,12 +521,32 @@ def _extract_from_system_messages(
     return results
 
 
-def extract_skill_manifest(messages: Optional[list]) -> str:
-    """Extract the ``<available_skills>`` manifest from the parent
-    conversation's system messages.
+def _hidden_tool_results(messages: Optional[list], name: str) -> list[str]:
+    """Return the text results of the *name* calls in *messages*, which Core 0.13.1+ adds as hidden tool history."""
+    call_ids = {
+        call.get("id")
+        for message in messages or []
+        if isinstance(message, dict) and message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+        if isinstance(call, dict) and (call.get("function") or {}).get("name") == name
+    }
+    return [
+        message["content"]
+        for message in messages or []
+        if isinstance(message, dict)
+        and message.get("role") == "tool"
+        and message.get("tool_call_id") in call_ids
+        and isinstance(message.get("content"), str)
+    ]
 
-    Core can list model-attached, accessible workspace, and terminal skills.
-    Inline skills may also appear as ``<skill>`` tags
+
+def extract_skill_manifest(messages: Optional[list]) -> str:
+    """Extract the ``<available_skills>`` manifest from the parent conversation.
+
+    Core lists it in a system message, or for a model with skill tools (0.13.1+)
+    as the result of a hidden ``list_available_skills`` call; the latest one is
+    current. Core can list model-attached, accessible workspace, and terminal
+    skills. Inline skills may also appear as ``<skill>`` tags
     (see :func:`extract_user_skill_tags`).
 
     Args:
@@ -530,7 +556,14 @@ def extract_skill_manifest(messages: Optional[list]) -> str:
         The manifest XML string, or empty string if not found.
     """
     results = _extract_from_system_messages(messages, _find_manifest_in_text)
-    return results[0] if results else ""
+    if results:
+        return results[0]
+    listed = [
+        manifest
+        for manifest in map(_find_manifest_in_text, _hidden_tool_results(messages, "list_available_skills"))
+        if manifest
+    ]
+    return listed[-1] if listed else ""
 
 
 def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
@@ -546,15 +579,22 @@ def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
     return _extract_from_system_messages(messages, _find_skill_tags_in_text)
 
 
-def extract_skill_ids(messages: Optional[list]) -> list[str]:
-    """Return the IDs of the skills the parent lists or inlines, as Core's ``__skill_ids__``."""
-    ids = set(re.findall(r"<id>(.*?)</id>", extract_skill_manifest(messages)))
-    for tag in extract_user_skill_tags(messages):
-        match = re.match(r'<skill (?:id="([^"]+)"|name="([^"]*)")', tag)
+def _skill_ids_in(skills: list[str]) -> set[str]:
+    ids = set()
+    for skill in skills:
+        if skill.startswith(_SKILLS_MANIFEST_START):
+            ids.update(re.findall(r"<id>(.*?)</id>", skill))
+            continue
+        match = re.match(r'<skill (?:id="([^"]+)"|name="([^"]*)")', skill)
         if match:
             # Core inlines terminal skills without an id attribute.
             ids.add(match.group(1) or f'terminal:{quote(match.group(2), safe="")}')
-    return sorted(ids)
+    return ids
+
+
+def extract_skill_ids(messages: Optional[list]) -> list[str]:
+    """Return the IDs of the skills the parent lists or inlines, as Core's ``__skill_ids__``."""
+    return sorted(_skill_ids_in([extract_skill_manifest(messages), *extract_user_skill_tags(messages)]))
 
 
 async def _core_inline_skill_tags(
@@ -645,11 +685,19 @@ async def add_skills(
 
     A child without Core's skill reading tools gets the chat's skills (``metadata["skill_ids"]``) as Core inlines
     them for a model without skill tools. When Core cannot render them, it keeps the parent's skills and drops
-    the ``<available_skills>`` list unless a ``view_skill`` tool can load it.
+    the ``<available_skills>`` list unless a ``view_skill`` tool can load it. A child with them on Core 0.13.1+,
+    of a parent Core gave the skills only as a list, gets what Core gives the child of a delegated task: the list
+    as a hidden tool result after the messages, and the skills the chat activated loaded by hidden ``view_skill``
+    calls. A parent's inlined ``<skill>`` blocks reach the child as they are.
     """
     if not skills:
         return messages
     tools_dict = tools_dict or {}
+    view_skill = tools_dict.get("view_skill") or {}
+    if view_skill.get("type") == "builtin" and all(skill.startswith(_SKILLS_MANIFEST_START) for skill in skills):
+        hidden = await _add_hidden_skills(messages, skills, view_skill, request, extra_params)
+        if hidden is not None:
+            return hidden
     if not any(tools_dict.get(name, {}).get("type") == "builtin" for name in _SKILL_READ_TOOLS):
         skill_ids = (extra_params.get("__metadata__") or {}).get("skill_ids") or []
         rendered = await _core_inline_skill_tags(skill_ids, request, extra_params)
@@ -662,6 +710,32 @@ async def add_skills(
     for skill in skills:
         messages = add_or_update_system_message(skill, messages, append=True)
     return messages
+
+
+async def _add_hidden_skills(
+    messages: list, skills: list[str], view_skill: dict, request: Request, extra_params: dict
+) -> Optional[list]:
+    try:
+        from open_webui.models.config import Config
+        from open_webui.utils.middleware import hidden_tool_result, preload_skills
+        from open_webui.utils.misc import convert_output_to_messages
+        from open_webui.utils.tools import get_updated_tool_function
+    except ImportError:
+        return None
+    metadata = extra_params.get("__metadata__") or {}
+    # view_skill records the version it loaded in the chat_context its read_skill_file reads later.
+    bound = {"__metadata__": metadata, **({"__request__": request} if request is not None else {})}
+    view_skill = {**view_skill, "callable": await get_updated_tool_function(view_skill["callable"], bound)}
+    mentioned = set((metadata.get("chat_context") or {}).get("mentioned_skill_ids") or [])
+    activated = (
+        mentioned
+        if await Config.get("skills.lazy_loading.enable", False)
+        else set(metadata.get("skill_ids") or []) | mentioned
+    )
+    manifest = next((skill for skill in skills if skill.startswith(_SKILLS_MANIFEST_START)), "")
+    output = hidden_tool_result("list_available_skills", manifest) if manifest else []
+    output += await preload_skills(messages, activated & _skill_ids_in(skills), view_skill)
+    return [*messages, *convert_output_to_messages(output, raw=True)] if output else messages
 
 
 def isolate_chat_context(metadata: Optional[dict]) -> dict:
@@ -733,7 +807,972 @@ async def register_view_skill(
     except Exception as e:
         _skills_log.warning(f"Failed to register view_skill: {e}")
 
+# --- inlined from src/owui_ext/shared/tool_execution.py (owui_ext.shared.tool_execution) ---
+import ast
+import asyncio
+import json
+import logging
+import re
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+from fastapi import Request
+_tool_execution_log = logging.getLogger("owui_ext.shared.tool_execution")
+_core_process_tool_result = None
+_INCOMPLETE_FINISH_REASONS = {"length", "content_filter", "incomplete", "failed"}
+_NOT_APPROVED = "Error: tool call was not approved."
+
+
+@dataclass
+class ToolCallState:
+    """One agent loop's tool calls, judged the way Core 0.13.1+ judges a chat's.
+
+    ``own_tools`` are the loop's own tools, which need no approval.
+    ``review_approval`` is False when approving the agent tool's call also approved its agents' calls.
+    """
+
+    own_tools: frozenset = frozenset()
+    review_approval: bool = True
+    history: list = field(default_factory=list)
+    round_error: Optional[str] = None
+    stop_reason: Optional[str] = None
+
+
+def _core_tool_calling():
+    try:
+        from open_webui.utils import tool_calling
+    except ImportError:
+        return None
+    return tool_calling
+
+
+def _is_tool_result_error(content: Any) -> bool:
+    try:
+        from open_webui.utils.middleware import _is_tool_result_error as is_error
+    except ImportError:
+        return False
+    return is_error(content)
+
+
+def _well_formed_calls(tool_calls: Any) -> bool:
+    return isinstance(tool_calls, list) and all(
+        isinstance(call, dict) and isinstance(call.get("function"), dict) for call in tool_calls
+    )
+
+
+def take_tool_calls(choice: dict, form_data: dict, state: Optional[ToolCallState]) -> tuple[Any, Any]:
+    """Return a response's text and tool calls the way Core's tool loop takes them.
+
+    Core recovers calls a model wrote as its whole text, splits arguments holding several
+    objects into calls, and executes none of the calls of a response cut off before its end.
+    """
+    message = choice.get("message", {})
+    content = message.get("content", "")
+    tool_calls = message.get("tool_calls", [])
+    calling = _core_tool_calling()
+    if calling is None or state is None:
+        return content, tool_calls
+    incomplete = choice.get("finish_reason") in _INCOMPLETE_FINISH_REASONS
+    state.round_error = calling.INCOMPLETE_CALL_ERROR if incomplete and tool_calls else None
+    if tool_calls:
+        if incomplete or not _well_formed_calls(tool_calls):
+            return content, tool_calls
+        return content, calling.split_tool_calls(tool_calls)
+    tool_choice = form_data.get("tool_choice")
+    if incomplete or tool_choice == "none" or form_data.get("response_format") not in (None, {"type": "text"}):
+        return content, tool_calls
+    allowed = {
+        spec.get("function", spec).get("name")
+        for spec in form_data.get("tools") or []
+        if isinstance(spec, dict) and isinstance(spec.get("function", spec), dict)
+    }
+    if isinstance(tool_choice, dict):
+        chosen = tool_choice.get("function") or tool_choice
+        allowed &= {chosen.get("name") if isinstance(chosen, dict) else None}
+    recovered = calling.recover_tool_calls(content, allowed)
+    return ("", recovered) if recovered else (content, tool_calls)
+
+
+def final_answer_instruction(state: Optional[ToolCallState], at_iteration_limit: str) -> str:
+    """The instruction for a loop's last request: Core's when its tool loop stopped tool use, else *at_iteration_limit*."""
+    if state is None or not state.stop_reason:
+        return at_iteration_limit
+    from open_webui.utils.tool_calling import FINAL_ANSWER_PROMPT
+
+    return FINAL_ANSWER_PROMPT
+
+
+async def model_reviews_approval(metadata: Optional[dict]) -> bool:
+    """Whether Core asks the model itself if each call needs approval (Auto mode without a review engine)."""
+    try:
+        from open_webui.models.config import Config
+        from open_webui.utils.tool_calling import add_tool_call_metadata  # noqa: F401
+    except ImportError:
+        return False
+    if ((metadata or {}).get("params") or {}).get("tool_approval_mode") != "auto":
+        return False
+    settings = await Config.get_many(
+        "chat.tool_permissions.enable",
+        "chat.tool_permissions.auto.enable",
+        "chat.tool_permissions.auto.engine",
+    )
+    return bool(
+        settings.get("chat.tool_permissions.enable")
+        and settings.get("chat.tool_permissions.auto.enable")
+        and settings.get("chat.tool_permissions.auto.engine", "") == ""
+    )
+
+
+def add_approval_review(tools: dict, own_tools, listed: Optional[dict]) -> dict:
+    """Add Core's ``__approval__`` argument to the loop's tools, and to the *listed* ones Tool Search returns."""
+    from open_webui.utils.tool_calling import add_tool_call_metadata
+
+    reviewed = {name: tool for name, tool in tools.items() if name not in own_tools}
+    add_tool_call_metadata(reviewed, approval=True)
+    if isinstance(listed, dict):
+        listed.update({name: reviewed[name] for name in listed if name in reviewed})
+    return {**tools, **reviewed}
+
+
+async def set_approval_policy(messages: list, review: bool) -> list:
+    """Apply Core's approval instructions to *messages*: the Auto policy when the model reviews its calls, else none."""
+    try:
+        from open_webui.utils.tool_permissions import (
+            get_tool_permissions_auto_config,
+            set_tool_approval_prompt,
+        )
+    except ImportError:
+        return messages
+    policy = (await get_tool_permissions_auto_config())["prompt"] if review else None
+    return set_tool_approval_prompt(messages, policy)
+
+
+def input_request_lock(event_call: Any) -> asyncio.Lock:
+    """The lock of a chat request's input requests, kept on Core's event caller, which all tools of it share."""
+    try:
+        return vars(event_call).setdefault("input_request_lock", asyncio.Lock())
+    except TypeError:
+        return asyncio.Lock()
+
+
+async def _approved_by_user(extra_params: dict, call_id: Any, name: str, params: dict) -> bool:
+    """Ask in the browser as Core does for a chat it cannot pause."""
+    event_call = extra_params.get("__event_call__")
+    if not callable(event_call):
+        return False
+    reply = await event_call(
+        {"type": "confirmation", "data": {"tool_call": {"id": call_id, "name": name, "arguments": params}}}
+    )
+    return reply is True
+
+
+CITATION_TOOLS: set[str] = {
+    "view_file",
+    "view_knowledge_file",
+    "query_chat_files",
+    "query_knowledge_files",
+    "fetch_url",
+}
+
+
+TERMINAL_EVENT_TOOLS: set[str] = {
+    "display_file",
+    "write_file",
+    "replace_file_content",
+    "run_command",
+}
+
+
+_UPLOADED_FILE_ID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+
+def is_terminal_tool(tool: dict) -> bool:
+    return tool.get("type") == "terminal" or (tool.get("server") or {}).get("is_terminal") is True
+
+
+def resolve_display_file_tool(tool: dict, params: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Send an uploaded file's ``display_file`` call to Core's builtin, as Core does for terminal tools."""
+    path = str(params.get("path", ""))
+    if not (path.startswith("/api/v1/files/") or _UPLOADED_FILE_ID.fullmatch(path)):
+        return tool, None
+    if tool.get("file_tool"):
+        return tool["file_tool"], None
+    try:
+        from open_webui.tools.builtin import display_file  # noqa: F401
+    except ImportError:
+        # Core before 0.12.5 sends every display_file path to the terminal.
+        return tool, None
+    if is_terminal_tool(tool):
+        return None, "Error: Uploaded file display is not available."
+    return tool, None
+
+
+def attach_displayed_upload(tool_result: Any, files: list) -> Any:
+    """Attach the uploaded file ``display_file`` showed to the reply, since a nested call cannot preview it inline."""
+    try:
+        result = json.loads(tool_result) if isinstance(tool_result, str) else tool_result
+    except ValueError:
+        return tool_result
+    if not (isinstance(result, dict) and result.get("source") == "open_webui" and result.get("exists") is True):
+        return tool_result
+    files.append(
+        {
+            "type": "file",
+            "id": result["path"].split("/")[4],
+            "name": result.get("name"),
+            "url": result["path"],
+            "content_type": result.get("content_type"),
+        }
+    )
+    if not result.get("page"):
+        return tool_result
+    return json.dumps(
+        {**result, "note": "The file is attached to the reply instead of previewed, so the page was not opened."},
+        ensure_ascii=False,
+    )
+
+
+def core_version() -> tuple[int, ...]:
+    from open_webui.env import VERSION
+
+    return tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2])
+
+
+def _saved_reply(metadata: Optional[dict]) -> bool:
+    metadata = metadata or {}
+    # Core before 0.12.0 adds message files to the chat history only, not to the message table it reads them from.
+    if core_version() < (0, 12) or not (metadata.get("user_id") and metadata.get("message_id")):
+        return False
+    from open_webui.utils.chat_id import is_saved_chat_id
+
+    return is_saved_chat_id(metadata.get("chat_id"))
+
+
+def _reply_file_lock(request: Any, chat_id: str, message_id: str) -> asyncio.Lock:
+    """Share one lock per reply with nested agent tools, which get copies of this request's state."""
+    state = getattr(request, "state", None)
+    locks = getattr(state, "reply_file_locks", None)
+    if locks is None:
+        locks = {}
+        if state is not None:
+            state.reply_file_locks = locks
+    return locks.setdefault((chat_id, message_id), asyncio.Lock())
+
+
+def order_file_events(event_emitter: Optional[Callable], metadata: Optional[dict], request: Any) -> Optional[Callable]:
+    """Add each file event's new files to a saved chat's reply in one write, then show everyone viewing it the full list.
+
+    Core saves a file event by reading the reply's files and writing them back, which drops files another
+    tool adds in between, and its chat screen replaces the reply's files with each event's list.
+    """
+    if not callable(event_emitter) or not _saved_reply(metadata):
+        return event_emitter
+    from open_webui.models.chats import Chats
+    from open_webui.socket.main import get_event_emitter
+
+    chat_id, message_id = metadata["chat_id"], metadata["message_id"]
+    lock = _reply_file_lock(request, chat_id, message_id)
+
+    async def emit(event_data):
+        event_type = event_data.get("type") if isinstance(event_data, dict) else None
+        if not (event_type == "files" or (event_type == "chat:message:files" and event_data.get(_ALREADY_SAVED))):
+            return await event_emitter(event_data)
+        data = event_data.get("data") or {}
+        files = list(data.get("files") or [])
+        async with lock:
+            saved, added = [], files
+            try:
+                stored = await Chats.get_message_metadata(chat_id, message_id, "files")
+                saved = stored if isinstance(stored, list) else []
+                added = [file for index, file in enumerate(files) if file not in saved and file not in files[:index]]
+                if added:
+                    saved = await Chats.add_message_files_by_id_and_message_id(chat_id, message_id, added) or saved
+            except Exception:
+                _tool_execution_log.exception("Could not save the reply's files")
+            show = await get_event_emitter(metadata, update_db=False)
+            # Core's emitter shows each event before saving it and goes on when the save fails.
+            await show({"type": "files", "data": {**data, "files": saved + [file for file in added if file not in saved]}})
+
+    return emit
+
+
+_ALREADY_SAVED = "already_saved"
+
+
+def mark_saved_image_files(event_emitter: Optional[Callable], tool: dict, tool_name: str) -> Optional[Callable]:
+    """Mark the file list Core's image tools send after saving, so ``order_file_events`` shows the reply's current list.
+
+    Core ignores the extra key, so an emitter without ``order_file_events`` handles the event as sent.
+    """
+    if not (callable(event_emitter) and tool.get("type") == "builtin" and tool_name in ("generate_image", "edit_image")):
+        return event_emitter
+
+    async def emit(event_data):
+        if isinstance(event_data, dict) and event_data.get("type") == "chat:message:files":
+            event_data = {**event_data, _ALREADY_SAVED: True}
+        return await event_emitter(event_data)
+
+    return emit
+
+
+def _model_has_vision(model: Optional[dict]) -> bool:
+    meta = ((model or {}).get("info") or {}).get("meta") or {}
+    return bool((meta.get("capabilities") or {}).get("vision", True))
+
+
+async def _maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _normalize_user(user: Any) -> Any:
+    if user is None or hasattr(user, "id"):
+        return user
+    if isinstance(user, dict):
+        try:
+            from open_webui.models.users import UserModel
+
+            return UserModel(**user)
+        except Exception:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(**user)
+    return user
+
+
+async def process_tool_result(
+    *,
+    tool_function_name: str = "tool",
+    tool_type: str,
+    tool_result: Any,
+    direct_tool: bool = False,
+    request: Optional[Request] = None,
+    metadata: Optional[dict] = None,
+    user: Any = None,
+) -> tuple[Any, list, list]:
+    """Process tool result into (payload, files, embeds) using core."""
+    global _core_process_tool_result
+    if _core_process_tool_result is None:
+        try:
+            from open_webui.utils.middleware import process_tool_result as fn
+        except ImportError as exc:
+            raise RuntimeError(
+                "Open WebUI process_tool_result helper is required"
+            ) from exc
+        if not callable(fn):
+            raise RuntimeError("Open WebUI process_tool_result helper is not callable")
+        _core_process_tool_result = fn
+
+    return await _maybe_await(
+        _core_process_tool_result(
+            request,
+            tool_function_name,
+            tool_result,
+            tool_type,
+            direct_tool=direct_tool,
+            metadata=metadata if isinstance(metadata, dict) else {},
+            user=_normalize_user(user),
+        )
+    )
+
+
+async def split_tool_result_files(
+    files: list, user: Any = None, fetch_url_images: bool = True
+) -> tuple[list[str], list]:
+    """Match native Core: data images go to the model, URL images to both, other files to display."""
+    images = []
+    display_files = []
+    for file in files:
+        url = file.get("url") if isinstance(file, dict) and file.get("type") == "image" else None
+        if isinstance(url, str) and url.startswith("data:"):
+            images.append(url)
+            continue
+        display_files.append(file)
+        if isinstance(url, str) and url:
+            # Core before 0.12.0 keeps URL images display-only.
+            if core_version() >= (0, 12):
+                if not fetch_url_images:
+                    images.append(url)
+                    continue
+                from open_webui.utils.files import get_image_base64_from_url
+
+                image = await get_image_base64_from_url(url, user=_normalize_user(user))
+                if image:
+                    images.append(image)
+    return images, display_files
+
+
+def append_tool_result_images(messages: list[dict], urls: list[str]) -> None:
+    """Keep tool replies contiguous, then attach images as a user message."""
+    if urls:
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Here are the images from the tool results above. Please analyze them.",
+                    },
+                    *[{"type": "image_url", "image_url": {"url": url}} for url in urls],
+                ],
+            }
+        )
+
+
+def structure_terminal_file_tool_result(
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool_result: Any,
+    tool: dict,
+    metadata: Optional[dict],
+) -> Any:
+    """Apply Core's structured ``display_file`` result when available."""
+    from open_webui.utils import middleware as middleware_utils
+
+    builder = getattr(middleware_utils, "build_terminal_file_tool_result", None)
+    if not callable(builder):
+        return tool_result
+    structured_result = builder(
+        tool_function_name,
+        tool_function_params,
+        tool_result,
+        tool,
+        metadata,
+    )
+    return tool_result if structured_result is None else structured_result
+
+
+async def execute_direct_tool_call(
+    *,
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool: dict,
+    extra_params: dict,
+) -> Any:
+    """Execute direct tools through ``__event_call__`` like core middleware."""
+    event_call = extra_params.get("__event_call__")
+    if not callable(event_call):
+        raise RuntimeError("Direct tool execution requires __event_call__ context")
+    metadata = extra_params.get("__metadata__")
+    session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
+    return await event_call(
+        {
+            "type": "execute:tool",
+            "data": {
+                "id": str(uuid.uuid4()),
+                "name": tool_function_name,
+                "params": tool_function_params,
+                "server": tool.get("server", {}),
+                "session_id": session_id,
+            },
+        }
+    )
+
+
+def normalize_terminal_tools_result(
+    *, terminal_tools_result: Any, extra_params: Optional[dict]
+) -> dict:
+    """Normalize get_terminal_tools() return value across Open WebUI versions."""
+    terminal_system_prompt = None
+    terminal_tools = terminal_tools_result
+
+    if (
+        isinstance(terminal_tools_result, tuple)
+        and len(terminal_tools_result) == 2
+        and isinstance(terminal_tools_result[0], dict)
+    ):
+        terminal_tools = terminal_tools_result[0]
+        if isinstance(terminal_tools_result[1], str):
+            stripped_prompt = terminal_tools_result[1].strip()
+            if stripped_prompt:
+                terminal_system_prompt = stripped_prompt
+
+    if isinstance(extra_params, dict):
+        if terminal_system_prompt:
+            extra_params["__terminal_system_prompt__"] = terminal_system_prompt
+        else:
+            extra_params.pop("__terminal_system_prompt__", None)
+
+    if isinstance(terminal_tools, dict):
+        return terminal_tools
+    return {}
+
+
+async def emit_terminal_tool_event(
+    *,
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool_result: Any,
+    event_emitter: Optional[Callable],
+) -> None:
+    """Emit ``terminal:*`` UI events for Open Terminal tool results.
+
+    Recognises only the names listed in ``TERMINAL_EVENT_TOOLS``
+    (display_file / write_file / replace_file_content / run_command);
+    unknown names fall through silently.
+    """
+    if not event_emitter or tool_function_name not in TERMINAL_EVENT_TOOLS:
+        return
+    parsed = tool_result
+    if tool_function_name != "run_command" and isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except (ValueError, TypeError):
+            parsed = None
+    resolved_path = parsed.get("path") if isinstance(parsed, dict) else None
+    if tool_function_name == "display_file":
+        path = resolved_path or (
+            tool_function_params.get("path", "")
+            if isinstance(tool_function_params, dict)
+            else ""
+        )
+        if not isinstance(path, str) or not path:
+            return
+        if isinstance(parsed, dict) and (parsed.get("exists") is False or parsed.get("source") == "open_webui"):
+            return
+        page = tool_function_params.get("page")
+        # NOTE: nested calls cannot produce Core's top-level structured
+        # output pair, so inline requests open the viewer instead.
+        event = {
+            "type": "terminal:display_file",
+            "data": {
+                "path": path,
+                **({"page": page} if page else {}),
+            },
+        }
+    elif tool_function_name in {"write_file", "replace_file_content"}:
+        path = resolved_path or (
+            tool_function_params.get("path", "")
+            if isinstance(tool_function_params, dict)
+            else ""
+        )
+        if not isinstance(path, str) or not path:
+            return
+        event = {
+            "type": f"terminal:{tool_function_name}",
+            "data": {"path": path},
+        }
+    elif tool_function_name == "run_command":
+        event = {"type": "terminal:run_command", "data": {}}
+    else:
+        return
+    try:
+        await event_emitter(event)
+    except Exception as exc:
+        _tool_execution_log.warning(
+            f"Error emitting terminal event for {tool_function_name}: {exc}"
+        )
+
+
+def filter_tool_arguments(tool: dict, arguments: dict) -> dict:
+    """Keep the *arguments* *tool*'s spec lists, as Core does; MCP servers validate their own."""
+    if tool.get("type") == "mcp":
+        return arguments
+    allowed = tool.get("spec", {}).get("parameters", {}).get("properties", {}).keys()
+    return {k: v for k, v in arguments.items() if k in allowed}
+
+
+def resolve_call_tool(tool_call: dict, tools_dict: dict) -> tuple[dict, Optional[str]]:
+    """Return a copy of *tool_call* targeting the tool a Tool Search ``call_tool`` names, or an error."""
+    try:
+        from open_webui.utils.tool_search import resolve_tool_call
+    except ImportError:
+        return tool_call, None
+    resolved = dict(tool_call)
+    return resolved, resolve_tool_call(resolved, tools_dict)
+
+
+def call_targets(tool_call: dict, tools_dict: dict) -> list[str]:
+    """Return the names of the tools *tool_call* runs: each one a ``call_tool`` batch names, else its one tool."""
+    members = _call_tool_batch(tool_call, tools_dict) if isinstance(tool_call.get("function"), dict) else None
+    if members is None:
+        names = [resolve_call_tool(tool_call, tools_dict)[0].get("function", {}).get("name", "")]
+    else:
+        names = [member["provider_batch"]["tool_name"] for member in members if "provider_batch" in member]
+    return [name for name in names if isinstance(name, str)]
+
+
+def _call_tool_batch(tool_call: dict, tools: dict) -> Optional[list]:
+    """Return the calls a Core 0.13.1+ ``call_tool(calls=[...])`` batch stages, or None for any other call."""
+    try:
+        from open_webui.utils.tool_search import split_tool_call_batches
+    except ImportError:
+        return None
+    members = split_tool_call_batches([tool_call], tools)
+    if members == [tool_call]:
+        return None
+    return members
+
+
+def _replay_like_core(function: dict) -> None:
+    """Rewrite a model's call the way Core 0.13.1+ replays it: arguments it cannot read become an error object."""
+    if _core_tool_calling() is None:
+        return
+    from open_webui.utils.misc import get_provider_function
+
+    function["arguments"] = get_provider_function(
+        {"name": function.get("name", ""), "arguments": function.get("arguments", "{}")}
+    )["arguments"]
+
+
+def quote_arguments_core_raises_on(function: dict) -> None:
+    """Make Core reject, as unreadable text, the arguments Core 0.13.2 raises on: a literal with an unhashable member."""
+    calling = _core_tool_calling()
+    if calling is None:
+        return
+    try:
+        calling.parse_arguments(function.get("arguments", "{}"))
+    except ValueError:
+        pass
+    except TypeError:
+        function["arguments"] = json.dumps(function["arguments"])
+
+
+def _record_call(state: Optional[ToolCallState], item: dict) -> Optional[str]:
+    """Record a call of this response and return Core's error when it repeats failed ones, stopping tool use."""
+    if state is None:
+        return None
+    calling = _core_tool_calling()
+    blocked = calling.tool_repetition_error(item, state.history) if calling is not None else None
+    if blocked:
+        state.stop_reason = state.stop_reason or blocked
+    state.history.append(item)
+    return blocked
+
+
+def _record_failed_call(state: Optional[ToolCallState], function: dict) -> None:
+    """Record a call that failed before it ran."""
+    _record_call(
+        state, {"name": function.get("name", ""), "arguments": function.get("arguments", "{}"), "status": "failed"}
+    )
+
+
+async def execute_tool_call(
+    tool_call: dict,
+    tools_dict: dict,
+    extra_params: dict,
+    event_emitter: Optional[Callable] = None,
+    state: Optional[ToolCallState] = None,
+    stop_after: frozenset = frozenset(),
+) -> dict:
+    """Execute a model's tool call and return ``{tool_call_id, content}``.
+
+    A ``call_tool`` batch runs each call it names, up to one of *stop_after*, and answers with Core's
+    combined ``{"results": [...]}``. The call itself is left as Core replays it to the model.
+    """
+    if not isinstance(tool_call, dict):
+        return {
+            "tool_call_id": str(uuid.uuid4()),
+            "content": f"Malformed tool_call: expected dict, got {type(tool_call).__name__}",
+        }
+    tool_call_id = tool_call.get("id", str(uuid.uuid4()))
+    if not isinstance(tool_call.get("function"), dict):
+        return {
+            "tool_call_id": tool_call_id,
+            "content": f"Malformed tool_call: 'function' is {type(tool_call.get('function')).__name__}, not dict",
+        }
+    try:
+        return await _execute_model_call(
+            tool_call, tool_call_id, tools_dict, extra_params, event_emitter, state, stop_after
+        )
+    finally:
+        _replay_like_core(tool_call["function"])
+
+
+async def _execute_model_call(
+    tool_call: dict,
+    tool_call_id: Any,
+    tools_dict: dict,
+    extra_params: dict,
+    event_emitter: Optional[Callable],
+    state: Optional[ToolCallState],
+    stop_after: frozenset,
+) -> dict:
+    quote_arguments_core_raises_on(tool_call["function"])
+    if state is not None and state.round_error:
+        state.stop_reason = state.stop_reason or state.round_error
+        _record_failed_call(state, tool_call["function"])
+        return {"tool_call_id": tool_call_id, "content": state.round_error}
+    members = _call_tool_batch(tool_call, tools_dict)
+    if members is None:
+        result = await _execute_single_call(
+            tool_call, tool_call_id, tools_dict, extra_params, event_emitter, state
+        )
+        result.pop("status", None)
+        return result
+    if "provider_batch" not in members[0]:
+        _record_failed_call(state, tool_call["function"])
+        return {"tool_call_id": tool_call_id, "content": members[0]["execution_error"]}
+    entries, images = [], []
+    for member in members:
+        result = await _execute_single_call(
+            member, member["id"], tools_dict, extra_params, event_emitter, state
+        )
+        entries.append(
+            {
+                "tool_name": member["provider_batch"]["tool_name"],
+                "status": result.get("status", "failed"),
+                "output": [{"type": "input_text", "text": result["content"]}],
+            }
+        )
+        images.extend(result.get("images", []))
+        name = member["provider_batch"]["tool_name"]
+        if isinstance(name, str) and name in stop_after:
+            break
+    return {
+        "tool_call_id": tool_call_id,
+        "content": json.dumps({"results": entries}, ensure_ascii=False, separators=(",", ":")),
+        **({"images": images} if images else {}),
+    }
+
+
+async def _execute_single_call(
+    tool_call: dict,
+    tool_call_id: Any,
+    tools_dict: dict,
+    extra_params: dict,
+    event_emitter: Optional[Callable],
+    state: Optional[ToolCallState],
+) -> dict:
+    tool_call, error = resolve_call_tool(tool_call, tools_dict)
+    if error:
+        _record_failed_call(state, tool_call["function"])
+        return {"tool_call_id": tool_call_id, "content": error, "status": "failed"}
+    func = tool_call["function"]
+    tool_function_name = func.get("name", "")
+    tool_args_raw = func.get("arguments", "{}")
+
+    calling = _core_tool_calling()
+    item = None
+    if calling is not None:
+        tool = tools_dict.get(tool_function_name)
+        item = {
+            "name": tool_function_name,
+            "arguments": tool_args_raw if isinstance(tool_args_raw, str) else json.dumps(tool_args_raw),
+            "status": "in_progress",
+        }
+        error = (
+            calling.prepare_tool_call(
+                item,
+                tool.get("spec", {}).get("parameters"),
+                display_labels=tool.get("display_labels", False),
+                approval_review=tool.get("approval_review", False),
+            )
+            if tool
+            else f'Error: Tool "{tool_function_name}" not found.'
+        )
+        blocked = _record_call(state, item)
+        if "provider_function" not in tool_call:
+            func["arguments"] = item["arguments"]
+        if error or blocked:
+            item["status"] = "failed"
+            return {"tool_call_id": tool_call_id, "content": error or blocked, "status": "failed"}
+        tool_function_params = json.loads(item["arguments"])
+    else:
+        tool_function_params = tool_args_raw
+    if isinstance(tool_function_params, str):
+        try:
+            tool_function_params = ast.literal_eval(tool_function_params)
+        except Exception:
+            try:
+                tool_function_params = json.loads(tool_args_raw)
+            except Exception as exc:
+                _tool_execution_log.error(
+                    f"Error parsing tool call arguments: {tool_args_raw} - {exc}"
+                )
+                return {
+                    "tool_call_id": tool_call_id,
+                    "content": f"Error parsing arguments: {exc}",
+                }
+    if not isinstance(tool_function_params, dict):
+        return {
+            "tool_call_id": tool_call_id,
+            "content": "Error: Tool call arguments must be a JSON object.",
+        }
+
+    tool_result: Any = None
+    tool_result_files: list[dict] = []
+    tool_result_embeds: list[Any] = []
+    vision = _model_has_vision(extra_params.get("__model__"))
+    tool_result_images: list[str] = []
+    emit_terminal_event = False
+    if tool_function_name in tools_dict:
+        tool = tools_dict[tool_function_name]
+        if tool_function_name == "display_file":
+            tool, error = resolve_display_file_tool(tool, tool_function_params)
+            if error:
+                if item is not None:
+                    item["status"] = "failed"
+                return {"tool_call_id": tool_call_id, "content": error, "status": "failed"}
+        direct_tool = bool(tool.get("direct", False))
+        metadata = extra_params.get("__metadata__")
+        core_metadata = getattr(extra_params.get("__event_call__"), "core_metadata", None)
+        if isinstance(metadata, dict) and isinstance(core_metadata, dict) and "session_id" in metadata:
+            metadata["session_id"] = core_metadata.get("session_id")
+
+        try:
+            tool_function_params = filter_tool_arguments(tool, tool_function_params)
+            if not await _call_allowed(
+                item, tool, tool_function_params, tool_call_id, extra_params, state
+            ):
+                item["status"] = "failed"
+                return {"tool_call_id": tool_call_id, "content": _NOT_APPROVED, "status": "failed"}
+
+            if direct_tool:
+                tool_result = await execute_direct_tool_call(
+                    tool_function_name=tool_function_name,
+                    tool_function_params=tool_function_params,
+                    tool=tool,
+                    extra_params=extra_params,
+                )
+            else:
+                tool_function = tool["callable"]
+
+                # Only override per-call dynamic context — preserve __user__
+                # so tool-specific UserValves injected by get_tools() survive.
+                from open_webui.utils.tools import get_updated_tool_function
+
+                call_params = {
+                    "__messages__": extra_params.get("__messages__", []),
+                    "__files__": (
+                        metadata.get("files")
+                        if isinstance(metadata, dict)
+                        else extra_params.get("__files__")
+                    )
+                    or [],
+                    "__event_emitter__": mark_saved_image_files(
+                        extra_params.get("__event_emitter__"), tool, tool_function_name
+                    ),
+                    "__event_call__": extra_params.get("__event_call__"),
+                }
+                # Loaded tools are shared by agents, while Core binds each
+                # chat's own metadata to its tools.
+                if isinstance(metadata, dict):
+                    call_params["__metadata__"] = metadata
+                if extra_params.get("__request__") is not None:
+                    call_params["__request__"] = extra_params["__request__"]
+                tool_function = await _maybe_await(get_updated_tool_function(
+                    function=tool_function,
+                    extra_params=call_params,
+                ))
+
+                tool_result = await tool_function(**tool_function_params)
+
+            tool_type = tool.get("type", "")
+            tool_result = structure_terminal_file_tool_result(
+                tool_function_name,
+                tool_function_params,
+                tool_result,
+                tool,
+                extra_params.get("__metadata__"),
+            )
+            tool_result, tool_result_files, tool_result_embeds = await process_tool_result(
+                tool_function_name=tool_function_name,
+                tool_type=tool_type,
+                tool_result=tool_result,
+                direct_tool=direct_tool,
+                request=extra_params.get("__request__"),
+                metadata=extra_params.get("__metadata__"),
+                user=extra_params.get("__user__"),
+            )
+            tool_result_images, tool_result_files = await split_tool_result_files(
+                tool_result_files, extra_params.get("__user__"), fetch_url_images=vision
+            )
+            if tool_function_name == "display_file" and tool.get("type") == "builtin":
+                tool_result = attach_displayed_upload(tool_result, tool_result_files)
+            emit_terminal_event = True
+
+        except Exception as exc:
+            _tool_execution_log.exception(
+                f"Error executing tool {tool_function_name}: {exc}"
+            )
+            tool_result = f"Error: {exc}"
+    else:
+        tool_result = f"Tool '{tool_function_name}' not found"
+
+    if emit_terminal_event:
+        await emit_terminal_tool_event(
+            tool_function_name=tool_function_name,
+            tool_function_params=tool_function_params,
+            tool_result=tool_result,
+            event_emitter=event_emitter,
+        )
+        if event_emitter and tool_result_files:
+            await event_emitter({"type": "files", "data": {"files": tool_result_files}})
+        if event_emitter and tool_result_embeds:
+            await event_emitter({"type": "embeds", "data": {"embeds": tool_result_embeds}})
+
+    if tool_result is None:
+        tool_result = ""
+    elif not isinstance(tool_result, str):
+        try:
+            tool_result = json.dumps(tool_result, ensure_ascii=False, default=str)
+        except Exception:
+            tool_result = str(tool_result)
+
+    if event_emitter and tool_result and tool_function_name in CITATION_TOOLS:
+        try:
+            from open_webui.utils.middleware import get_citation_source_from_tool_result
+
+            tool_id = tools_dict.get(tool_function_name, {}).get("tool_id", "")
+            citation_sources = get_citation_source_from_tool_result(
+                tool_name=tool_function_name,
+                tool_params=tool_function_params,
+                tool_result=tool_result,
+                tool_id=tool_id,
+            )
+            for source in citation_sources:
+                await event_emitter({"type": "source", "data": source})
+        except Exception as exc:
+            _tool_execution_log.warning(
+                f"Error extracting citation sources from {tool_function_name}: {exc}"
+            )
+
+    if tool_result_images and not vision:
+        tool_result += "\n[image]" * len(tool_result_images)
+        tool_result_images = []
+
+    status = "failed" if _is_tool_result_error(tool_result) else "completed"
+    if item is not None:
+        item["status"] = status
+    return {
+        "tool_call_id": tool_call_id,
+        "content": tool_result,
+        "status": status,
+        **({"images": tool_result_images} if tool_result_images else {}),
+    }
+
+
+async def _call_allowed(
+    item: Optional[dict],
+    tool: dict,
+    params: dict,
+    call_id: Any,
+    extra_params: dict,
+    state: Optional[ToolCallState],
+) -> bool:
+    """Judge an agent's call by the chat's tool approval mode, as Core 0.13.1+ judges the child of a delegated task."""
+    if item is None or state is None or not state.review_approval or item["name"] in state.own_tools:
+        return True
+    from open_webui.utils.tool_permissions import requires_tool_approval
+
+    metadata = extra_params.get("__metadata__")
+    if not await requires_tool_approval(
+        {"messages": extra_params.get("__messages__") or []},
+        metadata if isinstance(metadata, dict) else {},
+        item,
+        tool,
+        params,
+    ):
+        return True
+    return await _approved_by_user(extra_params, call_id, item["name"], params)
+
 # --- inlined from src/owui_ext/shared/agent_requests.py (owui_ext.shared.agent_requests) ---
+APPROVE_ONCE_PARAM = "__approve_agent_tool_calls_once__"
+_INPUT_REQUESTS = frozenset({"confirmation", "input", "request:user_input", "request:elicitation"})
+
+
 def strip_tool_search_manifest(messages: list) -> list:
     """Drop Core's Tool Search manifest from system messages, for requests sent without its tools."""
     try:
@@ -784,6 +1823,8 @@ def follow_core_session(event_call, core_metadata):
 
     Core 0.12.4+ points its chat metadata at the browser's new session when it
     reconnects during an input request; nested agents send from their own copies.
+    Agents of a request send input requests in turn: Core 0.12.0+ times each from when it is sent, while the
+    browser shows one at a time.
     """
     if (
         not callable(event_call)
@@ -791,13 +1832,20 @@ def follow_core_session(event_call, core_metadata):
         or isinstance(getattr(event_call, "core_metadata", None), dict)
     ):
         return event_call
+    lock = input_request_lock(event_call)
 
-    async def call(event_data):
+    async def send(event_data):
         data = event_data.get("data") if isinstance(event_data, dict) else None
         # Core resumes an input request only when its data has no session_id.
         if isinstance(data, dict) and "session_id" in data:
             event_data = {**event_data, "data": {**data, "session_id": core_metadata.get("session_id")}}
         return await event_call(event_data)
+
+    async def call(event_data):
+        if isinstance(event_data, dict) and event_data.get("type") in _INPUT_REQUESTS:
+            async with lock:
+                return await send(event_data)
+        return await send(event_data)
 
     call.core_metadata = core_metadata
     return call
@@ -869,6 +1917,10 @@ class AgentRequests:
         self.always_loaded = tuple(always_loaded)
         self.base: dict = {}
         self.chat_request = None
+        self.tool_state = ToolCallState(
+            own_tools=frozenset(self.always_loaded),
+            review_approval=not extra_params.get(APPROVE_ONCE_PARAM),
+        )
 
     @property
     def tools_param(self) -> list | None:
@@ -904,6 +1956,11 @@ class AgentRequests:
         ) = await apply_agent_tool_search(
             self.tools_dict, self.extra_params, self.always_loaded, filter_tools
         )
+        review = self.tool_state.review_approval and await model_reviews_approval(self.metadata)
+        if review:
+            self.tools_dict = add_approval_review(
+                self.tools_dict, self.always_loaded, self.metadata.get("tools") if deferred else None
+            )
         if not deferred:
             # As with Tool Search, leave out the tools the loop handles itself (a submission ends it).
             listed = {
@@ -921,6 +1978,7 @@ class AgentRequests:
         else:
             form_data.pop("tools", None)
         form_data = _append_tool_server_prompts(form_data, self.extra_params)
+        form_data["messages"] = await set_approval_policy(form_data["messages"], review)
         self.base = {
             key: value
             for key, value in form_data.items()
@@ -1543,623 +2601,6 @@ def truncate_status(description: str, limit: int) -> str:
             return description[:index] + "..."
     return description
 
-# --- inlined from src/owui_ext/shared/tool_execution.py (owui_ext.shared.tool_execution) ---
-import ast
-import asyncio
-import json
-import logging
-import re
-import uuid
-from typing import Any, Callable, Optional
-from fastapi import Request
-_tool_execution_log = logging.getLogger("owui_ext.shared.tool_execution")
-_core_process_tool_result = None
-
-
-CITATION_TOOLS: set[str] = {
-    "view_file",
-    "view_knowledge_file",
-    "query_chat_files",
-    "query_knowledge_files",
-    "fetch_url",
-}
-
-
-TERMINAL_EVENT_TOOLS: set[str] = {
-    "display_file",
-    "write_file",
-    "replace_file_content",
-    "run_command",
-}
-
-
-_UPLOADED_FILE_ID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
-
-
-def is_terminal_tool(tool: dict) -> bool:
-    return tool.get("type") == "terminal" or (tool.get("server") or {}).get("is_terminal") is True
-
-
-def resolve_display_file_tool(tool: dict, params: dict) -> tuple[Optional[dict], Optional[str]]:
-    """Send an uploaded file's ``display_file`` call to Core's builtin, as Core does for terminal tools."""
-    path = str(params.get("path", ""))
-    if not (path.startswith("/api/v1/files/") or _UPLOADED_FILE_ID.fullmatch(path)):
-        return tool, None
-    if tool.get("file_tool"):
-        return tool["file_tool"], None
-    try:
-        from open_webui.tools.builtin import display_file  # noqa: F401
-    except ImportError:
-        # Core before 0.12.5 sends every display_file path to the terminal.
-        return tool, None
-    if is_terminal_tool(tool):
-        return None, "Error: Uploaded file display is not available."
-    return tool, None
-
-
-def attach_displayed_upload(tool_result: Any, files: list) -> Any:
-    """Attach the uploaded file ``display_file`` showed to the reply, since a nested call cannot preview it inline."""
-    try:
-        result = json.loads(tool_result) if isinstance(tool_result, str) else tool_result
-    except ValueError:
-        return tool_result
-    if not (isinstance(result, dict) and result.get("source") == "open_webui" and result.get("exists") is True):
-        return tool_result
-    files.append(
-        {
-            "type": "file",
-            "id": result["path"].split("/")[4],
-            "name": result.get("name"),
-            "url": result["path"],
-            "content_type": result.get("content_type"),
-        }
-    )
-    if not result.get("page"):
-        return tool_result
-    return json.dumps(
-        {**result, "note": "The file is attached to the reply instead of previewed, so the page was not opened."},
-        ensure_ascii=False,
-    )
-
-
-def core_version() -> tuple[int, ...]:
-    from open_webui.env import VERSION
-
-    return tuple(int(part) for part in re.findall(r"\d+", VERSION)[:2])
-
-
-def _saved_reply(metadata: Optional[dict]) -> bool:
-    metadata = metadata or {}
-    # Core before 0.12.0 adds message files to the chat history only, not to the message table it reads them from.
-    if core_version() < (0, 12) or not (metadata.get("user_id") and metadata.get("message_id")):
-        return False
-    from open_webui.utils.chat_id import is_saved_chat_id
-
-    return is_saved_chat_id(metadata.get("chat_id"))
-
-
-def _reply_file_lock(request: Any, chat_id: str, message_id: str) -> asyncio.Lock:
-    """Share one lock per reply with nested agent tools, which get copies of this request's state."""
-    state = getattr(request, "state", None)
-    locks = getattr(state, "reply_file_locks", None)
-    if locks is None:
-        locks = {}
-        if state is not None:
-            state.reply_file_locks = locks
-    return locks.setdefault((chat_id, message_id), asyncio.Lock())
-
-
-def order_file_events(event_emitter: Optional[Callable], metadata: Optional[dict], request: Any) -> Optional[Callable]:
-    """Add each file event's new files to a saved chat's reply in one write, then show everyone viewing it the full list.
-
-    Core saves a file event by reading the reply's files and writing them back, which drops files another
-    tool adds in between, and its chat screen replaces the reply's files with each event's list.
-    """
-    if not callable(event_emitter) or not _saved_reply(metadata):
-        return event_emitter
-    from open_webui.models.chats import Chats
-    from open_webui.socket.main import get_event_emitter
-
-    chat_id, message_id = metadata["chat_id"], metadata["message_id"]
-    lock = _reply_file_lock(request, chat_id, message_id)
-
-    async def emit(event_data):
-        event_type = event_data.get("type") if isinstance(event_data, dict) else None
-        if not (event_type == "files" or (event_type == "chat:message:files" and event_data.get(_ALREADY_SAVED))):
-            return await event_emitter(event_data)
-        data = event_data.get("data") or {}
-        files = list(data.get("files") or [])
-        async with lock:
-            saved, added = [], files
-            try:
-                stored = await Chats.get_message_metadata(chat_id, message_id, "files")
-                saved = stored if isinstance(stored, list) else []
-                added = [file for index, file in enumerate(files) if file not in saved and file not in files[:index]]
-                if added:
-                    saved = await Chats.add_message_files_by_id_and_message_id(chat_id, message_id, added) or saved
-            except Exception:
-                _tool_execution_log.exception("Could not save the reply's files")
-            show = await get_event_emitter(metadata, update_db=False)
-            # Core's emitter shows each event before saving it and goes on when the save fails.
-            await show({"type": "files", "data": {**data, "files": saved + [file for file in added if file not in saved]}})
-
-    return emit
-
-
-_ALREADY_SAVED = "already_saved"
-
-
-def mark_saved_image_files(event_emitter: Optional[Callable], tool: dict, tool_name: str) -> Optional[Callable]:
-    """Mark the file list Core's image tools send after saving, so ``order_file_events`` shows the reply's current list.
-
-    Core ignores the extra key, so an emitter without ``order_file_events`` handles the event as sent.
-    """
-    if not (callable(event_emitter) and tool.get("type") == "builtin" and tool_name in ("generate_image", "edit_image")):
-        return event_emitter
-
-    async def emit(event_data):
-        if isinstance(event_data, dict) and event_data.get("type") == "chat:message:files":
-            event_data = {**event_data, _ALREADY_SAVED: True}
-        return await event_emitter(event_data)
-
-    return emit
-
-
-def _model_has_vision(model: Optional[dict]) -> bool:
-    meta = ((model or {}).get("info") or {}).get("meta") or {}
-    return bool((meta.get("capabilities") or {}).get("vision", True))
-
-
-async def _maybe_await(value: Any) -> Any:
-    if hasattr(value, "__await__"):
-        return await value
-    return value
-
-
-def _normalize_user(user: Any) -> Any:
-    if user is None or hasattr(user, "id"):
-        return user
-    if isinstance(user, dict):
-        try:
-            from open_webui.models.users import UserModel
-
-            return UserModel(**user)
-        except Exception:
-            from types import SimpleNamespace
-
-            return SimpleNamespace(**user)
-    return user
-
-
-async def process_tool_result(
-    *,
-    tool_function_name: str = "tool",
-    tool_type: str,
-    tool_result: Any,
-    direct_tool: bool = False,
-    request: Optional[Request] = None,
-    metadata: Optional[dict] = None,
-    user: Any = None,
-) -> tuple[Any, list, list]:
-    """Process tool result into (payload, files, embeds) using core."""
-    global _core_process_tool_result
-    if _core_process_tool_result is None:
-        try:
-            from open_webui.utils.middleware import process_tool_result as fn
-        except ImportError as exc:
-            raise RuntimeError(
-                "Open WebUI process_tool_result helper is required"
-            ) from exc
-        if not callable(fn):
-            raise RuntimeError("Open WebUI process_tool_result helper is not callable")
-        _core_process_tool_result = fn
-
-    return await _maybe_await(
-        _core_process_tool_result(
-            request,
-            tool_function_name,
-            tool_result,
-            tool_type,
-            direct_tool=direct_tool,
-            metadata=metadata if isinstance(metadata, dict) else {},
-            user=_normalize_user(user),
-        )
-    )
-
-
-async def split_tool_result_files(
-    files: list, user: Any = None, fetch_url_images: bool = True
-) -> tuple[list[str], list]:
-    """Match native Core: data images go to the model, URL images to both, other files to display."""
-    images = []
-    display_files = []
-    for file in files:
-        url = file.get("url") if isinstance(file, dict) and file.get("type") == "image" else None
-        if isinstance(url, str) and url.startswith("data:"):
-            images.append(url)
-            continue
-        display_files.append(file)
-        if isinstance(url, str) and url:
-            # Core before 0.12.0 keeps URL images display-only.
-            if core_version() >= (0, 12):
-                if not fetch_url_images:
-                    images.append(url)
-                    continue
-                from open_webui.utils.files import get_image_base64_from_url
-
-                image = await get_image_base64_from_url(url, user=_normalize_user(user))
-                if image:
-                    images.append(image)
-    return images, display_files
-
-
-def append_tool_result_images(messages: list[dict], urls: list[str]) -> None:
-    """Keep tool replies contiguous, then attach images as a user message."""
-    if urls:
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Here are the images from the tool results above. Please analyze them.",
-                    },
-                    *[{"type": "image_url", "image_url": {"url": url}} for url in urls],
-                ],
-            }
-        )
-
-
-def structure_terminal_file_tool_result(
-    tool_function_name: str,
-    tool_function_params: dict,
-    tool_result: Any,
-    tool: dict,
-    metadata: Optional[dict],
-) -> Any:
-    """Apply Core's structured ``display_file`` result when available."""
-    from open_webui.utils import middleware as middleware_utils
-
-    builder = getattr(middleware_utils, "build_terminal_file_tool_result", None)
-    if not callable(builder):
-        return tool_result
-    structured_result = builder(
-        tool_function_name,
-        tool_function_params,
-        tool_result,
-        tool,
-        metadata,
-    )
-    return tool_result if structured_result is None else structured_result
-
-
-async def execute_direct_tool_call(
-    *,
-    tool_function_name: str,
-    tool_function_params: dict,
-    tool: dict,
-    extra_params: dict,
-) -> Any:
-    """Execute direct tools through ``__event_call__`` like core middleware."""
-    event_call = extra_params.get("__event_call__")
-    if not callable(event_call):
-        raise RuntimeError("Direct tool execution requires __event_call__ context")
-    metadata = extra_params.get("__metadata__")
-    session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
-    return await event_call(
-        {
-            "type": "execute:tool",
-            "data": {
-                "id": str(uuid.uuid4()),
-                "name": tool_function_name,
-                "params": tool_function_params,
-                "server": tool.get("server", {}),
-                "session_id": session_id,
-            },
-        }
-    )
-
-
-def normalize_terminal_tools_result(
-    *, terminal_tools_result: Any, extra_params: Optional[dict]
-) -> dict:
-    """Normalize get_terminal_tools() return value across Open WebUI versions."""
-    terminal_system_prompt = None
-    terminal_tools = terminal_tools_result
-
-    if (
-        isinstance(terminal_tools_result, tuple)
-        and len(terminal_tools_result) == 2
-        and isinstance(terminal_tools_result[0], dict)
-    ):
-        terminal_tools = terminal_tools_result[0]
-        if isinstance(terminal_tools_result[1], str):
-            stripped_prompt = terminal_tools_result[1].strip()
-            if stripped_prompt:
-                terminal_system_prompt = stripped_prompt
-
-    if isinstance(extra_params, dict):
-        if terminal_system_prompt:
-            extra_params["__terminal_system_prompt__"] = terminal_system_prompt
-        else:
-            extra_params.pop("__terminal_system_prompt__", None)
-
-    if isinstance(terminal_tools, dict):
-        return terminal_tools
-    return {}
-
-
-async def emit_terminal_tool_event(
-    *,
-    tool_function_name: str,
-    tool_function_params: dict,
-    tool_result: Any,
-    event_emitter: Optional[Callable],
-) -> None:
-    """Emit ``terminal:*`` UI events for Open Terminal tool results.
-
-    Recognises only the names listed in ``TERMINAL_EVENT_TOOLS``
-    (display_file / write_file / replace_file_content / run_command);
-    unknown names fall through silently.
-    """
-    if not event_emitter or tool_function_name not in TERMINAL_EVENT_TOOLS:
-        return
-    parsed = tool_result
-    if tool_function_name != "run_command" and isinstance(parsed, str):
-        try:
-            parsed = json.loads(parsed)
-        except (ValueError, TypeError):
-            parsed = None
-    resolved_path = parsed.get("path") if isinstance(parsed, dict) else None
-    if tool_function_name == "display_file":
-        path = resolved_path or (
-            tool_function_params.get("path", "")
-            if isinstance(tool_function_params, dict)
-            else ""
-        )
-        if not isinstance(path, str) or not path:
-            return
-        if isinstance(parsed, dict) and (parsed.get("exists") is False or parsed.get("source") == "open_webui"):
-            return
-        page = tool_function_params.get("page")
-        # NOTE: nested calls cannot produce Core's top-level structured
-        # output pair, so inline requests open the viewer instead.
-        event = {
-            "type": "terminal:display_file",
-            "data": {
-                "path": path,
-                **({"page": page} if page else {}),
-            },
-        }
-    elif tool_function_name in {"write_file", "replace_file_content"}:
-        path = resolved_path or (
-            tool_function_params.get("path", "")
-            if isinstance(tool_function_params, dict)
-            else ""
-        )
-        if not isinstance(path, str) or not path:
-            return
-        event = {
-            "type": f"terminal:{tool_function_name}",
-            "data": {"path": path},
-        }
-    elif tool_function_name == "run_command":
-        event = {"type": "terminal:run_command", "data": {}}
-    else:
-        return
-    try:
-        await event_emitter(event)
-    except Exception as exc:
-        _tool_execution_log.warning(
-            f"Error emitting terminal event for {tool_function_name}: {exc}"
-        )
-
-
-def filter_tool_arguments(tool: dict, arguments: dict) -> dict:
-    """Keep the *arguments* *tool*'s spec lists, as Core does; MCP servers validate their own."""
-    if tool.get("type") == "mcp":
-        return arguments
-    allowed = tool.get("spec", {}).get("parameters", {}).get("properties", {}).keys()
-    return {k: v for k, v in arguments.items() if k in allowed}
-
-
-def resolve_call_tool(tool_call: dict, tools_dict: dict) -> tuple[dict, Optional[str]]:
-    """Return a copy of *tool_call* targeting the tool a Tool Search ``call_tool`` names, or an error."""
-    try:
-        from open_webui.utils.tool_search import resolve_tool_call
-    except ImportError:
-        return tool_call, None
-    resolved = dict(tool_call)
-    return resolved, resolve_tool_call(resolved, tools_dict)
-
-
-async def execute_tool_call(
-    tool_call: dict,
-    tools_dict: dict,
-    extra_params: dict,
-    event_emitter: Optional[Callable] = None,
-) -> dict:
-    """Execute a single tool call and return ``{tool_call_id, content}``."""
-    if not isinstance(tool_call, dict):
-        return {
-            "tool_call_id": str(uuid.uuid4()),
-            "content": f"Malformed tool_call: expected dict, got {type(tool_call).__name__}",
-        }
-    tool_call_id = tool_call.get("id", str(uuid.uuid4()))
-    if not isinstance(tool_call.get("function"), dict):
-        return {
-            "tool_call_id": tool_call_id,
-            "content": f"Malformed tool_call: 'function' is {type(tool_call.get('function')).__name__}, not dict",
-        }
-    tool_call, error = resolve_call_tool(tool_call, tools_dict)
-    if error:
-        return {"tool_call_id": tool_call_id, "content": error}
-    func = tool_call["function"]
-    tool_function_name = func.get("name", "")
-    tool_args_raw = func.get("arguments", "{}")
-
-    tool_function_params = tool_args_raw
-    if isinstance(tool_args_raw, str):
-        try:
-            tool_function_params = ast.literal_eval(tool_args_raw)
-        except Exception:
-            try:
-                tool_function_params = json.loads(tool_args_raw)
-            except Exception as exc:
-                _tool_execution_log.error(
-                    f"Error parsing tool call arguments: {tool_args_raw} - {exc}"
-                )
-                return {
-                    "tool_call_id": tool_call_id,
-                    "content": f"Error parsing arguments: {exc}",
-                }
-    if not isinstance(tool_function_params, dict):
-        return {
-            "tool_call_id": tool_call_id,
-            "content": "Error: Tool call arguments must be a JSON object.",
-        }
-
-    tool_result: Any = None
-    tool_result_files: list[dict] = []
-    tool_result_embeds: list[Any] = []
-    vision = _model_has_vision(extra_params.get("__model__"))
-    tool_result_images: list[str] = []
-    emit_terminal_event = False
-    if tool_function_name in tools_dict:
-        tool = tools_dict[tool_function_name]
-        if tool_function_name == "display_file":
-            tool, error = resolve_display_file_tool(tool, tool_function_params)
-            if error:
-                return {"tool_call_id": tool_call_id, "content": error}
-        direct_tool = bool(tool.get("direct", False))
-        metadata = extra_params.get("__metadata__")
-        core_metadata = getattr(extra_params.get("__event_call__"), "core_metadata", None)
-        if isinstance(metadata, dict) and isinstance(core_metadata, dict) and "session_id" in metadata:
-            metadata["session_id"] = core_metadata.get("session_id")
-
-        try:
-            tool_function_params = filter_tool_arguments(tool, tool_function_params)
-
-            if direct_tool:
-                tool_result = await execute_direct_tool_call(
-                    tool_function_name=tool_function_name,
-                    tool_function_params=tool_function_params,
-                    tool=tool,
-                    extra_params=extra_params,
-                )
-            else:
-                tool_function = tool["callable"]
-
-                # Only override per-call dynamic context — preserve __user__
-                # so tool-specific UserValves injected by get_tools() survive.
-                from open_webui.utils.tools import get_updated_tool_function
-
-                call_params = {
-                    "__messages__": extra_params.get("__messages__", []),
-                    "__files__": (
-                        metadata.get("files")
-                        if isinstance(metadata, dict)
-                        else extra_params.get("__files__")
-                    )
-                    or [],
-                    "__event_emitter__": mark_saved_image_files(
-                        extra_params.get("__event_emitter__"), tool, tool_function_name
-                    ),
-                    "__event_call__": extra_params.get("__event_call__"),
-                }
-                # Loaded tools are shared by agents, while Core binds each
-                # chat's own metadata to its tools.
-                if isinstance(metadata, dict):
-                    call_params["__metadata__"] = metadata
-                if extra_params.get("__request__") is not None:
-                    call_params["__request__"] = extra_params["__request__"]
-                tool_function = await _maybe_await(get_updated_tool_function(
-                    function=tool_function,
-                    extra_params=call_params,
-                ))
-
-                tool_result = await tool_function(**tool_function_params)
-
-            tool_type = tool.get("type", "")
-            tool_result = structure_terminal_file_tool_result(
-                tool_function_name,
-                tool_function_params,
-                tool_result,
-                tool,
-                extra_params.get("__metadata__"),
-            )
-            tool_result, tool_result_files, tool_result_embeds = await process_tool_result(
-                tool_function_name=tool_function_name,
-                tool_type=tool_type,
-                tool_result=tool_result,
-                direct_tool=direct_tool,
-                request=extra_params.get("__request__"),
-                metadata=extra_params.get("__metadata__"),
-                user=extra_params.get("__user__"),
-            )
-            tool_result_images, tool_result_files = await split_tool_result_files(
-                tool_result_files, extra_params.get("__user__"), fetch_url_images=vision
-            )
-            if tool_function_name == "display_file" and tool.get("type") == "builtin":
-                tool_result = attach_displayed_upload(tool_result, tool_result_files)
-            emit_terminal_event = True
-
-        except Exception as exc:
-            _tool_execution_log.exception(
-                f"Error executing tool {tool_function_name}: {exc}"
-            )
-            tool_result = f"Error: {exc}"
-    else:
-        tool_result = f"Tool '{tool_function_name}' not found"
-
-    if emit_terminal_event:
-        await emit_terminal_tool_event(
-            tool_function_name=tool_function_name,
-            tool_function_params=tool_function_params,
-            tool_result=tool_result,
-            event_emitter=event_emitter,
-        )
-        if event_emitter and tool_result_files:
-            await event_emitter({"type": "files", "data": {"files": tool_result_files}})
-        if event_emitter and tool_result_embeds:
-            await event_emitter({"type": "embeds", "data": {"embeds": tool_result_embeds}})
-
-    if tool_result is None:
-        tool_result = ""
-    elif not isinstance(tool_result, str):
-        try:
-            tool_result = json.dumps(tool_result, ensure_ascii=False, default=str)
-        except Exception:
-            tool_result = str(tool_result)
-
-    if event_emitter and tool_result and tool_function_name in CITATION_TOOLS:
-        try:
-            from open_webui.utils.middleware import get_citation_source_from_tool_result
-
-            tool_id = tools_dict.get(tool_function_name, {}).get("tool_id", "")
-            citation_sources = get_citation_source_from_tool_result(
-                tool_name=tool_function_name,
-                tool_params=tool_function_params,
-                tool_result=tool_result,
-                tool_id=tool_id,
-            )
-            for source in citation_sources:
-                await event_emitter({"type": "source", "data": source})
-        except Exception as exc:
-            _tool_execution_log.warning(
-                f"Error extracting citation sources from {tool_function_name}: {exc}"
-            )
-
-    if tool_result_images and not vision:
-        tool_result += "\n[image]" * len(tool_result_images)
-        tool_result_images = []
-
-    return {
-        "tool_call_id": tool_call_id,
-        "content": tool_result,
-        **({"images": tool_result_images} if tool_result_images else {}),
-    }
-
 # --- inlined from src/owui_ext/shared/async_utils.py (owui_ext.shared.async_utils) ---
 async def maybe_await(value):
     if hasattr(value, "__await__"):
@@ -2273,7 +2714,13 @@ def _attached_knowledge_types(
     model_meta = model.get("info", {}).get("meta", {})
     knowledge_items = list(model_meta.get("knowledge") or [])
     knowledge_items.extend(metadata.get("folder_knowledge") or [])
-    if not (model_meta.get("capabilities") or {}).get("file_context", True):
+    try:
+        from open_webui.utils.tools import is_file_context_enabled
+    except ImportError:
+        file_context = (model_meta.get("capabilities") or {}).get("file_context", True)
+    else:
+        file_context = is_file_context_enabled(model, metadata)
+    if not file_context:
         knowledge_items.extend(
             item
             for item in metadata.get("files") or []
@@ -2382,6 +2829,26 @@ def extract_direct_tool_server_prompts(direct_tools: Mapping[str, dict]) -> list
     return prompts
 
 
+def spec_without_call_metadata(tool: dict) -> dict:
+    """Copy *tool*'s spec without the arguments Core 0.13.1+ adds to the chat's tools for its own use."""
+    spec = dict(tool["spec"])
+    added = [
+        name
+        for name, marker in (("__labels__", "display_labels"), ("__approval__", "approval_review"))
+        if tool.get(marker)
+    ]
+    parameters = spec.get("parameters")
+    if added and isinstance(parameters, dict):
+        spec["parameters"] = {
+            **parameters,
+            "properties": {
+                key: value for key, value in (parameters.get("properties") or {}).items() if key not in added
+            },
+            "required": [key for key in parameters.get("required") or [] if key not in added],
+        }
+    return spec
+
+
 async def resolve_direct_tool_servers_from_request_and_metadata(
     *,
     request: Optional[Request],
@@ -2408,7 +2875,7 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
                 continue
             settings = connection_settings(server)
             approved_specs = [
-                dict(tool["spec"])
+                spec_without_call_metadata(tool)
                 for tool in parent_tools.values()
                 if isinstance(tool, dict)
                 and tool.get("direct") is True
@@ -2643,20 +3110,28 @@ async def build_tools_dict(
             extra_params["__metadata__"] = metadata
             extra_metadata = metadata
 
-    is_admin_terminal = True
+    is_terminal_connection = True
     if terminal_id and terminal_context_enabled:
         try:
-            from open_webui.models.config import Config
+            from open_webui.utils.tether import get_terminal_connections
         except ImportError:
-            pass
+            # Core before 0.13.1 serves only the admin's terminal connections.
+            try:
+                from open_webui.models.config import Config
+            except ImportError:
+                pass
+            else:
+                terminal_connections = await maybe_await(
+                    Config.get("terminal_server.connections", None)
+                )
+                if terminal_connections is not None:
+                    is_terminal_connection = terminal_id in {
+                        connection.get("id") for connection in terminal_connections
+                    }
         else:
-            terminal_connections = await maybe_await(
-                Config.get("terminal_server.connections", None)
-            )
-            if terminal_connections is not None:
-                is_admin_terminal = terminal_id in {
-                    connection.get("id") for connection in terminal_connections
-                }
+            is_terminal_connection = terminal_id in {
+                connection.get("id") for connection in await get_terminal_connections(user)
+            }
 
     if resolved_direct_tool_servers is None:
         direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
@@ -2755,7 +3230,7 @@ async def build_tools_dict(
                     content=f"Could not load MCP tools: {e}",
                 )
 
-        if terminal_id and terminal_context_enabled and is_admin_terminal:
+        if terminal_id and terminal_context_enabled and is_terminal_connection:
             if get_terminal_tools is None:
                 if debug:
                     log.info("get_terminal_tools is unavailable in this Open WebUI version")
@@ -3357,9 +3832,7 @@ async def run_agent_loop(
             if not choices:
                 return "No response from model"
 
-            message = choices[0].get("message", {})
-            content = message.get("content", "")
-            tool_calls = message.get("tool_calls", [])
+            content, tool_calls = take_tool_calls(choices[0], form_data, agent_requests.tool_state)
 
             # Emit status with LLM response content
             if event_emitter and content:
@@ -3446,6 +3919,7 @@ async def run_agent_loop(
                         "__request__": tool_request,
                     },
                     event_emitter=event_emitter,
+                    state=agent_requests.tool_state,
                 )
 
                 # Emit status with tool result preview
@@ -3474,14 +3948,19 @@ async def run_agent_loop(
                 )
 
             append_tool_result_images(current_messages, tool_images)
+            if agent_requests.tool_state.stop_reason:
+                break
 
-    # Max iterations reached
     if event_emitter:
         await event_emitter(
             {
                 "type": "status",
                 "data": {
-                    "description": f"[{agent_name}] Max iterations ({max_iterations}) reached, finalizing...",
+                    "description": (
+                        f"[{agent_name}] Tool use stopped, finalizing..."
+                        if agent_requests.tool_state.stop_reason
+                        else f"[{agent_name}] Max iterations ({max_iterations}) reached, finalizing..."
+                    ),
                     "done": False,
                 },
             }
@@ -3493,7 +3972,10 @@ async def run_agent_loop(
         + [
             {
                 "role": "user",
-                "content": "Maximum tool iterations reached. Provide your final answer based on gathered information.",
+                "content": final_answer_instruction(
+                    agent_requests.tool_state,
+                    "Maximum tool iterations reached. Provide your final answer based on gathered information.",
+                ),
             }
         ],
         tools=None,
@@ -3516,6 +3998,8 @@ async def run_agent_loop(
     except Exception as exc:
         log.exception(f"Error getting final MAGI agent response: {exc}")
 
+    if agent_requests.tool_state.stop_reason:
+        return "MAGI agent stopped using tools without providing a final response."
     return "MAGI agent reached maximum iterations without providing a final response."
 
 
@@ -3594,7 +4078,11 @@ class Tools:
                 "Pass the parent conversation's skills to MAGI agents and allow "
                 "the skill reading tools (view_skill, read_skill_file, "
                 "grep_skill_files). Each agent gets the parent's <skill> blocks "
-                "and <available_skills> list. An agent whose model has no skill "
+                "and <available_skills> list; on Open WebUI 0.13.1+, when the parent's "
+                "model has skill tools and so got only the list, an agent whose "
+                "model has skill tools gets the list and the skills the chat "
+                "activated as tool results instead, as Open WebUI gives them to a "
+                "delegated task. An agent whose model has no skill "
                 "tools gets the chat's skills inlined the way Open WebUI does for "
                 "such a model instead (Open WebUI 0.12.1+; older versions pass "
                 "only the <skill> blocks). When off, agents get no skills or "
@@ -3662,6 +4150,16 @@ class Tools:
         INCLUDE_SOURCES: bool = Field(
             default=True,
             description="Include sources in agent outputs when web research is used.",
+        )
+        APPROVE_AGENT_TOOL_CALLS_ONCE: bool = Field(
+            default=False,
+            description=(
+                "Let approving this tool's call also approve the tool calls its agents make (Open WebUI 0.13.1+). "
+                "Off: each of their tool calls follows the chat's tool permissions, so Ask asks about each and Auto checks each. "
+                "On: once this tool's call is approved, or passes the Auto check without asking, its agents run their tool calls without asking; "
+                "the next call of this tool and the chat's other tool calls are still checked. "
+                "Stays on for your later chats until you turn it off."
+            ),
         )
         pass
 
@@ -3780,6 +4278,7 @@ class Tools:
             "__oauth_token__": __oauth_token__,
             "__files__": (__metadata__ or {}).get("files") or [],
             "__skill_ids__": extract_skill_ids(__messages__),
+            APPROVE_ONCE_PARAM: user_valves.APPROVE_AGENT_TOOL_CALLS_ONCE,
         }
 
         tool_id_list = []
