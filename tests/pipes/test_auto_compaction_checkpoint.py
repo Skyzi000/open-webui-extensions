@@ -1,0 +1,6558 @@
+from __future__ import annotations
+
+import asyncio
+import copy
+import dataclasses
+import hashlib
+import inspect
+import random
+import re
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from functions.pipe import auto_compact as mod
+
+
+def test_source_hash_is_deterministic_for_equivalent_canonical_payloads():
+    left = [
+        {
+            "id": "volatile-a",
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}],
+            "timestamp": 100,
+            "usage": {"total_tokens": 1},
+        }
+    ]
+    right = [
+        {
+            "id": "volatile-b",
+            "timestamp": 200,
+            "role": "user",
+            "usage": {"total_tokens": 999},
+            "content": [{"text": "hello", "type": "text"}],
+        }
+    ]
+
+    assert mod.compute_source_hash(left) == mod.compute_source_hash(right)
+
+
+@pytest.mark.parametrize(
+    ("messages", "kwargs", "expected"),
+    [
+        pytest.param(
+            [{"role": "assistant", "content": "answer"}],
+            {},
+            "sha256:26041d0d9b64729a42038d97fa271ffef19c6f8ece24549fc1bfca73392bd879",
+            id="plain-assistant",
+        ),
+        pytest.param(
+            [{"role": "user", "content": "question"}],
+            {},
+            "sha256:1b7f10b4a126472618896f92734890e2edacabe567cb20c311c4881ef9a0671c",
+            id="plain-user",
+        ),
+        pytest.param(
+            [{"role": "tool", "tool_call_id": "call-1", "content": "result"}],
+            {},
+            "sha256:7bdf0bcdd2780650ec7b9bab1647b673cd6d121d9beea981c318627d36365a2e",
+            id="plain-tool",
+        ),
+        pytest.param(
+            [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            {},
+            "sha256:5ed9a648836592ffbb710ea69ef2795cd4b92ee05725bab9e3032ddb2025fee2",
+            id="text-part",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ],
+            {},
+            "sha256:3023290754b37d612764bc3c01668519228fc068e5804985e3e940c675839acf",
+            id="input-text-part",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}],
+                }
+            ],
+            {},
+            "sha256:802d700ebbd1fc0e6d33447872121c527c26b388412fbac0a104eb064b1fb543",
+            id="output-text-part",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,abc",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:e1886fb12c891fa5a0b7aaac6ac550a1fac36ac9d791caea4de3973a4497139d",
+            id="input-image-string",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": "https://images.example/a.png",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:615820f5a3c5ada80522b9924fc529a33b2188aecfad9c6bab578d94fb0c9930",
+            id="image-url-string",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://images.example/a.png"},
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:bd2f1346ec183e920e7e7e67bcab590b35c29b1d6fbd6348e072d340497680a0",
+            id="image-url-object",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,abc"},
+                        },
+                    ],
+                }
+            ],
+            {
+                "file_backed_image_db_chain": [
+                    {
+                        "role": "user",
+                        "content": "describe",
+                        "files": [
+                            {
+                                "id": "image-1",
+                                "type": "image",
+                                "name": "photo.png",
+                                "url": "https://files.example/photo.png",
+                                "file": {"id": "image-1", "hash": "abc"},
+                            }
+                        ],
+                    }
+                ]
+            },
+            "sha256:9d525ba81214d15260aa832110c6fcaeab29fe635e629462ce48cbe6f0d8c1e3",
+            id="stabilized-image-url-file",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"q":"x"}',
+                            },
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:1e1176acc8ff6988c9318f32d18288561183570cd438cb83cc73cdfb02c8ba6f",
+            id="assistant-tool-call",
+        ),
+        pytest.param(
+            [{"role": "user", "name": "alice", "content": "hello"}],
+            {},
+            "sha256:57a7794ebc9fd6d6824e06dc9279bfb7fcb2afdd28ebc3bf5d16baf03ed1ffea",
+            id="message-name",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "function_call": {
+                        "name": "lookup",
+                        "arguments": '{"q":"x"}',
+                    },
+                }
+            ],
+            {},
+            "sha256:4fbe1e6bf270216149dabdcb2a0b803557e37225fe8413198917f874d867f028",
+            id="legacy-function-call",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://images.example/a.png",
+                                "detail": "high",
+                            },
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:10fa4627acb7af1dda22484a649114384488fcd37417ab29b7cde5b6c01ff41e",
+            id="image-url-detail",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "https://images.example/a.png",
+                            "detail": "high",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:86ea1e6ce391353835fae95b2546fbc759d6fd25b4e0cbd8f5a3daa324454e1a",
+            id="input-image-detail",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file_id": "file-1",
+                            "filename": "report.pdf",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:2e8e90f8f3762593e10afeec608f214162037930d336612228e31d4f3d0c5c64",
+            id="flat-input-file-id",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file_data": "data:application/pdf;base64,AA==",
+                            "filename": "report.pdf",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:04794d852ecb7b59b8b0477bf553cd24a1376cfeee61afe7eae1f8978dceb5ae",
+            id="flat-input-file-data",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "file",
+                            "file": {
+                                "id": "file-1",
+                                "hash": "abc123",
+                                "name": "report.pdf",
+                            },
+                            "filename": "report.pdf",
+                        }
+                    ],
+                }
+            ],
+            {},
+            "sha256:639a4713595524ce46f3b866fb2dc346849abc4ed495da39d9feb2fd0c3f7d3f",
+            id="explicit-file",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://images.example/a.png"},
+                        },
+                    ],
+                }
+            ],
+            {},
+            "sha256:d76ae9a6767da2c81fe04a3fa1562a3d250b552aad2cf15aa89c8417c98ba83d",
+            id="multipart-text-image",
+        ),
+    ],
+)
+def test_clean_history_source_hashes_remain_byte_identical(
+    messages, kwargs, expected
+):
+    assert mod.compute_summary_source_hash(messages, **kwargs) == expected
+
+
+def test_source_hash_drops_decorations_from_known_message_nodes():
+    clean = [
+        {
+            "role": "user",
+            "name": "provider-user-name",
+            "content": [
+                {"type": "text", "text": "inspect"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://images.example/a.png"},
+                },
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "done",
+            "function_call": {
+                "name": "legacy-provider-decoration",
+                "arguments": "{}",
+            },
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+                }
+            ],
+        },
+    ]
+    decorated = copy.deepcopy(clean)
+    decorated[0]["provider_message_state"] = {"trace": "volatile"}
+    decorated[0]["content"][0]["provider_annotations"] = {"trace": "volatile"}
+    decorated[0]["content"][1]["provider_part_state"] = True
+    decorated[1]["tool_calls"][0]["provider_call_state"] = {"trace": 7}
+    decorated[1]["tool_calls"][0]["function"]["provider_function_state"] = "volatile"
+
+    assert mod.compute_summary_source_hash(clean) == mod.compute_summary_source_hash(
+        decorated
+    )
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected"),
+    [
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "provider_custom",
+                            "payload": {"value": 1},
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+            "sha256:44f219bc2f41f9d385f36af2a461b0b4780e5fb4075ff0427fb3a949ea678c98",
+            id="unknown-part-cache-hint",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "provider_custom",
+                            "content": [{"type": "text", "text": "nested"}],
+                        }
+                    ],
+                }
+            ],
+            "sha256:b3d551d5d4b9127e4b9d2cf901f1c172a29129270e1cfe282b8c36ae8ec7cfe1",
+            id="unknown-part-nested-single-text",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": {"provider": "custom"},
+                            "payload": {"value": 1},
+                        }
+                    ],
+                }
+            ],
+            "sha256:b30122c1f99d0896034a007976a6aef62f188f0b7e35ed908f06d1f61e278b07",
+            id="dict-part-type-remains-total",
+        ),
+    ],
+)
+def test_source_hash_matches_head_projection_for_content_part_edges(
+    messages, expected
+):
+    assert mod.compute_summary_source_hash(messages) == expected
+
+
+# HEAD kept image_url provider junk (95e3ccb6); 0.8.5 drops it to clean-twin 10fa4627.
+def test_source_hash_drops_provider_junk_from_image_url_parts():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://images.example/a.png",
+                        "detail": "high",
+                        "provider_url_state": "volatile",
+                    },
+                    "provider_part_state": {"trace": 1},
+                }
+            ],
+        }
+    ]
+
+    assert mod.compute_summary_source_hash(messages) == (
+        "sha256:10fa4627acb7af1dda22484a649114384488fcd37417ab29b7cde5b6c01ff41e"
+    )
+
+
+def test_source_hash_preserves_generic_tool_result_attributes_from_head():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": [{"type": "text", "text": "result"}],
+                    "is_error": True,
+                    "provider_result": {"trace": "stable"},
+                }
+            ],
+        }
+    ]
+
+    assert mod.compute_summary_source_hash(messages) == (
+        "sha256:74e482d31f5c81a5e6b6b136f17a36855e897fe81684aa098454a5b47bd45374"
+    )
+
+
+def test_source_hash_keeps_known_part_and_tool_call_identity():
+    pairs = [
+        (
+            {"role": "user", "name": "alpha", "content": "hello"},
+            {"role": "user", "name": "beta", "content": "hello"},
+        ),
+        (
+            {
+                "role": "assistant",
+                "content": "",
+                "function_call": {"name": "lookup", "arguments": '{"q":1}'},
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "function_call": {"name": "lookup", "arguments": '{"q":2}'},
+            },
+        ),
+        (
+            {"role": "user", "content": [{"type": "text", "text": "alpha"}]},
+            {"role": "user", "content": [{"type": "text", "text": "beta"}]},
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://images.example/a.png"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://images.example/b.png"},
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://images.example/a.png"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://images.example/a.png",
+                            "detail": "high",
+                        },
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "https://images.example/a.png",
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "https://images.example/a.png",
+                        "detail": "high",
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [{"type": "text", "text": "result"}],
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-2",
+                        "content": [{"type": "text", "text": "result"}],
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "filename": "report.pdf",
+                        "file": {"id": "file-1", "hash": "abc"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "filename": "report.pdf",
+                        "file": {"id": "file-2", "hash": "def"},
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_id": "file-1",
+                        "filename": "report.pdf",
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_id": "file-2",
+                        "filename": "report.pdf",
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": "data:application/pdf;base64,AA==",
+                        "filename": "report.pdf",
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": "data:application/pdf;base64,BB==",
+                        "filename": "report.pdf",
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "filename": "alpha.txt",
+                        "file": {"id": "file-1", "hash": "abc"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "filename": "beta.txt",
+                        "file": {"id": "file-1", "hash": "abc"},
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-2",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }
+                ],
+            },
+        ),
+        (
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"q":1}'},
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"q":2}'},
+                    }
+                ],
+            },
+        ),
+        (
+            {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            {"role": "tool", "tool_call_id": "call-2", "content": "result"},
+        ),
+    ]
+
+    for left, right in pairs:
+        assert mod.compute_summary_source_hash(
+            [left]
+        ) != mod.compute_summary_source_hash([right])
+
+
+def test_source_hash_keeps_unknown_tool_call_types_total_and_generic():
+    first = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "custom-1", "type": "provider_custom", "payload": {"value": 1}}
+            ],
+        }
+    ]
+    second = copy.deepcopy(first)
+    second[0]["tool_calls"][0]["payload"]["value"] = 2
+
+    assert mod.compute_summary_source_hash(first).startswith("sha256:")
+    assert mod.compute_summary_source_hash(first) != mod.compute_summary_source_hash(
+        second
+    )
+
+
+def test_tolerant_source_projection_preserves_token_estimate_bytes():
+    message = {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "text",
+                "text": "answer",
+                "cache_control": {"type": "ephemeral"},
+                "provider_annotations": {"trace": "token-visible"},
+            }
+        ],
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": '{"q":"x"}',
+                    "provider_function_extra": "token-visible",
+                },
+                "provider_call_extra": {"trace": 7},
+            }
+        ],
+        "provider_message_extra": "dropped-top-level",
+    }
+    expected = {
+        "content": [
+            {
+                "provider_annotations": {"trace": "token-visible"},
+                "text": "answer",
+                "type": "text",
+            }
+        ],
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "function": {
+                    "arguments": '{"q":"x"}',
+                    "name": "lookup",
+                    "provider_function_extra": "token-visible",
+                },
+                "id": "call-1",
+                "provider_call_extra": {"trace": 7},
+                "type": "function",
+            }
+        ],
+    }
+
+    class ByteEncoder:
+        name = "order-085-byte"
+
+        def encode(self, value, **_kwargs):
+            return list(value.encode("utf-8"))
+
+    image_count, text = mod._message_token_image_count_and_text(message)
+    mod._MESSAGE_TOKEN_ESTIMATE_CACHE.clear()
+    try:
+        count = mod.estimate_message_tokens(
+            message,
+            encoder=ByteEncoder(),
+            encoding_name="order-085-byte",
+        )
+    finally:
+        mod._MESSAGE_TOKEN_ESTIMATE_CACHE.clear()
+
+    assert mod.canonicalize_message_for_token_estimate(message) == expected
+    assert image_count == 0
+    assert text == (
+        '{"content":[{"provider_annotations":{"trace":"token-visible"},'
+        '"text":"answer","type":"text"}],"role":"assistant","tool_calls":['
+        '{"function":{"arguments":"{\\"q\\":\\"x\\"}","name":"lookup",'
+        '"provider_function_extra":"token-visible"},"id":"call-1",'
+        '"provider_call_extra":{"trace":7},"type":"function"}]}'
+    )
+    assert count == 299
+
+
+def test_source_hash_ignores_provider_prompt_cache_hints():
+    stable = [
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": [{"type": "text", "text": "nested result"}],
+                },
+            ],
+        },
+    ]
+    with_cache_hint = copy.deepcopy(stable)
+    with_cache_hint[0]["content"][0]["cache_control"] = {"type": "ephemeral"}
+    with_cache_hint[1]["content"][0]["cache_control"] = {"type": "ephemeral"}
+    with_cache_hint[1]["content"][0]["cacheControl"] = {"type": "ephemeral"}
+    with_cache_hint[1]["content"][1]["cache_control"] = {"type": "ephemeral"}
+    with_cache_hint[1]["content"][1]["content"][0]["cache_control"] = {"type": "ephemeral"}
+    changed_text = copy.deepcopy(stable)
+    changed_text[1]["content"][1]["content"][0]["text"] = "changed result"
+
+    assert mod.compute_source_hash(stable) == mod.compute_source_hash(with_cache_hint)
+    assert mod.compute_source_hash(stable) != mod.compute_source_hash(changed_text)
+
+
+def test_source_hash_collapses_single_text_part_to_plain_string():
+    plain = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "world"},
+    ]
+    wrapped = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "world"}]},
+    ]
+
+    assert mod.compute_source_hash(plain) == mod.compute_source_hash(wrapped)
+
+
+def test_source_hash_keeps_multimodal_identity_and_drops_text_annotations():
+    plain = [{"role": "user", "content": "hello"}]
+    with_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+        }
+    ]
+    with_annotations = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello", "annotations": ["note"]}],
+        }
+    ]
+
+    assert mod.compute_source_hash(plain) != mod.compute_source_hash(with_image)
+    assert mod.compute_source_hash(plain) == mod.compute_source_hash(with_annotations)
+
+
+def test_source_hash_ignores_core_file_upload_transients():
+    stable = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "inspect this file"},
+            {
+                "type": "file",
+                "file": {
+                    "id": "file-1",
+                    "name": "report.pdf",
+                    "signed_url": "https://signed.example/a?token=old",
+                    "metadata": {"upload_id": "tmp-a", "sha256": "abc123"},
+                },
+            },
+        ],
+        "files": [
+            {
+                "type": "file",
+                "id": "file-1",
+                "url": "file-1",
+                "name": "report.pdf",
+                "collection_name": "knowledge",
+                "content_type": "application/pdf",
+                "size": 12345,
+                "status": "uploaded",
+                "error": "",
+                "itemId": "ui-item-a",
+                "file": {
+                    "id": "file-1",
+                    "user_id": "user-1",
+                    "hash": "abc123",
+                    "filename": "report.pdf",
+                    "path": "/var/lib/open-webui/uploads/a/report.pdf",
+                    "data": {"content": "extracted text", "status": "pending"},
+                    "meta": {
+                        "name": "report.pdf",
+                        "content_type": "application/pdf",
+                        "collection_name": "knowledge",
+                        "data": {"upload_id": "tmp-a"},
+                    },
+                    "created_at": 100,
+                    "updated_at": 100,
+                },
+            }
+        ],
+    }
+    changed_transient = copy.deepcopy(stable)
+    changed_transient["content"][1]["file"]["signed_url"] = "https://signed.example/a?token=new"
+    changed_transient["content"][1]["file"]["metadata"]["upload_id"] = "tmp-b"
+    changed_transient["files"][0]["status"] = "processing"
+    changed_transient["files"][0]["error"] = "temporary warning"
+    changed_transient["files"][0]["itemId"] = "ui-item-b"
+    changed_transient["files"][0]["size"] = 99999
+    changed_transient["files"][0]["progress"] = {"phase": "extracting", "percent": 50}
+    changed_transient["files"][0]["file"]["path"] = "/var/lib/open-webui/uploads/b/report.pdf"
+    changed_transient["files"][0]["file"]["data"]["status"] = "done"
+    changed_transient["files"][0]["file"]["meta"]["data"]["upload_id"] = "tmp-b"
+    changed_transient["files"][0]["file"]["created_at"] = 200
+    changed_transient["files"][0]["file"]["updated_at"] = 200
+    changed_semantic = copy.deepcopy(stable)
+    changed_semantic["files"][0]["file"]["hash"] = "def456"
+
+    assert mod.compute_source_hash([stable]) == mod.compute_source_hash([changed_transient])
+    assert mod.compute_source_hash([stable]) != mod.compute_source_hash([changed_semantic])
+
+
+def test_source_hash_preserves_file_metadata_used_for_source_context():
+    first = {
+        "role": "user",
+        "content": "Use attached page",
+        "files": [
+            {
+                "type": "text",
+                "name": "https://example.com/a",
+                "url": "https://example.com/a",
+                "context": "full",
+                "file": {
+                    "data": {"content": "same text"},
+                    "meta": {"name": "page", "source": "https://example.com/a"},
+                },
+            }
+        ],
+    }
+    second = copy.deepcopy(first)
+    second["files"][0]["file"]["meta"]["source"] = "https://example.com/b"
+
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([second])
+
+
+def test_source_hash_preserves_web_search_attachment_urls_and_queries():
+    first = {
+        "role": "user",
+        "content": "Search the web",
+        "files": [
+            {
+                "collection_name": "web-search-collection",
+                "name": "open webui auto compaction",
+                "type": "web_search",
+                "urls": ["https://example.com/old"],
+                "queries": ["open webui auto compaction"],
+                "status": "uploaded",
+            }
+        ],
+    }
+    changed_url = copy.deepcopy(first)
+    changed_url["files"][0]["urls"] = ["https://example.com/new"]
+    changed_query = copy.deepcopy(first)
+    changed_query["files"][0]["queries"] = ["open webui checkpoint compaction"]
+
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([changed_url])
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([changed_query])
+    assert "status" not in mod.canonicalize_messages_for_source_hash([first])[0]["files"][0]
+
+
+def test_source_hash_preserves_non_file_content_file_paths():
+    first = {
+        "role": "user",
+        "content": [{"type": "profile", "file": {"path": "/workspace/a.txt", "name": "same"}}],
+    }
+    second = copy.deepcopy(first)
+    second["content"][0]["file"]["path"] = "/workspace/b.txt"
+
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([second])
+
+
+def test_source_hash_preserves_semantic_paths_outside_file_metadata():
+    first = {
+        "role": "assistant",
+        "content": [{"type": "input", "path": "/workspace/a.txt"}],
+        "function_call": {"name": "read_file", "arguments": {"path": "/workspace/a.txt"}},
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": {"path": "/workspace/a.txt"}},
+            }
+        ],
+        "sources": [{"source": {"id": "doc-1", "name": "docs", "path": "docs/a.md"}}],
+    }
+    second = copy.deepcopy(first)
+    second["content"][0]["path"] = "/workspace/b.txt"
+    second["function_call"] = {"name": "read_file", "arguments": {"path": "/workspace/b.txt"}}
+    second["tool_calls"][0]["function"]["arguments"]["path"] = "/workspace/b.txt"
+    second["sources"][0]["source"]["path"] = "docs/b.md"
+
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([second])
+
+
+def test_source_hash_preserves_semantic_urls():
+    first = {
+        "role": "user",
+        "content": "Use this reference URL",
+        "sources": [{"title": "docs", "url": "https://example.com/a"}],
+    }
+    second = {
+        "role": "user",
+        "content": "Use this reference URL",
+        "sources": [{"title": "docs", "url": "https://example.com/b"}],
+    }
+
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([second])
+
+
+def test_source_hash_preserves_semantic_download_urls_outside_file_metadata():
+    first = {
+        "role": "user",
+        "content": "Use this reference URL",
+        "sources": [{"source": {"name": "docs", "download_url": "https://example.com/a"}}],
+    }
+    second = {
+        "role": "user",
+        "content": "Use this reference URL",
+        "sources": [{"source": {"name": "docs", "download_url": "https://example.com/b"}}],
+    }
+
+    assert mod.compute_source_hash([first]) != mod.compute_source_hash([second])
+
+
+def test_source_hash_ignores_retrieval_source_scores():
+    stable = {
+        "role": "assistant",
+        "content": "answer",
+        "sources": [
+            {
+                "source": {"id": "doc-1", "name": "docs", "type": "file"},
+                "document": ["same chunk"],
+                "metadata": [{"source": "docs/a.md"}],
+                "distances": [0.1],
+            }
+        ],
+    }
+    changed_score = copy.deepcopy(stable)
+    changed_score["sources"][0]["distances"] = [0.9]
+    changed_document = copy.deepcopy(stable)
+    changed_document["sources"][0]["document"] = ["different chunk"]
+
+    assert mod.compute_source_hash([stable]) == mod.compute_source_hash([changed_score])
+    assert mod.compute_source_hash([stable]) != mod.compute_source_hash([changed_document])
+
+
+def test_profile_hash_only_uses_hard_compatibility_boundaries():
+    baseline = mod.compute_profile_hash(
+        target_model="gpt-4.1",
+        summary_model="gpt-4.1-mini",
+        wrapper_suffix="abc",
+        summary_prompt="old prompt",
+        historical_message_excerpt_bytes=256,
+        historical_message_excerpt_count=16,
+    )
+    ordinary_changes = mod.compute_profile_hash(
+        target_model="claude-sonnet",
+        summary_model="pipe.summary",
+        wrapper_suffix="xyz",
+        summary_prompt="new prompt",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=64,
+    )
+    hard_change = mod.compute_profile_hash(summary_format_family="changed-summary-format-family")
+
+    assert ordinary_changes == baseline
+    assert hard_change != baseline
+
+
+def test_wrapper_ids_round_trip_special_target_model_ids():
+    targets = [
+        "openai.gpt-4.1",
+        "ollama/llama3.2:latest",
+        "provider:model/with.dots:and/slashes",
+        "pipe.backed.target",
+    ]
+
+    for target in targets:
+        wrapper_id = mod.build_wrapper_model_id("auto_compact", target)
+        assert wrapper_id == f"auto_compact.{target}"
+        assert wrapper_id.startswith("auto_compact.")
+        decoded = mod.decode_wrapper_model_id(wrapper_id, expected_pipe_function_id="auto_compact")
+        assert decoded.pipe_function_id == "auto_compact"
+        assert decoded.target_model_id == target
+
+
+def test_decode_rejects_malformed_or_wrong_pipe_wrapper_ids():
+    with pytest.raises(ValueError, match="wrapper"):
+        mod.decode_wrapper_model_id("not-a-wrapper", expected_pipe_function_id="auto_compact")
+
+    with pytest.raises(ValueError, match="pipe"):
+        mod.decode_wrapper_model_id("other_pipe.gpt", expected_pipe_function_id="auto_compact")
+
+
+def test_checkpoint_table_contract_names_and_columns():
+    table = mod.CHECKPOINT_TABLE
+
+    assert table.name == "skyzi000_owui_ext_autocompact_checkpoint_v1"
+    assert table.metadata.schema == mod.OPEN_WEBUI_DATABASE_SCHEMA
+    assert {idx.name for idx in table.indexes} == {
+        "skyzi000_owui_ext_accp_v1_prefix_idx",
+        "skyzi000_owui_ext_accp_v1_recent_idx",
+    }
+    assert {constraint.name for constraint in table.constraints} >= {
+        "skyzi000_owui_ext_accp_v1_lookup_uq"
+    }
+    assert set(table.c.keys()) == {
+        "id",
+        "namespace",
+        "schema_version",
+        "user_id",
+        "chat_id",
+        "pipe_function_id",
+        "profile_hash",
+        "source_message_count",
+        "source_hash",
+        "summary_text",
+        "summary_meta",
+        "summary_token_count",
+        "state",
+        "parent_checkpoint_id",
+        "claim_token",
+        "claim_expires_at",
+        "created_at",
+        "updated_at",
+        "last_used_at",
+    }
+
+
+def test_checkpoint_lookup_indexes_partition_by_pipe_function_id_not_selected_wrapper_id():
+    table = mod.CHECKPOINT_TABLE
+    lookup = next(
+        constraint
+        for constraint in table.constraints
+        if constraint.name == "skyzi000_owui_ext_accp_v1_lookup_uq"
+    )
+    prefix = next(idx for idx in table.indexes if idx.name == "skyzi000_owui_ext_accp_v1_prefix_idx")
+
+    assert [column.name for column in lookup.columns] == [
+        "namespace",
+        "user_id",
+        "chat_id",
+        "pipe_function_id",
+        "profile_hash",
+        "source_hash",
+    ]
+    assert [column.name for column in prefix.columns] == [
+        "namespace",
+        "user_id",
+        "chat_id",
+        "pipe_function_id",
+        "profile_hash",
+        "source_message_count",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_table_initialization_is_cached_on_request_state(monkeypatch):
+    calls = []
+
+    class DummyConnection:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def run_sync(self, fn):
+            calls.append(fn)
+
+    class DummyEngine:
+        def begin(self):
+            return DummyConnection()
+
+    request = type("Request", (), {"state": type("State", (), {})()})()
+    monkeypatch.setattr(mod, "_CHECKPOINT_SCHEMA_READY", False)
+
+    await mod.ensure_checkpoint_table_initialized(request=request, async_engine=DummyEngine())
+    await mod.ensure_checkpoint_table_initialized(request=request, async_engine=DummyEngine())
+
+    assert len(calls) == 1
+    assert request.state.__dict__[mod.REQUEST_STATE_SCHEMA_READY_KEY] is True
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_table_initialization_uses_process_cache_without_request(monkeypatch):
+    calls = []
+
+    class DummyConnection:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def run_sync(self, fn):
+            calls.append(fn)
+
+    class DummyEngine:
+        def begin(self):
+            return DummyConnection()
+
+    monkeypatch.setattr(mod, "_CHECKPOINT_SCHEMA_READY", False)
+
+    await mod.ensure_checkpoint_table_initialized(request=None, async_engine=DummyEngine())
+    await mod.ensure_checkpoint_table_initialized(request=None, async_engine=DummyEngine())
+
+    assert len(calls) == 1
+
+
+def test_generation_lock_cleanup_removes_unused_lock():
+    key = ("ns", "user", "chat", "pipe", "profile", "source")
+    lock = mod.get_generation_lock(key)
+
+    assert mod._GENERATION_LOCKS[key] is lock
+
+    mod.release_generation_lock(key, lock)
+
+    assert key not in mod._GENERATION_LOCKS
+
+
+class ClaimStore:
+    """In-memory CheckpointStore stand-in implementing the DB claim interface."""
+
+    def __init__(self, rows=None, *, share_rows=False):
+        self.rows = rows if share_rows and rows is not None else [dict(row) for row in (rows or [])]
+        self.claimed_rows = []
+        self.completed_rows = []
+        self.released = []
+        self.reclaimed = []
+        self.touched = []
+
+    def _match(self, identity):
+        identity_keys = (
+            "namespace",
+            "user_id",
+            "chat_id",
+            "pipe_function_id",
+            "profile_hash",
+            "source_hash",
+        )
+        for row in self.rows:
+            if all(row.get(key) == identity.get(key) for key in identity_keys):
+                return row
+        return None
+
+    async def lookup_any(self, **kwargs):
+        row = self._match(kwargs)
+        return dict(row) if row else None
+
+    async def lookup_ready(self, **kwargs):
+        row = self._match(kwargs)
+        if row is not None and row.get("state") == "ready":
+            return dict(row)
+        return None
+
+    async def find_longest_parent(self, **kwargs):
+        identity_keys = ("namespace", "user_id", "chat_id", "pipe_function_id", "profile_hash")
+        candidates = [
+            row
+            for row in self.rows
+            if all(row.get(key) == kwargs.get(key) for key in identity_keys)
+        ]
+        return mod.select_longest_matching_parent(candidates, kwargs["source_messages"])
+
+    async def claim_pending(self, row):
+        if self._match(row) is not None:
+            return False
+        stored = dict(row)
+        self.rows.append(stored)
+        self.claimed_rows.append(dict(stored))
+        return True
+
+    async def reclaim_pending(self, checkpoint_id, *, claim_token, expires_at, now=None):
+        for row in self.rows:
+            if row.get("id") != checkpoint_id or row.get("state") != "pending":
+                continue
+            expires = row.get("claim_expires_at")
+            if expires is not None and now is not None and int(expires) > int(now):
+                return False
+            row["claim_token"] = claim_token
+            row["claim_expires_at"] = expires_at
+            self.reclaimed.append(checkpoint_id)
+            return True
+        return False
+
+    async def extend_claim(self, checkpoint_id, *, claim_token, expires_at):
+        for row in self.rows:
+            if (
+                row.get("id") == checkpoint_id
+                and row.get("state") == "pending"
+                and row.get("claim_token") == claim_token
+            ):
+                row["claim_expires_at"] = expires_at
+                return True
+        return False
+
+    async def release_claim(self, checkpoint_id, *, claim_token):
+        for row in list(self.rows):
+            if (
+                row.get("id") == checkpoint_id
+                and row.get("state") == "pending"
+                and row.get("claim_token") == claim_token
+            ):
+                self.rows.remove(row)
+                self.released.append(checkpoint_id)
+                return True
+        return False
+
+    async def complete_pending(
+        self,
+        checkpoint_id,
+        *,
+        claim_token,
+        summary_text,
+        parent_checkpoint_id,
+        summary_token_count=None,
+        now=None,
+        generation_lease_id=None,
+        generation_lease_claim_token=None,
+    ):
+        if generation_lease_id is not None:
+            timestamp = int(time.time()) if now is None else int(now)
+            lease = next(
+                (
+                    row
+                    for row in self.rows
+                    if row.get("id") == generation_lease_id
+                    and row.get("state") == "pending"
+                    and row.get("claim_token") == generation_lease_claim_token
+                    and row.get("claim_expires_at") is not None
+                    and int(row["claim_expires_at"]) > timestamp
+                ),
+                None,
+            )
+            if lease is None:
+                return None
+        for row in self.rows:
+            if (
+                row.get("id") == checkpoint_id
+                and row.get("state") == "pending"
+                and row.get("claim_token") == claim_token
+            ):
+                row.update(
+                    state="ready",
+                    summary_text=summary_text,
+                    parent_checkpoint_id=parent_checkpoint_id,
+                    summary_token_count=summary_token_count,
+                    claim_token=None,
+                    claim_expires_at=None,
+                )
+                self.completed_rows.append(dict(row))
+                return dict(row)
+        return None
+
+    async def touch(self, checkpoint_id, *, now=None):
+        self.touched.append(checkpoint_id)
+        return True
+
+
+def source_claims(store):
+    return [row for row in store.claimed_rows if row["namespace"] == mod.CHECKPOINT_NAMESPACE]
+
+
+def generation_lease_claims(store):
+    return [
+        row
+        for row in store.claimed_rows
+        if row["namespace"] == mod.CHECKPOINT_GENERATION_LEASE_NAMESPACE
+    ]
+
+
+def released_source_claims(store):
+    released = set(store.released)
+    return [row for row in source_claims(store) if row["id"] in released]
+
+
+def released_generation_lease_claims(store):
+    released = set(store.released)
+    return [row for row in generation_lease_claims(store) if row["id"] in released]
+
+
+def make_checkpoint_row(
+    source_messages,
+    *,
+    state="pending",
+    summary_text="",
+    claim_token="claim-token-1",
+    claim_expires_at=10**12,
+    now=100,
+    profile_hash=None,
+):
+    return mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=profile_hash or mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages),
+        source_message_count=len(source_messages),
+        summary_text=summary_text,
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state=state,
+        claim_token=claim_token,
+        claim_expires_at=claim_expires_at,
+        now=now,
+    )
+
+
+def make_generation_lease_row(
+    *,
+    claim_token="lease-owner",
+    claim_expires_at=10**12,
+    profile_hash=None,
+):
+    return mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_GENERATION_LEASE_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=profile_hash or mod.compute_profile_hash(),
+        source_hash=mod.CHECKPOINT_GENERATION_LEASE_SOURCE_HASH,
+        source_message_count=0,
+        summary_text="",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state="pending",
+        claim_token=claim_token,
+        claim_expires_at=claim_expires_at,
+        now=1,
+    )
+
+
+async def noop_initialize(**kwargs):
+    return None
+
+
+async def run_get_or_create(
+    source_messages,
+    summary_factory,
+    *,
+    summary_meta=None,
+    parent_checkpoint=None,
+    checkpoint_profile_hash=mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    use_generation_lease=True,
+):
+    return await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        summary_meta=summary_meta or {},
+        summary_factory=summary_factory,
+        parent_checkpoint=parent_checkpoint,
+        checkpoint_profile_hash=checkpoint_profile_hash,
+        use_generation_lease=use_generation_lease,
+    )
+
+
+def test_checkpoint_profile_hash_separates_active_from_inactive_and_task_modes():
+    active_profile = mod.checkpoint_profile_hash_for_ref_mode(
+        ref_mode_active=True
+    )
+    inactive_profile = mod.checkpoint_profile_hash_for_ref_mode(
+        ref_mode_active=False
+    )
+
+    assert active_profile == mod.compute_profile_hash()
+    assert inactive_profile != active_profile
+    assert (
+        mod.checkpoint_profile_hash_for_ref_mode(ref_mode_active=False)
+        == inactive_profile
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_profiles_isolate_ready_rows_and_generation_leases(
+    monkeypatch,
+):
+    source_messages = [{"role": "user", "content": "old"}]
+    active_profile = mod.checkpoint_profile_hash_for_ref_mode(
+        ref_mode_active=True
+    )
+    inactive_profile = mod.checkpoint_profile_hash_for_ref_mode(
+        ref_mode_active=False
+    )
+    store = ClaimStore()
+    generated_profiles = []
+
+    async def summary_factory(_parent):
+        generated_profiles.append("generated")
+        return f"summary-{len(generated_profiles)}"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    active_result = await run_get_or_create(
+        source_messages,
+        summary_factory,
+        checkpoint_profile_hash=active_profile,
+    )
+    inactive_result = await run_get_or_create(
+        source_messages,
+        summary_factory,
+        checkpoint_profile_hash=inactive_profile,
+    )
+
+    async def unexpected_generation(_parent):
+        raise AssertionError("same-mode ready checkpoints must be reused")
+
+    repeated_active = await run_get_or_create(
+        source_messages,
+        unexpected_generation,
+        checkpoint_profile_hash=active_profile,
+    )
+    repeated_inactive = await run_get_or_create(
+        source_messages,
+        unexpected_generation,
+        checkpoint_profile_hash=inactive_profile,
+    )
+
+    assert active_result == repeated_active == "summary-1"
+    assert inactive_result == repeated_inactive == "summary-2"
+    assert len(generated_profiles) == 2
+    assert {
+        row["profile_hash"] for row in source_claims(store)
+    } == {active_profile, inactive_profile}
+    assert {
+        row["profile_hash"] for row in generation_lease_claims(store)
+    } == {active_profile, inactive_profile}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_profile", "requested_profile"),
+    [
+        (
+            mod.checkpoint_profile_hash_for_ref_mode(ref_mode_active=True),
+            mod.checkpoint_profile_hash_for_ref_mode(ref_mode_active=False),
+        ),
+        (
+            mod.checkpoint_profile_hash_for_ref_mode(ref_mode_active=False),
+            mod.checkpoint_profile_hash_for_ref_mode(ref_mode_active=True),
+        ),
+    ],
+)
+async def test_checkpoint_profiles_do_not_reuse_cross_mode_pending_rows(
+    monkeypatch,
+    stored_profile,
+    requested_profile,
+):
+    source_messages = [{"role": "user", "content": "old"}]
+    pending = make_checkpoint_row(
+        source_messages,
+        profile_hash=stored_profile,
+    )
+    store = ClaimStore([pending])
+
+    async def summary_factory(_parent):
+        return "requested-mode-summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    result = await run_get_or_create(
+        source_messages,
+        summary_factory,
+        checkpoint_profile_hash=requested_profile,
+    )
+
+    assert result == "requested-mode-summary"
+    assert [
+        row["profile_hash"] for row in source_claims(store)
+    ] == [requested_profile]
+    assert [
+        row["profile_hash"] for row in generation_lease_claims(store)
+    ] == [requested_profile]
+
+
+@pytest.mark.asyncio
+async def test_logical_history_snapshot_is_built_once_per_request_history(
+    monkeypatch,
+):
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+    ]
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    request = SimpleNamespace(state=SimpleNamespace())
+    original_build = mod.build_logical_history_snapshot
+    build_calls = 0
+
+    async def counted_build(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        await asyncio.sleep(0)
+        return await original_build(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "build_logical_history_snapshot", counted_build)
+
+    first, second = await asyncio.gather(
+        mod.get_or_build_logical_history_snapshot(
+            request,
+            messages,
+            identity=identity,
+        ),
+        mod.get_or_build_logical_history_snapshot(
+            request,
+            copy.deepcopy(messages),
+            identity=identity,
+        ),
+    )
+    third = await mod.get_or_build_logical_history_snapshot(
+        request,
+        copy.deepcopy(messages),
+        identity=identity,
+    )
+    canonical = await mod.build_canonical_history_source(
+        messages,
+        source_message_count=len(messages),
+    )
+
+    assert first is second is third
+    assert build_calls == 1
+    assert first.prefix_raw_source_hashes[-1] == canonical.raw_source_hash
+
+
+@pytest.mark.asyncio
+async def test_get_or_build_snapshot_accepts_precomputed_source_hash(monkeypatch):
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [
+        {"role": "user", "content": "with files"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    metadata = {
+        "chat_id": "chat-1",
+        "user_message_id": "msg-1",
+        "files": [{"id": "file-1", "type": "file", "name": "a.txt"}],
+    }
+    db_chain = [
+        {
+            "role": "user",
+            "content": "with files",
+            "files": [{"id": "file-1", "type": "file"}],
+        },
+        {"role": "assistant", "content": "answer"},
+    ]
+
+    async def load_chain(request, chat_id, current_message_id):
+        return copy.deepcopy(db_chain)
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+    request = SimpleNamespace(state=SimpleNamespace())
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        request, metadata, messages
+    )
+    assert resolver is not None
+
+    first = await mod.get_or_build_logical_history_snapshot(
+        request,
+        messages,
+        identity=identity,
+        prefix_file_fingerprint_resolver=resolver,
+    )
+    source_hash = mod.compute_summary_source_hash(
+        messages,
+        resolver(len(messages)),
+        mod._prefix_file_fingerprint_resolver_db_chain(resolver),
+    )
+    second = await mod.get_or_build_logical_history_snapshot(
+        request,
+        messages,
+        identity=identity,
+        prefix_file_fingerprint_resolver=resolver,
+        source_hash=source_hash,
+    )
+    assert first is second
+
+    plain_request = SimpleNamespace(state=SimpleNamespace())
+    third = await mod.get_or_build_logical_history_snapshot(
+        plain_request,
+        messages,
+        identity=identity,
+    )
+    fourth = await mod.get_or_build_logical_history_snapshot(
+        plain_request,
+        messages,
+        identity=identity,
+        source_hash=mod.compute_summary_source_hash(messages),
+    )
+    assert third is fourth
+
+
+def _v2_history_catalog_entry(
+    checkpoint,
+    snapshot,
+    *,
+    user_message_id="message-1",
+):
+    source = mod._history_ref_source_handle(
+        checkpoint,
+        user_message_id=user_message_id,
+        logical_snapshot=snapshot,
+    )
+    assert isinstance(source, mod.HistoryRefSourceHandle)
+    return mod.RefCatalogEntry(
+        manifest=mod.RefManifest(
+            ref=f"history:{source.checkpoint_id}",
+            utf8_bytes=None,
+            sha256=source.raw_source_hash,
+        ),
+        source=source,
+    )
+
+
+@pytest.mark.asyncio
+async def test_v2_readvertisement_replaces_snapshot_and_releases_request_retention():
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(state=SimpleNamespace()),
+    )
+    old_messages = [{"role": "user", "content": "stable prefix"}]
+    old_snapshot = await mod.get_or_build_logical_history_snapshot(
+        request,
+        old_messages,
+        identity=identity,
+    )
+    checkpoint = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        source_hash=mod._logical_snapshot_source_hash(old_snapshot, 1),
+        source_message_count=1,
+        summary_text="stable summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": old_snapshot.prefix_raw_source_hashes[0],
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    old_entry = _v2_history_catalog_entry(checkpoint, old_snapshot)
+    key = mod.RefBindingKey(
+        user_id=identity[1],
+        chat_id=identity[2],
+        user_message_id="message-1",
+        assistant_message_id="assistant-1",
+        incoming_model_id="wrapper-1",
+        base_pipe_id=identity[3],
+        profile_hash=identity[4],
+        branch_anchor="branch-1",
+    )
+    registry = {}
+    first_reservation = await mod.reserve_ref_binding(request, key, registry)
+    assert first_reservation is not None
+    first_attempt = mod.stage_ref_attempt(
+        request,
+        first_reservation,
+        mod.build_history_ref_projection_plan((old_entry,)),
+    )
+    await mod.commit_ref_attempt(request, first_attempt)
+    reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
+    assert await reader(f"wc -c {old_entry.manifest.ref}") == str(
+        old_snapshot.prefix_utf8_bytes[0]
+    )
+
+    new_messages = [
+        *old_messages,
+        {"role": "assistant", "content": "new boundary"},
+    ]
+    new_snapshot = await mod.get_or_build_logical_history_snapshot(
+        request,
+        new_messages,
+        identity=identity,
+    )
+    new_entry = _v2_history_catalog_entry(checkpoint, new_snapshot)
+    second_reservation = await mod.reserve_ref_binding(request, key, registry)
+    assert second_reservation is not None
+    second_attempt = mod.stage_ref_attempt(
+        request,
+        second_reservation,
+        mod.build_history_ref_projection_plan((new_entry,)),
+    )
+    await mod.commit_ref_attempt(request, second_attempt)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    binding_entry = next(
+        entry
+        for entry in store.bindings[key].catalog
+        if entry.manifest.ref == old_entry.manifest.ref
+    )
+    snapshot_cache = getattr(
+        request.state,
+        mod.REQUEST_STATE_LOGICAL_HISTORY_SNAPSHOT_CACHE_KEY,
+    )
+    reader_memo = inspect.getclosurevars(reader).nonlocals[
+        "resolved_history_refs"
+    ]
+
+    assert binding_entry is new_entry
+    assert binding_entry.source.logical_snapshot is new_snapshot
+    assert set(snapshot_cache) == {identity}
+    cached_key, cached_value = snapshot_cache[identity]
+    assert cached_key[0] == identity
+    assert cached_value is new_snapshot
+    assert reader_memo == {}
+    assert all(
+        not isinstance(entry.source, mod.HistoryRefSourceHandle)
+        or entry.source.logical_snapshot is not old_snapshot
+        for entry in store.bindings[key].catalog
+    )
+    assert all(value is not old_snapshot for _key, value in snapshot_cache.values())
+
+
+@pytest.mark.parametrize("source_kind", ["tool", "v1-history"])
+@pytest.mark.asyncio
+async def test_tool_and_v1_readvertisement_remain_first_wins(source_kind):
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(state=SimpleNamespace()),
+    )
+    key = mod.RefBindingKey(
+        user_id="user-1",
+        chat_id="chat-1",
+        user_message_id="message-1",
+        assistant_message_id="assistant-1",
+        incoming_model_id="wrapper-1",
+        base_pipe_id="auto_compact",
+        profile_hash=mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+        branch_anchor="branch-1",
+    )
+    if source_kind == "tool":
+        ref = f"tool:{'a' * 64}"
+        manifest = mod.RefManifest(ref=ref, utf8_bytes=5, sha256="a" * 64)
+        first_entry = mod.RefCatalogEntry(
+            manifest=manifest,
+            source=mod.ZeroCopySourceHandle(text="first"),
+        )
+        second_entry = mod.RefCatalogEntry(
+            manifest=manifest,
+            source=mod.ZeroCopySourceHandle(text="later"),
+        )
+    else:
+        ref = f"history:accp_{'a' * 64}"
+        manifest = mod.RefManifest(ref=ref, utf8_bytes=None, sha256="a" * 64)
+        source = mod.HistoryRefSourceHandle(
+            checkpoint_id=f"accp_{'a' * 64}",
+            namespace=mod.CHECKPOINT_NAMESPACE,
+            user_id="user-1",
+            chat_id="chat-1",
+            pipe_function_id="auto_compact",
+            profile_hash=mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+            source_hash="source-a",
+            source_message_count=1,
+            raw_source_hash="a" * 64,
+            user_message_id="message-1",
+            transient_message_patterns=None,
+        )
+        first_entry = mod.RefCatalogEntry(manifest=manifest, source=source)
+        second_entry = mod.RefCatalogEntry(
+            manifest=manifest,
+            source=dataclasses.replace(source, user_message_id="message-2"),
+        )
+    registry = {}
+    for entry in (first_entry, second_entry):
+        reservation = await mod.reserve_ref_binding(request, key, registry)
+        assert reservation is not None
+        attempt = mod.stage_ref_attempt(
+            request,
+            reservation,
+            mod.RefProjectionPlan(
+                catalog=(entry,),
+                manifests=(entry.manifest,),
+                reader_schema=mod.REF_EXEC_TOOL_SPEC,
+            ),
+        )
+        await mod.commit_ref_attempt(request, attempt)
+
+    store = getattr(request.state, mod.REQUEST_STATE_REF_STORE_KEY)
+    retained = next(
+        entry for entry in store.bindings[key].catalog if entry.manifest.ref == ref
+    )
+    assert retained is first_entry
+
+
+@pytest.mark.asyncio
+async def test_v2_readvertisement_rejects_changed_manifest_digest():
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    snapshot = await mod.build_logical_history_snapshot(
+        [{"role": "user", "content": "one"}],
+        identity=identity,
+    )
+    checkpoint = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        source_hash=mod._logical_snapshot_source_hash(snapshot, 1),
+        source_message_count=1,
+        summary_text="summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": snapshot.prefix_raw_source_hashes[0],
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    first_entry = _v2_history_catalog_entry(checkpoint, snapshot)
+    second_entry = dataclasses.replace(
+        first_entry,
+        manifest=dataclasses.replace(first_entry.manifest, sha256="b" * 64),
+        source=dataclasses.replace(first_entry.source, raw_source_hash="b" * 64),
+    )
+    request = SimpleNamespace(state=SimpleNamespace())
+    key = mod.RefBindingKey(
+        user_id=identity[1],
+        chat_id=identity[2],
+        user_message_id="message-1",
+        assistant_message_id="assistant-1",
+        incoming_model_id="wrapper-1",
+        base_pipe_id=identity[3],
+        profile_hash=identity[4],
+        branch_anchor="branch-1",
+    )
+    registry = {}
+    first_reservation = await mod.reserve_ref_binding(request, key, registry)
+    assert first_reservation is not None
+    first_attempt = mod.stage_ref_attempt(
+        request,
+        first_reservation,
+        mod.build_history_ref_projection_plan((first_entry,)),
+    )
+    await mod.commit_ref_attempt(request, first_attempt)
+    second_reservation = await mod.reserve_ref_binding(request, key, registry)
+    assert second_reservation is not None
+    second_attempt = mod.stage_ref_attempt(
+        request,
+        second_reservation,
+        mod.build_history_ref_projection_plan((second_entry,)),
+    )
+
+    with pytest.raises(
+        mod.RefProjectionError,
+        match="v2 history re-advertisement integrity",
+    ):
+        await mod.commit_ref_attempt(request, second_attempt)
+
+
+@pytest.mark.asyncio
+async def test_v2_history_ref_verification_hash_computes_once_per_snapshot(monkeypatch):
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [{"role": "user", "content": "one"}]
+    snapshot = await mod.build_logical_history_snapshot(messages, identity=identity)
+    checkpoint = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        # Built from the equivalent summary hash on purpose: computing the
+        # snapshot's own verification hash here would warm its memo.
+        source_hash=mod.compute_summary_source_hash(messages),
+        source_message_count=1,
+        summary_text="summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": snapshot.prefix_raw_source_hashes[0],
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(state=SimpleNamespace()),
+    )
+    key = mod.RefBindingKey(
+        user_id="user-1",
+        chat_id="chat-1",
+        user_message_id="message-1",
+        assistant_message_id="assistant-1",
+        incoming_model_id="wrapper-1",
+        base_pipe_id="auto_compact",
+        profile_hash=mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+        branch_anchor="branch-1",
+    )
+    registry = {}
+    source_hash_json_hashes = 0
+    in_source_hash = False
+    real_json_hash = mod._json_hash
+    real_source_hash = mod._logical_snapshot_source_hash
+
+    def counting_json_hash(payload):
+        nonlocal source_hash_json_hashes
+        if in_source_hash:
+            source_hash_json_hashes += 1
+        return real_json_hash(payload)
+
+    def counting_source_hash(snapshot_arg, count):
+        nonlocal in_source_hash
+        in_source_hash = True
+        try:
+            return real_source_hash(snapshot_arg, count)
+        finally:
+            in_source_hash = False
+
+    monkeypatch.setattr(mod, "_json_hash", counting_json_hash)
+    monkeypatch.setattr(mod, "_logical_snapshot_source_hash", counting_source_hash)
+
+    entry = _v2_history_catalog_entry(checkpoint, snapshot)
+    reservation = await mod.reserve_ref_binding(request, key, registry)
+    assert reservation is not None
+    attempt = mod.stage_ref_attempt(
+        request,
+        reservation,
+        mod.build_history_ref_projection_plan((entry,)),
+    )
+    await mod.commit_ref_attempt(request, attempt)
+    reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
+
+    for _ in range(5):
+        assert await reader(f"cat {entry.manifest.ref}")
+
+    assert source_hash_json_hashes == 1
+
+
+@pytest.mark.asyncio
+async def test_unresolved_v2_history_entry_source_hash_computes_once_in_worker(
+    monkeypatch,
+):
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [{"role": "user", "content": "one"}]
+    snapshot = await mod.build_logical_history_snapshot(messages, identity=identity)
+    checkpoint = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        source_hash=mod.compute_summary_source_hash(messages),
+        source_message_count=1,
+        summary_text="summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": snapshot.prefix_raw_source_hashes[0],
+            }
+        },
+        parent_checkpoint_id=None,
+    )
+    # The unresolved entry skips verification on purpose so the snapshot's
+    # verification-hash memo stays cold for the handoff measurement.
+    source = mod._history_ref_source_handle(
+        checkpoint,
+        user_message_id="message-1",
+        logical_snapshot=snapshot,
+        require_logical_snapshot_match=False,
+    )
+    assert isinstance(source, mod.HistoryRefSourceHandle)
+    entry = mod.RefCatalogEntry(
+        manifest=mod.RefManifest(
+            ref=f"history:{source.checkpoint_id}",
+            utf8_bytes=None,
+            sha256=source.raw_source_hash,
+        ),
+        source=source,
+    )
+    handoffs = []
+    real_source_hash_function = mod._logical_snapshot_source_hash
+
+    async def capture_to_thread(function, *args):
+        if function is real_source_hash_function:
+            handoffs.append(args)
+        return function(*args)
+
+    monkeypatch.setattr(mod.asyncio, "to_thread", capture_to_thread)
+    request = SimpleNamespace(state=SimpleNamespace())
+    metadata = {"chat_id": "chat-1", "user_message_id": "message-1"}
+
+    resolved = await mod.resolve_history_ref_catalog_entry(
+        entry,
+        request=request,
+        metadata=metadata,
+    )
+    assert isinstance(resolved.source, mod.LogicalHistorySourceHandle)
+    assert len(handoffs) == 1
+    again = await mod.resolve_history_ref_catalog_entry(
+        entry,
+        request=request,
+        metadata=metadata,
+    )
+    assert isinstance(again.source, mod.LogicalHistorySourceHandle)
+    assert len(handoffs) == 1
+
+
+@pytest.mark.asyncio
+async def test_logical_history_snapshot_freezes_canonical_prefixes_in_one_thread_handoff(
+    monkeypatch,
+):
+    messages = [
+        {"role": "user", "content": "α"},
+        {"role": "assistant", "content": "line\nbreak"},
+    ]
+    original_messages = copy.deepcopy(messages)
+    fingerprint_counts = []
+
+    def prefix_file_fingerprint(count):
+        fingerprint_counts.append(count)
+        return f"files-{count}"
+
+    thread_handoffs = []
+
+    async def capture_to_thread(function, *args):
+        thread_handoffs.append((function, args))
+        messages[0]["content"] = "mutated after handoff"
+        return function(*args)
+
+    monkeypatch.setattr(mod.asyncio, "to_thread", capture_to_thread)
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+
+    snapshot = await mod.build_logical_history_snapshot(
+        messages,
+        identity=identity,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint,
+    )
+
+    expected_records = (
+        '{"content":"α","role":"user"}',
+        '{"content":"line\\nbreak","role":"assistant"}',
+    )
+    assert len(thread_handoffs) == 1
+    assert thread_handoffs[0][0] is mod._build_logical_history_snapshot_sync
+    assert thread_handoffs[0][1][0] == tuple(original_messages)
+    assert thread_handoffs[0][1][0][0] is not messages[0]
+    assert fingerprint_counts == []
+    assert snapshot.identity == identity
+    assert snapshot.records == expected_records
+    for count in (1, 2):
+        payload = "\n".join(expected_records[:count])
+        assert snapshot.prefix_raw_source_hashes[count - 1] == hashlib.sha256(
+            payload.encode()
+        ).hexdigest()
+        assert snapshot.prefix_utf8_bytes[count - 1] == len(payload.encode())
+        assert mod._logical_snapshot_source_hash(snapshot, count) == (
+            mod.compute_summary_source_hash(
+                original_messages[:count],
+                f"files-{count}",
+            )
+        )
+    assert fingerprint_counts == [1, 2]
+
+    messages[1]["content"] = "mutated after build"
+    assert snapshot.records == expected_records
+    assert tuple(snapshot.source_hash_messages) == expected_records
+
+
+@pytest.mark.asyncio
+async def test_logical_history_snapshot_build_does_not_precompute_prefix_fingerprints():
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"m{index}"}
+        for index in range(200)
+    ]
+    fingerprint_counts = []
+
+    def prefix_file_fingerprint(count):
+        fingerprint_counts.append(count)
+        return f"files-{count}"
+
+    snapshot = await mod.build_logical_history_snapshot(
+        messages,
+        identity=identity,
+        prefix_file_fingerprint_resolver=prefix_file_fingerprint,
+    )
+
+    assert fingerprint_counts == []
+    source_hash = mod._logical_snapshot_source_hash(snapshot, 7)
+    assert fingerprint_counts == [7]
+    assert source_hash == mod.compute_summary_source_hash(
+        messages[:7],
+        "files-7",
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_fingerprint_freezes_metadata_files_before_worker_handoff(
+    monkeypatch,
+):
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+    ]
+    metadata = {
+        "chat_id": "chat-1",
+        "user_message_id": "msg-1",
+        "files": [
+            {
+                "id": "file-1",
+                "type": "file",
+                "name": "original.txt",
+                "docs": ["ignored body"],
+            },
+        ],
+    }
+    db_chain = [
+        {
+            "role": "user",
+            "content": "one",
+            "files": [{"id": "file-1", "type": "file"}],
+        },
+        {
+            "role": "assistant",
+            "content": "two",
+            "files": [{"id": "file-2", "type": "file"}],
+        },
+        {"role": "user", "content": "three"},
+    ]
+    expected_files = copy.deepcopy(metadata["files"])
+
+    async def load_chain(request, chat_id, current_message_id):
+        return copy.deepcopy(db_chain)
+
+    async def capture_to_thread(function, *args):
+        if function is mod._make_prefix_file_fingerprint_resolver:
+            # Mutate during the loop -> worker handoff window: the freeze
+            # must have happened on the event loop, before this point.
+            metadata["files"].append(
+                {"id": "file-2", "type": "file", "name": "appended.txt"}
+            )
+            metadata["files"][0]["name"] = "rewritten.txt"
+        return function(*args)
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+    monkeypatch.setattr(mod.asyncio, "to_thread", capture_to_thread)
+    request = SimpleNamespace(state=SimpleNamespace())
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        request, metadata, messages
+    )
+    assert resolver is not None
+    snapshot = await mod.get_or_build_logical_history_snapshot(
+        request,
+        messages,
+        identity=identity,
+        prefix_file_fingerprint_resolver=resolver,
+    )
+    metadata["files"][0]["name"] = "rewritten-again.txt"
+
+    expected_fingerprint = reference_prefix_file_fingerprint(
+        db_chain,
+        expected_files,
+        None,
+        2,
+    )
+    assert expected_fingerprint is not None
+    assert mod._logical_snapshot_source_hash(snapshot, 2) == (
+        mod.compute_summary_source_hash(
+            messages[:2],
+            expected_fingerprint,
+            db_chain,
+        )
+    )
+    assert not hasattr(
+        snapshot.prefix_file_fingerprint,
+        mod.PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR,
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_fingerprint_deepcopy_excludes_file_bodies(monkeypatch):
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+    ]
+    metadata = {
+        "chat_id": "chat-1",
+        "user_message_id": "msg-1",
+        "files": [
+            {
+                "id": "file-1",
+                "type": "file",
+                "name": "a.txt",
+                "docs": ["d" * 4096],
+                "content": {"body": "c" * 4096},
+            },
+            {
+                "id": "image-1",
+                "type": "image",
+                "name": "i.png",
+                "docs": ["d" * 4096],
+            },
+        ],
+    }
+    db_chain = [
+        {
+            "role": "user",
+            "content": "one",
+            "files": [{"id": "file-1", "type": "file"}],
+        },
+        {"role": "assistant", "content": "two"},
+    ]
+
+    async def load_chain(request, chat_id, current_message_id):
+        return [
+            {
+                "role": "user",
+                "content": "one",
+                "files": [{"id": "file-1", "type": "file"}],
+            },
+            {"role": "assistant", "content": "two"},
+        ]
+
+    deepcopied_inputs = []
+    real_deepcopy = copy.deepcopy
+
+    def observing_deepcopy(value):
+        deepcopied_inputs.append(value)
+        return real_deepcopy(value)
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+    monkeypatch.setattr(mod.copy, "deepcopy", observing_deepcopy)
+    request = SimpleNamespace(state=SimpleNamespace())
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        request,
+        metadata,
+        messages,
+    )
+
+    assert resolver is not None
+    assert len(deepcopied_inputs) == 1
+    frozen_input = deepcopied_inputs[0]
+    assert len(frozen_input) == 1
+    frozen_item = frozen_input[0]
+    assert frozen_item["id"] == "file-1"
+    assert frozen_item["name"] == "a.txt"
+    assert "docs" not in frozen_item
+    assert "content" not in frozen_item
+    assert resolver(1) == reference_prefix_file_fingerprint(
+        db_chain,
+        metadata["files"],
+        None,
+        1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_logical_snapshot_source_hash_is_stable_across_memo_warming():
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+    ]
+    fresh = await mod.build_logical_history_snapshot(messages, identity=identity)
+    warmed = await mod.build_logical_history_snapshot(
+        copy.deepcopy(messages),
+        identity=identity,
+    )
+    for count in range(1, len(messages) + 1):
+        mod._logical_snapshot_source_hash(warmed, count)
+
+    for count in range(0, len(messages) + 2):
+        expected = mod._logical_snapshot_source_hash(fresh, count)
+        assert mod._logical_snapshot_source_hash(warmed, count) == expected
+        assert mod._logical_snapshot_source_hash(warmed, count) == expected
+
+    other = await mod.build_logical_history_snapshot(
+        [
+            {"role": "user", "content": "different"},
+            {"role": "assistant", "content": "history"},
+        ],
+        identity=identity,
+    )
+    assert mod._logical_snapshot_source_hash(other, 1) != (
+        mod._logical_snapshot_source_hash(fresh, 1)
+    )
+
+
+def test_logical_history_handle_iterates_prefix_without_slicing_snapshot_records():
+    class RecordsWithoutSlicing(tuple):
+        def __getitem__(self, key):
+            if isinstance(key, slice):
+                raise AssertionError("logical history iteration must not copy a tuple slice")
+            return super().__getitem__(key)
+
+    records = RecordsWithoutSlicing(("one", "two", "three"))
+    snapshot = mod.LogicalHistorySnapshot(
+        identity=(
+            mod.CHECKPOINT_NAMESPACE,
+            "user-1",
+            "chat-1",
+            "auto_compact",
+            mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+        ),
+        records=records,
+        source_hash_messages=("one", "two", "three"),
+        prefix_raw_source_hashes=("a" * 64, "b" * 64, "c" * 64),
+        prefix_utf8_bytes=(3, 7, 13),
+    )
+    handle = mod.LogicalHistorySourceHandle(
+        snapshot=snapshot,
+        source_message_count=2,
+        utf8_bytes=7,
+        raw_source_hash="b" * 64,
+        line_count=2,
+    )
+
+    assert tuple(handle.iter_records()) == ("one", "two")
+    assert not issubclass(mod.LogicalHistorySourceHandle, mod.HistoryRefSourceHandle)
+
+
+@pytest.mark.asyncio
+async def test_logical_history_reader_bytes_survive_post_match_body_mutation():
+    messages = [
+        {"role": "user", "content": "immutable one"},
+        {"role": "assistant", "content": "immutable two"},
+    ]
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(state=SimpleNamespace()),
+    )
+    snapshot = await mod.get_or_build_logical_history_snapshot(
+        request,
+        messages,
+        identity=identity,
+    )
+    source = mod._logical_history_source_handle(snapshot, len(messages))
+    checkpoint_id = f"accp_{'1' * 64}"
+    ref = f"history:{checkpoint_id}"
+    entry = mod.RefCatalogEntry(
+        manifest=mod.RefManifest(
+            ref=ref,
+            utf8_bytes=source.utf8_bytes,
+            sha256=source.raw_source_hash,
+        ),
+        source=source,
+    )
+    plan = mod.build_history_ref_projection_plan((entry,))
+    key = mod.RefBindingKey(
+        user_id="user-1",
+        chat_id="chat-1",
+        user_message_id="message-1",
+        assistant_message_id="assistant-1",
+        incoming_model_id="wrapper-1",
+        base_pipe_id="auto_compact",
+        profile_hash=identity[4],
+        branch_anchor="branch-1",
+    )
+    registry = {}
+    reservation = await mod.reserve_ref_binding(request, key, registry)
+    assert reservation is not None
+    attempt = mod.stage_ref_attempt(request, reservation, plan)
+    await mod.commit_ref_attempt(request, attempt)
+    reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
+
+    served_before = await reader(f"cat {ref}")
+    messages[0]["content"] = "mutated after checkpoint match"
+    messages.append({"role": "user", "content": "new tail"})
+    served_after = await reader(f"cat {ref}")
+
+    assert served_after == served_before
+    assert "immutable one" in served_after
+    assert "mutated after checkpoint match" not in served_after
+    assert "new tail" not in served_after
+
+
+@pytest.mark.asyncio
+async def test_v2_ancestor_handles_share_snapshot_identity_and_boundary_indexes():
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    snapshot = await mod.build_logical_history_snapshot(messages, identity=identity)
+    rows = []
+    parent_id = None
+    for count in (2, 4):
+        source_hash = mod._logical_snapshot_source_hash(snapshot, count)
+        assert source_hash is not None
+        row = mod.build_checkpoint_row(
+            namespace=identity[0],
+            user_id=identity[1],
+            chat_id=identity[2],
+            pipe_function_id=identity[3],
+            profile_hash=identity[4],
+            source_hash=source_hash,
+            source_message_count=count,
+            summary_text=f"summary-{count}",
+            summary_meta={
+                mod.SUMMARY_META_HISTORY_REF_KEY: {
+                    "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                    "raw_source_hash": snapshot.prefix_raw_source_hashes[count - 1],
+                }
+            },
+            parent_checkpoint_id=parent_id,
+            now=count,
+        )
+        rows.append(row)
+        parent_id = row["id"]
+    metadata = {"chat_id": "chat-1", "user_message_id": "message-4"}
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore(rows),
+        selected_checkpoint=rows[-1],
+        user_message_id=metadata["user_message_id"],
+        logical_snapshot=snapshot,
+    )
+    resolved = [
+        await mod.resolve_history_ref_catalog_entry(
+            entry,
+            request=SimpleNamespace(state=SimpleNamespace()),
+            metadata=metadata,
+        )
+        for entry in catalog
+    ]
+
+    assert [entry.source.source_message_count for entry in resolved] == [4, 2]
+    for entry in resolved:
+        source = entry.source
+        assert isinstance(source, mod.LogicalHistorySourceHandle)
+        assert source.snapshot is snapshot
+        boundary = source.source_message_count - 1
+        assert source.raw_source_hash == snapshot.prefix_raw_source_hashes[boundary]
+        assert source.utf8_bytes == snapshot.prefix_utf8_bytes[boundary]
+        assert tuple(source.iter_records()) == snapshot.records[: boundary + 1]
+
+
+@pytest.mark.asyncio
+async def test_v2_ancestor_with_files_id_source_mismatch_is_cataloged_and_fails_on_read():
+    messages = [
+        {
+            "role": "user",
+            "content": "stable bytes",
+            "files": [{"id": "file-a", "type": "file"}],
+        },
+        {"role": "assistant", "content": "selected boundary"},
+    ]
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    matching_files = [
+        {
+            "id": "file-a",
+            "type": "file",
+            "name": "stable.txt",
+            "file": {"id": "file-a", "hash": "stable-hash"},
+        }
+    ]
+    mismatched_files = [
+        {
+            "id": "file-b",
+            "type": "file",
+            "name": "stable.txt",
+            "file": {"id": "file-b", "hash": "stable-hash"},
+        }
+    ]
+    matching_fingerprint = mod._stable_file_fingerprint(matching_files)
+    mismatched_fingerprint = mod._stable_file_fingerprint(mismatched_files)
+    assert matching_fingerprint != mismatched_fingerprint
+    snapshot = await mod.build_logical_history_snapshot(
+        messages,
+        identity=identity,
+        prefix_file_fingerprint_resolver=lambda _count: matching_fingerprint,
+    )
+    matching_ancestor_hash = mod._logical_snapshot_source_hash(snapshot, 1)
+    mismatched_ancestor_hash = mod.compute_summary_source_hash(
+        messages[:1],
+        mismatched_fingerprint,
+    )
+    assert matching_ancestor_hash != mismatched_ancestor_hash
+
+    ancestor = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        source_hash=mismatched_ancestor_hash,
+        source_message_count=1,
+        summary_text="ancestor summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": snapshot.prefix_raw_source_hashes[0],
+            }
+        },
+        parent_checkpoint_id=None,
+        now=1,
+    )
+    selected_source_hash = mod._logical_snapshot_source_hash(snapshot, 2)
+    assert selected_source_hash is not None
+    selected = mod.build_checkpoint_row(
+        namespace=identity[0],
+        user_id=identity[1],
+        chat_id=identity[2],
+        pipe_function_id=identity[3],
+        profile_hash=identity[4],
+        source_hash=selected_source_hash,
+        source_message_count=2,
+        summary_text="selected summary",
+        summary_meta={
+            mod.SUMMARY_META_HISTORY_REF_KEY: {
+                "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                "raw_source_hash": snapshot.prefix_raw_source_hashes[1],
+            }
+        },
+        parent_checkpoint_id=ancestor["id"],
+        now=2,
+    )
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore((ancestor, selected)),
+        selected_checkpoint=selected,
+        user_message_id="message-2",
+        logical_snapshot=snapshot,
+    )
+    ancestor_ref = f"history:{ancestor['id']}"
+    assert ancestor_ref in {entry.manifest.ref for entry in catalog}
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(state=SimpleNamespace()),
+    )
+    key = mod.RefBindingKey(
+        user_id=identity[1],
+        chat_id=identity[2],
+        user_message_id="message-2",
+        assistant_message_id="assistant-1",
+        incoming_model_id="wrapper-1",
+        base_pipe_id=identity[3],
+        profile_hash=identity[4],
+        branch_anchor="branch-1",
+    )
+    registry = {}
+    reservation = await mod.reserve_ref_binding(request, key, registry)
+    assert reservation is not None
+    attempt = mod.stage_ref_attempt(
+        request,
+        reservation,
+        mod.build_history_ref_projection_plan(catalog),
+    )
+    await mod.commit_ref_attempt(request, attempt)
+    reader = registry[mod.REF_EXEC_TOOL_NAME]["callable"]
+
+    assert await reader(f"cat {ancestor_ref}") == (
+        "Error: externalized history ref unavailable: "
+        "checkpoint source integrity verification failed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_v2_source_hash_preimage_matches_served_source_identity_set():
+    patterns = (mod.re.compile(r"(?s)<SYSTEM_CONTEXT>.*</SYSTEM_CONTEXT>\s*\Z"),)
+    messages = [
+        {"role": "system", "content": "excluded system"},
+        {"role": "user", "content": "durable one"},
+        {
+            "role": "user",
+            "content": "<SYSTEM_CONTEXT>excluded transient</SYSTEM_CONTEXT>",
+        },
+        {"role": "assistant", "content": "durable two"},
+        {"role": "user", "content": "durable three"},
+    ]
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    snapshot = await mod.build_logical_history_snapshot(
+        messages,
+        identity=identity,
+        transient_message_patterns=patterns,
+    )
+    source_count = mod._source_identity_message_count(
+        messages,
+        transient_message_patterns=patterns,
+    )
+    handle = mod._logical_history_source_handle(snapshot, source_count)
+    served_records = tuple(handle.iter_records())
+    served_text = "\n".join(served_records)
+
+    assert source_count == len(snapshot.source_hash_messages) == len(served_records) == 3
+    assert mod._logical_snapshot_source_hash(snapshot, source_count) == (
+        mod.compute_summary_source_hash(
+            messages,
+            transient_message_patterns=patterns,
+        )
+    )
+    assert snapshot.source_hash_messages == served_records
+    assert "excluded system" not in served_text
+    assert "excluded transient" not in served_text
+    assert all(content in served_text for content in ("durable one", "durable two", "durable three"))
+
+
+@pytest.mark.asyncio
+async def test_v2_history_enrich_resolve_and_ancestors_never_reload_or_readvertise_raw(
+    monkeypatch,
+):
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+    ]
+    identity = (
+        mod.CHECKPOINT_NAMESPACE,
+        "user-1",
+        "chat-1",
+        "auto_compact",
+        mod.ACTIVE_CHECKPOINT_PROFILE_HASH,
+    )
+    snapshot = await mod.build_logical_history_snapshot(messages, identity=identity)
+    rows = []
+    parent_id = None
+    for count in range(1, len(messages) + 1):
+        source_hash = mod._logical_snapshot_source_hash(snapshot, count)
+        assert source_hash is not None
+        row = mod.build_checkpoint_row(
+            namespace=identity[0],
+            user_id=identity[1],
+            chat_id=identity[2],
+            pipe_function_id=identity[3],
+            profile_hash=identity[4],
+            source_hash=source_hash,
+            source_message_count=count,
+            summary_text=f"summary-{count}",
+            summary_meta={
+                mod.SUMMARY_META_HISTORY_REF_KEY: {
+                    "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                    "raw_source_hash": snapshot.prefix_raw_source_hashes[count - 1],
+                }
+            },
+            parent_checkpoint_id=parent_id,
+            now=count,
+        )
+        rows.append(row)
+        parent_id = row["id"]
+
+    raw_loads = []
+
+    async def reject_raw_load(**kwargs):
+        raw_loads.append(kwargs)
+        raise AssertionError("v2 history must never fall back to the raw branch")
+
+    monkeypatch.setattr(mod, "load_raw_chat_branch", reject_raw_load)
+    store = HistoryCatalogStore(rows)
+    metadata = {"chat_id": "chat-1", "user_message_id": "message-3"}
+    enriched = await mod.enrich_checkpoint_history_ref(
+        store=store,
+        checkpoint=copy.deepcopy(rows[-1]),
+        request=SimpleNamespace(state=SimpleNamespace()),
+        metadata=metadata,
+        logical_snapshot=snapshot,
+    )
+    catalog = await mod.build_history_ref_catalog(
+        store=store,
+        selected_checkpoint=rows[-1],
+        user_message_id="message-3",
+        logical_snapshot=snapshot,
+    )
+    resolved = [
+        await mod.resolve_history_ref_catalog_entry(
+            entry,
+            request=SimpleNamespace(state=SimpleNamespace()),
+            metadata=metadata,
+        )
+        for entry in catalog
+    ]
+
+    assert enriched == rows[-1]
+    assert [entry.manifest.ref for entry in catalog] == [
+        f"history:{row['id']}" for row in reversed(rows)
+    ]
+    assert all(
+        isinstance(entry.source, mod.LogicalHistorySourceHandle)
+        for entry in resolved
+    )
+    for entry in resolved:
+        count = entry.source.source_message_count
+        assert tuple(entry.source.iter_records()) == snapshot.records[:count]
+    assert raw_loads == []
+
+    assert (
+        await mod.enrich_checkpoint_history_ref(
+            store=store,
+            checkpoint=copy.deepcopy(rows[-1]),
+            request=SimpleNamespace(state=SimpleNamespace()),
+            metadata=metadata,
+            logical_snapshot=None,
+        )
+        is None
+    )
+    assert (
+        await mod.build_history_ref_catalog(
+            store=store,
+            selected_checkpoint=rows[-1],
+            user_message_id="message-3",
+            logical_snapshot=None,
+        )
+        == ()
+    )
+    assert raw_loads == []
+
+
+def test_checkpoint_row_uses_stable_identity_and_contract_fields():
+    row = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+        source_message_count=12,
+        summary_text="summary",
+        summary_meta={"has_multimodal": False},
+        parent_checkpoint_id="parent-1",
+        now=123,
+    )
+    same = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+        source_message_count=12,
+        summary_text="new summary",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=999,
+    )
+    explicit_count = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+        source_message_count=12,
+        summary_text="counted summary",
+        summary_meta={},
+        summary_token_count=42,
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    assert same["id"] == row["id"]
+    assert explicit_count["id"] == row["id"]
+    assert explicit_count["summary_token_count"] == 42
+    assert row == {
+        "id": row["id"],
+        "namespace": mod.CHECKPOINT_NAMESPACE,
+        "schema_version": 1,
+        "user_id": "user-1",
+        "chat_id": "chat-1",
+        "pipe_function_id": "auto_compact",
+        "profile_hash": "profile",
+        "source_message_count": 12,
+        "source_hash": "source",
+        "summary_text": "summary",
+        "summary_meta": {"has_multimodal": False},
+        "summary_token_count": None,
+        "state": "ready",
+        "parent_checkpoint_id": "parent-1",
+        "claim_token": None,
+        "claim_expires_at": None,
+        "created_at": 123,
+        "updated_at": 123,
+        "last_used_at": 123,
+    }
+
+
+def test_checkpoint_row_supports_pending_claim_state():
+    row = mod.build_checkpoint_row(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+        source_message_count=3,
+        summary_text="",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        state="pending",
+        claim_token="claim-1",
+        claim_expires_at=456,
+        now=123,
+    )
+
+    assert row["state"] == "pending"
+    assert row["summary_text"] == ""
+    assert row["claim_token"] == "claim-1"
+    assert row["claim_expires_at"] == 456
+
+
+@pytest.mark.asyncio
+async def test_claim_store_allows_same_source_hash_in_separate_namespace():
+    source_messages = [{"role": "user", "content": "old"}]
+    summary = make_checkpoint_row(source_messages)
+    lease = dict(make_generation_lease_row(), source_hash=summary["source_hash"])
+    store = ClaimStore()
+
+    assert await store.claim_pending(summary) is True
+    assert await store.claim_pending(lease) is True
+    assert len(store.rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_store_queries_filter_by_pipe_function_id():
+    from sqlalchemy.dialects import sqlite
+
+    statements = []
+
+    class FakeMappings:
+        def first(self):
+            return None
+
+        def all(self):
+            return []
+
+    class FakeResult:
+        def mappings(self):
+            return FakeMappings()
+
+    class FakeDb:
+        async def execute(self, statement):
+            statements.append(str(statement.compile(dialect=sqlite.dialect())))
+            return FakeResult()
+
+    store = mod.CheckpointStore(db=FakeDb())
+
+    await store.lookup_ready(
+        namespace="auto_compact",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+    )
+    await store.lookup_any(
+        namespace="auto_compact",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash="source",
+    )
+    await store.find_longest_parent(
+        namespace="auto_compact",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_messages=[{"role": "user", "content": "old"}],
+    )
+
+    assert statements
+    assert all("pipe_function_id =" in statement for statement in statements)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_parent_query_filters_by_count_without_in_clause():
+    from sqlalchemy.dialects import sqlite
+
+    statements = []
+
+    class FakeMappings:
+        def all(self):
+            return []
+
+    class FakeResult:
+        def mappings(self):
+            return FakeMappings()
+
+    class FakeDb:
+        async def execute(self, statement):
+            statements.append(str(statement.compile(dialect=sqlite.dialect())))
+            return FakeResult()
+
+    store = mod.CheckpointStore(db=FakeDb())
+
+    await store.find_longest_parent(
+        namespace="auto_compact",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_messages=[{"role": "user", "content": f"m{index}"} for index in range(50)],
+    )
+
+    assert len(statements) == 1
+    assert "source_message_count <=" in statements[0]
+    assert " IN " not in statements[0]
+
+
+def test_parent_checkpoint_selection_requires_exact_source_hash():
+    source_messages = [
+        {"role": "user", "content": "m1"},
+        {"role": "assistant", "content": "m2"},
+        {"role": "user", "content": "m3"},
+        {"role": "assistant", "content": "m4"},
+    ]
+    rows = [
+        {
+            "id": "short",
+            "source_message_count": 2,
+            "source_hash": mod.compute_source_hash(source_messages[:2]),
+            "state": "ready",
+        },
+        {"id": "mismatch", "source_message_count": 4, "source_hash": "wrong", "state": "ready"},
+        {
+            "id": "long",
+            "source_message_count": 3,
+            "source_hash": mod.compute_source_hash(source_messages[:3]),
+            "state": "ready",
+        },
+        {
+            "id": "pending",
+            "source_message_count": 4,
+            "source_hash": mod.compute_source_hash(source_messages),
+            "state": "pending",
+        },
+    ]
+
+    parent = mod.select_longest_matching_parent(rows, source_messages)
+
+    assert parent["id"] == "long"
+
+
+def test_parent_checkpoint_selection_hashes_only_candidate_counts(monkeypatch):
+    source_messages = [{"role": "user", "content": f"m{index}"} for index in range(6)]
+    real_compute = mod.compute_source_hash
+    hashed_counts = []
+
+    def counting_compute(messages, **kwargs):
+        hashed_counts.append(len(messages))
+        return real_compute(messages, **kwargs)
+
+    monkeypatch.setattr(mod, "compute_source_hash", counting_compute)
+    rows = [
+        {"id": "wrong-long", "source_message_count": 4, "source_hash": "wrong", "state": "ready"},
+        {
+            "id": "match",
+            "source_message_count": 2,
+            "source_hash": real_compute(source_messages[:2]),
+            "state": "ready",
+        },
+        {"id": "wrong-long-too", "source_message_count": 4, "source_hash": "also-wrong", "state": "ready"},
+    ]
+
+    parent = mod.select_longest_matching_parent(rows, source_messages)
+
+    assert parent["id"] == "match"
+    assert sorted(set(hashed_counts)) == [2, 4]
+    assert len(hashed_counts) == 2
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_exact_hit_uses_ready_summary_without_claiming(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    existing = make_checkpoint_row(
+        source_messages,
+        state="ready",
+        summary_text="existing summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([existing])
+
+    async def summary_factory(parent):
+        raise AssertionError("summary factory must not run for an exact checkpoint hit")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    result = await run_get_or_create(source_messages, summary_factory)
+
+    assert result == "existing summary"
+    assert store.touched == [existing["id"]]
+    assert store.claimed_rows == []
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_exact_hit_survives_last_used_update_failure(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    existing = make_checkpoint_row(
+        source_messages,
+        state="ready",
+        summary_text="existing summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+
+    class FailingTouchStore(ClaimStore):
+        async def touch(self, checkpoint_id, *, now=None):
+            raise RuntimeError("touch failed")
+
+    async def summary_factory(parent):
+        raise AssertionError("summary factory must not run when touch fails")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: FailingTouchStore([existing]))
+
+    result = await run_get_or_create(source_messages, summary_factory)
+
+    assert result == "existing summary"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_miss_claims_generates_and_completes_ready_row(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    store = ClaimStore()
+    calls = []
+
+    async def summary_factory(parent):
+        calls.append(parent)
+        return "generated summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    result = await run_get_or_create(
+        source_messages,
+        summary_factory,
+        summary_meta={"has_multimodal": False},
+    )
+
+    assert result == "generated summary"
+    assert calls == [None]
+    assert len(source_claims(store)) == 1
+    source_claim = source_claims(store)[0]
+    assert source_claim["state"] == "pending"
+    assert source_claim["summary_text"] == ""
+    assert source_claim["claim_token"]
+    assert source_claim["claim_expires_at"] > int(time.time()) - 5
+    assert source_claim["source_hash"] == mod.compute_source_hash(source_messages)
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert released_source_claims(store) == []
+    assert len(store.completed_rows) == 1
+    assert store.completed_rows[0]["state"] == "ready"
+    assert store.completed_rows[0]["summary_text"] == "generated summary"
+    assert store.completed_rows[0]["parent_checkpoint_id"] is None
+    assert result.checkpoint["state"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_pending_checkpoint_waiter_returns_ready_row_without_generating(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    pending = make_checkpoint_row(source_messages, claim_token="other-worker")
+    ready = dict(
+        pending,
+        state="ready",
+        summary_text="other worker summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+
+    class EventualReadyStore(ClaimStore):
+        def __init__(self):
+            super().__init__([pending])
+            self.lookup_calls = 0
+
+        async def lookup_any(self, **kwargs):
+            if kwargs["namespace"] == mod.CHECKPOINT_GENERATION_LEASE_NAMESPACE:
+                return await super().lookup_any(**kwargs)
+            self.lookup_calls += 1
+            if self.lookup_calls >= 3:
+                return dict(ready)
+            return dict(pending)
+
+    store = EventualReadyStore()
+
+    async def summary_factory(parent):
+        raise AssertionError("waiters must not generate a summary while another worker owns the claim")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0.01)
+
+    result = await run_get_or_create(source_messages, summary_factory)
+
+    assert result == "other worker summary"
+    assert store.touched == [ready["id"]]
+    assert source_claims(store) == []
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+
+
+@pytest.mark.asyncio
+async def test_pending_checkpoint_wait_times_out_with_explicit_error(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    pending = make_checkpoint_row(source_messages, claim_token="other-worker")
+    store = ClaimStore([pending])
+
+    async def summary_factory(parent):
+        raise AssertionError("waiters must not generate a summary on wait timeout")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(RuntimeError, match="[Tt]imed out"):
+        await run_get_or_create(source_messages, summary_factory)
+
+    assert store.completed_rows == []
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_claim_is_reclaimed_and_completed(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    stale = make_checkpoint_row(source_messages, claim_token="crashed-worker", claim_expires_at=1, now=1)
+    stale["summary_meta"] = mod.build_checkpoint_summary_meta(
+        source_messages,
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=1,
+    )
+    current_summary_meta = mod.build_checkpoint_summary_meta(
+        source_messages,
+        historical_message_excerpt_bytes=64,
+        historical_message_excerpt_count=0,
+    )
+    store = ClaimStore([stale])
+    calls = []
+
+    async def summary_factory(parent):
+        calls.append(parent)
+        return "reclaimed summary"
+
+    async def estimate_rendered_summary_message_tokens(**kwargs):
+        return len(
+            mod.render_summary_message(
+                kwargs["summary_text"],
+                kwargs["summary_meta"],
+            )["content"]
+        )
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_rendered_summary_message_tokens",
+        estimate_rendered_summary_message_tokens,
+    )
+
+    result = await run_get_or_create(
+        source_messages,
+        summary_factory,
+        summary_meta=current_summary_meta,
+    )
+
+    assert result == "reclaimed summary"
+    assert calls == [None]
+    assert len(store.completed_rows) == 1
+    assert store.completed_rows[0]["summary_text"] == "reclaimed summary"
+    assert store.completed_rows[0]["summary_meta"] == stale["summary_meta"]
+    assert store.completed_rows[0]["summary_token_count"] == len(
+        mod.render_summary_message_from_checkpoint(store.completed_rows[0])["content"]
+    )
+    assert store.completed_rows[0]["summary_token_count"] != len(
+        mod.render_summary_message(str(result), current_summary_meta)["content"]
+    )
+    assert store.rows[0]["state"] == "ready"
+    assert store.rows[0]["claim_token"] is None
+
+
+@pytest.mark.asyncio
+async def test_lost_claim_falls_back_to_ready_row_from_other_worker(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    other_ready = make_checkpoint_row(
+        source_messages,
+        state="ready",
+        summary_text="other summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+
+    class LostClaimStore(ClaimStore):
+        def __init__(self):
+            super().__init__()
+            self.ready_lookup_calls = 0
+
+        async def complete_pending(self, checkpoint_id, **kwargs):
+            return None
+
+        async def lookup_ready(self, **kwargs):
+            self.ready_lookup_calls += 1
+            if self.ready_lookup_calls == 1:
+                return None
+            return dict(other_ready)
+
+    store = LostClaimStore()
+
+    async def summary_factory(parent):
+        return "my summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    result = await run_get_or_create(source_messages, summary_factory)
+
+    assert result == "other summary"
+
+
+@pytest.mark.asyncio
+async def test_lookup_ready_checkpoint_uses_file_backed_image_identity(monkeypatch):
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image]}]
+    source_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ],
+        }
+    ]
+    expected_hash = mod.compute_summary_source_hash(
+        source_messages,
+        file_backed_image_db_chain=db_chain,
+    )
+    captured = {}
+
+    class ReadyStore:
+        async def lookup_ready(self, **kwargs):
+            captured.update(kwargs)
+            return {"summary_text": "ready"}
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: ReadyStore())
+
+    checkpoint = await mod._lookup_ready_checkpoint_for_source(
+        request=SimpleNamespace(),
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        file_backed_image_db_chain=db_chain,
+    )
+
+    assert checkpoint == {"summary_text": "ready"}
+    assert captured["source_hash"] == expected_hash
+
+
+@pytest.mark.asyncio
+async def test_lost_claim_without_ready_row_surfaces_error(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+
+    class LostClaimStore(ClaimStore):
+        async def complete_pending(self, checkpoint_id, **kwargs):
+            return None
+
+    store = LostClaimStore()
+
+    async def summary_factory(parent):
+        return "my summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    with pytest.raises(RuntimeError, match="claim was lost"):
+        await run_get_or_create(source_messages, summary_factory)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_summary_surfaces_claim_failure_before_generation(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    calls = []
+
+    class FailingClaimStore(ClaimStore):
+        async def claim_pending(self, row):
+            if row["namespace"] == mod.CHECKPOINT_NAMESPACE:
+                raise RuntimeError("db down")
+            return await super().claim_pending(row)
+
+    store = FailingClaimStore()
+
+    async def summary_factory(parent):
+        calls.append(parent)
+        return "generated summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    with pytest.raises(RuntimeError, match="db down"):
+        await run_get_or_create(source_messages, summary_factory)
+
+    assert calls == []
+    assert source_claims(store) == []
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_does_not_store_incomplete_summary_and_releases_claim(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    store = ClaimStore()
+
+    async def summary_factory(parent):
+        assert parent is None
+        return await mod.extract_text_from_completion_response(
+            {"choices": [{"message": {"content": "partial summary"}, "finish_reason": "length"}]}
+        )
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    with pytest.raises(RuntimeError, match="stopped before completing"):
+        await run_get_or_create(source_messages, summary_factory)
+
+    assert store.completed_rows == []
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert store.rows == []
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_cancellation_releases_claim(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    store = ClaimStore()
+    started = asyncio.Event()
+
+    async def summary_factory(parent):
+        assert parent is None
+        started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    task = asyncio.create_task(run_get_or_create(source_messages, summary_factory))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert store.completed_rows == []
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert store.rows == []
+
+
+@pytest.mark.asyncio
+async def test_generation_lease_timeout_starts_no_source_claim_or_summary(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    lease = make_generation_lease_row()
+    store = ClaimStore([lease])
+    factory_calls = []
+
+    async def summary_factory(parent):
+        factory_calls.append(parent)
+        return "must not be generated"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_WAIT_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+
+    with pytest.raises(RuntimeError, match="[Tt]imed out"):
+        await run_get_or_create(source_messages, summary_factory)
+
+    assert factory_calls == []
+    assert source_claims(store) == []
+
+
+@pytest.mark.asyncio
+async def test_foreground_checkpoint_does_not_wait_for_unrelated_generation_lease(monkeypatch):
+    store = ClaimStore([make_generation_lease_row()])
+    factory_calls = []
+
+    async def summary_factory(parent):
+        factory_calls.append(parent)
+        return "foreground summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+
+    result = await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=[{"role": "user", "content": "new branch"}],
+        summary_meta={},
+        summary_factory=summary_factory,
+        use_generation_lease=False,
+    )
+
+    assert result == "foreground summary"
+    assert factory_calls == [None]
+    assert [row["namespace"] for row in store.claimed_rows] == [mod.CHECKPOINT_NAMESPACE]
+
+
+@pytest.mark.asyncio
+async def test_expired_generation_lease_is_reclaimed_and_removed_after_success(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    lease = make_generation_lease_row(claim_token="crashed-worker", claim_expires_at=1)
+    store = ClaimStore([lease])
+
+    async def summary_factory(parent):
+        assert parent is None
+        return "reclaimed generation"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0)
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+
+    result = await run_get_or_create(source_messages, summary_factory)
+
+    assert result == "reclaimed generation"
+    assert lease["id"] in store.reclaimed
+    assert all(row["id"] != lease["id"] for row in store.rows)
+
+
+@pytest.mark.asyncio
+async def test_generation_lease_is_removed_after_success(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    store = ClaimStore()
+
+    async def summary_factory(parent):
+        assert parent is None
+        return "generated summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+
+    result = await run_get_or_create(source_messages, summary_factory)
+
+    assert result == "generated summary"
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert all(row["id"] != generation_lease_claims(store)[0]["id"] for row in store.rows)
+
+
+@pytest.mark.asyncio
+async def test_generation_lease_is_removed_after_cancellation(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    store = ClaimStore()
+    started = asyncio.Event()
+
+    async def summary_factory(parent):
+        assert parent is None
+        started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+
+    task = asyncio.create_task(run_get_or_create(source_messages, summary_factory))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert all(row["id"] != generation_lease_claims(store)[0]["id"] for row in store.rows)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_extension_uses_parent_summary_and_stores_lineage(monkeypatch):
+    parent_source = [{"role": "user", "content": "old"}]
+    parent = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="parent summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([parent])
+    calls = []
+
+    async def summary_factory(candidate_parent):
+        calls.append(candidate_parent)
+        return "extended summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "new"},
+    ]
+    result = await run_get_or_create(
+        source_messages,
+        summary_factory,
+        summary_meta={"has_multimodal": False},
+    )
+
+    assert result == "extended summary"
+    assert len(calls) == 1
+    assert calls[0]["id"] == parent["id"]
+    assert len(store.completed_rows) == 1
+    assert store.completed_rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
+    assert store.completed_rows[0]["source_message_count"] == 2
+    assert store.completed_rows[0]["parent_checkpoint_id"] == parent["id"]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_reuse_survives_target_and_summary_model_changes(monkeypatch):
+    source_messages = [{"role": "user", "content": "old"}]
+    existing = make_checkpoint_row(
+        source_messages,
+        state="ready",
+        summary_text="existing summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    ready_lookup_keys = []
+
+    class RecordingClaimStore(ClaimStore):
+        async def lookup_ready(self, **kwargs):
+            ready_lookup_keys.append(kwargs)
+            return await super().lookup_ready(**kwargs)
+
+    store = RecordingClaimStore([existing])
+
+    async def summary_factory(parent):
+        raise AssertionError("checkpoint reuse must not depend on current target or summary model")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    first = await run_get_or_create(source_messages, summary_factory)
+    second = await run_get_or_create(
+        source_messages,
+        summary_factory,
+        summary_meta={"summary_model": "changed", "target_model": "changed"},
+    )
+
+    assert first == "existing summary"
+    assert second == "existing summary"
+    assert len(ready_lookup_keys) == 2
+    assert ready_lookup_keys[0]["profile_hash"] == ready_lookup_keys[1]["profile_hash"]
+    assert ready_lookup_keys[0]["source_hash"] == ready_lookup_keys[1]["source_hash"]
+
+
+@pytest.mark.asyncio
+async def test_parent_checkpoint_failure_releases_claim_and_does_not_resubmit_raw_prefix(monkeypatch):
+    parent_source = [{"role": "user", "content": "old"}]
+    parent = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="parent summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([parent])
+    calls = []
+
+    async def summary_factory(candidate_parent):
+        calls.append(candidate_parent)
+        raise RuntimeError("summary context overflow")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    with pytest.raises(mod.ParentCheckpointExtensionFailed) as exc_info:
+        await run_get_or_create(
+            [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "new"},
+            ],
+            summary_factory,
+        )
+
+    assert len(calls) == 1
+    assert exc_info.value.parent["id"] == parent["id"]
+    assert store.completed_rows == []
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert [row["id"] for row in store.rows] == [parent["id"]]
+
+
+@pytest.mark.asyncio
+async def test_summary_file_context_unavailable_releases_claim_without_ready_checkpoint(monkeypatch):
+    store = ClaimStore()
+    calls = []
+
+    async def summary_factory(candidate_parent):
+        calls.append(candidate_parent)
+        raise mod.SummaryFileContextUnavailable("summary file context unavailable")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await run_get_or_create(
+            [{"role": "user", "content": "old"}],
+            summary_factory,
+        )
+
+    assert calls == [None]
+    assert store.completed_rows == []
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert store.rows == []
+
+
+@pytest.mark.asyncio
+async def test_summary_file_context_unavailable_bypasses_parent_extension_fallback(monkeypatch):
+    parent_source = [{"role": "user", "content": "old"}]
+    parent = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="parent summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([parent])
+    calls = []
+
+    async def summary_factory(candidate_parent):
+        calls.append(candidate_parent)
+        raise mod.SummaryFileContextUnavailable("summary file context unavailable")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    with pytest.raises(mod.SummaryFileContextUnavailable):
+        await run_get_or_create(
+            [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "new"},
+            ],
+            summary_factory,
+        )
+
+    assert len(calls) == 1
+    assert store.completed_rows == []
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert [row["id"] for row in store.rows] == [parent["id"]]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_store_claim_conflict_returns_false():
+    from sqlalchemy.exc import IntegrityError
+
+    class FakeDb:
+        def __init__(self):
+            self.commit_calls = 0
+            self.rollback_calls = 0
+
+        async def execute(self, statement):
+            raise IntegrityError("insert", {}, Exception("duplicate"))
+
+        async def commit(self):
+            self.commit_calls += 1
+
+        async def rollback(self):
+            self.rollback_calls += 1
+
+    db = FakeDb()
+    store = mod.CheckpointStore(db=db)
+    row = make_checkpoint_row([{"role": "user", "content": "old"}])
+
+    assert await store.claim_pending(row) is False
+    assert db.commit_calls == 0
+    assert db.rollback_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_history_ref_cas_statement_avoids_whole_json_equality_cross_dialect():
+    from sqlalchemy.dialects import postgresql, sqlite
+    from sqlalchemy.sql import operators, visitors
+    from sqlalchemy.sql.elements import BinaryExpression
+
+    class Result:
+        rowcount = 0
+
+    class CapturingDb:
+        def __init__(self, dialect):
+            self.statement = None
+            self.rollback_calls = 0
+            self.dialect = dialect
+
+        def get_bind(self):
+            return SimpleNamespace(dialect=self.dialect)
+
+        async def execute(self, statement):
+            self.statement = statement
+            return Result()
+
+        async def commit(self):
+            raise AssertionError("rowcount-zero CAS must not commit")
+
+        async def rollback(self):
+            self.rollback_calls += 1
+
+    statements = {}
+    for dialect in (postgresql.dialect(), sqlite.dialect()):
+        db = CapturingDb(dialect)
+        store = mod.CheckpointStore(db=db)
+
+        swapped = await store.compare_and_swap_history_ref(
+            "checkpoint-1",
+            expected_summary_meta={"has_multimodal": True},
+            history_ref={"format": mod.HISTORY_REF_FORMAT, "raw_source_hash": "a" * 64},
+        )
+
+        assert swapped is False
+        assert db.rollback_calls == 1
+        assert db.statement is not None
+        statements[dialect.name] = db.statement
+
+    postgresql_statement = statements["postgresql"]
+    sqlite_statement = statements["sqlite"]
+    postgresql_sql = str(
+        postgresql_statement.compile(dialect=postgresql.dialect())
+    )
+    sqlite_sql = str(sqlite_statement.compile(dialect=sqlite.dialect()))
+    postgresql_where_sql = str(
+        postgresql_statement.whereclause.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    sqlite_where_sql = str(
+        sqlite_statement.whereclause.compile(
+            dialect=sqlite.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    for statement in statements.values():
+        whole_json_equalities = [
+            expression
+            for expression in visitors.iterate(statement.whereclause)
+            if isinstance(expression, BinaryExpression)
+            and expression.operator is operators.eq
+            and any(
+                side is mod.CHECKPOINT_TABLE.c.summary_meta
+                for side in (expression.left, expression.right)
+            )
+        ]
+        assert whole_json_equalities == []
+    table_name = mod.CHECKPOINT_TABLE.name
+    assert f"{table_name}.id =" in postgresql_sql
+    assert f"{table_name}.state =" in postgresql_sql
+    assert "json_typeof(" in postgresql_sql.lower()
+    assert "json_typeof(" + f"{table_name}.summary_meta" in postgresql_sql.lower()
+    assert (
+        f"json_typeof({table_name}.summary_meta) = 'object'"
+        in postgresql_where_sql
+    )
+    assert " -> " in postgresql_sql and "->>" not in postgresql_sql
+    assert "IS NULL" in postgresql_sql
+    assert "json_type(" in sqlite_sql.lower()
+    assert "json_type(" + f"{table_name}.summary_meta" in sqlite_sql.lower()
+    assert f"json_type({table_name}.summary_meta) = 'object'" in sqlite_where_sql
+    assert "JSON_EXTRACT" not in sqlite_sql
+    assert "IS NULL" in sqlite_sql
+    assert f"{table_name}.summary_meta =" not in postgresql_sql
+    assert f"{table_name}.summary_meta =" not in sqlite_sql
+
+
+@pytest.mark.parametrize(
+    ("summary_meta", "expected_state", "expected_format"),
+    [
+        ({}, "absent", None),
+        ({"has_multimodal": True}, "absent", None),
+        (None, "invalid", None),
+        ("scalar", "invalid", None),
+        (1, "invalid", None),
+        (True, "invalid", None),
+        ([], "invalid", None),
+        (
+            {
+                "history_ref": {
+                    "format": mod.HISTORY_REF_FORMAT,
+                    "raw_source_hash": "a" * 64,
+                }
+            },
+            "valid-v1",
+            mod.HISTORY_REF_FORMAT,
+        ),
+        (
+            {
+                "history_ref": {
+                    "format": mod.HISTORY_REF_LOGICAL_FORMAT,
+                    "raw_source_hash": "b" * 64,
+                }
+            },
+            "valid-v2",
+            mod.HISTORY_REF_LOGICAL_FORMAT,
+        ),
+        ({"history_ref": None}, "invalid", None),
+        (
+            {
+                "history_ref": {
+                    "format": mod.HISTORY_REF_FORMAT,
+                    "raw_source_hash": "not-a-digest",
+                }
+            },
+            "invalid",
+            None,
+        ),
+    ],
+)
+def test_history_ref_metadata_parser_distinguishes_absent_valid_and_invalid(
+    summary_meta,
+    expected_state,
+    expected_format,
+):
+    parsed = mod._parse_history_ref_metadata(summary_meta)
+
+    assert parsed.state == expected_state
+    assert (
+        parsed.value.get("format") if parsed.value is not None else None
+    ) == expected_format
+
+
+@pytest.mark.asyncio
+async def test_compact_body_extends_from_parent_summary_plus_delta(monkeypatch):
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    parent = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="parent summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([parent])
+    captured = {}
+
+    async def generate_summary_text(**kwargs):
+        captured["source_messages"] = kwargs["source_messages"]
+        return "extended summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    body = {
+        "model": "target",
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "delta"},
+            {"role": "assistant", "content": "delta answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+        historical_message_excerpt_count=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+    )
+
+    assert did_compact is True
+    assert "<checkpoint_summary><![CDATA[parent summary]]></checkpoint_summary>" in captured["source_messages"][0]["content"]
+    assert captured["source_messages"][1:] == [
+        {"role": "user", "content": "delta"},
+        {"role": "assistant", "content": "delta answer"},
+    ]
+    assert "extended summary" in compacted["messages"][0]["content"]
+    assert compacted["messages"][-1] == {"role": "user", "content": "active"}
+
+
+@pytest.mark.asyncio
+async def test_compact_body_uses_raw_summary_source_but_canonical_checkpoint_hash(monkeypatch):
+    store = ClaimStore()
+    captured = {}
+
+    async def generate_summary_text(**kwargs):
+        captured["source_messages"] = kwargs["source_messages"]
+        return "summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    body = {
+        "model": "target",
+        "stream": True,
+        "messages": [
+            {
+                "role": "user",
+                "content": "old file",
+                "files": [
+                    {
+                        "type": "text",
+                        "name": "https://example.com/a",
+                        "url": "https://example.com/a",
+                        "status": "processing",
+                        "progress": {"phase": "extracting"},
+                        "file": {
+                            "id": "file-1",
+                            "filename": "page.txt",
+                            "path": "/var/lib/open-webui/uploads/a/page.txt",
+                            "hash": "abc123",
+                            "data": {"content": "page text", "status": "pending"},
+                            "meta": {"source": "https://example.com/a", "data": {"upload_id": "tmp-a"}},
+                            "created_at": 100,
+                        },
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+        historical_message_excerpt_count=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+    )
+
+    assert did_compact is True
+    summary_file = captured["source_messages"][0]["files"][0]
+    assert summary_file == body["messages"][0]["files"][0]
+    assert source_claims(store)[0]["source_hash"] == mod.compute_source_hash(body["messages"][:2])
+    assert store.completed_rows[0]["summary_text"] == "summary"
+    assert "summary" in compacted["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_compact_body_uses_parent_checkpoint_delta_when_extension_summary_fails(monkeypatch):
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    parent = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="parent summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([parent])
+
+    async def generate_summary_text(**kwargs):
+        raise mod.RetryableContextOverflow("summary context overflow")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    body = {
+        "model": "target",
+        "stream": True,
+        "previous_response_id": "resp-old",
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "delta"},
+            {"role": "assistant", "content": "delta answer"},
+            {"role": "user", "content": "active"},
+        ],
+    }
+
+    compacted, did_compact, _compaction_prefix_count = await mod._compact_body(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1"},
+        body=body,
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="target",
+        historical_message_excerpt_bytes=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_BYTES,
+        historical_message_excerpt_count=mod.DEFAULT_HISTORICAL_MESSAGE_EXCERPT_COUNT,
+    )
+
+    assert did_compact is True
+    assert "previous_response_id" not in compacted
+    assert compacted["messages"][0] == {"role": "system", "content": "system"}
+    assert "parent summary" in compacted["messages"][1]["content"]
+    assert {"role": "user", "content": "old"} not in compacted["messages"]
+    assert {"role": "assistant", "content": "old answer"} not in compacted["messages"]
+    assert compacted["messages"][2:] == [
+        {"role": "user", "content": "delta"},
+        {"role": "assistant", "content": "delta answer"},
+        {"role": "user", "content": "active"},
+    ]
+    assert store.completed_rows == []
+    assert [row["id"] for row in store.rows] == [parent["id"]]
+
+
+def test_compute_summary_source_hash_collapses_to_source_hash_without_fingerprint():
+    messages = [{"role": "user", "content": "hello"}]
+
+    assert mod.compute_summary_source_hash(messages, None) == mod.compute_source_hash(messages)
+    assert mod.compute_summary_source_hash(messages, "") == mod.compute_source_hash(messages)
+    fingerprinted = mod.compute_summary_source_hash(messages, "sha256:abc")
+    assert fingerprinted != mod.compute_source_hash(messages)
+
+
+def test_stable_file_fingerprint_ignores_transient_metadata():
+    stable = [
+        {
+            "id": "file-1",
+            "type": "file",
+            "name": "report.pdf",
+            "updated_at": 100,
+            "file": {"id": "file-1", "updated_at": 100},
+            "status": "processing",
+            "progress": {"phase": "extracting"},
+            "size": 999,
+        }
+    ]
+    changed_transient = [
+        {
+            "id": "file-1",
+            "type": "file",
+            "name": "report.pdf",
+            "updated_at": 200,
+            "file": {"id": "file-1", "updated_at": 200},
+            "status": "uploaded",
+            "progress": {"phase": "done"},
+            "size": 123,
+        }
+    ]
+
+    assert mod._stable_file_fingerprint(stable) == mod._stable_file_fingerprint(changed_transient)
+
+
+def test_stable_file_fingerprint_detects_content_hash_change():
+    a = [{"id": "file-1", "type": "file", "name": "a.pdf", "file": {"id": "file-1", "hash": "abc"}}]
+    b = [{"id": "file-1", "type": "file", "name": "a.pdf", "file": {"id": "file-1", "hash": "def"}}]
+
+    assert mod._stable_file_fingerprint(a) != mod._stable_file_fingerprint(b)
+
+
+def test_stable_file_fingerprint_ignores_file_bodies_and_docs():
+    stable = [
+        {
+            "id": "file-1",
+            "type": "file",
+            "name": "a.pdf",
+            "content": "large extracted body A",
+            "context": "large RAG context A",
+            "docs": [{"content": "chunk A"}],
+            "file": {
+                "id": "file-1",
+                "hash": "abc",
+                "context": "embedded RAG context A",
+                "data": {"content": "embedded body A"},
+                "metadata": {
+                    "content": "metadata body A",
+                    "context": "metadata RAG context A",
+                    "docs": [{"content": "metadata chunk A"}],
+                    "data": {"content": "metadata embedded body A"},
+                },
+            },
+        }
+    ]
+    changed_body = copy.deepcopy(stable)
+    changed_body[0]["content"] = "large extracted body B"
+    changed_body[0]["context"] = "large RAG context B"
+    changed_body[0]["docs"] = [{"content": "chunk B"}]
+    changed_body[0]["file"]["context"] = "embedded RAG context B"
+    changed_body[0]["file"]["data"]["content"] = "embedded body B"
+    changed_body[0]["file"]["metadata"]["content"] = "metadata body B"
+    changed_body[0]["file"]["metadata"]["context"] = "metadata RAG context B"
+    changed_body[0]["file"]["metadata"]["docs"] = [{"content": "metadata chunk B"}]
+    changed_body[0]["file"]["metadata"]["data"]["content"] = "metadata embedded body B"
+
+    assert mod._stable_file_fingerprint(stable) == mod._stable_file_fingerprint(changed_body)
+
+
+def test_source_hash_stabilizes_db_file_backed_image_urls():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image]}]
+    with_url = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "https://files.example/photo.png"}},
+            ],
+        }
+    ]
+    with_base64 = copy.deepcopy(with_url)
+    with_base64[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,abc"
+    different_image = copy.deepcopy(db_chain)
+    different_image[0]["files"][0]["file"]["hash"] = "def"
+
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) == mod.compute_summary_source_hash(with_base64, file_backed_image_db_chain=db_chain)
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) != mod.compute_summary_source_hash(with_url, file_backed_image_db_chain=different_image)
+    assert mod.compute_summary_source_hash(with_url) != mod.compute_summary_source_hash(with_base64)
+
+
+def test_source_hash_ignores_db_image_files_without_urls():
+    image_without_url = {
+        "id": "image-0",
+        "type": "image",
+        "name": "missing-url.png",
+        "file": {"id": "image-0", "hash": "missing-url"},
+    }
+    injected_image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image_without_url, injected_image]}]
+    with_url = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "https://files.example/photo.png"}},
+            ],
+        }
+    ]
+    with_base64 = copy.deepcopy(with_url)
+    with_base64[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,abc"
+
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) == mod.compute_summary_source_hash(with_base64, file_backed_image_db_chain=db_chain)
+
+
+def test_source_hash_keeps_unstable_db_images_distinct():
+    for first_image, second_image in (
+        (
+            {"type": "image", "url": "https://files.example/a.png"},
+            {"type": "image", "url": "https://files.example/b.png"},
+        ),
+        (
+            {"type": "image", "name": "screenshot.png", "url": "https://files.example/a.png"},
+            {"type": "image", "name": "screenshot.png", "url": "https://files.example/b.png"},
+        ),
+    ):
+        first_chain = [{"role": "user", "content": "describe", "files": [first_image]}]
+        second_chain = [{"role": "user", "content": "describe", "files": [second_image]}]
+        first_message = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aaa"}},
+                ],
+            }
+        ]
+        second_message = copy.deepcopy(first_message)
+        second_message[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,bbb"
+
+        assert mod.compute_summary_source_hash(
+            first_message,
+            file_backed_image_db_chain=first_chain,
+        ) != mod.compute_summary_source_hash(second_message, file_backed_image_db_chain=second_chain)
+
+
+def test_source_hash_does_not_relabel_existing_multimodal_image_parts():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [
+        {
+            "role": "user",
+            "files": [image],
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "https://external.example/other.png"}},
+            ],
+        }
+    ]
+    with_url = copy.deepcopy(db_chain)
+    with_url[0].pop("files")
+    with_base64 = copy.deepcopy(with_url)
+    with_base64[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,abc"
+
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) != mod.compute_summary_source_hash(with_base64, file_backed_image_db_chain=db_chain)
+
+
+def test_source_hash_does_not_relabel_non_user_image_files():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "assistant", "content": "rendered image", "files": [image]}]
+    with_url = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "rendered image"},
+                {"type": "image_url", "image_url": {"url": "https://files.example/photo.png"}},
+            ],
+        }
+    ]
+    with_base64 = copy.deepcopy(with_url)
+    with_base64[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,abc"
+
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) != mod.compute_summary_source_hash(with_base64, file_backed_image_db_chain=db_chain)
+
+
+def test_source_hash_does_not_relabel_non_user_source_image_parts():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "rendered image", "files": [image]}]
+    with_url = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "rendered image"},
+                {"type": "image_url", "image_url": {"url": "https://files.example/photo.png"}},
+            ],
+        }
+    ]
+    with_base64 = copy.deepcopy(with_url)
+    with_base64[0]["content"][1]["image_url"]["url"] = "data:image/png;base64,abc"
+
+    assert mod.compute_summary_source_hash(
+        with_url,
+        file_backed_image_db_chain=db_chain,
+    ) != mod.compute_summary_source_hash(with_base64, file_backed_image_db_chain=db_chain)
+
+
+def test_longest_matching_checkpoint_uses_file_backed_image_identity():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image]}]
+    with_base64 = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ],
+        }
+    ]
+    row = {
+        "state": "ready",
+        "source_message_count": 1,
+        "source_hash": mod.compute_summary_source_hash(
+            with_base64,
+            file_backed_image_db_chain=db_chain,
+        ),
+    }
+
+    def resolver(count):
+        return None
+
+    setattr(resolver, mod.PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR, db_chain)
+
+    assert mod.select_longest_matching_checkpoint(
+        [row],
+        with_base64,
+        prefix_file_fingerprint_resolver=resolver,
+    ) == row
+
+
+def test_file_backed_image_identity_survives_middle_system_churn():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image]}]
+    creation_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ],
+        }
+    ]
+    row = {
+        "state": "ready",
+        "source_message_count": 1,
+        "source_hash": mod.compute_summary_source_hash(
+            creation_messages,
+            file_backed_image_db_chain=db_chain,
+        ),
+    }
+
+    current_messages = [
+        {"role": "system", "content": "volatile middle system"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,reencoded"}},
+            ],
+        },
+    ]
+
+    def resolver(count):
+        return None
+
+    setattr(resolver, mod.PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR, db_chain)
+
+    assert mod.select_longest_matching_checkpoint(
+        [row],
+        current_messages,
+        prefix_file_fingerprint_resolver=resolver,
+    ) == row
+
+
+def test_file_backed_image_identity_skips_db_chain_system_rows():
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "url": "https://files.example/photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [
+        {"role": "system", "content": "stored system row"},
+        {"role": "user", "content": "describe", "files": [image]},
+    ]
+    creation_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ],
+        }
+    ]
+    row = {
+        "state": "ready",
+        "source_message_count": 1,
+        "source_hash": mod.compute_summary_source_hash(
+            creation_messages,
+            file_backed_image_db_chain=db_chain,
+        ),
+    }
+
+    current_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,reencoded"}},
+            ],
+        }
+    ]
+
+    def resolver(count):
+        return None
+
+    setattr(resolver, mod.PREFIX_FILE_FINGERPRINT_RESOLVER_DB_CHAIN_ATTR, db_chain)
+
+    assert mod.select_longest_matching_checkpoint(
+        [row],
+        current_messages,
+        prefix_file_fingerprint_resolver=resolver,
+    ) == row
+
+
+def test_longest_matching_checkpoint_fingerprint_window_survives_middle_system_churn():
+    resolver_counts: list[int] = []
+
+    def resolver(count):
+        resolver_counts.append(count)
+        return f"fingerprint-{count}"
+
+    creation_prefix = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    row = {
+        "state": "ready",
+        "source_message_count": 2,
+        "source_hash": mod.compute_summary_source_hash(creation_prefix, resolver(2)),
+    }
+
+    current_prefix = [
+        {"role": "user", "content": "old"},
+        {"role": "system", "content": "volatile middle system"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "follow-up"},
+        {"role": "assistant", "content": "follow-up answer"},
+    ]
+
+    assert (
+        mod.select_longest_matching_checkpoint(
+            [row],
+            current_prefix,
+            prefix_file_fingerprint_resolver=resolver,
+        )
+        == row
+    )
+    assert set(resolver_counts) == {2}
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_resolver_keeps_db_chain_without_metadata_files(monkeypatch):
+    image = {
+        "id": "image-1",
+        "type": "image",
+        "name": "photo.png",
+        "file": {"id": "image-1", "hash": "abc"},
+    }
+    db_chain = [{"role": "user", "content": "describe", "files": [image]}]
+
+    async def load_chain(request, chat_id, current_message_id):
+        return db_chain
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        SimpleNamespace(state=SimpleNamespace()),
+        {"chat_id": "chat-1", "user_message_id": "msg-1"},
+        source_messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            }
+        ],
+    )
+
+    assert resolver is not None
+    assert resolver(1) is None
+    assert mod._prefix_file_fingerprint_resolver_db_chain(resolver) == db_chain
+
+
+@pytest.mark.asyncio
+async def test_history_ref_serve_reuses_fingerprinted_checkpoint_resolver_without_metadata_files(
+    monkeypatch,
+):
+    raw_messages = [
+        {
+            "role": "user",
+            "content": "history",
+            "files": [{"id": "file-a", "type": "file"}],
+        }
+    ]
+    metadata_files = [
+        {
+            "id": "file-a",
+            "type": "file",
+            "name": "a.pdf",
+            "file": {"hash": "aaa"},
+        }
+    ]
+    request = SimpleNamespace(state=SimpleNamespace())
+    db_chain_loads = []
+
+    async def load_chat_message_chain(request, chat_id, current_message_id):
+        db_chain_loads.append((chat_id, current_message_id))
+        return copy.deepcopy(raw_messages)
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        request,
+        {
+            "chat_id": "chat-1",
+            "user_message_id": "message-1",
+            "files": metadata_files,
+        },
+        raw_messages,
+    )
+    assert resolver is not None
+
+    row = _history_checkpoint_rows(raw_messages)[0]
+    from open_webui.utils.middleware import process_messages_with_output
+
+    expanded_messages = process_messages_with_output(copy.deepcopy(raw_messages))
+    row["source_hash"] = mod.compute_summary_source_hash(
+        expanded_messages,
+        resolver(1),
+        mod._prefix_file_fingerprint_resolver_db_chain(resolver),
+    )
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore([row]),
+        selected_checkpoint=row,
+        user_message_id="message-1",
+    )
+
+    async def load_raw_chat_branch(*, chat_id, metadata):
+        return copy.deepcopy(raw_messages)
+
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
+    resolved = await mod.resolve_history_ref_catalog_entry(
+        catalog[0],
+        request=request,
+        metadata={"chat_id": "chat-1", "user_message_id": "message-1"},
+    )
+
+    assert resolved.manifest.ref == f"history:{row['id']}"
+    assert db_chain_loads == [("chat-1", "message-1")]
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_resolver_skips_db_chain_for_text_without_metadata_files(monkeypatch):
+    calls = []
+
+    async def load_chain(request, chat_id, current_message_id):
+        calls.append((chat_id, current_message_id))
+        return [{"role": "user", "content": "hello"}]
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        SimpleNamespace(state=SimpleNamespace()),
+        {"chat_id": "chat-1", "user_message_id": "msg-1"},
+        source_messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert resolver is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_resolver_skips_db_chain_for_text_with_empty_metadata_files(monkeypatch):
+    calls = []
+
+    async def load_chain(request, chat_id, current_message_id):
+        calls.append((chat_id, current_message_id))
+        return [{"role": "user", "content": "hello"}]
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        SimpleNamespace(state=SimpleNamespace()),
+        {"chat_id": "chat-1", "user_message_id": "msg-1", "files": []},
+        source_messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert resolver is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_prefix_file_resolver_skips_db_chain_for_assistant_image_without_metadata_files(monkeypatch):
+    calls = []
+
+    async def load_chain(request, chat_id, current_message_id):
+        calls.append((chat_id, current_message_id))
+        return [{"role": "assistant", "content": "image"}]
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+
+    resolver = await mod._build_prefix_file_fingerprint_resolver(
+        SimpleNamespace(state=SimpleNamespace()),
+        {"chat_id": "chat-1", "user_message_id": "msg-1"},
+        source_messages=[
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "image"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            }
+        ],
+    )
+
+    assert resolver is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_reusable_checkpoint_paths_skip_db_chain_for_tail_only_images_without_metadata_files(monkeypatch):
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "active"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,active"}},
+            ],
+        },
+    ]
+    prefix = messages[:2]
+    checkpoint = make_checkpoint_row(
+        prefix,
+        state="ready",
+        summary_text="old summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([checkpoint])
+    calls = []
+
+    async def load_chain(request, chat_id, current_message_id):
+        calls.append((chat_id, current_message_id))
+        return [{"role": "user", "content": "active"}]
+
+    async def estimate_body_tokens_async(body, *, request):
+        return 10
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "estimate_body_tokens_async", estimate_body_tokens_async)
+
+    match = await mod._body_reusable_checkpoint_match(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1", "user_message_id": "msg-1"},
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+    )
+    assert match is not None
+
+    tokens = await mod._estimate_checkpoint_applied_body_tokens(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1", "user_message_id": "msg-1"},
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+        match=match,
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        file_context_enabled=False,
+    )
+    assert tokens is not None
+
+    compacted, did_compact, _prefix_count = await mod._compact_body_with_reusable_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1", "user_message_id": "msg-1"},
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+        match=match,
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+    )
+    assert did_compact is True
+    assert "old summary" in compacted["messages"][0]["content"]
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_reusable_checkpoint_match_computes_summary_source_hash_once(monkeypatch):
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "active"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,active"},
+                },
+            ],
+        },
+    ]
+    prefix = messages[:2]
+    checkpoint = make_checkpoint_row(
+        prefix,
+        state="ready",
+        summary_text="old summary",
+        claim_token=None,
+        claim_expires_at=None,
+    )
+    store = ClaimStore([checkpoint])
+    hash_calls = 0
+    real_hash = mod.compute_summary_source_hash
+
+    def counting_hash(
+        source_messages,
+        prefix_file_fingerprint=None,
+        file_backed_image_db_chain=None,
+        *,
+        transient_message_patterns=None,
+    ):
+        nonlocal hash_calls
+        hash_calls += 1
+        return real_hash(
+            source_messages,
+            prefix_file_fingerprint,
+            file_backed_image_db_chain,
+            transient_message_patterns=transient_message_patterns,
+        )
+
+    async def load_chain(request, chat_id, current_message_id):
+        return [{"role": "user", "content": "active"}]
+
+    monkeypatch.setattr(mod, "compute_summary_source_hash", counting_hash)
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chain)
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    match = await mod._body_reusable_checkpoint_match(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata={"chat_id": "chat-1", "user_message_id": "msg-1"},
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+        capture_logical_snapshot=True,
+    )
+    assert match is not None
+    assert hash_calls == 1
+
+
+def test_replace_prefix_accepts_parent_checkpoint_with_prefix_file_fingerprint():
+    messages = [
+        {"role": "user", "content": "old with file"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    cut = mod.select_safe_message_cut(messages)
+    fingerprint = "sha256:prefix-files-a"
+    parent = mod.build_checkpoint_row(
+        namespace="ns",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash=mod.compute_summary_source_hash(cut.summarization_prefix, fingerprint),
+        source_message_count=len(cut.summarization_prefix),
+        summary_text="Parent summary with file context",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    compacted = mod.replace_prefix_with_parent_checkpoint_and_delta(
+        cut,
+        parent,
+        prefix_file_fingerprint=fingerprint,
+        historical_message_excerpt_count=0,
+    )
+
+    assert "Parent summary with file context" in compacted[0]["content"]
+    assert compacted[-1] == {"role": "user", "content": "active"}
+
+
+@pytest.mark.asyncio
+async def test_compact_body_parent_extension_fallback_uses_prefix_file_fingerprint(monkeypatch):
+    messages = [
+        {"role": "user", "content": "old with file"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    metadata_files = [{"id": "file-a", "type": "file", "name": "a.pdf", "file": {"hash": "aaa"}}]
+    metadata = {"chat_id": "chat-1", "user_message_id": "msg-1", "files": metadata_files}
+    db_chain = [
+        {"role": "user", "content": "old with file", "files": [{"id": "file-a", "type": "file"}]},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active"},
+    ]
+    cut = mod.select_safe_message_cut(messages)
+    fingerprint = mod._stable_file_fingerprint(metadata_files)
+    parent = mod.build_checkpoint_row(
+        namespace="ns",
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash="profile",
+        source_hash=mod.compute_summary_source_hash(cut.summarization_prefix, fingerprint),
+        source_message_count=len(cut.summarization_prefix),
+        summary_text="Parent fallback summary with file context",
+        summary_meta={},
+        parent_checkpoint_id=None,
+        now=123,
+    )
+
+    async def fake_load_chain(request, chat_id, message_id):
+        return db_chain
+
+    async def fake_get_or_create_summary(**kwargs):
+        raise mod.ParentCheckpointExtensionFailed(parent, RuntimeError("extension failed"))
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", fake_load_chain)
+    monkeypatch.setattr(mod, "_get_or_create_compaction_summary", fake_get_or_create_summary)
+
+    compacted, did_compact, prefix_count = await mod._compact_body(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        metadata=metadata,
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+        target_model_id="target",
+        summary_model_id="summary",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=0,
+    )
+
+    assert did_compact is True
+    assert prefix_count == len(cut.summarization_prefix)
+    assert "Parent fallback summary with file context" in compacted["messages"][0]["content"]
+
+
+def test_soft_prefetch_inflight_source_hash_separates_file_identities():
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    first_metadata = {"files": [{"id": "file-a", "type": "file", "name": "a.pdf", "file": {"hash": "aaa"}}]}
+    second_metadata = {"files": [{"id": "file-a", "type": "file", "name": "a.pdf", "file": {"hash": "bbb"}}]}
+
+    assert mod._soft_prefetch_inflight_source_hash(source_messages, first_metadata) != mod._soft_prefetch_inflight_source_hash(source_messages, second_metadata)
+
+
+@pytest.mark.asyncio
+async def test_prefetch_pending_lookup_uses_prefix_file_fingerprint_resolver(monkeypatch):
+    source_messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    db_chain = [
+        {"role": "user", "content": "old", "files": [{"id": "file-a", "type": "file"}]},
+        {"role": "assistant", "content": "answer"},
+    ]
+    metadata = {
+        "chat_id": "chat-1",
+        "_auto_compaction_processed_db_chain": db_chain,
+        "files": [{"id": "file-a", "type": "file", "name": "a.pdf", "file": {"hash": "aaa"}}],
+    }
+    captured: dict[str, object] = {}
+
+    async def fake_load_chain(request, chat_id, message_id):
+        return db_chain
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", fake_load_chain)
+
+    async def fake_lookup_pending(**kwargs):
+        resolver = kwargs.get("prefix_file_fingerprint_resolver")
+        captured["resolver"] = resolver
+        captured["fingerprint"] = resolver(len(source_messages)) if resolver is not None else None
+        return {"id": "pending-1"}
+
+    monkeypatch.setattr(mod, "_lookup_pending_checkpoint_for_source_prefix", fake_lookup_pending)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata=metadata,
+        body={"messages": source_messages},
+        pipe_function_id="auto_compact",
+        summary_model_id="summary-model",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+    )
+
+    assert result is False
+    assert callable(captured["resolver"])
+    assert captured["fingerprint"] == mod._stable_file_fingerprint(metadata["files"])
+
+
+@pytest.mark.asyncio
+async def test_prefetch_skips_child_checkpoint_when_ready_parent_estimate_is_below_soft(monkeypatch):
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    delta_messages = [
+        {"role": "user", "content": "middle"},
+        {"role": "assistant", "content": "middle answer"},
+    ]
+    source_messages = [*parent_source, *delta_messages]
+    parent_checkpoint = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="ready parent summary",
+    )
+    parent_checkpoint["claim_token"] = None
+    parent_checkpoint["claim_expires_at"] = None
+    store = ClaimStore([parent_checkpoint])
+    estimate_calls = []
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        estimate_calls.append(kwargs)
+        return 40
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("ready parent below soft should make child checkpoint generation redundant")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata={"chat_id": "chat-1", "message_id": "message-1"},
+        body={"messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="summary-model",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_trigger_input_tokens=1000,
+        effective_soft_trigger_input_tokens=100,
+        trigger_estimated_tokens=500,
+    )
+
+    assert result is False
+    assert len(estimate_calls) == 1
+    assert store.claimed_rows == []
+
+
+@pytest.mark.asyncio
+async def test_prefetch_rechecks_parent_after_claim_before_generating_child(monkeypatch):
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    delta_messages = [
+        {"role": "user", "content": "middle"},
+        {"role": "assistant", "content": "middle answer"},
+    ]
+    source_messages = [*parent_source, *delta_messages]
+    parent_checkpoint = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="late parent summary",
+    )
+    parent_checkpoint["claim_token"] = None
+    parent_checkpoint["claim_expires_at"] = None
+
+    class ParentAppearsAfterPrecheckStore(ClaimStore):
+        def __init__(self):
+            super().__init__([])
+            self.parent_lookup_count = 0
+
+        async def find_longest_parent(self, **kwargs):
+            self.parent_lookup_count += 1
+            if self.parent_lookup_count == 1:
+                return None
+            if not any(row.get("id") == parent_checkpoint["id"] for row in self.rows):
+                self.rows.append(dict(parent_checkpoint))
+            return mod.select_longest_matching_parent(self.rows, kwargs["source_messages"])
+
+    store = ParentAppearsAfterPrecheckStore()
+    estimate_calls = []
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        estimate_calls.append(kwargs)
+        return 40
+
+    async def generate_summary_text(**kwargs):
+        raise AssertionError("late parent below soft should be rechecked before generating a child summary")
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata={"chat_id": "chat-1", "message_id": "message-1"},
+        body={"messages": [*source_messages, {"role": "user", "content": "active"}]},
+        pipe_function_id="auto_compact",
+        summary_model_id="summary-model",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_trigger_input_tokens=1000,
+        effective_soft_trigger_input_tokens=100,
+        trigger_estimated_tokens=500,
+    )
+
+    assert result is False
+    assert len(estimate_calls) == 1
+    assert len(source_claims(store)) == 1
+    assert released_source_claims(store) == source_claims(store)
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert store.completed_rows == []
+
+
+@pytest.mark.asyncio
+async def test_prefetch_does_not_skip_tool_prefix_for_mismatched_message_exact_checkpoint(monkeypatch):
+    messages = [
+        {"role": "user", "content": "older request"},
+        {"role": "assistant", "content": "older answer"},
+        {"role": "user", "content": "active request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search"}}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "old result"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-2", "type": "function", "function": {"name": "fetch"}}],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "latest result"},
+    ]
+    tool_cut = mod.select_tool_result_compaction_cut(messages)
+    message_cut = mod.select_safe_message_cut(messages)
+    assert tool_cut is not None
+    assert len(tool_cut.summarization_prefix) > len(message_cut.summarization_prefix)
+    source_messages = tool_cut.summarization_prefix
+    message_exact_checkpoint = make_checkpoint_row(
+        message_cut.summarization_prefix,
+        state="ready",
+        summary_text="short message checkpoint",
+    )
+    message_exact_checkpoint["claim_token"] = None
+    message_exact_checkpoint["claim_expires_at"] = None
+    store = ClaimStore()
+    summary_calls = []
+
+    async def body_reusable_checkpoint_match(**kwargs):
+        return mod.ReusableCheckpointMatch(
+            kind="exact",
+            source_message_count=len(message_cut.summarization_prefix),
+            source_kind="message",
+            checkpoint=message_exact_checkpoint,
+        )
+
+    async def generate_summary_text(**kwargs):
+        summary_calls.append(kwargs)
+        return "generated tool prefix summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(mod, "_body_reusable_checkpoint_match", body_reusable_checkpoint_match)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata={"chat_id": "chat-1", "message_id": "message-1"},
+        body={"messages": messages},
+        pipe_function_id="auto_compact",
+        summary_model_id="summary-model",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_trigger_input_tokens=1000,
+        effective_soft_trigger_input_tokens=100,
+        trigger_estimated_tokens=500,
+    )
+
+    assert result is True
+    assert len(summary_calls) == 1
+    assert summary_calls[0]["source_messages"] == source_messages
+    assert len(source_claims(store)) == 1
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert len(store.completed_rows) == 1
+    assert store.completed_rows[0]["source_hash"] == mod.compute_source_hash(source_messages)
+
+
+@pytest.mark.asyncio
+async def test_prefetch_uses_task_estimate_body_for_parent_below_soft_guard(monkeypatch):
+    parent_source = [
+        {"role": "user", "content": "old task input"},
+        {"role": "assistant", "content": "old task answer"},
+    ]
+    delta_messages = [
+        {"role": "user", "content": "middle task input"},
+        {"role": "assistant", "content": "middle task answer"},
+    ]
+    active = {"role": "user", "content": "active task input"}
+    source_messages = [*parent_source, *delta_messages]
+    parent_checkpoint = make_checkpoint_row(
+        parent_source,
+        state="ready",
+        summary_text="ready task parent summary",
+    )
+    parent_checkpoint["claim_token"] = None
+    parent_checkpoint["claim_expires_at"] = None
+    store = ClaimStore([parent_checkpoint])
+    raw_source_body = {"model": "target", "messages": [*source_messages, active]}
+    task_estimate_body = {
+        "model": "target",
+        "messages": [{"role": "user", "content": "Task:\nold task input\nmiddle task input\nactive task input"}],
+    }
+    metadata = {
+        "chat_id": "chat-1",
+        "message_id": "message-1",
+        "task": mod.TASKS.TAGS_GENERATION.value,
+        "task_body": {
+            "model": "target",
+            "chat_id": "chat-1",
+            "messages": [*source_messages, active],
+        },
+    }
+    task_estimate_calls = []
+    summary_calls = []
+
+    async def estimate_task_checkpoint_applied_body_tokens(**kwargs):
+        task_estimate_calls.append(copy.deepcopy(kwargs))
+        assert kwargs["body"]["messages"] == task_estimate_body["messages"]
+        return 150
+
+    async def estimate_checkpoint_applied_body_tokens(**kwargs):
+        raise AssertionError("task prefetch guard must not use the raw history body estimate")
+
+    async def generate_summary_text(**kwargs):
+        summary_calls.append(kwargs)
+        return "generated task child summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+    monkeypatch.setattr(
+        mod,
+        "_estimate_task_checkpoint_applied_body_tokens",
+        estimate_task_checkpoint_applied_body_tokens,
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "_estimate_checkpoint_applied_body_tokens", estimate_checkpoint_applied_body_tokens)
+    monkeypatch.setattr(mod, "_generate_summary_text", generate_summary_text)
+
+    result = await mod._prefetch_compaction_checkpoint(
+        request=SimpleNamespace(state=SimpleNamespace()),
+        user={"id": "user-1"},
+        user_id="user-1",
+        chat_id="chat-1",
+        metadata=metadata,
+        body=raw_source_body,
+        task_estimate_body=task_estimate_body,
+        pipe_function_id="auto_compact",
+        summary_model_id="summary-model",
+        source_messages=source_messages,
+        summary_tool_policy="fallback_on_tool_call",
+        historical_message_excerpt_bytes=1024,
+        historical_message_excerpt_count=3,
+        effective_trigger_input_tokens=1000,
+        effective_soft_trigger_input_tokens=100,
+        trigger_estimated_tokens=500,
+    )
+
+    assert result is True
+    assert len(task_estimate_calls) == 2
+    assert len(summary_calls) == 1
+    assert len(source_claims(store)) == 1
+    assert len(generation_lease_claims(store)) == 1
+    assert released_generation_lease_claims(store) == generation_lease_claims(store)
+    assert len(store.completed_rows) == 1
+
+
+def test_prefix_file_fingerprint_resolver_covers_only_absorbed_prefix_range():
+    # Files live in the DB chain (production layout), not in body.messages.
+    db_chain = [
+        {"role": "user", "content": "m1", "files": [{"id": "prefix-file", "type": "file"}]},
+        {"role": "assistant", "content": "m2"},
+        {"role": "user", "content": "m3", "files": [{"id": "current-file", "type": "file"}]},
+    ]
+    metadata_files = [
+        {"id": "prefix-file", "type": "file", "name": "p.txt"},
+        {"id": "current-file", "type": "file", "name": "c.txt"},
+    ]
+    resolver = mod._make_prefix_file_fingerprint_resolver(db_chain, metadata_files)
+
+    fp_prefix = resolver(2)
+    assert fp_prefix is not None
+    assert resolver(1) == fp_prefix
+    assert resolver(0) is None
+    # A current-turn/retained file outside the absorbed prefix range does not
+    # change the prefix fingerprint, so it cannot alter the checkpoint key.
+    metadata_files_without_current = [metadata_files[0]]
+    resolver_without_current = mod._make_prefix_file_fingerprint_resolver(db_chain, metadata_files_without_current)
+    assert resolver_without_current(2) == fp_prefix
+
+
+def reference_prefix_file_fingerprint(
+    db_chain,
+    metadata_files,
+    transient_message_patterns,
+    count,
+):
+    prefix_ids = mod._classify_files_for_summary(
+        db_chain,
+        count,
+        0,
+        transient_message_patterns=transient_message_patterns,
+    )
+    if not prefix_ids:
+        return None
+    items = [
+        item
+        for item in metadata_files
+        if isinstance(item, dict)
+        and not mod._is_image_file_item(item)
+        and item.get("id") in prefix_ids
+    ]
+    return mod._stable_file_fingerprint(items) or None
+
+
+def _random_fingerprint_chain(rng):
+    db_chain = []
+    metadata_files = []
+    file_seq = 0
+    for _ in range(rng.randint(1, 60)):
+        roll = rng.random()
+        if roll < 0.08:
+            db_chain.append("non-dict-row")
+            continue
+        message = {"role": "user", "content": f"m{len(db_chain)}"}
+        if roll < 0.2:
+            message["role"] = "system"
+        elif roll < 0.34:
+            message["content"] = f"<CTX>transient {len(db_chain)}</CTX>"
+        if roll > 0.5:
+            files = []
+            for _ in range(rng.randint(1, 2)):
+                file_seq += 1
+                style = rng.random()
+                if style < 0.15:
+                    files.append({"id": f"img-{file_seq}", "type": "image"})
+                elif style < 0.35:
+                    files.append({"id": "shared-file", "type": "file"})
+                else:
+                    files.append({"id": f"file-{file_seq}", "type": "file"})
+            message["files"] = files
+            if rng.random() < 0.7:
+                for file_entry in files:
+                    if rng.random() < 0.5:
+                        metadata_files.append(
+                            {
+                                "id": file_entry["id"],
+                                "type": file_entry.get("type", "file"),
+                                "name": f"{file_entry['id']}.txt",
+                                "docs": ["dropped body"],
+                            }
+                        )
+        db_chain.append(message)
+    if rng.random() < 0.35:
+        db_chain.append(
+            {
+                "role": "system",
+                "content": "trailing system row",
+                "files": [{"id": "trailing-file", "type": "file"}],
+            }
+        )
+        if rng.random() < 0.5:
+            metadata_files.append(
+                {"id": "trailing-file", "type": "file", "name": "t.txt"}
+            )
+    metadata_files.append({"id": "image-only", "type": "image", "name": "i.png"})
+    metadata_files.append({"id": "ghost-file", "type": "file", "name": "g.txt"})
+    return db_chain, metadata_files
+
+
+def test_prefix_file_fingerprint_resolver_matches_classify_reference():
+    transient_message_patterns = (re.compile(r"<CTX>.*</CTX>"),)
+    rng = random.Random(20260906)
+
+    for case_index in range(36):
+        db_chain, metadata_files = _random_fingerprint_chain(rng)
+        for patterns in (None, transient_message_patterns):
+            resolver = mod._make_prefix_file_fingerprint_resolver(
+                db_chain,
+                metadata_files,
+                transient_message_patterns=patterns,
+            )
+            for count in range(-1, len(db_chain) + 3):
+                assert resolver(count) == reference_prefix_file_fingerprint(
+                    db_chain,
+                    metadata_files,
+                    patterns,
+                    count,
+                ), (case_index, patterns is None, count)
+
+
+def test_prefix_file_fingerprint_resolver_cost_is_bounded_per_unique_count(monkeypatch):
+    total = 200
+    db_chain = [
+        {
+            "role": "user",
+            "content": f"m{index}",
+            "files": [{"id": f"file-{index}", "type": "file"}],
+        }
+        for index in range(total)
+    ]
+    metadata_files = [
+        {"id": f"file-{index}", "type": "file", "name": f"f{index}.txt"}
+        for index in range(total)
+    ]
+    counts = {"identity": 0, "fingerprint": 0, "classify": 0, "boundary": 0}
+    real_identity = mod._is_source_identity_message
+    real_fingerprint = mod._stable_file_fingerprint
+    real_classify = mod._classify_files_for_summary
+    real_boundary = mod._raw_chain_boundary
+
+    def counting_identity(message, **kwargs):
+        counts["identity"] += 1
+        return real_identity(message, **kwargs)
+
+    def counting_fingerprint(items):
+        counts["fingerprint"] += 1
+        return real_fingerprint(items)
+
+    def counting_classify(*args, **kwargs):
+        counts["classify"] += 1
+        return real_classify(*args, **kwargs)
+
+    def counting_boundary(*args, **kwargs):
+        counts["boundary"] += 1
+        return real_boundary(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "_is_source_identity_message", counting_identity)
+    monkeypatch.setattr(mod, "_stable_file_fingerprint", counting_fingerprint)
+    monkeypatch.setattr(mod, "_classify_files_for_summary", counting_classify)
+    monkeypatch.setattr(mod, "_raw_chain_boundary", counting_boundary)
+
+    resolver = mod._make_prefix_file_fingerprint_resolver(db_chain, metadata_files)
+
+    assert resolver(1) is not None
+    assert resolver(100) is not None
+    assert resolver(200) is not None
+    assert resolver(100) is not None
+
+    assert counts["identity"] <= 3 * total
+    assert counts["fingerprint"] == 3
+    assert counts["classify"] == 0
+    assert counts["boundary"] == 0
+
+
+@pytest.mark.asyncio
+async def test_different_prefix_file_fingerprint_does_not_reuse_checkpoint(monkeypatch):
+    # In production, attachments live in metadata.files / DB chain rather than
+    # body.messages, so identical source text with different absorbed prefix
+    # files must NOT reuse the same checkpoint summary.
+    source_messages = [{"role": "user", "content": "same text"}]
+    store = ClaimStore()
+    factory_calls = []
+
+    async def summary_factory(parent):
+        factory_calls.append(parent)
+        return "generated summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    first = await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        summary_meta={},
+        summary_factory=summary_factory,
+        prefix_file_fingerprint="sha256:prefix-files-a",
+    )
+    second = await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        summary_meta={},
+        summary_factory=summary_factory,
+        prefix_file_fingerprint="sha256:prefix-files-b",
+    )
+
+    assert len(factory_calls) == 2
+    assert first.checkpoint["source_hash"] != second.checkpoint["source_hash"]
+    assert len(store.completed_rows) == 2
+    assert store.completed_rows[0]["id"] != store.completed_rows[1]["id"]
+
+
+@pytest.mark.asyncio
+async def test_same_prefix_file_fingerprint_reuses_checkpoint(monkeypatch):
+    source_messages = [{"role": "user", "content": "same text"}]
+    store = ClaimStore()
+    factory_calls = []
+
+    async def summary_factory(parent):
+        factory_calls.append(parent)
+        return "generated summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: store)
+
+    first = await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        summary_meta={},
+        summary_factory=summary_factory,
+        prefix_file_fingerprint="sha256:prefix-files-a",
+    )
+    second = await mod._get_or_create_checkpoint_summary(
+        request=None,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        source_messages=source_messages,
+        summary_meta={},
+        summary_factory=summary_factory,
+        prefix_file_fingerprint="sha256:prefix-files-a",
+    )
+
+    assert len(factory_calls) == 1
+    assert first == second
+    assert len(store.completed_rows) == 1
+
+
+def test_checkpoint_ddl_tolerates_only_duplicate_object_errors():
+    from sqlalchemy.exc import OperationalError
+
+    class FakeNested:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeConn:
+        def __init__(self, error):
+            self.error = error
+
+        def begin_nested(self):
+            return FakeNested()
+
+        def execute(self, statement):
+            raise self.error
+
+    duplicate_table = OperationalError("CREATE TABLE x", {}, Exception("table x already exists"))
+    mod._execute_checkpoint_ddl_tolerating_duplicates(FakeConn(duplicate_table), "CREATE TABLE x")
+
+    broken = OperationalError("CREATE TABLE x", {}, Exception("disk I/O error"))
+    with pytest.raises(OperationalError):
+        mod._execute_checkpoint_ddl_tolerating_duplicates(FakeConn(broken), "CREATE TABLE x")
+
+
+def _engine_store_factory(engine):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False)
+
+    class EngineCheckpointStore(mod.CheckpointStore):
+        async def _context(self):
+            return sessionmaker()
+
+    return EngineCheckpointStore
+
+
+async def _checkpoint_table_columns(engine):
+    import sqlalchemy
+
+    async with engine.connect() as conn:
+        return await conn.run_sync(
+            lambda sync_conn: {
+                column["name"]
+                for column in sqlalchemy.inspect(sync_conn).get_columns(mod.CHECKPOINT_TABLE_NAME)
+            }
+        )
+
+
+@pytest.fixture
+async def claim_engine(tmp_path, monkeypatch):
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path}/checkpoints.db",
+        poolclass=NullPool,
+        connect_args={"timeout": 30},
+    )
+    monkeypatch.setattr(mod, "_CHECKPOINT_SCHEMA_READY", False)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_history_ref_cas_real_sqlite_updates_only_object_with_absent_key(
+    claim_engine,
+):
+    import json
+
+    from sqlalchemy import select
+
+    cases = (
+        ("sql-null", None, {}, False),
+        ("json-null", "null", {}, False),
+        ("scalar", json.dumps("scalar"), {}, False),
+        ("array", json.dumps(["value"]), {}, False),
+        (
+            "existing-key",
+            json.dumps(
+                {
+                    "has_multimodal": True,
+                    mod.SUMMARY_META_HISTORY_REF_KEY: {
+                        "format": mod.HISTORY_REF_FORMAT,
+                        "raw_source_hash": "b" * 64,
+                    },
+                }
+            ),
+            {"has_multimodal": True},
+            False,
+        ),
+        (
+            "object-without-key",
+            json.dumps({"has_multimodal": True}),
+            {"has_multimodal": True},
+            True,
+        ),
+    )
+    table_name = mod.CHECKPOINT_TABLE.name
+    rows = []
+    async with claim_engine.begin() as connection:
+        await connection.exec_driver_sql(
+            f'CREATE TABLE "{table_name}" ('
+            "id TEXT PRIMARY KEY, state TEXT NOT NULL, "
+            "summary_meta JSON, updated_at INTEGER NOT NULL)"
+        )
+        for label, summary_meta, _expected_meta, _swapped in cases:
+            row = {"id": label}
+            rows.append(row)
+            await connection.exec_driver_sql(
+                f'INSERT INTO "{table_name}" '
+                "(id, state, summary_meta, updated_at) VALUES (?, 'ready', ?, 0)",
+                (label, summary_meta),
+            )
+
+    store = _engine_store_factory(claim_engine)()
+    history_ref = {
+        "format": mod.HISTORY_REF_FORMAT,
+        "raw_source_hash": "a" * 64,
+    }
+    results = []
+    for row, (_label, _summary_meta, expected_meta, _swapped) in zip(
+        rows, cases, strict=True
+    ):
+        results.append(
+            await store.compare_and_swap_history_ref(
+                row["id"],
+                expected_summary_meta=expected_meta,
+                history_ref=history_ref,
+            )
+        )
+
+    async with claim_engine.connect() as connection:
+        persisted = {
+            row["id"]: row["summary_meta"]
+            for row in (
+                await connection.execute(
+                    select(
+                        mod.CHECKPOINT_TABLE.c.id,
+                        mod.CHECKPOINT_TABLE.c.summary_meta,
+                    ).where(
+                        mod.CHECKPOINT_TABLE.c.id.in_([row["id"] for row in rows])
+                    )
+                )
+            ).mappings()
+        }
+
+    assert results == [case[3] for case in cases]
+    for row, (label, _summary_meta, _expected_meta, swapped) in zip(
+        rows, cases, strict=True
+    ):
+        if swapped:
+            assert persisted[row["id"]] == {
+                "has_multimodal": True,
+                mod.SUMMARY_META_HISTORY_REF_KEY: history_ref,
+            }
+        elif label == "existing-key":
+            assert persisted[row["id"]][mod.SUMMARY_META_HISTORY_REF_KEY][
+                "raw_source_hash"
+            ] == "b" * 64
+        else:
+            assert mod.SUMMARY_META_HISTORY_REF_KEY not in (
+                persisted[row["id"]]
+                if isinstance(persisted[row["id"]], dict)
+                else {}
+            )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_callers_generate_summary_only_once(claim_engine, monkeypatch):
+    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", _engine_store_factory(claim_engine))
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0.02)
+
+    source_messages = [{"role": "user", "content": "old"}]
+    factory_calls = []
+
+    def make_summary_factory(label):
+        async def summary_factory(parent):
+            factory_calls.append(label)
+            await asyncio.sleep(0.2)
+            return "generated summary"
+
+        return summary_factory
+
+    async def run(label):
+        return await mod._get_or_create_checkpoint_summary(
+            request=None,
+            user_id="user-1",
+            chat_id="chat-1",
+            pipe_function_id="auto_compact",
+            source_messages=source_messages,
+            summary_meta={"summary_model": label},
+            summary_factory=make_summary_factory(label),
+        )
+
+    first, second = await asyncio.gather(run("summary-model-a"), run("summary-model-b"))
+
+    assert first == "generated summary"
+    assert second == "generated summary"
+    assert len(factory_calls) == 1
+    assert first.checkpoint["id"] == second.checkpoint["id"]
+    assert first.checkpoint["state"] == "ready"
+    assert second.checkpoint["state"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_independent_workers_serialize_parent_and_child_checkpoint_generation(monkeypatch):
+    parent_source = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    child_source = [
+        *parent_source,
+        {"role": "user", "content": "new"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+    shared_rows = []
+    parent_store = ClaimStore(shared_rows, share_rows=True)
+    child_db_started = asyncio.Event()
+
+    class ChildStore(ClaimStore):
+        async def lookup_any(self, **kwargs):
+            child_db_started.set()
+            return await super().lookup_any(**kwargs)
+
+    child_store = ChildStore(shared_rows, share_rows=True)
+    stores = iter((parent_store, child_store))
+    parent_llm_started = asyncio.Event()
+    release_parent_llm = asyncio.Event()
+    child_llm_started = asyncio.Event()
+    child_parents = []
+
+    async def parent_summary_factory(parent):
+        assert parent is None
+        parent_llm_started.set()
+        await release_parent_llm.wait()
+        return "parent summary"
+
+    async def child_summary_factory(parent):
+        child_parents.append(parent)
+        child_llm_started.set()
+        return "child summary"
+
+    monkeypatch.setattr(mod, "ensure_checkpoint_table_initialized", noop_initialize)
+    monkeypatch.setattr(mod, "CheckpointStore", lambda: next(stores))
+    monkeypatch.setattr(mod, "get_generation_lock", lambda key: asyncio.Lock())
+    monkeypatch.setattr(mod, "release_generation_lock", lambda key, lock: None)
+    monkeypatch.setattr(mod, "CHECKPOINT_PENDING_POLL_SECONDS", 0)
+
+    parent_task = asyncio.create_task(run_get_or_create(parent_source, parent_summary_factory))
+    await asyncio.wait_for(parent_llm_started.wait(), timeout=1)
+    child_task = asyncio.create_task(run_get_or_create(child_source, child_summary_factory))
+
+    try:
+        await asyncio.wait_for(child_db_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not child_llm_started.is_set()
+
+        release_parent_llm.set()
+        parent_result, child_result = await asyncio.gather(parent_task, child_task)
+
+        assert parent_result == "parent summary"
+        assert child_result == "child summary"
+        assert child_llm_started.is_set()
+        assert len(child_parents) == 1
+        assert child_parents[0]["summary_text"] == "parent summary"
+        assert child_result.checkpoint["parent_checkpoint_id"] == parent_result.checkpoint["id"]
+    finally:
+        release_parent_llm.set()
+        for task in (parent_task, child_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(parent_task, child_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stale_owner_cannot_overwrite_reclaimed_checkpoint(claim_engine):
+    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
+    store = _engine_store_factory(claim_engine)()
+    source_messages = [{"role": "user", "content": "old"}]
+    pending = make_checkpoint_row(source_messages, claim_token="stale-owner", claim_expires_at=100, now=100)
+
+    assert await store.claim_pending(pending) is True
+    assert await store.claim_pending(dict(pending, claim_token="rival")) is False
+    assert (
+        await store.reclaim_pending(pending["id"], claim_token="too-early", expires_at=10**12, now=50)
+        is False
+    )
+    assert (
+        await store.reclaim_pending(pending["id"], claim_token="fresh-owner", expires_at=10**12, now=200)
+        is True
+    )
+    assert (
+        await store.complete_pending(
+            pending["id"],
+            claim_token="stale-owner",
+            summary_text="stale summary",
+            parent_checkpoint_id=None,
+        )
+        is None
+    )
+
+    completed = await store.complete_pending(
+        pending["id"],
+        claim_token="fresh-owner",
+        summary_text="fresh summary",
+        parent_checkpoint_id=None,
+    )
+
+    assert completed is not None
+    assert completed["state"] == "ready"
+    assert completed["summary_text"] == "fresh summary"
+    assert completed["claim_token"] is None
+    assert (
+        await store.reclaim_pending(pending["id"], claim_token="late", expires_at=10**12, now=10**11)
+        is False
+    )
+    ready = await store.lookup_ready(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages),
+    )
+    assert ready is not None
+    assert ready["summary_text"] == "fresh summary"
+
+
+@pytest.mark.asyncio
+async def test_stale_generation_lease_owner_cannot_complete_source_checkpoint(
+    claim_engine,
+):
+    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
+    store = _engine_store_factory(claim_engine)()
+    source_messages = [{"role": "user", "content": "old"}]
+    source = make_checkpoint_row(
+        source_messages,
+        claim_token="source-token-a",
+        claim_expires_at=10**12,
+        now=100,
+    )
+    lease = make_generation_lease_row(
+        claim_token="lease-token-a",
+        claim_expires_at=100,
+    )
+
+    assert await store.claim_pending(source) is True
+    assert await store.claim_pending(lease) is True
+    assert (
+        await store.reclaim_pending(
+            lease["id"],
+            claim_token="lease-token-b",
+            expires_at=10**12,
+            now=200,
+        )
+        is True
+    )
+
+    completed = await store.complete_pending(
+        source["id"],
+        claim_token="source-token-a",
+        summary_text="stale summary",
+        parent_checkpoint_id=None,
+        generation_lease_id=lease["id"],
+        generation_lease_claim_token="lease-token-a",
+        now=200,
+    )
+
+    assert completed is None
+    persisted = await store.lookup_any(
+        namespace=mod.CHECKPOINT_NAMESPACE,
+        user_id="user-1",
+        chat_id="chat-1",
+        pipe_function_id="auto_compact",
+        profile_hash=mod.compute_profile_hash(),
+        source_hash=mod.compute_source_hash(source_messages),
+    )
+    assert persisted is not None
+    assert persisted["state"] == "pending"
+    assert persisted["claim_token"] == "source-token-a"
+    assert (
+        await store.lookup_ready(
+            namespace=mod.CHECKPOINT_NAMESPACE,
+            user_id="user-1",
+            chat_id="chat-1",
+            pipe_function_id="auto_compact",
+            profile_hash=mod.compute_profile_hash(),
+            source_hash=mod.compute_source_hash(source_messages),
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_released_claim_lets_next_caller_claim_again(claim_engine):
+    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
+    store = _engine_store_factory(claim_engine)()
+    source_messages = [{"role": "user", "content": "old"}]
+    pending = make_checkpoint_row(source_messages, claim_token="failed-owner")
+
+    assert await store.claim_pending(pending) is True
+    assert await store.release_claim(pending["id"], claim_token="other-token") is False
+    assert await store.release_claim(pending["id"], claim_token="failed-owner") is True
+    assert await store.claim_pending(dict(pending, claim_token="next-owner")) is True
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_schema_init_tolerates_concurrent_and_repeated_runs(claim_engine):
+    async def init_once():
+        async with claim_engine.begin() as conn:
+            await conn.run_sync(mod._initialize_checkpoint_schema)
+
+    await asyncio.gather(init_once(), init_once())
+    await init_once()
+
+    columns = await _checkpoint_table_columns(claim_engine)
+    assert {"claim_token", "claim_expires_at"} <= columns
+
+
+def _history_checkpoint_rows(messages):
+    rows = []
+    parent_id = None
+    for count in range(1, len(messages) + 1):
+        source = mod._build_canonical_history_source_sync(tuple(messages), count, None)
+        row = mod.build_checkpoint_row(
+            namespace=mod.CHECKPOINT_NAMESPACE,
+            user_id="user-1",
+            chat_id="chat-1",
+            pipe_function_id="auto_compact",
+            profile_hash=mod.compute_profile_hash(),
+            source_hash=mod.compute_source_hash(messages[:count]),
+            source_message_count=count,
+            summary_text=f"summary-{count}",
+            summary_meta={
+                "history_ref": {
+                    "format": "canonical-history-jsonl-v1",
+                    "raw_source_hash": source.raw_source_hash,
+                }
+            },
+            parent_checkpoint_id=parent_id,
+            now=count,
+        )
+        rows.append(row)
+        parent_id = row["id"]
+    return rows
+
+
+class HistoryCatalogStore:
+    def __init__(self, rows):
+        self.rows = {row["id"]: copy.deepcopy(row) for row in rows}
+
+    async def lookup_ready_descriptor_by_id(self, checkpoint_id, **_identity):
+        row = self.rows.get(checkpoint_id)
+        return copy.deepcopy(row) if row is not None else None
+
+
+@pytest.mark.asyncio
+async def test_v1_history_ancestor_resolution_verifies_first_middle_last_file_ids(
+    monkeypatch,
+):
+    raw_messages = [
+        {
+            "id": f"message-{index}",
+            "role": "user",
+            "content": f"message-{index}",
+            "files": [{"id": f"file-{index}", "type": "file"}],
+        }
+        for index in range(1, 4)
+    ]
+    metadata_files = [
+        {
+            "id": f"file-{index}",
+            "type": "file",
+            "name": f"file-{index}.txt",
+            "file": {"id": f"file-{index}", "hash": f"hash-{index}"},
+        }
+        for index in range(1, 4)
+    ]
+    from open_webui.utils.middleware import process_messages_with_output
+
+    expanded_messages = process_messages_with_output(copy.deepcopy(raw_messages))
+
+    async def load_chat_message_chain(_request, chat_id, current_message_id):
+        assert (chat_id, current_message_id) == ("chat-1", "message-3")
+        return copy.deepcopy(raw_messages)
+
+    monkeypatch.setattr(mod, "_load_chat_message_chain", load_chat_message_chain)
+    metadata = {
+        "chat_id": "chat-1",
+        "user_message_id": "message-3",
+        "files": metadata_files,
+    }
+    build_resolver = await mod._build_prefix_file_fingerprint_resolver(
+        SimpleNamespace(state=SimpleNamespace()),
+        metadata,
+        expanded_messages,
+    )
+    assert build_resolver is not None
+    expected_fingerprints = tuple(build_resolver(count) for count in range(1, 4))
+    assert all(expected_fingerprints)
+
+    rows = []
+    parent_id = None
+    for count in range(1, 4):
+        canonical = await mod.build_canonical_history_source(
+            raw_messages,
+            source_message_count=count,
+        )
+        row = mod.build_checkpoint_row(
+            namespace=mod.CHECKPOINT_NAMESPACE,
+            user_id="user-1",
+            chat_id="chat-1",
+            pipe_function_id="auto_compact",
+            profile_hash=mod.compute_profile_hash(),
+            source_hash=mod.compute_summary_source_hash(
+                expanded_messages[:count],
+                expected_fingerprints[count - 1],
+                mod._prefix_file_fingerprint_resolver_db_chain(build_resolver),
+            ),
+            source_message_count=count,
+            summary_text=f"summary-{count}",
+            summary_meta={
+                mod.SUMMARY_META_HISTORY_REF_KEY: {
+                    "format": mod.HISTORY_REF_FORMAT,
+                    "raw_source_hash": canonical.raw_source_hash,
+                }
+            },
+            parent_checkpoint_id=parent_id,
+            now=count,
+        )
+        rows.append(row)
+        parent_id = row["id"]
+
+    observed_file_ids = []
+    stable_file_fingerprint = mod._stable_file_fingerprint
+
+    def observe_file_ids(items):
+        observed_file_ids.append(tuple(item["id"] for item in items))
+        return stable_file_fingerprint(items)
+
+    monkeypatch.setattr(mod, "_stable_file_fingerprint", observe_file_ids)
+    raw_loads = []
+
+    async def load_raw_chat_branch(*, chat_id, metadata):
+        raw_loads.append((chat_id, metadata["user_message_id"]))
+        return copy.deepcopy(raw_messages)
+
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore(rows),
+        selected_checkpoint=rows[-1],
+        user_message_id="message-3",
+    )
+    request = SimpleNamespace(state=SimpleNamespace())
+
+    for index in (0, 1, 2):
+        entry = next(
+            entry
+            for entry in catalog
+            if entry.manifest.ref == f"history:{rows[index]['id']}"
+        )
+        resolved = await mod.resolve_history_ref_catalog_entry(
+            entry,
+            request=request,
+            metadata=metadata,
+        )
+        assert isinstance(resolved.source, mod.CanonicalHistorySourceHandle)
+        assert resolved.source.line_count == index + 1
+
+    assert observed_file_ids == [
+        ("file-1",),
+        ("file-1", "file-2"),
+        ("file-1", "file-2", "file-3"),
+    ]
+    assert raw_loads == [("chat-1", "message-3")] * 3
+
+
+@pytest.mark.asyncio
+async def test_history_catalog_enumerates_over_128_ancestors_and_revalidates_requested_ref_on_read(
+    monkeypatch,
+    claim_engine,
+):
+    from sqlalchemy import event
+
+    messages = [{"role": "user", "content": f"message-{index}"} for index in range(130)]
+    rows = _history_checkpoint_rows(messages)
+    await mod.ensure_checkpoint_table_initialized(async_engine=claim_engine)
+    async with claim_engine.begin() as connection:
+        await connection.execute(mod.CHECKPOINT_TABLE.insert(), rows)
+    store = _engine_store_factory(claim_engine)()
+    load_calls = []
+    select_statements = []
+
+    async def load_raw_chat_branch(*, chat_id, metadata):
+        load_calls.append({"chat_id": chat_id, "metadata": metadata})
+        return copy.deepcopy(messages)
+
+    def capture_select(_connection, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            select_statements.append(statement)
+
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
+    event.listen(claim_engine.sync_engine, "before_cursor_execute", capture_select)
+    try:
+        catalog = await mod.build_history_ref_catalog(
+            store=store,
+            selected_checkpoint=rows[-1],
+            user_message_id="message-130",
+        )
+    finally:
+        event.remove(claim_engine.sync_engine, "before_cursor_execute", capture_select)
+
+    assert len(catalog) == 130
+    assert all("summary_text" not in statement for statement in select_statements)
+    assert load_calls == []
+    assert {entry.manifest.ref for entry in catalog} == {
+        f"history:{row['id']}" for row in rows
+    }
+
+    for index in (0, 64, 129):
+        entry = next(item for item in catalog if item.manifest.ref == f"history:{rows[index]['id']}")
+        resolved = await mod.resolve_history_ref_catalog_entry(
+            entry,
+            request=SimpleNamespace(state=SimpleNamespace()),
+            metadata={"chat_id": "chat-1", "user_message_id": "message-130"},
+        )
+        assert resolved.manifest.sha256 == rows[index]["summary_meta"]["history_ref"]["raw_source_hash"]
+        assert resolved.source.line_count == index + 1
+
+    assert len(load_calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_history_catalog_keeps_valid_prefix_when_ancestor_chain_is_malformed():
+    messages = [{"role": "user", "content": f"message-{index}"} for index in range(3)]
+    rows = _history_checkpoint_rows(messages)
+    child = rows[-1]
+    malformed = [
+        [*rows[:-1], dict(child, parent_checkpoint_id=child["id"])],
+        [dict(child, parent_checkpoint_id="accp_" + "f" * 64)],
+        [rows[0], dict(rows[1], source_message_count=3), child],
+    ]
+
+    for case in malformed:
+        catalog = await mod.build_history_ref_catalog(
+            store=HistoryCatalogStore(case),
+            selected_checkpoint=case[-1],
+            user_message_id="message-3",
+        )
+        assert [entry.manifest.ref for entry in catalog] == [
+            f"history:{child['id']}"
+        ]
+
+    selected_without_history_ref = copy.deepcopy(child)
+    selected_without_history_ref["summary_meta"] = {}
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore([*rows[:-1], selected_without_history_ref]),
+        selected_checkpoint=selected_without_history_ref,
+        user_message_id="message-3",
+    )
+    assert [entry.manifest.ref for entry in catalog] == [
+        f"history:{rows[1]['id']}",
+        f"history:{rows[0]['id']}",
+    ]
+
+    for invalid_selected in (
+        dict(child, state="pending"),
+        dict(child, user_id=""),
+        dict(child, source_message_count=0),
+    ):
+        assert (
+            await mod.build_history_ref_catalog(
+                store=HistoryCatalogStore([*rows[:-1], invalid_selected]),
+                selected_checkpoint=invalid_selected,
+                user_message_id="message-3",
+            )
+            == ()
+        )
+
+
+@pytest.mark.asyncio
+async def test_history_catalog_excludes_sibling_and_keeps_prefix_before_identity_mismatch():
+    messages = [{"role": "user", "content": f"message-{index}"} for index in range(3)]
+    rows = _history_checkpoint_rows(messages)
+    sibling = dict(
+        rows[1],
+        id="accp_" + "a" * 64,
+        source_hash="sibling",
+        parent_checkpoint_id=rows[0]["id"],
+    )
+    valid_catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore([*rows, sibling]),
+        selected_checkpoint=rows[-1],
+        user_message_id="message-3",
+    )
+
+    assert f"history:{sibling['id']}" not in {entry.manifest.ref for entry in valid_catalog}
+
+    for mismatched_parent in (
+        dict(rows[1], user_id="user-2"),
+        dict(rows[1], profile_hash="other-profile"),
+    ):
+        catalog = await mod.build_history_ref_catalog(
+            store=HistoryCatalogStore([rows[0], mismatched_parent, rows[-1]]),
+            selected_checkpoint=rows[-1],
+            user_message_id="message-3",
+        )
+        assert [entry.manifest.ref for entry in catalog] == [
+            f"history:{rows[-1]['id']}"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_history_unavailable_child_does_not_fallback_to_ancestor(monkeypatch):
+    messages = [{"role": "user", "content": "parent"}, {"role": "assistant", "content": "child"}]
+    rows = _history_checkpoint_rows(messages)
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore(rows),
+        selected_checkpoint=rows[-1],
+        user_message_id="message-2",
+    )
+    child = next(entry for entry in catalog if entry.manifest.ref == f"history:{rows[-1]['id']}")
+    parent = next(entry for entry in catalog if entry.manifest.ref == f"history:{rows[0]['id']}")
+
+    requested_branches = []
+
+    async def parent_only(*, chat_id, metadata):
+        requested_branches.append("missing-child")
+        return copy.deepcopy(messages[:1])
+
+    async def corrupt_child(*, chat_id, metadata):
+        requested_branches.append("corrupt-child")
+        return [messages[0], {"role": "assistant", "content": "tampered"}]
+
+    for loader, error in (
+        (parent_only, "checkpoint count references an unsaved source"),
+        (corrupt_child, "raw source hash"),
+    ):
+        monkeypatch.setattr(mod, "load_raw_chat_branch", loader)
+        with pytest.raises(mod.CanonicalHistoryError, match=error):
+            await mod.resolve_history_ref_catalog_entry(
+                child,
+                request=SimpleNamespace(state=SimpleNamespace()),
+                metadata={"chat_id": "chat-1", "user_message_id": "message-2"},
+            )
+
+    async def valid_branch(*, chat_id, metadata):
+        requested_branches.append("explicit-parent")
+        return copy.deepcopy(messages)
+
+    monkeypatch.setattr(mod, "load_raw_chat_branch", valid_branch)
+    resolved_parent = await mod.resolve_history_ref_catalog_entry(
+        parent,
+        request=SimpleNamespace(state=SimpleNamespace()),
+        metadata={"chat_id": "chat-1", "user_message_id": "message-2"},
+    )
+    assert resolved_parent.manifest.ref == f"history:{rows[0]['id']}"
+    assert requested_branches == [
+        "missing-child",
+        "corrupt-child",
+        "explicit-parent",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_history_manifest_is_rendered_but_not_stored(monkeypatch):
+    messages = [{"role": "user", "content": "history"}]
+    row = _history_checkpoint_rows(messages)[0]
+    stored_summary = row["summary_text"]
+
+    async def load_raw_chat_branch(*, chat_id, metadata):
+        return copy.deepcopy(messages)
+
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore([row]),
+        selected_checkpoint=row,
+        user_message_id="message-1",
+    )
+    plan = mod.build_history_ref_projection_plan(catalog)
+    body = {"messages": [mod.render_summary_message_from_checkpoint(row)]}
+    mod._apply_ref_manifests(body, plan)
+
+    assert body["metadata"]["auto_compact_ref_manifests"] == [
+        {
+            "ref": f"history:{row['id']}",
+            "sha256": row["summary_meta"]["history_ref"]["raw_source_hash"],
+        }
+    ]
+    assert row["summary_text"] == stored_summary
+    assert "history:" not in row["summary_text"]
+    assert "auto_compact_ref_manifests" not in row["summary_meta"]
+
+
+@pytest.mark.asyncio
+async def test_history_catalog_rejects_unverified_raw_hash(monkeypatch):
+    messages = [{"role": "user", "content": "history"}]
+    row = _history_checkpoint_rows(messages)[0]
+    row["summary_meta"]["history_ref"]["raw_source_hash"] = "0" * 64
+    load_calls = []
+
+    async def load_raw_chat_branch(*, chat_id, metadata):
+        load_calls.append(True)
+        return copy.deepcopy(messages)
+
+    monkeypatch.setattr(mod, "load_raw_chat_branch", load_raw_chat_branch)
+    catalog = await mod.build_history_ref_catalog(
+        store=HistoryCatalogStore([row]),
+        selected_checkpoint=row,
+        user_message_id="message-1",
+    )
+
+    assert [entry.manifest.ref for entry in catalog] == [f"history:{row['id']}"]
+    assert load_calls == []
+    with pytest.raises(mod.CanonicalHistoryError, match="raw source hash"):
+        await mod.resolve_history_ref_catalog_entry(
+            catalog[0],
+            request=SimpleNamespace(state=SimpleNamespace()),
+            metadata={"chat_id": "chat-1", "user_message_id": "message-1"},
+        )
