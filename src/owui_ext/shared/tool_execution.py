@@ -634,14 +634,17 @@ def _call_tool_batch(tool_call: dict, tools: dict) -> Optional[list]:
     return members
 
 
-def _replay_like_core(function: dict) -> None:
-    """Rewrite a model's call the way Core 0.13.1+ replays it: arguments it cannot read become an error object."""
+def _replay_like_core(function: dict, written: Any) -> None:
+    """Rewrite a model's call the way Core 0.13.1+ replays it: arguments it cannot read become an error object.
+
+    Core 0.13.3+ sends a JSON object back as the model had *written* it.
+    """
     if _core_tool_calling() is None:
         return
     from open_webui.utils.misc import get_provider_function
 
     function["arguments"] = get_provider_function(
-        {"name": function.get("name", ""), "arguments": function.get("arguments", "{}")}
+        {"name": function.get("name", ""), "arguments": function.get("arguments", "{}"), "original_arguments": written}
     )["arguments"]
 
 
@@ -701,12 +704,15 @@ async def execute_tool_call(
             "tool_call_id": tool_call_id,
             "content": f"Malformed tool_call: 'function' is {type(tool_call.get('function')).__name__}, not dict",
         }
+    function = tool_call["function"]
+    quote_arguments_core_raises_on(function)
+    written = function.get("arguments", "{}")
     try:
         return await _execute_model_call(
             tool_call, tool_call_id, tools_dict, extra_params, event_emitter, state, stop_after
         )
     finally:
-        _replay_like_core(tool_call["function"])
+        _replay_like_core(function, written)
 
 
 async def _execute_model_call(
@@ -718,7 +724,6 @@ async def _execute_model_call(
     state: Optional[ToolCallState],
     stop_after: frozenset,
 ) -> dict:
-    quote_arguments_core_raises_on(tool_call["function"])
     if state is not None and state.round_error:
         state.stop_reason = state.stop_reason or state.round_error
         _record_failed_call(state, tool_call["function"])

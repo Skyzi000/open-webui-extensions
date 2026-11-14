@@ -295,7 +295,7 @@ async def _add_hidden_skills(
 ) -> Optional[list]:
     try:
         from open_webui.models.config import Config
-        from open_webui.utils.middleware import hidden_tool_result, preload_skills
+        from open_webui.utils.middleware import get_reasoning_format, hidden_tool_result, preload_skills
         from open_webui.utils.misc import convert_output_to_messages
         from open_webui.utils.tools import get_updated_tool_function
     except ImportError:
@@ -313,7 +313,10 @@ async def _add_hidden_skills(
     manifest = next((skill for skill in skills if skill.startswith(_SKILLS_MANIFEST_START)), "")
     output = hidden_tool_result("list_available_skills", manifest) if manifest else []
     output += await preload_skills(messages, activated & _skill_ids_in(skills), view_skill)
-    return [*messages, *convert_output_to_messages(output, raw=True)] if output else messages
+    if not output:
+        return messages
+    reasoning_format = get_reasoning_format(extra_params.get("__model__") or {})
+    return [*messages, *convert_output_to_messages(output, raw=True, reasoning_format=reasoning_format)]
 
 
 def isolate_chat_context(metadata: Optional[dict]) -> dict:

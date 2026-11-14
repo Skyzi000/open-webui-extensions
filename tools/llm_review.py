@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.19
+version: 0.5.20
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -712,7 +712,7 @@ async def _add_hidden_skills(
 ) -> Optional[list]:
     try:
         from open_webui.models.config import Config
-        from open_webui.utils.middleware import hidden_tool_result, preload_skills
+        from open_webui.utils.middleware import get_reasoning_format, hidden_tool_result, preload_skills
         from open_webui.utils.misc import convert_output_to_messages
         from open_webui.utils.tools import get_updated_tool_function
     except ImportError:
@@ -730,7 +730,10 @@ async def _add_hidden_skills(
     manifest = next((skill for skill in skills if skill.startswith(_SKILLS_MANIFEST_START)), "")
     output = hidden_tool_result("list_available_skills", manifest) if manifest else []
     output += await preload_skills(messages, activated & _skill_ids_in(skills), view_skill)
-    return [*messages, *convert_output_to_messages(output, raw=True)] if output else messages
+    if not output:
+        return messages
+    reasoning_format = get_reasoning_format(extra_params.get("__model__") or {})
+    return [*messages, *convert_output_to_messages(output, raw=True, reasoning_format=reasoning_format)]
 
 
 def isolate_chat_context(metadata: Optional[dict]) -> dict:
@@ -1400,14 +1403,17 @@ def _call_tool_batch(tool_call: dict, tools: dict) -> Optional[list]:
     return members
 
 
-def _replay_like_core(function: dict) -> None:
-    """Rewrite a model's call the way Core 0.13.1+ replays it: arguments it cannot read become an error object."""
+def _replay_like_core(function: dict, written: Any) -> None:
+    """Rewrite a model's call the way Core 0.13.1+ replays it: arguments it cannot read become an error object.
+
+    Core 0.13.3+ sends a JSON object back as the model had *written* it.
+    """
     if _core_tool_calling() is None:
         return
     from open_webui.utils.misc import get_provider_function
 
     function["arguments"] = get_provider_function(
-        {"name": function.get("name", ""), "arguments": function.get("arguments", "{}")}
+        {"name": function.get("name", ""), "arguments": function.get("arguments", "{}"), "original_arguments": written}
     )["arguments"]
 
 
@@ -1467,12 +1473,15 @@ async def execute_tool_call(
             "tool_call_id": tool_call_id,
             "content": f"Malformed tool_call: 'function' is {type(tool_call.get('function')).__name__}, not dict",
         }
+    function = tool_call["function"]
+    quote_arguments_core_raises_on(function)
+    written = function.get("arguments", "{}")
     try:
         return await _execute_model_call(
             tool_call, tool_call_id, tools_dict, extra_params, event_emitter, state, stop_after
         )
     finally:
-        _replay_like_core(tool_call["function"])
+        _replay_like_core(function, written)
 
 
 async def _execute_model_call(
@@ -1484,7 +1493,6 @@ async def _execute_model_call(
     state: Optional[ToolCallState],
     stop_after: frozenset,
 ) -> dict:
-    quote_arguments_core_raises_on(tool_call["function"])
     if state is not None and state.round_error:
         state.stop_reason = state.stop_reason or state.round_error
         _record_failed_call(state, tool_call["function"])

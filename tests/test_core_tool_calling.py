@@ -16,6 +16,36 @@ pytestmark = pytest.mark.skipif(
     reason="Core before 0.13.1 has none of these tool-calling contracts",
 )
 
+
+
+def core_replays_calls_as_written():
+    try:
+        from open_webui.utils.misc import get_provider_function
+    except ImportError:
+        return False
+    written = '{"query":"key"}'
+    return get_provider_function({"name": "lookup", "arguments": written})["arguments"] == written
+
+
+def core_gives_hidden_calls_the_reasoning_field():
+    try:
+        from open_webui.utils.misc import convert_output_to_messages
+    except ImportError:
+        return False
+    if not hasattr(middleware, "hidden_tool_result"):
+        return False
+    output = middleware.hidden_tool_result("list_available_skills", "skills")
+    return convert_output_to_messages(output, raw=True, reasoning_format="reasoning_content")[0].get("reasoning_content") == ""
+
+
+CORE_REPLAYS_CALLS_AS_WRITTEN = core_replays_calls_as_written()
+needs_calls_replayed_as_written = pytest.mark.skipif(
+    not CORE_REPLAYS_CALLS_AS_WRITTEN, reason="Core before 0.13.3 replays a call's arguments normalized"
+)
+needs_reasoning_field_on_hidden_calls = pytest.mark.skipif(
+    not core_gives_hidden_calls_the_reasoning_field(),
+    reason="Core before 0.13.3 gives hidden tool calls no reasoning_content",
+)
 APPROVAL_SETTINGS = {
     "chat.tool_permissions.enable": True,
     "chat.tool_permissions.auto.enable": True,
@@ -129,6 +159,34 @@ async def test_children_get_the_skills_core_gave_the_chat_as_tool_history(monkey
             assert "HIDDEN_SKILL_BODY" not in body["system"]
         else:
             assert "HIDDEN_SKILL_BODY" in body["system"]
+
+
+@needs_reasoning_field_on_hidden_calls
+@pytest.mark.parametrize("entry", h.ENTRIES)
+@pytest.mark.parametrize("provider", ["", "llama.cpp"])
+async def test_hidden_skill_calls_carry_the_reasoning_field_a_llama_cpp_child_needs(monkeypatch, entry, provider):
+    from open_webui.models.skills import SkillForm, Skills
+
+    h.keep_core_config(monkeypatch, {"skills.lazy_loading.enable": False})
+    await Skills.insert_new_skill("loop-user", SkillForm(id="hidden-writer", name="Writer", content="HIDDEN_SKILL_BODY"))
+    child = {"id": "child", "owned_by": "openai", "provider": provider, "info": {"meta": {}, "params": {}}}
+    try:
+        messages, parent = await core_parent_with_skill(monkeypatch, "hidden-writer")
+        sent, _, _ = await h.run_entry(
+            monkeypatch, entry, h.answer,
+            parent_metadata={
+                **h.ENTRY_METADATA, "skill_ids": parent["skill_ids"], "chat_context": parent["chat_context"],
+            },
+            entry_kwargs={"__messages__": messages}, extra_models={"child": child},
+        )
+    finally:
+        await Skills.delete_skill_by_id("hidden-writer")
+
+    hidden_calls = [
+        message for body in sent if body["tools"] for message in body["messages"] if message.get("tool_calls")
+    ]
+    assert hidden_calls
+    assert all((message.get("reasoning_content") == "") == (provider == "llama.cpp") for message in hidden_calls)
 
 
 @pytest.mark.parametrize("entry", h.ENTRIES)
@@ -437,6 +495,11 @@ async def test_auto_mode_has_the_child_model_say_which_of_its_calls_need_approva
                 assert "__approval__" not in json.dumps(function)
     assert executed and set(executed) == {"key"}
     assert [call["name"] for call in asked] == (["lookup"] * len(executed) if required else [])
+    replayed = [
+        json.loads(call["function"]["arguments"]) for body in sent for message in body["messages"]
+        for call in message.get("tool_calls") or [] if call["function"]["name"] == "lookup"
+    ]
+    assert replayed and all(("__approval__" in arguments) == CORE_REPLAYS_CALLS_AS_WRITTEN for arguments in replayed)
 
 
 @pytest.mark.parametrize("entry", ["parallel_sub_agents", "magi_decision_support", "multi_model_council"])
@@ -483,6 +546,29 @@ async def test_calls_of_a_reply_cut_off_before_its_end_do_not_run_and_tool_use_s
         FINAL_ANSWER_PROMPT in str(body["messages"]) or "Tool use has stopped for this response." in str(body["messages"])
         for body in stopped
     )
+
+
+@needs_calls_replayed_as_written
+@pytest.mark.parametrize("entry", h.ENTRIES)
+async def test_a_call_goes_back_to_the_model_as_the_model_wrote_it(monkeypatch, entry):
+    written = '{"query":"k\\u00e9y"}'
+    executed = []
+
+    def respond(body):
+        if "lookup" in body["tools"] and not h.called(body, "lookup"):
+            response = h.tool_call("lookup")
+            response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = written
+            return response
+        return h.answer(body)
+
+    sent, _, _ = await h.run_entry(monkeypatch, entry, respond, regular_tools=recording_tools(executed))
+
+    replayed = [
+        call["function"]["arguments"] for body in sent for message in body["messages"]
+        for call in message.get("tool_calls") or [] if call["function"]["name"] == "lookup"
+    ]
+    assert executed and set(executed) == {"k\u00e9y"}
+    assert replayed and set(replayed) == {written}
 
 
 @pytest.mark.parametrize("entry", h.ENTRIES)
@@ -645,7 +731,8 @@ async def test_child_tool_arguments_are_normalized_like_core(monkeypatch, kind):
     assert executed == [False] * (2 if kind == "concatenated" else 1)
     calls = [call["function"]["arguments"] for body in sent[-1:] for message in body["messages"]
              for call in message.get("tool_calls") or []]
-    assert calls == ['{"query": false}'] * len(executed)
+    as_written = kind == "scalar" and CORE_REPLAYS_CALLS_AS_WRITTEN
+    assert calls == ['{"query": "false"}' if as_written else '{"query": false}'] * len(executed)
 
 
 @pytest.mark.parametrize("batched", [False, True])
