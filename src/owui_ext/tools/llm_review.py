@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.20
+version: 0.5.21
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -43,6 +43,7 @@ from owui_ext.shared.prompt_utils import (
 from owui_ext.shared.status_text import truncate_status
 from owui_ext.shared.tool_execution import (
     append_tool_result_images,
+    assistant_turn,
     call_targets,
     execute_direct_tool_call,
     execute_tool_call,
@@ -3126,12 +3127,7 @@ async def run_agent_loop(
             # agent to submit) gets one more shot at the capture.
             if not tool_calls:
                 if submission_tool_names:
-                    current_messages.append(
-                        {
-                            "role": "assistant",
-                            "content": content or "",
-                        }
-                    )
+                    current_messages.append(assistant_turn(message, content, None, extra_params))
                     names = ", ".join(
                         sorted(f"``{n}``" for n in submission_tool_names)
                     )
@@ -3218,13 +3214,7 @@ async def run_agent_loop(
                     f"'function' fields. Content so far: {content or '(none)'}"
                 )
 
-            current_messages.append(
-                {
-                    "role": "assistant",
-                    "content": content or "",
-                    "tool_calls": normalized_tool_calls,
-                }
-            )
+            current_messages.append(assistant_turn(message, content, normalized_tool_calls, extra_params))
 
             # Execute each tool call in source order. If any of them lands
             # in ``submission_tool_names`` we stop immediately AFTER that

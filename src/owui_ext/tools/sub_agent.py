@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.6.13
+version: 0.6.14
 license: MIT
 required_open_webui_version: 0.9.6
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -93,6 +93,7 @@ from owui_ext.shared.ref_exec import (
 )
 from owui_ext.shared.tool_execution import (
     append_tool_result_images,
+    assistant_turn,
     execute_direct_tool_call,
     execute_tool_call,
     final_answer_instruction,
@@ -100,6 +101,7 @@ from owui_ext.shared.tool_execution import (
     order_file_events,
     process_tool_result,
     take_tool_calls,
+    without_replayed_reasoning,
 )
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients, resolve_mcp_tools
 from owui_ext.shared.tool_loader import build_tools_dict
@@ -726,15 +728,15 @@ def _build_summary_body(
             "Sub-agent compaction summary failed: last sent payload has no messages"
         )
     body = dict(snapshot)
+    sent_model = snapshot.get("model") or model_id
+    body["model"] = run.compaction.summary_model.strip() or sent_model
+    summarized = list(snapshot_messages[:boundary])
+    if body["model"] != sent_model:
+        summarized = without_replayed_reasoning(summarized)
     body["messages"] = [
-        *list(snapshot_messages[:boundary]),
+        *summarized,
         {"role": "user", "content": resolve_summary_prompt()},
     ]
-    body["model"] = (
-        run.compaction.summary_model.strip()
-        or snapshot.get("model")
-        or model_id
-    )
     body["stream"] = False
     metadata = dict(snapshot.get("metadata") or {})
     metadata["model_id"] = body["model"]
@@ -1318,13 +1320,7 @@ async def run_sub_agent_loop(
                     f"'function' fields. Content so far: {content or '(none)'}"
                 )
 
-            current_messages.append(
-                {
-                    "role": "assistant",
-                    "content": content or "",
-                    "tool_calls": normalized_tool_calls,
-                }
-            )
+            current_messages.append(assistant_turn(message, content, normalized_tool_calls, extra_params))
 
             # Execute each tool call
             tool_images = []

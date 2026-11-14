@@ -811,6 +811,115 @@ async def test_inlet_metadata_kept_like_core_for_every_request_of_the_loop(monke
     assert sent and all(body["metadata"].get("inlet_flag") is (None if replace else True) for body in sent)
 
 
+REASONING_DETAILS = [{"type": "reasoning.text", "text": "thought", "format": "unknown"}]
+
+
+def core_replay(*output, reasoning_format=None):
+    from open_webui.utils.misc import convert_output_to_messages
+
+    return convert_output_to_messages(list(output), raw=True, reasoning_format=reasoning_format)
+
+
+def core_replays_reasoning_details():
+    return bool(core_replay({"type": "reasoning", "content": [], "reasoning_details": REASONING_DETAILS}))
+
+
+def core_fills_missing_reasoning_content():
+    call = {"type": "function_call", "call_id": "call", "name": "call", "arguments": "{}", "status": "completed"}
+    result = {"type": "function_call_output", "call_id": "call", "output": []}
+    return core_replay(call, result, reasoning_format="reasoning_content")[0].get("reasoning_content") == ""
+
+
+def core_sends_ollama_thinking_back():
+    reasoning_format = getattr(importlib.import_module("open_webui.utils.middleware"), "get_reasoning_format", None)
+    return bool(reasoning_format) and reasoning_format({"owned_by": "ollama"}) == "thinking"
+
+
+needs_request_filters = pytest.mark.skipif(
+    not hasattr(importlib.import_module("open_webui.utils.filter"), "get_filter_context"),
+    reason="Core before 0.11.2 has no request filters",
+)
+
+
+def child_of(provider):
+    return {"id": "child", "owned_by": "openai", "provider": provider, "info": {"meta": {}, "params": {}}}
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("provider", ["", "llama.cpp"])
+@pytest.mark.parametrize("thought", ["thought", None])
+async def test_a_tool_call_turn_goes_back_with_the_reasoning_core_sends_back(monkeypatch, entry, provider, thought):
+    def respond(body):
+        response = lookup_first(body)
+        message = response["choices"][0]["message"]
+        if thought and any(call["function"]["name"] == "lookup" for call in message.get("tool_calls") or []):
+            message.update(reasoning_content=thought, reasoning_details=copy.deepcopy(REASONING_DETAILS))
+        return response
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, respond, regular_tools=loop_tools, extra_models={"child": child_of(provider)}
+    )
+
+    turns = [
+        message for body in sent for message in body["messages"]
+        if any(call["function"]["name"] == "lookup" for call in message.get("tool_calls") or [])
+    ]
+    assert turns
+    sends_text = provider == "llama.cpp" and (thought or core_fills_missing_reasoning_content())
+    for turn in turns:
+        assert turn.get("reasoning_content") == ((thought or "") if sends_text else None)
+        assert turn.get("reasoning_details") == (REASONING_DETAILS if thought and core_replays_reasoning_details() else None)
+        assert "thinking" not in turn
+
+
+@pytest.mark.skipif(not core_sends_ollama_thinking_back(), reason="Core before 0.11.1 has no thinking field replay")
+@pytest.mark.parametrize("entry", ENTRIES)
+async def test_an_ollama_child_gets_its_thinking_back_after_a_tool_result(monkeypatch, entry):
+    from open_webui.utils import chat
+
+    sent = []
+
+    async def ollama(*, form_data, **_):
+        sent.append(copy.deepcopy(form_data))
+        response = lookup_first({"tools": tool_names(form_data), "messages": form_data["messages"]})
+        message = copy.deepcopy(response["choices"][0]["message"])
+        for call in message.get("tool_calls") or []:
+            call["function"]["arguments"] = json.loads(call["function"]["arguments"])
+            if call["function"]["name"] == "lookup":
+                message["thinking"] = "thought"
+        return {"model": form_data["model"], "message": message, "done": True}
+
+    monkeypatch.setattr(chat, "generate_ollama_chat_completion", ollama)
+    await run_entry(
+        monkeypatch, entry, answer, regular_tools=loop_tools,
+        extra_models={"child": {"id": "child", "owned_by": "ollama", "info": {"meta": {}, "params": {}}}},
+    )
+
+    turns = [
+        message for body in sent for message in body["messages"]
+        if any(call["function"]["name"] == "lookup" for call in message.get("tool_calls") or [])
+    ]
+    assert turns and all(turn.get("thinking") == "thought" for turn in turns)
+    assert not any("reasoning_content" in turn for turn in turns)
+    assert any(message["role"] == "tool" for body in sent for message in body["messages"])
+
+
+async def test_llm_review_sends_the_reasoning_back_with_a_reply_it_asks_to_resubmit(monkeypatch):
+    def respond(body):
+        submits = {"submit_review", "submit_draft"} & set(body["tools"])
+        if submits and not any(message.get("content") == "Free-form reply" for message in body["messages"]):
+            return {"choices": [{"message": {"content": "Free-form reply", "reasoning_content": "thought"}}]}
+        return answer(body)
+
+    sent, _, _ = await run_entry(monkeypatch, "llm_review", respond, extra_models={"child": child_of("llama.cpp")})
+
+    replies = [
+        message for body in sent for message in body["messages"] if message.get("content") == "Free-form reply"
+    ]
+    assert replies and all(reply.get("reasoning_content") == "thought" for reply in replies)
+    assert not any("tool_calls" in reply for reply in replies)
+
+
 def lookup_twice(body):
     rounds = sum(message["role"] == "tool" for message in body["messages"])
     if rounds < 2 and "lookup" in body["tools"]:
@@ -1094,6 +1203,55 @@ async def test_sub_agent_summary_request_names_the_summary_model(monkeypatch, en
     summaries = [body for body in sent if body["metadata"].get("task") == "sub_agent_summary"]
     assert summaries
     assert all(body["model"] == "summarizer" and body["model_id"] == "summarizer" for body in summaries)
+
+
+@pytest.mark.parametrize("entry", SUB_AGENT_ENTRIES)
+@pytest.mark.parametrize("routed_to, summary_model, summarizer_wrote_it", [
+    (None, "", True),
+    (None, "child", True),
+    (None, "summarizer", False),
+    pytest.param("destination", "destination", True, marks=needs_request_filters),
+    pytest.param("destination", "child", False, marks=needs_request_filters),
+])
+async def test_sub_agent_summary_gets_the_reasoning_only_when_the_model_that_wrote_it_summarizes(
+    monkeypatch, entry, routed_to, summary_model, summarizer_wrote_it,
+):
+    lookups = lookup_rounds_then_answer(4)
+
+    def respond(body):
+        response = lookups(body)
+        message = response["choices"][0]["message"]
+        if message.get("tool_calls"):
+            message.update(reasoning_content="thought", reasoning_details=copy.deepcopy(REASONING_DETAILS))
+        return response
+
+    def request_filter(form_data):
+        form_data["model"] = routed_to
+        return form_data
+
+    sent, _, _ = await run_entry(
+        monkeypatch, entry, respond, regular_tools=big_lookup_tools,
+        request_filter=request_filter if routed_to else None,
+        valves={**COMPACTION_VALVES, "COMPACTION_SUMMARY_MODEL": summary_model},
+        extra_models={
+            "child": child_of("llama.cpp"),
+            **{name: {**child_of(""), "id": name} for name in ("summarizer", "destination")},
+        },
+    )
+
+    def reasoning(summary):
+        return [
+            {key: turn[key] for key in ("thinking", "reasoning_content", "reasoning_details") if key in turn}
+            for body in sent if (body["metadata"].get("task") == "sub_agent_summary") is summary
+            for turn in body["messages"] if turn.get("tool_calls")
+        ]
+
+    written = {"reasoning_content": "thought"}
+    if core_replays_reasoning_details():
+        written["reasoning_details"] = REASONING_DETAILS
+    assert reasoning(summary=False) and all(fields == written for fields in reasoning(summary=False))
+    assert reasoning(summary=True)
+    assert all(fields == (written if summarizer_wrote_it else {}) for fields in reasoning(summary=True))
 
 
 @pytest.mark.parametrize("entry", SUB_AGENT_ENTRIES)

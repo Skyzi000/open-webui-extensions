@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.32
+version: 0.1.33
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -820,6 +820,7 @@ _tool_execution_log = logging.getLogger("owui_ext.shared.tool_execution")
 _core_process_tool_result = None
 _INCOMPLETE_FINISH_REASONS = {"length", "content_filter", "incomplete", "failed"}
 _NOT_APPROVED = "Error: tool call was not approved."
+_REPLAYED_REASONING_KEYS = ("thinking", "reasoning_content", "reasoning_details")
 
 
 @dataclass
@@ -1402,6 +1403,45 @@ def _call_tool_batch(tool_call: dict, tools: dict) -> Optional[list]:
     if members == [tool_call]:
         return None
     return members
+
+
+def assistant_turn(message: dict, content: Any, tool_calls: Optional[list], extra_params: dict) -> dict:
+    """Build the assistant turn of a child's response with the reasoning Core's own tool loop sends back with it."""
+    turn = {"role": "assistant", "content": content or ""}
+    if tool_calls:
+        turn["tool_calls"] = tool_calls
+    try:
+        from open_webui.utils import misc
+        from open_webui.utils.middleware import get_reasoning_format
+    except ImportError:
+        return turn
+    text = message.get("reasoning_content") or message.get("reasoning")
+    details = getattr(misc, "get_reasoning_details", lambda message: message.get("reasoning_details"))(message)
+    output: list = [{
+        "type": "reasoning",
+        "content": [{"type": "output_text", "text": text}] if text and isinstance(text, str) else [],
+        **({"reasoning_details": details} if details else {}),
+    }]
+    if tool_calls:
+        output += [
+            {"type": "function_call", "call_id": "call", "name": "call", "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call", "output": [], "status": "completed"},
+        ]
+    replayed = misc.convert_output_to_messages(
+        output, raw=True, reasoning_format=get_reasoning_format(extra_params.get("__model__") or {})
+    )
+    if replayed:
+        turn.update({key: replayed[0][key] for key in _REPLAYED_REASONING_KEYS if key in replayed[0]})
+    return turn
+
+
+def without_replayed_reasoning(messages: list) -> list:
+    return [
+        {key: value for key, value in message.items() if key not in _REPLAYED_REASONING_KEYS}
+        if isinstance(message, dict) and message.get("role") == "assistant"
+        else message
+        for message in messages
+    ]
 
 
 def _replay_like_core(function: dict, written: Any) -> None:
@@ -3852,13 +3892,7 @@ async def run_agent_loop(
                     }
                 )
 
-            current_messages.append(
-                {
-                    "role": "assistant",
-                    "content": content or "",
-                    "tool_calls": tool_calls,
-                }
-            )
+            current_messages.append(assistant_turn(message, content, tool_calls, extra_params))
 
             tool_images = []
             for tool_call in tool_calls:

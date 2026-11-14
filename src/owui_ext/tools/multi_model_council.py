@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.32
+version: 0.1.33
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -42,6 +42,7 @@ from owui_ext.shared.skills import (
 from owui_ext.shared.status_text import truncate_status
 from owui_ext.shared.tool_execution import (
     append_tool_result_images,
+    assistant_turn,
     execute_direct_tool_call,
     execute_tool_call,
     final_answer_instruction,
@@ -343,13 +344,7 @@ async def run_agent_loop(
                     }
                 )
 
-            current_messages.append(
-                {
-                    "role": "assistant",
-                    "content": content or "",
-                    "tool_calls": tool_calls,
-                }
-            )
+            current_messages.append(assistant_turn(message, content, tool_calls, extra_params))
 
             tool_images = []
             for tool_call in tool_calls:

@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.26
+version: 0.2.27
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -54,6 +54,7 @@ from owui_ext.shared.skills import (
 from owui_ext.shared.status_text import truncate_status
 from owui_ext.shared.tool_execution import (
     append_tool_result_images,
+    assistant_turn,
     execute_direct_tool_call,
     execute_tool_call,
     final_answer_instruction,
@@ -421,11 +422,7 @@ async def run_agent_loop(
                 )
 
             current_messages.append(
-                {
-                    "role": "assistant",
-                    "content": content or "",
-                    "tool_calls": tool_calls,
-                }
+                assistant_turn(choices[0].get("message", {}), content, tool_calls, extra_params)
             )
 
             tool_images = []
